@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
+from rich.table import Table
 
 from agentic_task_manager.core.executor import WorkflowExecutor
 from agentic_task_manager.core.workflow import AgenticWorkflow
 from agentic_task_manager.subscriptions.claude_code import ClaudeCodeSubscription
 from agentic_task_manager.subscriptions.codex import CodexSubscription
+from agentic_task_manager.utils.paths import get_data_dir
+from agentic_task_manager.utils.registry import find_workflow
 
 app = typer.Typer(help="Manage and run workflows")
 console = Console()
@@ -20,15 +25,28 @@ _SUBSCRIPTIONS = {
 }
 
 
+def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
+    """Resolve a workflow name/ID or file path."""
+    path = Path(name)
+    if path.suffix == ".toml" and path.exists():
+        return AgenticWorkflow.from_file(path)
+    return find_workflow(name, data_dir)
+
+
 @app.command("run")
 def run(
-    file: Path = typer.Argument(..., help="Workflow TOML file"),
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate without executing"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Execute a workflow."""
-    wf = AgenticWorkflow.from_file(file)
-    wf.validate()
+    """Execute a workflow by name or file path."""
+    try:
+        wf = _resolve_workflow(workflow, data_dir)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
 
+    wf.validate()
     result = asyncio.run(WorkflowExecutor(wf, _SUBSCRIPTIONS, dry_run=dry_run).run())
 
     if result.success:
@@ -40,26 +58,60 @@ def run(
 
 
 @app.command("validate")
-def validate(file: Path = typer.Argument(..., help="Workflow TOML file")) -> None:
-    """Validate a workflow file."""
+def validate(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Validate a workflow by name or file path."""
     try:
-        wf = AgenticWorkflow.from_file(file)
+        wf = _resolve_workflow(workflow, data_dir)
         wf.validate()
-        console.print(f"[green]✓[/green] {file} is valid")
+        console.print(f"[green]✓[/green] '{wf.config.id}' is valid")
     except Exception as exc:
         console.print(f"[red]✗[/red] Validation failed: {exc}")
         raise typer.Exit(1)
 
 
+@app.command("list")
+def list_workflows(data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True)) -> None:
+    """List all workflows in the data directory."""
+    base = data_dir or get_data_dir()
+    if not base.exists():
+        console.print(f"No workflows found in [bold]{base}[/bold].")
+        return
+
+    toml_files = sorted(base.glob("*.toml"))
+    if not toml_files:
+        console.print(f"No workflows found in [bold]{base}[/bold].")
+        return
+
+    table = Table("ID", "Name", "Schedule", "Agents", "Nodes")
+    for path in toml_files:
+        try:
+            wf = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        schedule = wf.config.schedule.cron_expression if wf.config.schedule else "—"
+        table.add_row(
+            wf.config.id,
+            wf.config.name,
+            schedule,
+            str(len(wf.agents)),
+            str(len(list(wf.graph._graph.nodes()))),
+        )
+    console.print(table)
+
+
 @app.command("create")
 def create(
     name: str = typer.Option(..., "--name", help="Workflow name"),
-    output: Path = typer.Option(Path("."), "--output", help="Output directory"),
+    output: Optional[Path] = typer.Option(None, "--output", help="Output directory (default: data dir)"),
 ) -> None:
-    """Create a new workflow scaffold."""
-    import re
+    """Create a new workflow scaffold in the data directory."""
     wf_id = re.sub(r"[^a-z0-9-]", "-", name.lower())
-    path = output / f"{wf_id}.toml"
+    dest = output or get_data_dir()
+    dest.mkdir(parents=True, exist_ok=True)
+    path = dest / f"{wf_id}.toml"
     content = f"""[workflow]
 id = "{wf_id}"
 name = "{name}"

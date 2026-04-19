@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import os
+import signal
+import subprocess
+import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 import typer
 from rich.console import Console
@@ -9,14 +14,25 @@ from rich.table import Table
 
 from agentic_task_manager.core.scheduler import WorkflowScheduler
 from agentic_task_manager.core.workflow import AgenticWorkflow
+from agentic_task_manager.utils.paths import get_data_dir
 
 app = typer.Typer(help="Manage workflow schedules")
 console = Console()
 
-_DEFAULT_DB = Path.home() / ".local" / "share" / "atm" / "schedules.db"
+
+def _data_dir() -> Path:
+    return get_data_dir()
 
 
-def _get_scheduler(db: Path = _DEFAULT_DB) -> WorkflowScheduler:
+def _default_db() -> Path:
+    return _data_dir() / "schedules.db"
+
+
+def _pid_file() -> Path:
+    return _data_dir() / "scheduler.pid"
+
+
+def _get_scheduler(db: Path) -> WorkflowScheduler:
     db.parent.mkdir(parents=True, exist_ok=True)
     return WorkflowScheduler(db_path=db)
 
@@ -24,11 +40,11 @@ def _get_scheduler(db: Path = _DEFAULT_DB) -> WorkflowScheduler:
 @app.command("add")
 def add(
     workflow_file: Path = typer.Argument(..., help="Workflow TOML file"),
-    db: Path = typer.Option(_DEFAULT_DB, "--db"),
+    db: Optional[Path] = typer.Option(None, "--db"),
 ) -> None:
     """Add a workflow to the schedule."""
     wf = AgenticWorkflow.from_file(workflow_file)
-    scheduler = _get_scheduler(db)
+    scheduler = _get_scheduler(db or _default_db())
     scheduler.add_workflow(wf, workflow_file)
     console.print(f"[green]Scheduled[/green] '{wf.config.id}'")
 
@@ -36,18 +52,18 @@ def add(
 @app.command("remove")
 def remove(
     workflow_id: str = typer.Argument(...),
-    db: Path = typer.Option(_DEFAULT_DB, "--db"),
+    db: Optional[Path] = typer.Option(None, "--db"),
 ) -> None:
     """Remove a workflow from the schedule."""
-    scheduler = _get_scheduler(db)
+    scheduler = _get_scheduler(db or _default_db())
     scheduler.remove_workflow(workflow_id)
     console.print(f"Removed '{workflow_id}'")
 
 
 @app.command("list")
-def list_schedules(db: Path = typer.Option(_DEFAULT_DB, "--db")) -> None:
+def list_schedules(db: Optional[Path] = typer.Option(None, "--db")) -> None:
     """List all scheduled workflows."""
-    scheduler = _get_scheduler(db)
+    scheduler = _get_scheduler(db or _default_db())
     jobs = scheduler.list_workflows()
     if not jobs:
         console.print("No scheduled workflows.")
@@ -60,13 +76,64 @@ def list_schedules(db: Path = typer.Option(_DEFAULT_DB, "--db")) -> None:
 
 @app.command("start")
 def start(
-    daemon: bool = typer.Option(False, "--daemon", help="Run in background"),
-    db: Path = typer.Option(_DEFAULT_DB, "--db"),
+    foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in the foreground"),
+    db: Optional[Path] = typer.Option(None, "--db"),
 ) -> None:
-    """Start the scheduler."""
-    scheduler = _get_scheduler(db)
+    """Start the scheduler (background by default)."""
+    db_path = db or _default_db()
+
+    if foreground:
+        _run_foreground(db_path)
+        return
+
+    pid_path = _pid_file()
+    if pid_path.exists():
+        existing_pid = int(pid_path.read_text().strip())
+        try:
+            os.kill(existing_pid, 0)
+            console.print(f"[yellow]Scheduler already running (PID {existing_pid})[/yellow]")
+            raise typer.Exit(1)
+        except (ProcessLookupError, PermissionError):
+            pid_path.unlink(missing_ok=True)
+
+    cmd = [sys.executable, "-m", "agentic_task_manager.cli.main", "schedule", "start",
+           "--foreground", "--db", str(db_path)]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(proc.pid))
+    console.print(f"[green]Scheduler started[/green] in background (PID {proc.pid})")
+    console.print(f"Run [bold]atm schedule stop[/bold] to stop it.")
+
+
+@app.command("stop")
+def stop() -> None:
+    """Stop the background scheduler."""
+    pid_path = _pid_file()
+    if not pid_path.exists():
+        console.print("[yellow]No background scheduler found.[/yellow]")
+        raise typer.Exit(1)
+
+    pid = int(pid_path.read_text().strip())
+    try:
+        os.kill(pid, signal.SIGTERM)
+        pid_path.unlink(missing_ok=True)
+        console.print(f"[green]Scheduler stopped[/green] (PID {pid})")
+    except ProcessLookupError:
+        pid_path.unlink(missing_ok=True)
+        console.print(f"[yellow]Scheduler (PID {pid}) was not running.[/yellow]")
+
+
+def _run_foreground(db_path: Path) -> None:
+    scheduler = _get_scheduler(db_path)
     scheduler.start()
-    console.print("[green]Scheduler started[/green]. Press Ctrl+C to stop.")
+    console.print("[green]Scheduler running[/green]. Press Ctrl+C to stop.")
     try:
         while True:
             time.sleep(1)
