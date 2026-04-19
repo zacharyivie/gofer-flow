@@ -1,0 +1,41 @@
+from __future__ import annotations
+
+import time
+from abc import ABC, abstractmethod
+from pathlib import Path
+
+from agentic_task_manager.core.agent import AgentResult
+from agentic_task_manager.utils.process import run_subprocess
+
+
+class Subscription(ABC):
+    async def execute(
+        self,
+        prompt: str,
+        working_dir: Path,
+        tools: list[str],
+        mcp_servers: list[str],
+        env: dict[str, str],
+        timeout: float | None = None,
+    ) -> AgentResult:
+        cmd = self._build_command(prompt, tools, mcp_servers)
+        start = time.monotonic()
+        returncode, stdout, stderr = await run_subprocess(
+            cmd, cwd=working_dir, env=env, timeout=timeout
+        )
+        duration = time.monotonic() - start
+        return AgentResult(
+            agent_id="",
+            success=returncode == 0,
+            output=stdout or stderr,
+            exit_code=returncode,
+            duration_seconds=duration,
+        )
+
+    @abstractmethod
+    def _build_command(
+        self, prompt: str, tools: list[str], mcp_servers: list[str]
+    ) -> list[str]: ...
+
+    @abstractmethod
+    def is_available(self) -> bool: ...
