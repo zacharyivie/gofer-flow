@@ -8,7 +8,7 @@ from rich.syntax import Syntax
 
 from agentic_task_manager.prompts.manager import PromptManager
 
-app = typer.Typer(help="Manage prompt library")
+app = typer.Typer(help="Manage prompt library", no_args_is_help=True)
 console = Console()
 
 _DEFAULT_PROMPTS_DIR = Path(__file__).parents[5] / "prompts"

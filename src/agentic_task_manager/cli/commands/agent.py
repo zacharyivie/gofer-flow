@@ -14,7 +14,7 @@ from agentic_task_manager.subscriptions.codex import CodexSubscription
 from agentic_task_manager.utils.paths import get_data_dir
 from agentic_task_manager.utils.registry import find_agent, find_workflow, list_all_agents
 
-app = typer.Typer(help="Manage and run agents")
+app = typer.Typer(help="Manage and run agents", no_args_is_help=True)
 console = Console()
 
 _SUBSCRIPTIONS = {

@@ -15,7 +15,7 @@ from agentic_task_manager.core.scheduler import WorkflowScheduler
 from agentic_task_manager.core.workflow import AgenticWorkflow
 from agentic_task_manager.utils.paths import get_data_dir
 
-app = typer.Typer(help="Manage workflow schedules")
+app = typer.Typer(help="Manage workflow schedules", no_args_is_help=True)
 console = Console()
 
 

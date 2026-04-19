@@ -15,7 +15,7 @@ from agentic_task_manager.subscriptions.codex import CodexSubscription
 from agentic_task_manager.utils.paths import get_data_dir
 from agentic_task_manager.utils.registry import find_workflow
 
-app = typer.Typer(help="Manage and run workflows")
+app = typer.Typer(help="Manage and run workflows", no_args_is_help=True)
 console = Console()
 
 _SUBSCRIPTIONS = {
