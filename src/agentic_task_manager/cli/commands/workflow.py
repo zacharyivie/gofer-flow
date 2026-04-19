@@ -84,21 +84,75 @@ def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidd
         console.print(f"No workflows found in [bold]{base}[/bold].")
         return
 
-    table = Table("ID", "Name", "Schedule", "Agents", "Nodes")
+    rows = []
     for path in toml_files:
         try:
             wf = AgenticWorkflow.from_file(path)
         except Exception:
             continue
+        if wf.agents and not list(wf.graph._graph.nodes()):
+            continue
         schedule = wf.config.schedule.cron_expression if wf.config.schedule else "—"
-        table.add_row(
+        rows.append((
             wf.config.id,
             wf.config.name,
             schedule,
             str(len(wf.agents)),
             str(len(list(wf.graph._graph.nodes()))),
-        )
+        ))
+
+    if not rows:
+        console.print(f"No workflows found in [bold]{base}[/bold].")
+        return
+
+    table = Table("ID", "Name", "Schedule", "Agents", "Nodes")
+    for row in rows:
+        table.add_row(*row)
     console.print(table)
+
+
+@app.command("edit")
+def edit(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Open a workflow TOML file in $EDITOR."""
+    import os
+    import subprocess
+
+    try:
+        wf = _resolve_workflow(workflow, data_dir)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    base = data_dir or get_data_dir()
+    path = base / f"{wf.config.id}.toml"
+    editor = os.environ.get("EDITOR", "vi")
+    subprocess.run([editor, str(path)])
+
+
+@app.command("rm")
+def rm(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Delete a workflow TOML file."""
+    try:
+        wf = _resolve_workflow(workflow, data_dir)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    base = data_dir or get_data_dir()
+    path = base / f"{wf.config.id}.toml"
+
+    if not yes:
+        typer.confirm(f"Delete workflow '{wf.config.id}' ({path})?", abort=True)
+
+    path.unlink()
+    console.print(f"[green]Deleted[/green] {path}")
 
 
 @app.command("create")
