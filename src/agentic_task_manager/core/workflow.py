@@ -4,16 +4,12 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import tomli_w as _tomli_w
 from pydantic import BaseModel, TypeAdapter
 
 from agentic_task_manager.core.agent import AgentConfig
 from agentic_task_manager.core.graph import GraphNode, WorkflowGraph
 from agentic_task_manager.core.operations import Operation
-
-try:
-    import tomli_w as _tomli_w  # optional write dependency
-except ImportError:
-    _tomli_w = None  # type: ignore[assignment]
 
 
 class ScheduleConfig(BaseModel):
@@ -84,9 +80,6 @@ class AgenticWorkflow:
         return workflow
 
     def to_file(self, path: Path) -> None:
-        if _tomli_w is None:
-            raise RuntimeError("tomli-w is required for serialisation: pip install tomli-w")
-
         data: dict[str, Any] = {
             "workflow": {
                 "id": self.config.id,

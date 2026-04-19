@@ -59,6 +59,96 @@ def test_schedule_add_and_list(tmp_path: Path) -> None:
     assert "simple" in result2.output
 
 
+def test_agent_create_with_inline_prompt(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "agent", "create",
+            "--name", "Test Agent",
+            "--subscription", "claude_code",
+            "--working-dir", str(tmp_path),
+            "--prompt", "You are a helpful assistant.",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    toml_file = tmp_path / "test-agent.toml"
+    assert toml_file.exists()
+    prompt_file = tmp_path / "prompts" / "test-agent.md"
+    assert prompt_file.exists()
+    assert prompt_file.read_text() == "You are a helpful assistant."
+
+
+def test_agent_create_with_prompt_file(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "my_prompt.md"
+    prompt_file.write_text("# My Prompt\nDo things.")
+    result = runner.invoke(
+        app,
+        [
+            "agent", "create",
+            "--name", "File Agent",
+            "--subscription", "codex",
+            "--working-dir", str(tmp_path),
+            "--prompt", str(prompt_file),
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    toml_file = tmp_path / "file-agent.toml"
+    assert toml_file.exists()
+    # prompt_file should be referenced directly, not copied
+    assert not (tmp_path / "prompts" / "file-agent.md").exists()
+
+
+def test_agent_create_collision_gets_suffix(tmp_path: Path) -> None:
+    base_args = [
+        "agent", "create",
+        "--name", "Dup Agent",
+        "--subscription", "claude_code",
+        "--working-dir", str(tmp_path),
+        "--prompt", "hi",
+        "--data-dir", str(tmp_path),
+    ]
+    runner.invoke(app, base_args)
+    result = runner.invoke(app, base_args)
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "dup-agent.toml").exists()
+    assert (tmp_path / "dup-agent-2.toml").exists()
+
+
+def test_agent_create_invalid_subscription(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "agent", "create",
+            "--name", "Bad Agent",
+            "--subscription", "nonexistent",
+            "--working-dir", str(tmp_path),
+            "--prompt", "hi",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Invalid subscription" in result.output
+
+
+def test_agent_list_all(tmp_path: Path) -> None:
+    runner.invoke(
+        app,
+        [
+            "agent", "create",
+            "--name", "List Agent",
+            "--subscription", "claude_code",
+            "--working-dir", str(tmp_path),
+            "--prompt", "hi",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    result = runner.invoke(app, ["agent", "list", "--data-dir", str(tmp_path)])
+    assert result.exit_code == 0
+    assert "list-agent" in result.output
+
+
 def test_prompts_list(tmp_path: Path) -> None:
     (tmp_path / "sample.md").write_text("# Sample")
     result = runner.invoke(app, ["prompts", "list", "--dir", str(tmp_path)])

@@ -16,6 +16,7 @@ dependencies = [
     "anyio>=4.4",
     "python-dotenv>=1.0",
     "sqlalchemy>=2.0",
+    "tomli-w>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +39,10 @@ testpaths = ["tests"]
 [tool.mypy]
 strict = true
 python_version = "3.11"
+
+[[tool.mypy.overrides]]
+module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100

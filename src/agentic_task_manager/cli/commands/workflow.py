@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import re
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -37,7 +36,7 @@ def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
 def run(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate without executing"),
-    data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Execute a workflow by name or file path."""
     try:
@@ -60,7 +59,7 @@ def run(
 @app.command("validate")
 def validate(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
-    data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Validate a workflow by name or file path."""
     try:
@@ -73,7 +72,7 @@ def validate(
 
 
 @app.command("list")
-def list_workflows(data_dir: Optional[Path] = typer.Option(None, "--data-dir", hidden=True)) -> None:
+def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True)) -> None:
     """List all workflows in the data directory."""
     base = data_dir or get_data_dir()
     if not base.exists():
@@ -105,7 +104,9 @@ def list_workflows(data_dir: Optional[Path] = typer.Option(None, "--data-dir", h
 @app.command("create")
 def create(
     name: str = typer.Option(..., "--name", help="Workflow name"),
-    output: Optional[Path] = typer.Option(None, "--output", help="Output directory (default: data dir)"),
+    output: Path | None = typer.Option(
+        None, "--output", help="Output directory (default: data dir)"
+    ),
 ) -> None:
     """Create a new workflow scaffold in the data directory."""
     wf_id = re.sub(r"[^a-z0-9-]", "-", name.lower())

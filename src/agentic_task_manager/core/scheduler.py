@@ -108,4 +108,4 @@ class WorkflowScheduler:
         self._scheduler.shutdown(wait=wait)
 
     def is_running(self) -> bool:
-        return self._scheduler.running
+        return bool(self._scheduler.running)

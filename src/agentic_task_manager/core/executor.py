@@ -45,7 +45,7 @@ class ExecutionContext:
             if not isinstance(obj, dict):
                 raise ValueError(f"Cannot resolve dynamic_count path: {value!r}")
             obj = obj.get(part)
-        return int(obj)  # type: ignore[arg-type]
+        return int(obj)
 
 
 @dataclass

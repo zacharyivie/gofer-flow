@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import typer
 from rich.console import Console
@@ -40,7 +39,7 @@ def _get_scheduler(db: Path) -> WorkflowScheduler:
 @app.command("add")
 def add(
     workflow_file: Path = typer.Argument(..., help="Workflow TOML file"),
-    db: Optional[Path] = typer.Option(None, "--db"),
+    db: Path | None = typer.Option(None, "--db"),
 ) -> None:
     """Add a workflow to the schedule."""
     wf = AgenticWorkflow.from_file(workflow_file)
@@ -52,7 +51,7 @@ def add(
 @app.command("remove")
 def remove(
     workflow_id: str = typer.Argument(...),
-    db: Optional[Path] = typer.Option(None, "--db"),
+    db: Path | None = typer.Option(None, "--db"),
 ) -> None:
     """Remove a workflow from the schedule."""
     scheduler = _get_scheduler(db or _default_db())
@@ -61,7 +60,7 @@ def remove(
 
 
 @app.command("list")
-def list_schedules(db: Optional[Path] = typer.Option(None, "--db")) -> None:
+def list_schedules(db: Path | None = typer.Option(None, "--db")) -> None:
     """List all scheduled workflows."""
     scheduler = _get_scheduler(db or _default_db())
     jobs = scheduler.list_workflows()
@@ -77,7 +76,7 @@ def list_schedules(db: Optional[Path] = typer.Option(None, "--db")) -> None:
 @app.command("start")
 def start(
     foreground: bool = typer.Option(False, "--foreground", "-f", help="Run in the foreground"),
-    db: Optional[Path] = typer.Option(None, "--db"),
+    db: Path | None = typer.Option(None, "--db"),
 ) -> None:
     """Start the scheduler (background by default)."""
     db_path = db or _default_db()
@@ -109,7 +108,7 @@ def start(
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(proc.pid))
     console.print(f"[green]Scheduler started[/green] in background (PID {proc.pid})")
-    console.print(f"Run [bold]atm schedule stop[/bold] to stop it.")
+    console.print("Run [bold]atm schedule stop[/bold] to stop it.")
 
 
 @app.command("stop")
