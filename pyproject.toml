@@ -17,6 +17,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "sqlalchemy>=2.0",
     "tomli-w>=1.0",
+    "questionary>=2.0",
 ]
 
 [project.optional-dependencies]

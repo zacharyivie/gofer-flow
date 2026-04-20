@@ -35,7 +35,10 @@ class Agent:
     async def run(self, context: dict[str, object] | None = None) -> AgentResult:
         from agentic_task_manager.prompts.manager import PromptManager
 
-        prompt_text = PromptManager().load(self._config.prompt_path, context or {})
+        ctx = context or {}
+        prompt_text = PromptManager().load(self._config.prompt_path, ctx)
+        if piped := ctx.get("_piped_input"):
+            prompt_text = f"{piped}\n\n{prompt_text}"
         result = await self._subscription.execute(
             prompt=prompt_text,
             working_dir=self._config.working_dir,

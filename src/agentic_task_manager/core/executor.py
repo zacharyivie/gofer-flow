@@ -7,7 +7,7 @@ from typing import Any
 import anyio
 
 from agentic_task_manager.core.agent import Agent, AgentResult
-from agentic_task_manager.core.graph import GraphNode
+from agentic_task_manager.core.graph import GraphNode, WorkflowGraph
 from agentic_task_manager.core.operations import (
     AgentOperation,
     BashCommandOperation,
@@ -30,6 +30,7 @@ class NodeOutput:
     output: str
     exit_code: int
     duration_seconds: float
+    skipped: bool = False
 
 
 @dataclass
@@ -46,6 +47,13 @@ class ExecutionContext:
                 raise ValueError(f"Cannot resolve dynamic_count path: {value!r}")
             obj = obj.get(part)
         return int(obj)
+
+    def predecessor_outputs(self, node_id: str, graph: WorkflowGraph) -> list[NodeOutput]:
+        return [
+            self.node_outputs[pid]
+            for pid in graph._graph.predecessors(node_id)
+            if pid in self.node_outputs
+        ]
 
 
 @dataclass
@@ -69,10 +77,12 @@ class WorkflowExecutor:
 
     async def run(self) -> ExecutionResult:
         ctx = ExecutionContext()
+        graph = self._workflow.graph
         start = time.monotonic()
         halted = False
+        skipped_nodes: set[str] = set()
 
-        for generation in self._workflow.graph.topological_generations():
+        for generation in graph.topological_generations():
             if halted:
                 break
             gen_results: dict[str, NodeOutput] = {}
@@ -80,14 +90,25 @@ class WorkflowExecutor:
 
             async with anyio.create_task_group() as tg:
                 for node in generation:
-                    tg.start_soon(self._run_node, node, ctx, gen_results, halt_flag)
+                    if self._should_skip(node, ctx, skipped_nodes, graph):
+                        skipped_nodes.add(node.node_id)
+                        gen_results[node.node_id] = NodeOutput(
+                            node_id=node.node_id,
+                            success=True,
+                            output="",
+                            exit_code=0,
+                            duration_seconds=0.0,
+                            skipped=True,
+                        )
+                    else:
+                        tg.start_soon(self._run_node, node, ctx, gen_results, halt_flag, graph)
 
             ctx.node_outputs.update(gen_results)
             if halt_flag[0]:
                 halted = True
 
         total = time.monotonic() - start
-        success = all(o.success for o in ctx.node_outputs.values())
+        success = all(o.success for o in ctx.node_outputs.values() if not o.skipped)
         return ExecutionResult(
             workflow_id=self._workflow.config.id,
             success=success,
@@ -95,12 +116,31 @@ class WorkflowExecutor:
             duration_seconds=total,
         )
 
+    def _should_skip(
+        self,
+        node: GraphNode,
+        ctx: ExecutionContext,
+        skipped_nodes: set[str],
+        graph: WorkflowGraph,
+    ) -> bool:
+        for pred_id in graph._graph.predecessors(node.node_id):
+            if pred_id in skipped_nodes:
+                return True
+            pred_output = ctx.node_outputs.get(pred_id)
+            if pred_output is None:
+                continue
+            edge = graph.get_edge_config(pred_id, node.node_id)
+            if not edge.evaluate(pred_output):
+                return True
+        return False
+
     async def _run_node(
         self,
         node: GraphNode,
         ctx: ExecutionContext,
         results: dict[str, NodeOutput],
         halt_flag: list[bool],
+        graph: WorkflowGraph,
     ) -> None:
         if self._dry_run:
             log.info("[dry-run] would execute node %s", node.node_id)
@@ -110,32 +150,48 @@ class WorkflowExecutor:
             return
 
         attempt = 0
+        output: NodeOutput | None = None
         while True:
-            output = await self._execute_operation(node, ctx)
+            output = await self._execute_operation(node, ctx, graph)
             results[node.node_id] = output
             if output.success or attempt >= node.retry_count:
                 break
             attempt += 1
             await anyio.sleep(node.retry_delay_seconds)
 
-        if not output.success:
+        if output is not None and not output.success:
             if node.on_failure == "halt":
                 halt_flag[0] = True
-            elif node.on_failure == "skip":
-                pass  # already recorded, continue
-            # "continue" same as skip for now
 
-    async def _execute_operation(self, node: GraphNode, ctx: ExecutionContext) -> NodeOutput:
+    def _resolve_pipe_stdin(
+        self, node: GraphNode, ctx: ExecutionContext, graph: WorkflowGraph
+    ) -> bytes | None:
+        piped = [
+            o.output
+            for pred_id in graph._graph.predecessors(node.node_id)
+            if (pred_node := graph._nodes.get(pred_id)) is not None
+            and pred_node.pipe_output
+            and (o := ctx.node_outputs.get(pred_id)) is not None
+        ]
+        if not piped:
+            return None
+        return "\n".join(piped).encode()
+
+    async def _execute_operation(
+        self, node: GraphNode, ctx: ExecutionContext, graph: WorkflowGraph
+    ) -> NodeOutput:
         op = node.operation
         start = time.monotonic()
 
         if op.type == OperationType.BASH_COMMAND:
             assert isinstance(op, BashCommandOperation)
+            stdin = self._resolve_pipe_stdin(node, ctx, graph)
             rc, stdout, stderr = await run_subprocess(
                 ["bash", "-c", op.command],
                 cwd=op.working_dir,
                 env=op.env or None,
                 timeout=node.timeout_seconds,
+                stdin=stdin,
             )
             return NodeOutput(
                 node_id=node.node_id,
@@ -149,8 +205,9 @@ class WorkflowExecutor:
             assert isinstance(op, (PythonScriptOperation, ShellScriptOperation))
             interpreter = "python" if op.type == OperationType.PYTHON_SCRIPT else "bash"
             cmd = [interpreter, str(op.script_path)] + list(op.args)
+            stdin = self._resolve_pipe_stdin(node, ctx, graph)
             rc, stdout, stderr = await run_subprocess(
-                cmd, env=op.env or None, timeout=node.timeout_seconds
+                cmd, env=op.env or None, timeout=node.timeout_seconds, stdin=stdin
             )
             return NodeOutput(
                 node_id=node.node_id,
@@ -172,11 +229,23 @@ class WorkflowExecutor:
             count = ctx.resolve_dynamic_count(op.dynamic_count)
             outputs: list[AgentResult] = []
 
+            input_ctx: dict[str, object] = {
+                k: (ctx.node_outputs[v].output if v in ctx.node_outputs else "")
+                for k, v in op.input_mapping.items()
+            }
+            piped_text = "\n".join(
+                ctx.node_outputs[pred_id].output
+                for pred_id in graph._graph.predecessors(node.node_id)
+                if (pred_node := graph._nodes.get(pred_id)) is not None
+                and pred_node.pipe_output
+                and pred_id in ctx.node_outputs
+            )
+            if piped_text:
+                input_ctx["_piped_input"] = piped_text
+
             if count == 1:
                 agent = Agent(agent_config, sub)
-                result = await agent.run(
-                    {k: str(ctx.node_outputs.get(v, "")) for k, v in op.input_mapping.items()}
-                )
+                result = await agent.run(input_ctx)
                 outputs.append(result)
             else:
                 async with anyio.create_task_group() as tg:
@@ -184,7 +253,7 @@ class WorkflowExecutor:
 
                     async def _run_one(idx: int) -> None:
                         agent = Agent(agent_config, sub)
-                        results_list[idx] = await agent.run({"index": str(idx)})
+                        results_list[idx] = await agent.run({**input_ctx, "index": str(idx)})
 
                     for i in range(count):
                         tg.start_soon(_run_one, i)

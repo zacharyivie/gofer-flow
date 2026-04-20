@@ -36,6 +36,7 @@ def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
 def run(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate without executing"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show each node's output"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Execute a workflow by name or file path."""
@@ -47,6 +48,13 @@ def run(
 
     wf.validate()
     result = asyncio.run(WorkflowExecutor(wf, _SUBSCRIPTIONS, dry_run=dry_run).run())
+
+    if verbose:
+        for node_id, node_out in result.node_outputs.items():
+            status = "[green]✓[/green]" if node_out.success else "[red]✗[/red]"
+            console.print(f"\n{status} [bold]{node_id}[/bold]")
+            if node_out.output:
+                console.print(node_out.output)
 
     if result.success:
         console.print(f"[green]✓[/green] Workflow '{result.workflow_id}' completed successfully "
@@ -153,6 +161,24 @@ def rm(
 
     path.unlink()
     console.print(f"[green]Deleted[/green] {path}")
+
+
+@app.command("build")
+def build(
+    output: Path | None = typer.Option(None, "--output", help="Output path for workflow TOML"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Interactively build a workflow via a guided wizard."""
+    from agentic_task_manager.cli.commands.builder import WorkflowBuilder
+
+    wf = WorkflowBuilder().run()
+    if wf is None:
+        raise typer.Abort()
+    dest_dir = data_dir or get_data_dir()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = output or dest_dir / f"{wf.config.id}.toml"
+    wf.to_file(dest)
+    console.print(f"[green]Saved[/green] {dest}")
 
 
 @app.command("create")

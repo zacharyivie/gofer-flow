@@ -7,11 +7,12 @@ from rich.console import Console
 from rich.syntax import Syntax
 
 from agentic_task_manager.prompts.manager import PromptManager
+from agentic_task_manager.utils.paths import get_data_dir
 
 app = typer.Typer(help="Manage prompt library", no_args_is_help=True)
 console = Console()
 
-_DEFAULT_PROMPTS_DIR = Path(__file__).parents[5] / "prompts"
+_DEFAULT_PROMPTS_DIR = get_data_dir() / "prompts"
 
 
 @app.command("list")

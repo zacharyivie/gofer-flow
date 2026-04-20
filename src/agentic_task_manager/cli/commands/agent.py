@@ -11,6 +11,7 @@ from agentic_task_manager.core.agent import Agent, AgentConfig
 from agentic_task_manager.core.workflow import AgenticWorkflow, WorkflowConfig
 from agentic_task_manager.subscriptions.claude_code import ClaudeCodeSubscription
 from agentic_task_manager.subscriptions.codex import CodexSubscription
+from agentic_task_manager.utils.agent_helpers import resolve_prompt, unique_agent_id
 from agentic_task_manager.utils.paths import get_data_dir
 from agentic_task_manager.utils.registry import find_agent, find_workflow, list_all_agents
 
@@ -53,7 +54,7 @@ def create(
         name = typer.prompt("Agent name")
     name = name.strip()
 
-    agent_id = _unique_agent_id(name, base)
+    agent_id = unique_agent_id(name, base)
     dest_path = base / f"{agent_id}.toml"
 
     if not subscription:
@@ -78,7 +79,7 @@ def create(
         )
     prompt = prompt.strip()
 
-    prompt_path = _resolve_prompt(prompt, base, agent_id)
+    prompt_path = resolve_prompt(prompt, base, agent_id)
 
     # ── Optional fields ──────────────────────────────────────────────────────
 
@@ -108,32 +109,6 @@ def create(
     wf.to_file(dest_path)
 
     console.print(f"[green]Created agent[/green] [bold]{agent_id}[/bold] → {dest_path}")
-
-
-def _unique_agent_id(name: str, data_dir: Path) -> str:
-    """Slugify name and append a numeric suffix if the ID is already taken."""
-    import re
-    base_id = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    candidate = base_id
-    counter = 2
-    while (data_dir / f"{candidate}.toml").exists():
-        candidate = f"{base_id}-{counter}"
-        counter += 1
-    return candidate
-
-
-def _resolve_prompt(prompt: str, data_dir: Path, agent_id: str) -> Path:
-    """Return a path to the prompt file, writing inline text if needed."""
-    candidate = Path(prompt).expanduser()
-    if candidate.exists() and candidate.is_file():
-        return candidate.resolve()
-
-    # Treat prompt as inline text — save to data_dir/prompts/<agent_id>.md
-    prompts_dir = data_dir / "prompts"
-    prompts_dir.mkdir(parents=True, exist_ok=True)
-    prompt_file = prompts_dir / f"{agent_id}.md"
-    prompt_file.write_text(prompt)
-    return prompt_file
 
 
 @app.command("edit")
@@ -175,7 +150,7 @@ def edit(
         cfg = cfg.model_copy(update={"working_dir": working_dir.expanduser().resolve()})
 
     if prompt is not None:
-        prompt_path = _resolve_prompt(prompt.strip(), base, agent_id)
+        prompt_path = resolve_prompt(prompt.strip(), base, agent_id)
         cfg = cfg.model_copy(update={"prompt_path": prompt_path})
 
     if tools is not None:
@@ -219,6 +194,7 @@ def rm(
             f"Remove agent '{agent_id}' from workflow '{wf.config.id}'?", abort=True
         )
 
+    prompt_path = cfg.prompt_path
     del wf.agents[agent_id]
     dest_path = base / f"{wf.config.id}.toml"
     if not wf.agents and not list(wf.graph._graph.nodes()):
@@ -229,6 +205,13 @@ def rm(
     else:
         wf.to_file(dest_path)
         console.print(f"[green]Removed agent[/green] [bold]{agent_id}[/bold] from {dest_path}")
+
+    managed_prompts_dir = base / "prompts"
+    try:
+        if prompt_path.is_relative_to(managed_prompts_dir) and prompt_path.exists():
+            prompt_path.unlink()
+    except ValueError:
+        pass
 
 
 @app.command("run")

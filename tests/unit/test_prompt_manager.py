@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import pytest
+from pathlib import Path
 
 from agentic_task_manager.prompts.manager import PromptManager
 
 
-def test_interpolation_simple(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_interpolation_simple(tmp_path: Path) -> None:
     p = tmp_path / "prompt.md"
     p.write_text("Hello {{name}}!")
     mgr = PromptManager(search_dirs=[tmp_path])
@@ -13,7 +13,7 @@ def test_interpolation_simple(tmp_path: pytest.fixture) -> None:  # type: ignore
     assert result == "Hello World!"
 
 
-def test_interpolation_nested(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_interpolation_nested(tmp_path: Path) -> None:
     p = tmp_path / "p.md"
     p.write_text("Count: {{prev.output.count}}")
     mgr = PromptManager()
@@ -21,7 +21,7 @@ def test_interpolation_nested(tmp_path: pytest.fixture) -> None:  # type: ignore
     assert result == "Count: 42"
 
 
-def test_missing_key_left_unchanged(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_missing_key_left_unchanged(tmp_path: Path) -> None:
     p = tmp_path / "p.md"
     p.write_text("{{missing}}")
     mgr = PromptManager()
@@ -29,14 +29,14 @@ def test_missing_key_left_unchanged(tmp_path: pytest.fixture) -> None:  # type: 
     assert result == "{{missing}}"
 
 
-def test_no_placeholders(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_no_placeholders(tmp_path: Path) -> None:
     p = tmp_path / "p.md"
     p.write_text("Plain text.")
     mgr = PromptManager()
     assert mgr.load(p, {}) == "Plain text."
 
 
-def test_list_prompts(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_list_prompts(tmp_path: Path) -> None:
     (tmp_path / "a.md").write_text("a")
     (tmp_path / "b.md").write_text("b")
     mgr = PromptManager(search_dirs=[tmp_path])
@@ -45,7 +45,7 @@ def test_list_prompts(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-t
     assert {"a.md", "b.md"} <= names
 
 
-def test_search_dir_resolution(tmp_path: pytest.fixture) -> None:  # type: ignore[valid-type]
+def test_search_dir_resolution(tmp_path: Path) -> None:
     (tmp_path / "greet.md").write_text("Hi {{user}}!")
     mgr = PromptManager(search_dirs=[tmp_path])
     from pathlib import Path

@@ -19,6 +19,7 @@ async def run_subprocess(
     cwd: str | os.PathLike[str] | None = None,
     env: dict[str, str] | None = None,
     timeout: float | None = None,
+    stdin: bytes | None = None,
 ) -> tuple[int, str, str]:
     """Run a subprocess and return (returncode, stdout, stderr)."""
     merged_env = {**os.environ, **(env or {})}
@@ -29,6 +30,7 @@ async def run_subprocess(
             cwd=cwd,
             env=merged_env,
             check=False,
+            input=stdin,
         )
         return (
             result.returncode,

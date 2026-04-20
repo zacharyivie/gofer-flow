@@ -41,7 +41,7 @@ async def test_agent_interpolates_prompt(agent_config: AgentConfig) -> None:
     sub = FakeSubscription()
     agent = Agent(agent_config, sub)
     await agent.run({"repo": "awesome-project"})
-    assert "awesome-project" in sub.calls[0]["prompt"]
+    assert "awesome-project" in str(sub.calls[0]["prompt"])
 
 
 async def test_agent_failure_propagates(agent_config: AgentConfig) -> None:
