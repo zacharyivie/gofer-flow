@@ -75,3 +75,8 @@ prompt = "Analyze: {{step1.output}}"
 from = "step1"
 to = "step2"
 ```
+
+## CLAUDE INSTRUCTIONS
+
+- Always verify linting after making code changes using `ruff check src tests --fix`
+- Always run `mypy on src tests` after making code changes

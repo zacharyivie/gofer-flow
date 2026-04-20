@@ -79,6 +79,22 @@ def validate(
         raise typer.Exit(1)
 
 
+@app.command("show")
+def show(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Display the DAG structure of a workflow."""
+    from agentic_task_manager.cli.dag_renderer import render_workflow
+
+    try:
+        wf = _resolve_workflow(workflow, data_dir)
+    except KeyError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+    render_workflow(wf, console)
+
+
 @app.command("list")
 def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True)) -> None:
     """List all workflows in the data directory."""
