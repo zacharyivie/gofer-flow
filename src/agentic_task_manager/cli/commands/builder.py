@@ -19,9 +19,13 @@ from agentic_task_manager.core.graph import CycleError, EdgeConditionType, EdgeC
 from agentic_task_manager.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CountFanSource,
+    DirectoryFanSource,
+    FanSource,
     OperationType,
     PythonScriptOperation,
     ShellScriptOperation,
+    TabularFanSource,
 )
 from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 from agentic_task_manager.utils.agent_helpers import resolve_prompt, unique_agent_id
@@ -145,11 +149,13 @@ class WorkflowBuilder:
                     chosen_idx = choices.index(chosen)
                     _, agent_config = all_agents[chosen_idx]
                     self._workflow.register_agent(agent_config)
+                    fan_source = self._ask_fan_source()
                     op = AgentOperation(
                         type=OperationType.AGENT,
                         agent_id=agent_config.agent_id,
                         prompt_path=agent_config.prompt_path,
                         working_dir=agent_config.working_dir,
+                        fan_source=fan_source,
                     )
                     pipe_output = questionary.confirm(
                         "Pipe output to next node?", default=False
@@ -199,11 +205,13 @@ class WorkflowBuilder:
                 )
                 self._workflow.register_agent(agent_config)
 
+                fan_source = self._ask_fan_source()
                 op = AgentOperation(
                     type=OperationType.AGENT,
                     agent_id=agent_id,
                     prompt_path=prompt_path,
                     working_dir=working_dir,
+                    fan_source=fan_source,
                 )
                 pipe_output = questionary.confirm("Pipe output to next node?", default=False).ask()
                 node = GraphNode(node_id=node_id, operation=op, pipe_output=pipe_output)
@@ -211,6 +219,74 @@ class WorkflowBuilder:
         if node is not None:
             self._workflow.add_operation(node)
             console.print(f"  [green]✓[/green] Added node '{node_id}'")
+
+    def _ask_fan_source(self) -> FanSource | None:
+        if not questionary.confirm(
+            "Run in parallel for each item in a collection?", default=False
+        ).ask():
+            return None
+
+        source_type = questionary.select(
+            "Run once for each…",
+            choices=[
+                "Fixed number of times",
+                "Row in a CSV/TSV file",
+                "File in a directory",
+            ],
+        ).ask()
+        if source_type is None:
+            return None
+
+        max_concurrency_str = questionary.text(
+            "Max parallel instances:", default="16"
+        ).ask()
+        max_concurrency = int(max_concurrency_str) if max_concurrency_str else 16
+        fail_fast = questionary.confirm(
+            "Stop all instances immediately if one fails?", default=False
+        ).ask()
+
+        if source_type == "Fixed number of times":
+            count_str = questionary.text(
+                "Number of parallel runs (integer or {{node.output}} reference):", default="1"
+            ).ask()
+            count: int | str
+            try:
+                count = int(count_str)
+            except (ValueError, TypeError):
+                count = count_str or 1
+            return CountFanSource(
+                type="count", count=count, max_concurrency=max_concurrency, fail_fast=fail_fast
+            )
+
+        if source_type == "Row in a CSV/TSV file":
+            path_str = questionary.text("Path to CSV/TSV file:").ask()
+            if not path_str:
+                return None
+            return TabularFanSource(
+                type="tabular",
+                path=Path(path_str),
+                max_concurrency=max_concurrency,
+                fail_fast=fail_fast,
+            )
+
+        if source_type == "File in a directory":
+            path_str = questionary.text("Directory path:").ask()
+            if not path_str:
+                return None
+            glob = questionary.text("File pattern (glob):", default="*").ask() or "*"
+            include_content = questionary.confirm(
+                "Pass file contents to the agent prompt?", default=False
+            ).ask()
+            return DirectoryFanSource(
+                type="directory",
+                path=Path(path_str),
+                glob=glob,
+                include_content=include_content,
+                max_concurrency=max_concurrency,
+                fail_fast=fail_fast,
+            )
+
+        return None
 
     def _ask_edges(self) -> None:
         assert self._workflow is not None

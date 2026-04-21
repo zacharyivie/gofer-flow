@@ -21,6 +21,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+xlsx = [
+    "openpyxl>=3.1",
+]
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",
@@ -42,7 +45,7 @@ strict = true
 python_version = "3.11"
 
 [[tool.mypy.overrides]]
-module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*"]
+module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*", "openpyxl", "openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.ruff]

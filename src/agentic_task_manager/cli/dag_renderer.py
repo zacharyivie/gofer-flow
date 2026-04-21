@@ -11,9 +11,12 @@ from agentic_task_manager.core.graph import EdgeConditionType, GraphNode, Workfl
 from agentic_task_manager.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CountFanSource,
+    DirectoryFanSource,
     Operation,
     PythonScriptOperation,
     ShellScriptOperation,
+    TabularFanSource,
 )
 
 if TYPE_CHECKING:
@@ -119,7 +122,17 @@ def _op_detail(op: Operation) -> str:
     if isinstance(op, ShellScriptOperation):
         return op.script_path.name
     if isinstance(op, AgentOperation):
-        return op.agent_id
+        if op.fan_source is None:
+            detail = op.agent_id
+            if op.dynamic_count != 1:
+                detail += f" ×{op.dynamic_count}"
+            return detail
+        if isinstance(op.fan_source, TabularFanSource):
+            return f"{op.agent_id} ↦ {op.fan_source.path.name}"
+        if isinstance(op.fan_source, DirectoryFanSource):
+            return f"{op.agent_id} ↦ {op.fan_source.path.name}/"
+        if isinstance(op.fan_source, CountFanSource):
+            return f"{op.agent_id} ×{op.fan_source.count}"
     return ""
 
 
@@ -194,9 +207,23 @@ def _build_arrow_column(
 # ── Node Detail Table ─────────────────────────────────────────────────────────
 
 
+def _fan_out_cell(op: Operation) -> str:
+    if not isinstance(op, AgentOperation) or op.fan_source is None:
+        if isinstance(op, AgentOperation) and op.dynamic_count != 1:
+            return f"count={op.dynamic_count}"
+        return "—"
+    if isinstance(op.fan_source, TabularFanSource):
+        return f"tabular/{op.fan_source.path.suffix.lstrip('.')}"
+    if isinstance(op.fan_source, DirectoryFanSource):
+        return f"dir glob={op.fan_source.glob}"
+    if isinstance(op.fan_source, CountFanSource):
+        return f"count={op.fan_source.count}"
+    return "—"
+
+
 def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
     table = Table(
-        "Node", "Type", "Detail", "Retry", "Timeout",
+        "Node", "Type", "Detail", "Fan-out", "Retry", "Timeout",
         title="[bold]Nodes[/bold]",
         show_lines=False,
         header_style="bold",
@@ -213,6 +240,7 @@ def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
                 Text(node.node_id, style="bold white"),
                 Text(op_name, style=color),
                 _op_detail(op),
+                _fan_out_cell(op),
                 retry,
                 timeout,
             )

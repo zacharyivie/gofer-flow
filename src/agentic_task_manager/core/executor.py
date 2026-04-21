@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import csv
+import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import anyio
@@ -11,9 +14,13 @@ from agentic_task_manager.core.graph import GraphNode, WorkflowGraph
 from agentic_task_manager.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CountFanSource,
+    DirectoryFanSource,
+    FanSource,
     OperationType,
     PythonScriptOperation,
     ShellScriptOperation,
+    TabularFanSource,
 )
 from agentic_task_manager.core.workflow import AgenticWorkflow
 from agentic_task_manager.subscriptions.base import Subscription
@@ -21,6 +28,60 @@ from agentic_task_manager.utils.logging import get_logger
 from agentic_task_manager.utils.process import run_subprocess
 
 log = get_logger(__name__)
+
+
+def _load_tabular(path: Path) -> list[dict[str, object]]:
+    suffix = path.suffix.lower()
+    def _with_row(row: dict[str, object]) -> dict[str, object]:
+        return {**row, "_row": json.dumps(row)}
+
+    if suffix == ".jsonl":
+        rows: list[dict[str, object]] = []
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    rows.append(_with_row(json.loads(line)))
+        return rows
+    if suffix == ".csv":
+        with path.open(newline="") as f:
+            return [_with_row(dict(row)) for row in csv.DictReader(f)]
+    if suffix == ".xlsx":
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ImportError(
+                "openpyxl is required for .xlsx support: pip install 'agentic-task-manager[xlsx]'"
+            ) from exc
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        ws = wb.active
+        rows_iter = ws.iter_rows(values_only=True)
+        headers = [str(h) for h in next(rows_iter)]
+        return [_with_row(dict(zip(headers, row))) for row in rows_iter]
+    raise ValueError(f"Unsupported tabular format: {suffix!r}. Use .jsonl, .csv, or .xlsx")
+
+
+def _resolve_fan_items(
+    source: FanSource, ctx: ExecutionContext
+) -> list[dict[str, object]]:
+    if isinstance(source, CountFanSource):
+        count = ctx.resolve_dynamic_count(source.count)
+        return [{"index": str(i)} for i in range(count)]
+    if isinstance(source, TabularFanSource):
+        return _load_tabular(source.path)
+    if isinstance(source, DirectoryFanSource):
+        items: list[dict[str, object]] = []
+        for p in sorted(source.path.glob(source.glob)):
+            if p.is_file():
+                entry: dict[str, object] = {
+                    "file_path": str(p),
+                    "file_name": p.name,
+                }
+                if source.include_content:
+                    entry["file_content"] = p.read_text()
+                items.append(entry)
+        return items
+    raise ValueError(f"Unknown fan source type: {source}")  # pragma: no cover
 
 
 @dataclass
@@ -31,6 +92,7 @@ class NodeOutput:
     exit_code: int
     duration_seconds: float
     skipped: bool = False
+    fan_outputs: list[tuple[str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -226,9 +288,6 @@ class WorkflowExecutor:
             if sub is None:
                 raise ValueError(f"No subscription for '{agent_config.subscription}'")
 
-            count = ctx.resolve_dynamic_count(op.dynamic_count)
-            outputs: list[AgentResult] = []
-
             input_ctx: dict[str, object] = {
                 k: (ctx.node_outputs[v].output if v in ctx.node_outputs else "")
                 for k, v in op.input_mapping.items()
@@ -243,30 +302,60 @@ class WorkflowExecutor:
             if piped_text:
                 input_ctx["_piped_input"] = piped_text
 
-            if count == 1:
+            if op.fan_source is not None:
+                fan_items = _resolve_fan_items(op.fan_source, ctx)
+                max_concurrency = op.fan_source.max_concurrency
+                fail_fast = op.fan_source.fail_fast
+            else:
+                count = ctx.resolve_dynamic_count(op.dynamic_count)
+                fan_items = [{**input_ctx, "index": str(i)} for i in range(count)]
+                input_ctx = {}
+                max_concurrency = 16
+                fail_fast = False
+
+            outputs: list[AgentResult] = []
+            errors: list[tuple[int, BaseException]] = []
+            if len(fan_items) == 1:
                 agent = Agent(agent_config, sub)
-                result = await agent.run(input_ctx)
+                result = await agent.run({**input_ctx, **fan_items[0]})
                 outputs.append(result)
             else:
+                limiter = anyio.CapacityLimiter(max_concurrency)
+                results_list: list[AgentResult | None] = [None] * len(fan_items)
+
+                async def _run_one(idx: int, item: dict[str, object]) -> None:
+                    async with limiter:
+                        try:
+                            agent = Agent(agent_config, sub)
+                            results_list[idx] = await agent.run({**input_ctx, **item})
+                        except Exception as exc:  # noqa: BLE001
+                            errors.append((idx, exc))
+                            if fail_fast:
+                                tg.cancel_scope.cancel()
+
                 async with anyio.create_task_group() as tg:
-                    results_list: list[AgentResult | None] = [None] * count
+                    for i, item in enumerate(fan_items):
+                        tg.start_soon(_run_one, i, item)
 
-                    async def _run_one(idx: int) -> None:
-                        agent = Agent(agent_config, sub)
-                        results_list[idx] = await agent.run({**input_ctx, "index": str(idx)})
-
-                    for i in range(count):
-                        tg.start_soon(_run_one, i)
+                if errors:
+                    for idx, exc in errors:
+                        log.warning("fan-out item %d failed: %s", idx, exc)
                 outputs = [r for r in results_list if r is not None]
 
             combined_output = "\n".join(r.output for r in outputs)
-            success = all(r.success for r in outputs)
+            success = all(r.success for r in outputs) and not errors
+            fan_outputs = (
+                [(f"{node.node_id}-{i + 1}", r.output) for i, r in enumerate(outputs)]
+                if len(outputs) > 1
+                else []
+            )
             return NodeOutput(
                 node_id=node.node_id,
                 success=success,
                 output=combined_output,
                 exit_code=0 if success else 1,
                 duration_seconds=time.monotonic() - start,
+                fan_outputs=fan_outputs,
             )
 
         raise ValueError(f"Unknown operation type: {op.type}")

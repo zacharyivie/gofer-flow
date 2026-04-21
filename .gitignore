@@ -10,6 +10,9 @@ dist/
 build/
 .eggs/
 
+# local dev testing files
+math problems/
+
 # Virtual environments
 .venv/
 venv/

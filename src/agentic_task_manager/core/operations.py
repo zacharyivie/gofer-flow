@@ -14,6 +14,35 @@ class OperationType(StrEnum):
     AGENT = "agent"
 
 
+class CountFanSource(BaseModel):
+    type: Literal["count"]
+    count: int | str = 1
+    max_concurrency: int = 16
+    fail_fast: bool = False
+
+
+class TabularFanSource(BaseModel):
+    type: Literal["tabular"]
+    path: Path
+    max_concurrency: int = 16
+    fail_fast: bool = False
+
+
+class DirectoryFanSource(BaseModel):
+    type: Literal["directory"]
+    path: Path
+    glob: str = "*"
+    include_content: bool = False
+    max_concurrency: int = 16
+    fail_fast: bool = False
+
+
+FanSource = Annotated[
+    CountFanSource | TabularFanSource | DirectoryFanSource,
+    Field(discriminator="type"),
+]
+
+
 class PythonScriptOperation(BaseModel):
     type: Literal[OperationType.PYTHON_SCRIPT]
     script_path: Path
@@ -42,6 +71,7 @@ class AgentOperation(BaseModel):
     working_dir: Path
     dynamic_count: int | str = 1
     input_mapping: dict[str, str] = {}
+    fan_source: FanSource | None = None
 
 
 Operation = Annotated[

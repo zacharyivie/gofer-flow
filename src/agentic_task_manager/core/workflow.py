@@ -136,12 +136,18 @@ class AgenticWorkflow:
         if self.config.schedule:
             data["workflow"]["schedule"] = self.config.schedule.model_dump()
 
+        def _paths_to_str(obj: Any) -> Any:
+            if isinstance(obj, Path):
+                return str(obj)
+            if isinstance(obj, dict):
+                return {k: _paths_to_str(v) for k, v in obj.items()}
+            if isinstance(obj, list):
+                return [_paths_to_str(i) for i in obj]
+            return obj
+
         if self.agents:
             data["agents"] = {
-                aid: {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in ac.model_dump(exclude={"agent_id"}).items()
-                }
+                aid: _paths_to_str(ac.model_dump(exclude={"agent_id"}))
                 for aid, ac in self.agents.items()
             }
 
@@ -149,10 +155,7 @@ class AgenticWorkflow:
         edges = []
         for gen in self.graph.topological_generations():
             for node in gen:
-                node_dict = {
-                    k: str(v) if isinstance(v, Path) else v
-                    for k, v in node.operation.model_dump(exclude_none=True).items()
-                }
+                node_dict = _paths_to_str(node.operation.model_dump(exclude_none=True))
                 node_dict["id"] = node.node_id
                 # Serialize GraphNode-level fields (only non-defaults to keep TOML clean)
                 if node.pipe_output:

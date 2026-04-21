@@ -52,9 +52,15 @@ def run(
     if verbose:
         for node_id, node_out in result.node_outputs.items():
             status = "[green]✓[/green]" if node_out.success else "[red]✗[/red]"
-            console.print(f"\n{status} [bold]{node_id}[/bold]")
-            if node_out.output:
-                console.print(node_out.output)
+            if node_out.fan_outputs:
+                for label, output in node_out.fan_outputs:
+                    console.print(f"\n{status} [bold]{label}[/bold]")
+                    if output:
+                        console.print(output)
+            else:
+                console.print(f"\n{status} [bold]{node_id}[/bold]")
+                if node_out.output:
+                    console.print(node_out.output)
 
     if result.success:
         console.print(f"[green]✓[/green] Workflow '{result.workflow_id}' completed successfully "

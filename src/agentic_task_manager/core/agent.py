@@ -39,6 +39,10 @@ class Agent:
         prompt_text = PromptManager().load(self._config.prompt_path, ctx)
         if piped := ctx.get("_piped_input"):
             prompt_text = f"{piped}\n\n{prompt_text}"
+        if file_content := ctx.get("file_content"):
+            prompt_text = f"{prompt_text}\n\n{file_content}"
+        if row := ctx.get("_row"):
+            prompt_text = f"{prompt_text}\n\n{row}"
         result = await self._subscription.execute(
             prompt=prompt_text,
             working_dir=self._config.working_dir,
