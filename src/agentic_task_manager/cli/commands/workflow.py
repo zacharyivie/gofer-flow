@@ -146,9 +146,12 @@ def edit(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Open a workflow TOML file in $EDITOR."""
-    import os
-    import subprocess
+    """Interactively edit a workflow's fields in the terminal."""
+    from agentic_task_manager.cli.tui_editor import (
+        FieldEditorApp,
+        sections_to_workflow,
+        workflow_to_sections,
+    )
 
     try:
         wf = _resolve_workflow(workflow, data_dir)
@@ -158,8 +161,19 @@ def edit(
 
     base = data_dir or get_data_dir()
     path = base / f"{wf.config.id}.toml"
-    editor = os.environ.get("EDITOR", "vi")
-    subprocess.run([editor, str(path)])
+    sections = workflow_to_sections(wf)
+
+    if FieldEditorApp(sections, title=f"Edit Workflow: {wf.config.id}").run():
+        sections_to_workflow(sections, wf)
+        try:
+            wf.validate()
+        except Exception as exc:
+            console.print(f"[red]Validation failed: {exc}[/red]")
+            raise typer.Exit(1)
+        wf.to_file(path)
+        console.print(f"[green]Saved[/green] {path}")
+    else:
+        console.print("[yellow]Edit cancelled.[/yellow]")
 
 
 @app.command("rm")

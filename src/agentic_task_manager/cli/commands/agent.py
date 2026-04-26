@@ -138,6 +138,28 @@ def edit(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
+    # No flags → interactive TUI editor
+    _any_flag = any(
+        v is not None for v in [subscription, working_dir, prompt, tools, mcp_servers, env]
+    )
+    if not _any_flag:
+        from agentic_task_manager.cli.tui_editor import (
+            FieldEditorApp,
+            agent_to_sections,
+            sections_to_agent,
+        )
+
+        sections = agent_to_sections(cfg)
+        if FieldEditorApp(sections, title=f"Edit Agent: {agent_id}").run():
+            cfg = sections_to_agent(sections, cfg)
+            wf.agents[agent_id] = cfg
+            dest_path = base / f"{wf.config.id}.toml"
+            wf.to_file(dest_path)
+            console.print(f"[green]Updated agent[/green] [bold]{agent_id}[/bold] → {dest_path}")
+        else:
+            console.print("[yellow]Edit cancelled.[/yellow]")
+        return
+
     if subscription is not None:
         subscription = subscription.strip()
         if subscription not in _SUBSCRIPTION_CHOICES:
