@@ -32,7 +32,7 @@ ruff format src/ tests/
 The project is a CLI tool (`gof`) for defining and executing DAG-based agentic workflows. Workflows are defined in TOML and can run bash commands, scripts, or LLM agent calls as nodes in a directed acyclic graph.
 
 **Layer structure:**
-- `cli/` — Typer CLI; routes commands to `commands/` submodules (workflow, agent, schedule, prompts, builder)
+- `cli/` — Typer CLI; routes commands to `commands/` submodules (workflow, agent, schedule, builder)
 - `core/` — Domain logic: operations, graph, workflow, executor, scheduler
 - `subscriptions/` — ABC for LLM CLI backends (claude, codex); subclasses only override `_build_command()`
 - `prompts/` — Markdown prompt templates with `{{var}}` interpolation
