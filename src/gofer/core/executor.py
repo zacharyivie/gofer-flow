@@ -9,9 +9,9 @@ from typing import Any
 
 import anyio
 
-from agentic_task_manager.core.agent import Agent, AgentResult
-from agentic_task_manager.core.graph import GraphNode, WorkflowGraph
-from agentic_task_manager.core.operations import (
+from gofer.core.agent import Agent, AgentResult
+from gofer.core.graph import GraphNode, WorkflowGraph
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     CountFanSource,
@@ -22,10 +22,10 @@ from agentic_task_manager.core.operations import (
     ShellScriptOperation,
     TabularFanSource,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow
-from agentic_task_manager.subscriptions.base import Subscription
-from agentic_task_manager.utils.logging import get_logger
-from agentic_task_manager.utils.process import run_subprocess
+from gofer.core.workflow import AgenticWorkflow
+from gofer.subscriptions.base import Subscription
+from gofer.utils.logging import get_logger
+from gofer.utils.process import run_subprocess
 
 log = get_logger(__name__)
 
@@ -51,7 +51,7 @@ def _load_tabular(path: Path) -> list[dict[str, object]]:
             import openpyxl
         except ImportError as exc:
             raise ImportError(
-                "openpyxl is required for .xlsx support: pip install 'agentic-task-manager[xlsx]'"
+                "openpyxl is required for .xlsx support: pip install 'gofer-flow[xlsx]'"
             ) from exc
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb.active

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_task_manager.prompts.manager import PromptManager
+from gofer.prompts.manager import PromptManager
 
 
 def test_interpolation_simple(tmp_path: Path) -> None:

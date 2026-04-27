@@ -4,8 +4,8 @@ import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from agentic_task_manager.core.agent import AgentResult
-from agentic_task_manager.utils.process import run_subprocess
+from gofer.core.agent import AgentResult
+from gofer.utils.process import run_subprocess
 
 
 class Subscription(ABC):

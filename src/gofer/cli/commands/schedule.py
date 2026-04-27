@@ -11,9 +11,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from agentic_task_manager.core.scheduler import WorkflowScheduler
-from agentic_task_manager.core.workflow import AgenticWorkflow
-from agentic_task_manager.utils.paths import get_data_dir
+from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.workflow import AgenticWorkflow
+from gofer.utils.paths import get_data_dir
 
 app = typer.Typer(help="Manage workflow schedules", no_args_is_help=True)
 console = Console()
@@ -95,7 +95,7 @@ def start(
         except (ProcessLookupError, PermissionError):
             pid_path.unlink(missing_ok=True)
 
-    cmd = [sys.executable, "-m", "agentic_task_manager.cli.main", "schedule", "start",
+    cmd = [sys.executable, "-m", "gofer.cli.main", "schedule", "start",
            "--foreground", "--db", str(db_path)]
 
     proc = subprocess.Popen(
@@ -108,7 +108,7 @@ def start(
     pid_path.parent.mkdir(parents=True, exist_ok=True)
     pid_path.write_text(str(proc.pid))
     console.print(f"[green]Scheduler started[/green] in background (PID {proc.pid})")
-    console.print("Run [bold]atm schedule stop[/bold] to stop it.")
+    console.print("Run [bold]gof schedule stop[/bold] to stop it.")
 
 
 @app.command("stop")

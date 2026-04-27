@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_task_manager.core.scheduler import WorkflowScheduler
-from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 
 
 def test_add_list_remove_lifecycle(tmp_path: Path) -> None:

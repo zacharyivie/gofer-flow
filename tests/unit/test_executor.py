@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_task_manager.core.agent import AgentConfig
-from agentic_task_manager.core.executor import WorkflowExecutor
-from agentic_task_manager.core.graph import GraphNode
-from agentic_task_manager.core.operations import AgentOperation, BashCommandOperation, OperationType
-from agentic_task_manager.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.core.agent import AgentConfig
+from gofer.core.executor import WorkflowExecutor
+from gofer.core.graph import GraphNode
+from gofer.core.operations import AgentOperation, BashCommandOperation, OperationType
+from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
 
 

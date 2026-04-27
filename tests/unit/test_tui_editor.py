@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_task_manager.cli.tui_editor import (
+from gofer.cli.tui_editor import (
     FieldDescriptor,
     FieldEditorApp,
     FieldKind,
@@ -20,16 +20,16 @@ from agentic_task_manager.cli.tui_editor import (
     sections_to_workflow,
     workflow_to_sections,
 )
-from agentic_task_manager.core.agent import AgentConfig
-from agentic_task_manager.core.graph import GraphNode
-from agentic_task_manager.core.operations import (
+from gofer.core.agent import AgentConfig
+from gofer.core.graph import GraphNode
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     OperationType,
     PythonScriptOperation,
     ShellScriptOperation,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 

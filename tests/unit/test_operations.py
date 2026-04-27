@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from agentic_task_manager.core.operations import (
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     Operation,

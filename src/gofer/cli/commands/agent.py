@@ -7,13 +7,13 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from agentic_task_manager.core.agent import Agent, AgentConfig
-from agentic_task_manager.core.workflow import AgenticWorkflow, WorkflowConfig
-from agentic_task_manager.subscriptions.claude_code import ClaudeCodeSubscription
-from agentic_task_manager.subscriptions.codex import CodexSubscription
-from agentic_task_manager.utils.agent_helpers import resolve_prompt, unique_agent_id
-from agentic_task_manager.utils.paths import get_data_dir
-from agentic_task_manager.utils.registry import find_agent, find_workflow, list_all_agents
+from gofer.core.agent import Agent, AgentConfig
+from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.subscriptions.claude_code import ClaudeCodeSubscription
+from gofer.subscriptions.codex import CodexSubscription
+from gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
+from gofer.utils.paths import get_data_dir
+from gofer.utils.registry import find_agent, find_workflow, list_all_agents
 
 app = typer.Typer(help="Manage and run agents", no_args_is_help=True)
 console = Console()
@@ -143,7 +143,7 @@ def edit(
         v is not None for v in [subscription, working_dir, prompt, tools, mcp_servers, env]
     )
     if not _any_flag:
-        from agentic_task_manager.cli.tui_editor import (
+        from gofer.cli.tui_editor import (
             FieldEditorApp,
             agent_to_sections,
             sections_to_agent,

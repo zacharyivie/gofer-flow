@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 
-from agentic_task_manager.subscriptions.base import Subscription
+from gofer.subscriptions.base import Subscription
 
 
 class ClaudeCodeSubscription(Subscription):

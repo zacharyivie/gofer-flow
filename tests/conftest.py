@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agentic_task_manager.core.agent import AgentResult
-from agentic_task_manager.subscriptions.base import Subscription
+from gofer.core.agent import AgentResult
+from gofer.subscriptions.base import Subscription
 
 
 class FakeSubscription(Subscription):

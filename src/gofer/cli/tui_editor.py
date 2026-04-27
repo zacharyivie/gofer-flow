@@ -22,15 +22,15 @@ from rich.console import Console
 from rich.style import Style
 from rich.text import Text
 
-from agentic_task_manager.core.agent import AgentConfig
-from agentic_task_manager.core.graph import GraphNode
-from agentic_task_manager.core.operations import (
+from gofer.core.agent import AgentConfig
+from gofer.core.graph import GraphNode
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     PythonScriptOperation,
     ShellScriptOperation,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig
 
 # ── Field descriptor types ───────────────────────────────────────────────────
 

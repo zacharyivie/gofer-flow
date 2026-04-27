@@ -6,11 +6,11 @@ from pathlib import Path
 
 
 def get_data_dir() -> Path:
-    """Return the OS-appropriate user data directory for ATM."""
+    """Return the OS-appropriate user data directory for Gofer Flow."""
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
     else:
         base = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share"))
-    return base / "atm"
+    return base / "gofer"

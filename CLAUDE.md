@@ -29,7 +29,7 @@ ruff format src/ tests/
 
 ## Architecture
 
-The project is a CLI tool (`atm`) for defining and executing DAG-based agentic workflows. Workflows are defined in TOML and can run bash commands, scripts, or LLM agent calls as nodes in a directed acyclic graph.
+The project is a CLI tool (`gof`) for defining and executing DAG-based agentic workflows. Workflows are defined in TOML and can run bash commands, scripts, or LLM agent calls as nodes in a directed acyclic graph.
 
 **Layer structure:**
 - `cli/` — Typer CLI; routes commands to `commands/` submodules (workflow, agent, schedule, prompts, builder)
@@ -48,7 +48,7 @@ The project is a CLI tool (`atm`) for defining and executing DAG-based agentic w
 **Key patterns:**
 - Operations use a Pydantic v2 discriminated union on the `type` field — all TOML deserialization is automatic
 - `dynamic_count` on `AgentOperation` nodes enables fan-out at runtime (resolved against prior outputs)
-- `WorkflowScheduler` wraps APScheduler with a SQLite job store; persists across restarts via `~/.local/share/atm/schedules.db`
+- `WorkflowScheduler` wraps APScheduler with a SQLite job store; persists across restarts via `~/.local/share/gofer/schedules.db`
 - Tests use `FakeSubscription` (defined in `tests/conftest.py`) to avoid requiring a real `claude`/`codex` CLI
 
 **TOML workflow format:**

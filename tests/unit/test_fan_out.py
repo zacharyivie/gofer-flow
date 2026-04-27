@@ -6,17 +6,17 @@ from pathlib import Path
 import anyio
 import pytest
 
-from agentic_task_manager.core.agent import AgentConfig, AgentResult
-from agentic_task_manager.core.executor import WorkflowExecutor, _load_tabular, _resolve_fan_items
-from agentic_task_manager.core.graph import GraphNode
-from agentic_task_manager.core.operations import (
+from gofer.core.agent import AgentConfig, AgentResult
+from gofer.core.executor import WorkflowExecutor, _load_tabular, _resolve_fan_items
+from gofer.core.graph import GraphNode
+from gofer.core.operations import (
     AgentOperation,
     CountFanSource,
     DirectoryFanSource,
     OperationType,
     TabularFanSource,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
 
 # ── _load_tabular ─────────────────────────────────────────────────────────────
@@ -60,14 +60,14 @@ def test_load_tabular_jsonl_skips_blank_lines(tmp_path: Path) -> None:
 
 
 def test_resolve_fan_items_count() -> None:
-    from agentic_task_manager.core.executor import ExecutionContext
+    from gofer.core.executor import ExecutionContext
     ctx = ExecutionContext()
     items = _resolve_fan_items(CountFanSource(type="count", count=3), ctx)
     assert items == [{"index": "0"}, {"index": "1"}, {"index": "2"}]
 
 
 def test_resolve_fan_items_directory(tmp_path: Path) -> None:
-    from agentic_task_manager.core.executor import ExecutionContext
+    from gofer.core.executor import ExecutionContext
     (tmp_path / "a.py").write_text("pass")
     (tmp_path / "b.py").write_text("pass")
     (tmp_path / "skip.txt").write_text("skip")
@@ -81,7 +81,7 @@ def test_resolve_fan_items_directory(tmp_path: Path) -> None:
 
 
 def test_resolve_fan_items_directory_include_content(tmp_path: Path) -> None:
-    from agentic_task_manager.core.executor import ExecutionContext
+    from gofer.core.executor import ExecutionContext
     (tmp_path / "hello.txt").write_text("hello world")
     ctx = ExecutionContext()
     source = DirectoryFanSource(type="directory", path=tmp_path, include_content=True)

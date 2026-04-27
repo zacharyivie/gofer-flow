@@ -4,8 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agentic_task_manager.core.scheduler import WorkflowScheduler
-from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 
 
 def _scheduled_workflow(wf_id: str = "daily") -> AgenticWorkflow:

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from agentic_task_manager.core.graph import CycleError, GraphNode, WorkflowGraph
-from agentic_task_manager.core.operations import BashCommandOperation, OperationType
+from gofer.core.graph import CycleError, GraphNode, WorkflowGraph
+from gofer.core.operations import BashCommandOperation, OperationType
 
 
 def _bash_node(node_id: str, command: str = "echo ok") -> GraphNode:

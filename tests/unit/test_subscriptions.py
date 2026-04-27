@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from agentic_task_manager.subscriptions.claude_code import ClaudeCodeSubscription
-from agentic_task_manager.subscriptions.codex import CodexSubscription
+from gofer.subscriptions.claude_code import ClaudeCodeSubscription
+from gofer.subscriptions.codex import CodexSubscription
 
 
 def test_claude_code_command_basic() -> None:

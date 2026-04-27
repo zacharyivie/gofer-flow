@@ -4,7 +4,7 @@ from pathlib import Path
 
 from typer.testing import CliRunner
 
-from agentic_task_manager.cli.main import app
+from gofer.cli.main import app
 
 runner = CliRunner()
 

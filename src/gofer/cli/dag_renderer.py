@@ -7,8 +7,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from agentic_task_manager.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
-from agentic_task_manager.core.operations import (
+from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     CountFanSource,
@@ -20,7 +20,7 @@ from agentic_task_manager.core.operations import (
 )
 
 if TYPE_CHECKING:
-    from agentic_task_manager.core.workflow import AgenticWorkflow
+    from gofer.core.workflow import AgenticWorkflow
 
 _BOX_HEIGHT = 4  # lines per node box (top border + title + detail + bottom border)
 _BOX_GAP = 1     # blank lines between boxes in a generation column

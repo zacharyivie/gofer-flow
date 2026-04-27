@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_task_manager.core.agent import Agent, AgentConfig
+from gofer.core.agent import Agent, AgentConfig
 from tests.conftest import FakeSubscription
 
 

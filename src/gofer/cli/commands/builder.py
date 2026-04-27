@@ -14,9 +14,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from agentic_task_manager.core.agent import AgentConfig
-from agentic_task_manager.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNode
-from agentic_task_manager.core.operations import (
+from gofer.core.agent import AgentConfig
+from gofer.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNode
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     CountFanSource,
@@ -27,10 +27,10 @@ from agentic_task_manager.core.operations import (
     ShellScriptOperation,
     TabularFanSource,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
-from agentic_task_manager.utils.agent_helpers import resolve_prompt, unique_agent_id
-from agentic_task_manager.utils.paths import get_data_dir
-from agentic_task_manager.utils.registry import list_all_agents
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
+from gofer.utils.paths import get_data_dir
+from gofer.utils.registry import list_all_agents
 
 console = Console()
 

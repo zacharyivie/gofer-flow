@@ -8,7 +8,7 @@ from rich.console import Console
 from rich.panel import Panel
 from typer.testing import CliRunner
 
-from agentic_task_manager.cli.dag_renderer import (
+from gofer.cli.dag_renderer import (
     _build_arrow_column,
     _condition_label,
     _node_box,
@@ -16,16 +16,16 @@ from agentic_task_manager.cli.dag_renderer import (
     _op_icon_color,
     render_workflow,
 )
-from agentic_task_manager.cli.main import app
-from agentic_task_manager.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
-from agentic_task_manager.core.operations import (
+from gofer.cli.main import app
+from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
+from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     OperationType,
     PythonScriptOperation,
     ShellScriptOperation,
 )
-from agentic_task_manager.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 
 runner = CliRunner()
 
@@ -257,7 +257,7 @@ def test_render_workflow_shows_name_and_id() -> None:
 
 
 def test_render_workflow_with_schedule() -> None:
-    from agentic_task_manager.core.workflow import ScheduleConfig
+    from gofer.core.workflow import ScheduleConfig
 
     wf = AgenticWorkflow(
         WorkflowConfig(

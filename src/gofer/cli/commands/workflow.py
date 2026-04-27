@@ -8,12 +8,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from agentic_task_manager.core.executor import WorkflowExecutor
-from agentic_task_manager.core.workflow import AgenticWorkflow
-from agentic_task_manager.subscriptions.claude_code import ClaudeCodeSubscription
-from agentic_task_manager.subscriptions.codex import CodexSubscription
-from agentic_task_manager.utils.paths import get_data_dir
-from agentic_task_manager.utils.registry import find_workflow
+from gofer.core.executor import WorkflowExecutor
+from gofer.core.workflow import AgenticWorkflow
+from gofer.subscriptions.claude_code import ClaudeCodeSubscription
+from gofer.subscriptions.codex import CodexSubscription
+from gofer.utils.paths import get_data_dir
+from gofer.utils.registry import find_workflow
 
 app = typer.Typer(help="Manage and run workflows", no_args_is_help=True)
 console = Console()
@@ -91,7 +91,7 @@ def show(
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Display the DAG structure of a workflow."""
-    from agentic_task_manager.cli.dag_renderer import render_workflow
+    from gofer.cli.dag_renderer import render_workflow
 
     try:
         wf = _resolve_workflow(workflow, data_dir)
@@ -147,7 +147,7 @@ def edit(
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Interactively edit a workflow's fields in the terminal."""
-    from agentic_task_manager.cli.tui_editor import (
+    from gofer.cli.tui_editor import (
         FieldEditorApp,
         sections_to_workflow,
         workflow_to_sections,
@@ -205,7 +205,7 @@ def build(
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Interactively build a workflow via a guided wizard."""
-    from agentic_task_manager.cli.commands.builder import WorkflowBuilder
+    from gofer.cli.commands.builder import WorkflowBuilder
 
     wf = WorkflowBuilder().run()
     if wf is None:

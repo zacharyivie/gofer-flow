@@ -7,10 +7,10 @@ from typing import TYPE_CHECKING
 import networkx as nx
 from pydantic import BaseModel
 
-from agentic_task_manager.core.operations import Operation
+from gofer.core.operations import Operation
 
 if TYPE_CHECKING:
-    from agentic_task_manager.core.executor import NodeOutput
+    from gofer.core.executor import NodeOutput
 
 
 class EdgeConditionType(StrEnum):

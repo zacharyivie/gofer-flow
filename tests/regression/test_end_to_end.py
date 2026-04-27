@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_task_manager.core.executor import WorkflowExecutor
-from agentic_task_manager.core.scheduler import WorkflowScheduler
-from agentic_task_manager.core.workflow import AgenticWorkflow
+from gofer.core.executor import WorkflowExecutor
+from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.workflow import AgenticWorkflow
 
 _TOML = """
 [workflow]

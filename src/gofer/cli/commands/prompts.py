@@ -6,8 +6,8 @@ import typer
 from rich.console import Console
 from rich.syntax import Syntax
 
-from agentic_task_manager.prompts.manager import PromptManager
-from agentic_task_manager.utils.paths import get_data_dir
+from gofer.prompts.manager import PromptManager
+from gofer.utils.paths import get_data_dir
 
 app = typer.Typer(help="Manage prompt library", no_args_is_help=True)
 console = Console()
