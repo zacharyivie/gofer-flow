@@ -149,14 +149,21 @@ def test_agent_list_all(tmp_path: Path) -> None:
     assert "list-agent" in result.output
 
 
-def test_prompts_list(tmp_path: Path) -> None:
+def test_prompt_list(tmp_path: Path) -> None:
     (tmp_path / "sample.md").write_text("# Sample")
-    result = runner.invoke(app, ["prompts", "list", "--dir", str(tmp_path)])
+    result = runner.invoke(app, ["prompt", "list", "--dir", str(tmp_path)])
     assert result.exit_code == 0
     assert "sample.md" in result.output
 
 
-def test_prompts_new(tmp_path: Path) -> None:
-    result = runner.invoke(app, ["prompts", "new", "--name", "myprompt", "--dir", str(tmp_path)])
+def test_prompt_new(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["prompt", "new", "--name", "myprompt", "--dir", str(tmp_path)])
     assert result.exit_code == 0
     assert (tmp_path / "myprompt.md").exists()
+
+
+def test_plural_commands_are_invalid() -> None:
+    for command in ("workflows", "agents", "prompts"):
+        result = runner.invoke(app, [command])
+        assert result.exit_code != 0
+        assert "No such command" in result.output
