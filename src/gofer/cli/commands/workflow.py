@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 from pathlib import Path
 
@@ -8,12 +9,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from gofer.core.executor import WorkflowExecutor
-from gofer.core.workflow import AgenticWorkflow
-from gofer.subscriptions.claude_code import ClaudeCodeSubscription
-from gofer.subscriptions.codex import CodexSubscription
-from gofer.utils.paths import get_data_dir
-from gofer.utils.registry import find_workflow
+from legacy.gofer.core.executor import WorkflowExecutor
+from legacy.gofer.core.workflow import AgenticWorkflow
+from legacy.gofer.subscriptions.claude_code import ClaudeCodeSubscription
+from legacy.gofer.subscriptions.codex import CodexSubscription
+from legacy.gofer.utils.paths import get_data_dir
+from legacy.gofer.utils.registry import find_workflow
 
 app = typer.Typer(help="Manage and run workflows", no_args_is_help=True)
 console = Console()
@@ -91,7 +92,7 @@ def show(
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Display the DAG structure of a workflow."""
-    from gofer.cli.dag_renderer import render_workflow
+    from legacy.gofer.cli.dag_renderer import render_workflow
 
     try:
         wf = _resolve_workflow(workflow, data_dir)
@@ -146,12 +147,8 @@ def edit(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Interactively edit a workflow's fields in the terminal."""
-    from gofer.cli.tui_editor import (
-        FieldEditorApp,
-        sections_to_workflow,
-        workflow_to_sections,
-    )
+    """Interactively edit a workflow in the terminal."""
+    from legacy.gofer.cli.tui_editor import WorkflowEditorApp
 
     try:
         wf = _resolve_workflow(workflow, data_dir)
@@ -161,16 +158,15 @@ def edit(
 
     base = data_dir or get_data_dir()
     path = base / f"{wf.config.id}.toml"
-    sections = workflow_to_sections(wf)
+    editable = copy.deepcopy(wf)
 
-    if FieldEditorApp(sections, title=f"Edit Workflow: {wf.config.id}").run():
-        sections_to_workflow(sections, wf)
+    if WorkflowEditorApp(editable, title=f"Edit Workflow: {wf.config.id}").run():
         try:
-            wf.validate()
+            editable.validate()
         except Exception as exc:
             console.print(f"[red]Validation failed: {exc}[/red]")
             raise typer.Exit(1)
-        wf.to_file(path)
+        editable.to_file(path)
         console.print(f"[green]Saved[/green] {path}")
     else:
         console.print("[yellow]Edit cancelled.[/yellow]")
@@ -205,7 +201,7 @@ def build(
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Interactively build a workflow via a guided wizard."""
-    from gofer.cli.commands.builder import WorkflowBuilder
+    from legacy.gofer.cli.commands.builder import WorkflowBuilder
 
     wf = WorkflowBuilder().run()
     if wf is None:

@@ -8,15 +8,15 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from gofer.core.workflow import AgenticWorkflow
-from gofer.utils.logging import get_logger
+from legacy.gofer.core.workflow import AgenticWorkflow
+from legacy.gofer.utils.logging import get_logger
 
 log = get_logger(__name__)
 
 
 def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str, Any]) -> None:
     wf = AgenticWorkflow.from_file(Path(workflow_path))
-    from gofer.core.executor import WorkflowExecutor
+    from legacy.gofer.core.executor import WorkflowExecutor
 
     async def _exec() -> None:
         executor = WorkflowExecutor(wf, subscriptions)

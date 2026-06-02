@@ -7,7 +7,7 @@ from gofer.core.executor import WorkflowExecutor
 from gofer.core.graph import GraphNode
 from gofer.core.operations import AgentOperation, BashCommandOperation, OperationType
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
-from tests.conftest import FakeSubscription
+from legacy.tests.conftest import FakeSubscription
 
 
 def _bash_node(node_id: str, command: str = "true") -> GraphNode:

@@ -8,9 +8,9 @@ from typing import Any
 import tomli_w as _tomli_w
 from pydantic import BaseModel, TypeAdapter
 
-from gofer.core.agent import AgentConfig
-from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
-from gofer.core.operations import Operation
+from legacy.gofer.core.agent import AgentConfig
+from legacy.gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
+from legacy.gofer.core.operations import Operation
 
 
 class ScheduleConfig(BaseModel):

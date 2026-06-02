@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shutil
 
-from gofer.subscriptions.base import Subscription
+from legacy.gofer.subscriptions.base import Subscription
 
 
 class ClaudeCodeSubscription(Subscription):

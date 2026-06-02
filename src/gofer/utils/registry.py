@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from gofer.core.agent import AgentConfig
-from gofer.core.workflow import AgenticWorkflow
-from gofer.utils.paths import get_data_dir
+from legacy.gofer.core.agent import AgentConfig
+from legacy.gofer.core.workflow import AgenticWorkflow
+from legacy.gofer.utils.paths import get_data_dir
 
 
 def _workflow_files(data_dir: Path | None = None) -> list[Path]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import gofer.cli.tui_editor as tui_editor
 from typer.testing import CliRunner
 
 from gofer.cli.main import app
@@ -47,6 +48,31 @@ def test_workflow_run_dry_run(tmp_path: Path) -> None:
     f.write_text(_SIMPLE_TOML)
     result = runner.invoke(app, ["workflow", "run", str(f), "--dry-run"])
     assert result.exit_code == 0
+
+
+def test_workflow_edit_uses_workflow_editor_app(tmp_path: Path, monkeypatch) -> None:
+    f = tmp_path / "simple.toml"
+    f.write_text(_SIMPLE_TOML)
+    captured: dict[str, object] = {}
+
+    class FakeWorkflowEditorApp:
+        def __init__(self, workflow, title: str) -> None:
+            captured["workflow_id"] = workflow.config.id
+            captured["title"] = title
+
+        def run(self) -> bool:
+            return False
+
+    monkeypatch.setattr(tui_editor, "WorkflowEditorApp", FakeWorkflowEditorApp)
+
+    result = runner.invoke(app, ["workflow", "edit", str(f), "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert captured == {
+        "workflow_id": "simple",
+        "title": "Edit Workflow: simple",
+    }
+    assert "Edit cancelled." in result.output
 
 
 def test_schedule_add_and_list(tmp_path: Path) -> None:

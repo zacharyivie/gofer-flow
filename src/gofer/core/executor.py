@@ -9,9 +9,9 @@ from typing import Any
 
 import anyio
 
-from gofer.core.agent import Agent, AgentResult
-from gofer.core.graph import GraphNode, WorkflowGraph
-from gofer.core.operations import (
+from legacy.gofer.core.agent import Agent, AgentResult
+from legacy.gofer.core.graph import GraphNode, WorkflowGraph
+from legacy.gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     CountFanSource,
@@ -22,10 +22,10 @@ from gofer.core.operations import (
     ShellScriptOperation,
     TabularFanSource,
 )
-from gofer.core.workflow import AgenticWorkflow
-from gofer.subscriptions.base import Subscription
-from gofer.utils.logging import get_logger
-from gofer.utils.process import run_subprocess
+from legacy.gofer.core.workflow import AgenticWorkflow
+from legacy.gofer.subscriptions.base import Subscription
+from legacy.gofer.utils.logging import get_logger
+from legacy.gofer.utils.process import run_subprocess
 
 log = get_logger(__name__)
 

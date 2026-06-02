@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from gofer.core.agent import Agent, AgentConfig
-from tests.conftest import FakeSubscription
+from legacy.tests.conftest import FakeSubscription
 
 
 @pytest.fixture

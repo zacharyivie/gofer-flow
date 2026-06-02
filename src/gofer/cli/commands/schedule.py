@@ -11,9 +11,9 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from gofer.core.scheduler import WorkflowScheduler
-from gofer.core.workflow import AgenticWorkflow
-from gofer.utils.paths import get_data_dir
+from legacy.gofer.core.scheduler import WorkflowScheduler
+from legacy.gofer.core.workflow import AgenticWorkflow
+from legacy.gofer.utils.paths import get_data_dir
 
 app = typer.Typer(help="Manage workflow schedules", no_args_is_help=True)
 console = Console()

@@ -17,7 +17,7 @@ from gofer.core.operations import (
     TabularFanSource,
 )
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
-from tests.conftest import FakeSubscription
+from legacy.tests.conftest import FakeSubscription
 
 # ── _load_tabular ─────────────────────────────────────────────────────────────
 

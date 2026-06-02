@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Literal
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
-    from gofer.subscriptions.base import Subscription
+    from legacy.gofer.subscriptions.base import Subscription
 
 
 class AgentConfig(BaseModel):
@@ -33,7 +33,7 @@ class Agent:
         self._subscription = subscription
 
     async def run(self, context: dict[str, object] | None = None) -> AgentResult:
-        from gofer.prompts.manager import PromptManager
+        from legacy.gofer.prompts.manager import PromptManager
 
         ctx = context or {}
         prompt_text = PromptManager().load(self._config.prompt_path, ctx)

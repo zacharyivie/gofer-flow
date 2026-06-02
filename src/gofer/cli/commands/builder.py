@@ -14,9 +14,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
 
-from gofer.core.agent import AgentConfig
-from gofer.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNode
-from gofer.core.operations import (
+from legacy.gofer.core.agent import AgentConfig
+from legacy.gofer.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNode
+from legacy.gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
     CountFanSource,
@@ -27,10 +27,10 @@ from gofer.core.operations import (
     ShellScriptOperation,
     TabularFanSource,
 )
-from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
-from gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
-from gofer.utils.paths import get_data_dir
-from gofer.utils.registry import list_all_agents
+from legacy.gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from legacy.gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
+from legacy.gofer.utils.paths import get_data_dir
+from legacy.gofer.utils.registry import list_all_agents
 
 console = Console()
 

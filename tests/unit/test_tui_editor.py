@@ -1,4 +1,4 @@
-"""Unit tests for tui_editor pure functions (no TTY required)."""
+"""Unit tests for tui_editor pure functions and workflow editor model behavior."""
 
 from __future__ import annotations
 
@@ -11,17 +11,22 @@ from gofer.cli.tui_editor import (
     FieldEditorApp,
     FieldKind,
     Section,
+    WorkflowEditorApp,
+    WorkflowEditorModel,
+    WorkflowMenuRowKind,
     _as_path,
     _as_path_or_none,
     _coerce,
     _format_value,
+    _node_to_section,
+    _sections_to_edge,
+    _sections_to_node,
+    _workflow_info_section,
     agent_to_sections,
     sections_to_agent,
-    sections_to_workflow,
-    workflow_to_sections,
 )
 from gofer.core.agent import AgentConfig
-from gofer.core.graph import GraphNode
+from gofer.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNode
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
@@ -30,8 +35,6 @@ from gofer.core.operations import (
     ShellScriptOperation,
 )
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 
 def _bash_workflow() -> AgenticWorkflow:
@@ -55,7 +58,15 @@ def _bash_workflow() -> AgenticWorkflow:
             timeout_seconds=30.0,
         )
     )
-    wf.then("step1", "step2")
+    wf.then(
+        "step1",
+        "step2",
+        EdgeConfig(
+            from_node="step1",
+            to_node="step2",
+            condition=EdgeConditionType.ON_SUCCESS,
+        ),
+    )
     return wf
 
 
@@ -71,7 +82,23 @@ def _agent_config() -> AgentConfig:
     )
 
 
-# ── _format_value ─────────────────────────────────────────────────────────────
+class _FakeDetailEditor:
+    def __init__(
+        self,
+        sections: list[Section],
+        title: str,
+        mutate: callable | None = None,
+        should_save: bool = True,
+    ) -> None:
+        self.sections = sections
+        self.title = title
+        self._mutate = mutate
+        self._should_save = should_save
+
+    def run(self) -> bool:
+        if self._mutate is not None:
+            self._mutate(self.sections, self.title)
+        return self._should_save
 
 
 def test_format_value_none() -> None:
@@ -114,9 +141,6 @@ def test_format_value_dict_empty() -> None:
     assert _format_value(fd) == "(empty)"
 
 
-# ── _coerce ───────────────────────────────────────────────────────────────────
-
-
 def test_coerce_int() -> None:
     assert _coerce(FieldKind.INT, "42") == 42
 
@@ -137,9 +161,6 @@ def test_coerce_string() -> None:
 def test_coerce_int_invalid() -> None:
     with pytest.raises(ValueError):
         _coerce(FieldKind.INT, "notanint")
-
-
-# ── _as_path helpers ──────────────────────────────────────────────────────────
 
 
 def test_as_path_from_path() -> None:
@@ -167,206 +188,286 @@ def test_as_path_or_none_valid() -> None:
     assert _as_path_or_none("/tmp") == Path("/tmp")
 
 
-# ── workflow_to_sections ─────────────────────────────────────────────────────
+def test_workflow_menu_rows_order() -> None:
+    model = WorkflowEditorModel(_bash_workflow())
+
+    rows = model.menu_rows()
+
+    assert rows[0].kind == WorkflowMenuRowKind.WORKFLOW_INFO
+    assert rows[1].kind == WorkflowMenuRowKind.SECTION_HEADER
+    assert rows[1].title == "Nodes"
+    assert [row.node_id for row in rows if row.kind == WorkflowMenuRowKind.NODE] == [
+        "step1",
+        "step2",
+    ]
+    edges = [row for row in rows if row.kind == WorkflowMenuRowKind.EDGE]
+    assert len(edges) == 1
+    assert edges[0].title == "step1 -> step2"
 
 
-def test_workflow_to_sections_structure() -> None:
+def test_workflow_menu_nodes_not_expanded_into_fields() -> None:
+    model = WorkflowEditorModel(_bash_workflow())
+
+    rows = [row for row in model.menu_rows() if row.kind == WorkflowMenuRowKind.NODE]
+
+    assert len(rows) == 2
+    assert all("command" not in row.title for row in rows)
+
+
+def test_workflow_menu_edges_listed_one_per_row() -> None:
     wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-
-    assert sections[0].title == "Workflow"
-    wf_keys = {fd.key for fd in sections[0].fields}
-    assert "config.id" in wf_keys
-    assert "config.name" in wf_keys
-    assert "config.schedule.cron_expression" in wf_keys
-
-    # Two node sections
-    node_titles = {s.title for s in sections[1:]}
-    assert any("step1" in t for t in node_titles)
-    assert any("step2" in t for t in node_titles)
-
-
-def test_workflow_to_sections_id_readonly() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    id_fd = next(fd for fd in sections[0].fields if fd.key == "config.id")
-    assert id_fd.read_only is True
-
-
-def test_workflow_to_sections_schedule_optional() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
-    assert cron_fd.optional is True
-    assert cron_fd.value is None
-
-
-def test_workflow_to_sections_with_schedule() -> None:
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="wf2",
-            name="Scheduled",
-            schedule=ScheduleConfig(cron_expression="0 9 * * *", timezone="US/Eastern"),
+    wf.add_operation(
+        GraphNode(
+            node_id="step3",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo done"),
         )
     )
-    sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
+    wf.then("step2", "step3")
+
+    rows = [row for row in WorkflowEditorModel(wf).menu_rows() if row.kind == WorkflowMenuRowKind.EDGE]
+
+    assert [row.title for row in rows] == ["step1 -> step2", "step2 -> step3"]
+
+
+def test_workflow_info_edit_updates_config() -> None:
+    wf = _bash_workflow()
+    model = WorkflowEditorModel(wf)
+
+    model.update_workflow_info(
+        name="Updated Workflow",
+        cron_expression="0 8 * * 1",
+        timezone="US/Eastern",
     )
-    assert cron_fd.value == "0 9 * * *"
 
-
-def test_workflow_to_sections_bash_fields() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    step2_sec = next(s for s in sections if "step2" in s.title)
-    step2_keys = {fd.key for fd in step2_sec.fields}
-    assert "nodes.step2.command" in step2_keys
-    assert "nodes.step2.retry_count" in step2_keys
-    assert "nodes.step2.timeout_seconds" in step2_keys
-
-
-def test_workflow_to_sections_node_values() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    step2_sec = next(s for s in sections if "step2" in s.title)
-    fm = {fd.key: fd.value for fd in step2_sec.fields}
-    assert fm["nodes.step2.command"] == "echo bye"
-    assert fm["nodes.step2.retry_count"] == 2
-    assert fm["nodes.step2.timeout_seconds"] == 30.0
-    assert fm["nodes.step2.env"] == {"FOO": "bar"}
-
-
-# ── sections_to_workflow ──────────────────────────────────────────────────────
-
-
-def test_sections_to_workflow_name_change() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    name_fd = next(fd for fd in sections[0].fields if fd.key == "config.name")
-    name_fd.value = "Updated Name"
-    sections_to_workflow(sections, wf)
-    assert wf.config.name == "Updated Name"
-
-
-def test_sections_to_workflow_adds_schedule() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
-    cron_fd.value = "0 8 * * 1"
-    sections_to_workflow(sections, wf)
+    assert wf.config.name == "Updated Workflow"
     assert wf.config.schedule is not None
     assert wf.config.schedule.cron_expression == "0 8 * * 1"
+    assert wf.config.schedule.timezone == "US/Eastern"
 
 
-def test_sections_to_workflow_clears_schedule() -> None:
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="wf3",
-            name="Sched",
-            schedule=ScheduleConfig(cron_expression="0 9 * * *"),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="n1",
-            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo"),
-        )
-    )
-    sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
-    cron_fd.value = None
-    sections_to_workflow(sections, wf)
-    assert wf.config.schedule is None
-
-
-def test_sections_to_workflow_updates_bash_command() -> None:
+def test_add_node_inserts_graph_node() -> None:
     wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    step1_sec = next(s for s in sections if "step1" in s.title)
-    cmd_fd = next(fd for fd in step1_sec.fields if fd.key == "nodes.step1.command")
-    cmd_fd.value = "echo updated"
-    sections_to_workflow(sections, wf)
-    node = wf.graph._nodes["step1"]
-    assert isinstance(node.operation, BashCommandOperation)
-    assert node.operation.command == "echo updated"
+    model = WorkflowEditorModel(wf)
 
-
-def test_sections_to_workflow_updates_retry_count() -> None:
-    wf = _bash_workflow()
-    sections = workflow_to_sections(wf)
-    step2_sec = next(s for s in sections if "step2" in s.title)
-    rc_fd = next(fd for fd in step2_sec.fields if fd.key == "nodes.step2.retry_count")
-    rc_fd.value = 5
-    sections_to_workflow(sections, wf)
-    assert wf.graph._nodes["step2"].retry_count == 5
-
-
-def test_workflow_to_sections_python_script() -> None:
-    wf = AgenticWorkflow(WorkflowConfig(id="py", name="Py"))
-    wf.add_operation(
+    model.add_node(
         GraphNode(
-            node_id="pyscript",
+            node_id="step3",
             operation=PythonScriptOperation(
                 type=OperationType.PYTHON_SCRIPT,
                 script_path=Path("/scripts/run.py"),
-                args=["--verbose"],
+                args=["--flag"],
             ),
+            pipe_output=True,
         )
     )
-    sections = workflow_to_sections(wf)
-    node_sec = next(s for s in sections if "pyscript" in s.title)
-    keys = {fd.key for fd in node_sec.fields}
-    assert "nodes.pyscript.script_path" in keys
-    assert "nodes.pyscript.args" in keys
+
+    node = wf.graph._nodes["step3"]
+    assert isinstance(node.operation, PythonScriptOperation)
+    assert node.pipe_output is True
 
 
-def test_workflow_to_sections_shell_script() -> None:
-    wf = AgenticWorkflow(WorkflowConfig(id="sh", name="Sh"))
+def test_delete_node_removes_attached_edges() -> None:
+    wf = _bash_workflow()
     wf.add_operation(
         GraphNode(
-            node_id="shscript",
-            operation=ShellScriptOperation(
-                type=OperationType.SHELL_SCRIPT,
-                script_path=Path("/scripts/run.sh"),
-            ),
+            node_id="step3",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo done"),
         )
     )
-    sections = workflow_to_sections(wf)
-    node_sec = next(s for s in sections if "shscript" in s.title)
-    keys = {fd.key for fd in node_sec.fields}
-    assert "nodes.shscript.script_path" in keys
+    wf.then("step2", "step3")
+    model = WorkflowEditorModel(wf)
+
+    model.delete_node("step2")
+
+    assert "step2" not in wf.graph._nodes
+    assert ("step1", "step2") not in wf.graph._edges
+    assert ("step2", "step3") not in wf.graph._edges
 
 
-def test_workflow_to_sections_agent_operation() -> None:
-    wf = AgenticWorkflow(WorkflowConfig(id="ag", name="Ag"))
+def test_edit_node_updates_operation_and_shared_fields() -> None:
+    wf = _bash_workflow()
+    node = wf.graph._nodes["step2"]
+    section = _node_to_section(node)
+    fm = {fd.key: fd for fd in section.fields}
+    fm["nodes.step2.command"].value = "echo changed"
+    fm["nodes.step2.retry_count"].value = 5
+    fm["nodes.step2.pipe_output"].value = True
+
+    updated = _sections_to_node([section], node)
+    WorkflowEditorModel(wf).update_node("step2", updated)
+
+    changed = wf.graph._nodes["step2"]
+    assert isinstance(changed.operation, BashCommandOperation)
+    assert changed.operation.command == "echo changed"
+    assert changed.retry_count == 5
+    assert changed.pipe_output is True
+
+
+def test_add_edge_stores_expected_config() -> None:
+    wf = _bash_workflow()
     wf.add_operation(
         GraphNode(
-            node_id="agent_node",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="myagent",
-                prompt_path=Path("/prompts/p.md"),
-                working_dir=Path("/work"),
-                dynamic_count=3,
-            ),
+            node_id="step3",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo done"),
         )
     )
-    sections = workflow_to_sections(wf)
-    node_sec = next(s for s in sections if "agent_node" in s.title)
-    keys = {fd.key for fd in node_sec.fields}
-    assert "nodes.agent_node.agent_id" in keys
-    assert "nodes.agent_node.prompt_path" in keys
-    assert "nodes.agent_node.dynamic_count" in keys
+    model = WorkflowEditorModel(wf)
+
+    model.add_edge(
+        EdgeConfig(
+            from_node="step2",
+            to_node="step3",
+            condition=EdgeConditionType.OUTPUT_MATCHES,
+            output_pattern="ok",
+        )
+    )
+
+    edge = wf.graph._edges[("step2", "step3")]
+    assert edge.condition == EdgeConditionType.OUTPUT_MATCHES
+    assert edge.output_pattern == "ok"
 
 
-# ── agent_to_sections / sections_to_agent ────────────────────────────────────
+def test_edit_edge_updates_condition_and_pattern() -> None:
+    wf = _bash_workflow()
+    edge = wf.graph._edges[("step1", "step2")]
+    section = Section(
+        "Edge",
+        [
+            FieldDescriptor("edge.from", "From", FieldKind.CHOICE, "step1", choices=["step1", "step2"]),
+            FieldDescriptor("edge.to", "To", FieldKind.CHOICE, "step2", choices=["step1", "step2"]),
+            FieldDescriptor(
+                "edge.condition",
+                "Condition",
+                FieldKind.CHOICE,
+                EdgeConditionType.OUTPUT_MATCHES.value,
+                choices=[condition.value for condition in EdgeConditionType],
+            ),
+            FieldDescriptor("edge.output_pattern", "Output Pattern", FieldKind.STRING, "done", optional=True),
+        ],
+    )
+
+    WorkflowEditorModel(wf).update_edge(("step1", "step2"), _sections_to_edge([section]))
+
+    updated = wf.graph._edges[("step1", "step2")]
+    assert updated.condition == EdgeConditionType.OUTPUT_MATCHES
+    assert updated.output_pattern == "done"
+    assert edge.from_node == "step1"
+
+
+def test_add_edge_rejects_cycles() -> None:
+    wf = _bash_workflow()
+    model = WorkflowEditorModel(wf)
+
+    with pytest.raises(CycleError):
+        model.add_edge(EdgeConfig(from_node="step2", to_node="step1"))
+
+
+def test_edit_edge_rejects_cycles() -> None:
+    wf = _bash_workflow()
+    wf.add_operation(
+        GraphNode(
+            node_id="step3",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo done"),
+        )
+    )
+    wf.then("step2", "step3")
+    model = WorkflowEditorModel(wf)
+
+    with pytest.raises(CycleError):
+        model.update_edge(
+            ("step2", "step3"),
+            EdgeConfig(from_node="step3", to_node="step1"),
+        )
+
+    assert ("step2", "step3") in wf.graph._edges
+
+
+def test_enter_on_node_opens_node_detail() -> None:
+    captured: list[str] = []
+
+    def factory(sections: list[Section], title: str) -> _FakeDetailEditor:
+        return _FakeDetailEditor(sections, title, mutate=None, should_save=False)
+
+    app = WorkflowEditorApp(_bash_workflow(), detail_editor_factory=factory)
+    app._cursor = 2
+    app.open_selected_detail()
+
+    row = app.current_row()
+    assert row.kind == WorkflowMenuRowKind.NODE
+    section = _node_to_section(app.workflow.graph._nodes["step1"])
+    captured.append(section.title)
+    assert captured == ["Node: step1 [bash_command]"]
+
+
+def test_enter_on_workflow_info_opens_detail() -> None:
+    titles: list[str] = []
+
+    def factory(sections: list[Section], title: str) -> _FakeDetailEditor:
+        titles.append(title)
+        return _FakeDetailEditor(sections, title, should_save=False)
+
+    app = WorkflowEditorApp(_bash_workflow(), detail_editor_factory=factory)
+    app._cursor = 0
+    app.open_selected_detail()
+
+    assert titles == ["Workflow Info: wf1"]
+
+
+def test_save_and_cancel_semantics_leave_original_workflow_unchanged() -> None:
+    original = _bash_workflow()
+    editable = _bash_workflow()
+
+    def mutate_name(sections: list[Section], title: str) -> None:
+        section = sections[0]
+        next(fd for fd in section.fields if fd.key == "config.name").value = "Edited"
+
+    app = WorkflowEditorApp(
+        editable,
+        detail_editor_factory=lambda sections, title: _FakeDetailEditor(
+            sections, title, mutate=mutate_name, should_save=True
+        ),
+    )
+    app.open_selected_detail()
+
+    assert editable.config.name == "Edited"
+    assert original.config.name == "Workflow One"
+
+    cancelled = _bash_workflow()
+    cancel_app = WorkflowEditorApp(
+        cancelled,
+        detail_editor_factory=lambda sections, title: _FakeDetailEditor(
+            sections, title, mutate=mutate_name, should_save=False
+        ),
+    )
+    cancel_app.open_selected_detail()
+
+    assert cancelled.config.name == "Workflow One"
+
+
+def test_workflow_info_section_id_read_only() -> None:
+    section = _workflow_info_section(_bash_workflow())
+    id_field = next(fd for fd in section.fields if fd.key == "config.id")
+    assert id_field.read_only is True
+
+
+def test_sections_to_node_agent_operation_round_trip() -> None:
+    node = GraphNode(
+        node_id="agent-node",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="agent-1",
+            prompt_path=Path("/prompts/prompt.md"),
+            working_dir=Path("/work"),
+            dynamic_count=3,
+        ),
+    )
+    section = _node_to_section(node)
+
+    updated = _sections_to_node([section], node)
+
+    assert isinstance(updated.operation, AgentOperation)
+    assert updated.operation.agent_id == "agent-1"
+    assert updated.operation.dynamic_count == 3
 
 
 def test_agent_to_sections_structure() -> None:
@@ -422,9 +523,6 @@ def test_sections_to_agent_updates_tools() -> None:
     tools_fd.value = ["bash", "read", "write"]
     result = sections_to_agent(sections, cfg)
     assert result.tools == ["bash", "read", "write"]
-
-
-# ── FieldEditorApp construction ───────────────────────────────────────────────
 
 
 def test_field_editor_flat_count() -> None:

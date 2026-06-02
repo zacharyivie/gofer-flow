@@ -7,7 +7,7 @@ from gofer.core.executor import WorkflowExecutor
 from gofer.core.graph import GraphNode
 from gofer.core.operations import AgentOperation, BashCommandOperation, OperationType
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
-from tests.conftest import FakeSubscription
+from legacy.tests.conftest import FakeSubscription
 
 
 async def test_multi_node_workflow_with_agent(tmp_path: Path) -> None:
