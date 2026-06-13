@@ -1,0 +1,4 @@
+interface:
+  display_name: "Gofer Flow Workflow Builder"
+  short_description: "Create Gofer Flow workflows end to end with the CLI."
+  default_prompt: "Create a Gofer Flow workflow from this request:"

@@ -19,7 +19,11 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
     from gofer.core.executor import WorkflowExecutor
 
     async def _exec() -> None:
-        executor = WorkflowExecutor(wf, subscriptions)
+        executor = WorkflowExecutor(
+            wf,
+            subscriptions,
+            log_base_dir=Path(workflow_path).parent / "logs",
+        )
         result = await executor.run()
         log.info("Workflow %s finished: success=%s", workflow_id, result.success)
 

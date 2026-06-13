@@ -21,28 +21,28 @@ def _make_workflow(wf_id: str = "test") -> AgenticWorkflow:
     return AgenticWorkflow(WorkflowConfig(id=wf_id, name="Test"))
 
 
-async def test_single_bash_node_succeeds() -> None:
+async def test_single_bash_node_succeeds(tmp_path: Path) -> None:
     wf = _make_workflow()
     wf.add_operation(_bash_node("echo", "echo hello"))
-    executor = WorkflowExecutor(wf, {})
+    executor = WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert result.success
     assert "echo" in result.node_outputs
 
 
-async def test_linear_execution_order() -> None:
+async def test_linear_execution_order(tmp_path: Path) -> None:
     wf = _make_workflow()
     wf.add_operation(_bash_node("a", "true"))
     wf.add_operation(_bash_node("b", "true"))
     wf.then("a", "b")
 
-    executor = WorkflowExecutor(wf, {})
+    executor = WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert result.success
     assert set(result.node_outputs) == {"a", "b"}
 
 
-async def test_failure_halts_workflow() -> None:
+async def test_failure_halts_workflow(tmp_path: Path) -> None:
     wf = _make_workflow()
     wf.add_operation(GraphNode(
         node_id="fail",
@@ -52,13 +52,13 @@ async def test_failure_halts_workflow() -> None:
     wf.add_operation(_bash_node("after"))
     wf.then("fail", "after")
 
-    executor = WorkflowExecutor(wf, {})
+    executor = WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert not result.success
     assert "after" not in result.node_outputs
 
 
-async def test_failure_skip_continues() -> None:
+async def test_failure_skip_continues(tmp_path: Path) -> None:
     wf = _make_workflow()
     wf.add_operation(GraphNode(
         node_id="fail",
@@ -68,15 +68,15 @@ async def test_failure_skip_continues() -> None:
     wf.add_operation(_bash_node("after"))
     wf.then("fail", "after")
 
-    executor = WorkflowExecutor(wf, {})
+    executor = WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert "after" in result.node_outputs
 
 
-async def test_dry_run_does_not_execute() -> None:
+async def test_dry_run_does_not_execute(tmp_path: Path) -> None:
     wf = _make_workflow()
     wf.add_operation(_bash_node("dangerous", "rm -rf /"))
-    executor = WorkflowExecutor(wf, {}, dry_run=True)
+    executor = WorkflowExecutor(wf, {}, dry_run=True, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert result.success
 
@@ -102,8 +102,40 @@ async def test_agent_node_uses_subscription(tmp_path: Path) -> None:
             working_dir=tmp_path,
         ),
     ))
-    executor = WorkflowExecutor(wf, {"claude_code": sub})
+    executor = WorkflowExecutor(wf, {"claude_code": sub}, log_base_dir=tmp_path / "logs")
     result = await executor.run()
     assert result.success
     assert "agent output" in result.node_outputs["agent-step"].output
     assert len(sub.calls) == 1
+
+
+async def test_workflow_run_writes_success_log(tmp_path: Path) -> None:
+    wf = _make_workflow("logged")
+    wf.add_operation(_bash_node("echo", "echo hello"))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.log_path is not None
+    assert result.log_path.parent == tmp_path / "logs" / "logged"
+    assert result.log_path.exists()
+    lines = result.log_path.read_text().splitlines()
+    assert lines[0].endswith(" - logged started successfully")
+    assert "echo - stdout:" in result.log_path.read_text()
+    assert "hello" in result.log_path.read_text()
+    assert lines[-1].endswith(" - INFO - logged completed successfully")
+
+
+async def test_workflow_run_writes_failure_log(tmp_path: Path) -> None:
+    wf = _make_workflow("broken")
+    wf.add_operation(_bash_node("fail", "echo bad >&2; exit 3"))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.log_path is not None
+    text = result.log_path.read_text()
+    lines = text.splitlines()
+    assert not result.success
+    assert lines[0].endswith(" - broken started successfully")
+    assert "fail - stderr:" in text
+    assert "bad" in text
+    assert "broken failed due to node fail failed" in lines[-1]

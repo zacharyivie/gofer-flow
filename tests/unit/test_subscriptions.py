@@ -29,12 +29,19 @@ def test_claude_code_command_with_mcp() -> None:
 def test_codex_command_basic() -> None:
     sub = CodexSubscription()
     cmd = sub._build_command("hello", [], [])
-    assert "codex" in cmd
-    assert "hello" in cmd
+    assert cmd == [
+        "codex",
+        "exec",
+        "--color",
+        "never",
+        "--sandbox",
+        "workspace-write",
+        "hello",
+    ]
 
 
-def test_codex_command_with_tools() -> None:
+def test_codex_command_ignores_unsupported_tool_flags() -> None:
     sub = CodexSubscription()
     cmd = sub._build_command("hi", ["Bash"], [])
-    assert "--tool" in cmd
-    assert "Bash" in cmd
+    assert "--tool" not in cmd
+    assert cmd[-1] == "hi"

@@ -45,7 +45,9 @@ def test_workflow_create(tmp_path: Path) -> None:
 def test_workflow_run_dry_run(tmp_path: Path) -> None:
     f = tmp_path / "wf.toml"
     f.write_text(_SIMPLE_TOML)
-    result = runner.invoke(app, ["workflow", "run", str(f), "--dry-run"])
+    result = runner.invoke(
+        app, ["workflow", "run", str(f), "--dry-run", "--data-dir", str(tmp_path)]
+    )
     assert result.exit_code == 0
 
 

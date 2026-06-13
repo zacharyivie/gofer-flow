@@ -32,6 +32,10 @@ def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
     return find_workflow(name, data_dir)
 
 
+def _log_base_dir(data_dir: Path | None) -> Path:
+    return (data_dir or get_data_dir()) / "logs"
+
+
 @app.command("run")
 def run(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
@@ -47,7 +51,14 @@ def run(
         raise typer.Exit(1)
 
     wf.validate()
-    result = asyncio.run(WorkflowExecutor(wf, _SUBSCRIPTIONS, dry_run=dry_run).run())
+    result = asyncio.run(
+        WorkflowExecutor(
+            wf,
+            _SUBSCRIPTIONS,
+            dry_run=dry_run,
+            log_base_dir=_log_base_dir(data_dir),
+        ).run()
+    )
 
     if verbose:
         for node_id, node_out in result.node_outputs.items():

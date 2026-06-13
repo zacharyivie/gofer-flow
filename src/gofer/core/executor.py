@@ -4,6 +4,7 @@ import csv
 import json
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ from gofer.core.operations import (
 from gofer.core.workflow import AgenticWorkflow
 from gofer.subscriptions.base import Subscription
 from gofer.utils.logging import get_logger
+from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess
 
 log = get_logger(__name__)
@@ -124,6 +126,51 @@ class ExecutionResult:
     success: bool
     node_outputs: dict[str, NodeOutput]
     duration_seconds: float
+    log_path: Path | None = None
+
+
+class WorkflowRunLog:
+    def __init__(self, workflow_id: str, base_dir: Path | None = None) -> None:
+        self.workflow_id = workflow_id
+        self.started_at = datetime.now().astimezone()
+        timestamp = self.started_at.strftime("%Y-%m-%dT%H-%M-%S%z")
+        root = base_dir or get_data_dir() / "logs"
+        self.path = root / workflow_id / f"{timestamp}.log"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(
+            f"{self._now()} - {self.workflow_id} started successfully\n",
+            encoding="utf-8",
+        )
+
+    def info(self, message: str) -> None:
+        self._write("INFO", message)
+
+    def error(self, message: str) -> None:
+        self._write("ERROR", message)
+
+    def node(self, node_id: str, message: str) -> None:
+        self._write("NODE", f"{node_id} - {message}")
+
+    def node_output(self, node_id: str, label: str, value: str) -> None:
+        if not value:
+            return
+        self._write("NODE", f"{node_id} - {label}:")
+        with self.path.open("a", encoding="utf-8") as fh:
+            for line in value.rstrip("\n").splitlines():
+                fh.write(f"{line}\n")
+
+    def complete(self, success: bool, reason: str | None = None) -> None:
+        if success:
+            self.info(f"{self.workflow_id} completed successfully")
+        else:
+            self.error(f"{self.workflow_id} failed due to {reason or 'unknown error'}")
+
+    def _write(self, level: str, message: str) -> None:
+        with self.path.open("a", encoding="utf-8") as fh:
+            fh.write(f"{self._now()} - {level} - {message}\n")
+
+    def _now(self) -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class WorkflowExecutor:
@@ -132,51 +179,72 @@ class WorkflowExecutor:
         workflow: AgenticWorkflow,
         subscriptions: dict[str, Subscription],
         dry_run: bool = False,
+        log_base_dir: Path | None = None,
     ) -> None:
         self._workflow = workflow
         self._subscriptions = subscriptions
         self._dry_run = dry_run
+        self._log_base_dir = log_base_dir
+        self._run_log: WorkflowRunLog | None = None
+
+    def _log(self) -> WorkflowRunLog:
+        if self._run_log is None:
+            raise RuntimeError("Workflow run log has not been initialized")
+        return self._run_log
 
     async def run(self) -> ExecutionResult:
+        self._run_log = WorkflowRunLog(self._workflow.config.id, self._log_base_dir)
+        run_log = self._log()
         ctx = ExecutionContext()
         graph = self._workflow.graph
         start = time.monotonic()
         halted = False
         skipped_nodes: set[str] = set()
+        try:
+            run_log.info(f"dry_run={self._dry_run}")
 
-        for generation in graph.topological_generations():
-            if halted:
-                break
-            gen_results: dict[str, NodeOutput] = {}
-            halt_flag: list[bool] = [False]
+            for generation in graph.topological_generations():
+                if halted:
+                    break
+                gen_results: dict[str, NodeOutput] = {}
+                halt_flag: list[bool] = [False]
 
-            async with anyio.create_task_group() as tg:
-                for node in generation:
-                    if self._should_skip(node, ctx, skipped_nodes, graph):
-                        skipped_nodes.add(node.node_id)
-                        gen_results[node.node_id] = NodeOutput(
-                            node_id=node.node_id,
-                            success=True,
-                            output="",
-                            exit_code=0,
-                            duration_seconds=0.0,
-                            skipped=True,
-                        )
-                    else:
-                        tg.start_soon(self._run_node, node, ctx, gen_results, halt_flag, graph)
+                async with anyio.create_task_group() as tg:
+                    for node in generation:
+                        if self._should_skip(node, ctx, skipped_nodes, graph):
+                            skipped_nodes.add(node.node_id)
+                            run_log.node(node.node_id, "skipped")
+                            gen_results[node.node_id] = NodeOutput(
+                                node_id=node.node_id,
+                                success=True,
+                                output="",
+                                exit_code=0,
+                                duration_seconds=0.0,
+                                skipped=True,
+                            )
+                        else:
+                            tg.start_soon(
+                                self._run_node, node, ctx, gen_results, halt_flag, graph
+                            )
 
-            ctx.node_outputs.update(gen_results)
-            if halt_flag[0]:
-                halted = True
+                ctx.node_outputs.update(gen_results)
+                if halt_flag[0]:
+                    halted = True
 
-        total = time.monotonic() - start
-        success = all(o.success for o in ctx.node_outputs.values() if not o.skipped)
-        return ExecutionResult(
-            workflow_id=self._workflow.config.id,
-            success=success,
-            node_outputs=ctx.node_outputs,
-            duration_seconds=total,
-        )
+            total = time.monotonic() - start
+            success = all(o.success for o in ctx.node_outputs.values() if not o.skipped)
+            reason = None if success else self._failure_reason(ctx.node_outputs)
+            run_log.complete(success, reason)
+            return ExecutionResult(
+                workflow_id=self._workflow.config.id,
+                success=success,
+                node_outputs=ctx.node_outputs,
+                duration_seconds=total,
+                log_path=run_log.path,
+            )
+        except BaseException as exc:
+            run_log.complete(False, str(exc))
+            raise
 
     def _should_skip(
         self,
@@ -206,6 +274,7 @@ class WorkflowExecutor:
     ) -> None:
         if self._dry_run:
             log.info("[dry-run] would execute node %s", node.node_id)
+            self._log().node(node.node_id, "dry-run would execute")
             results[node.node_id] = NodeOutput(
                 node_id=node.node_id, success=True, output="", exit_code=0, duration_seconds=0.0
             )
@@ -214,11 +283,31 @@ class WorkflowExecutor:
         attempt = 0
         output: NodeOutput | None = None
         while True:
-            output = await self._execute_operation(node, ctx, graph)
+            self._log().node(node.node_id, f"attempt {attempt + 1} started")
+            try:
+                output = await self._execute_operation(node, ctx, graph)
+            except Exception as exc:  # noqa: BLE001
+                self._log().error(f"{node.node_id} raised exception: {exc}")
+                output = NodeOutput(
+                    node_id=node.node_id,
+                    success=False,
+                    output=str(exc),
+                    exit_code=1,
+                    duration_seconds=0.0,
+                )
             results[node.node_id] = output
+            self._log().node_output(node.node_id, "node output", output.output)
+            self._log().node(
+                node.node_id,
+                f"attempt {attempt + 1} finished success={output.success} "
+                f"exit_code={output.exit_code} duration={output.duration_seconds:.2f}s",
+            )
             if output.success or attempt >= node.retry_count:
                 break
             attempt += 1
+            self._log().node(
+                node.node_id, f"retrying after {node.retry_delay_seconds:.2f}s"
+            )
             await anyio.sleep(node.retry_delay_seconds)
 
         if output is not None and not output.success:
@@ -248,6 +337,7 @@ class WorkflowExecutor:
         if op.type == OperationType.BASH_COMMAND:
             assert isinstance(op, BashCommandOperation)
             stdin = self._resolve_pipe_stdin(node, ctx, graph)
+            self._log().node(node.node_id, f"command: {op.command}")
             rc, stdout, stderr = await run_subprocess(
                 ["bash", "-c", op.command],
                 cwd=op.working_dir,
@@ -255,6 +345,8 @@ class WorkflowExecutor:
                 timeout=node.timeout_seconds,
                 stdin=stdin,
             )
+            self._log().node_output(node.node_id, "stdout", stdout)
+            self._log().node_output(node.node_id, "stderr", stderr)
             return NodeOutput(
                 node_id=node.node_id,
                 success=rc == 0,
@@ -268,9 +360,12 @@ class WorkflowExecutor:
             interpreter = "python" if op.type == OperationType.PYTHON_SCRIPT else "bash"
             cmd = [interpreter, str(op.script_path)] + list(op.args)
             stdin = self._resolve_pipe_stdin(node, ctx, graph)
+            self._log().node(node.node_id, f"command: {' '.join(cmd)}")
             rc, stdout, stderr = await run_subprocess(
                 cmd, env=op.env or None, timeout=node.timeout_seconds, stdin=stdin
             )
+            self._log().node_output(node.node_id, "stdout", stdout)
+            self._log().node_output(node.node_id, "stderr", stderr)
             return NodeOutput(
                 node_id=node.node_id,
                 success=rc == 0,
@@ -318,6 +413,7 @@ class WorkflowExecutor:
             if len(fan_items) == 1:
                 agent = Agent(agent_config, sub)
                 result = await agent.run({**input_ctx, **fan_items[0]})
+                self._log().node_output(node.node_id, "agent output", result.output)
                 outputs.append(result)
             else:
                 limiter = anyio.CapacityLimiter(max_concurrency)
@@ -328,8 +424,18 @@ class WorkflowExecutor:
                         try:
                             agent = Agent(agent_config, sub)
                             results_list[idx] = await agent.run({**input_ctx, **item})
+                            result = results_list[idx]
+                            if result is not None:
+                                self._log().node_output(
+                                    node.node_id,
+                                    f"fan-out item {idx + 1} output",
+                                    result.output,
+                                )
                         except Exception as exc:  # noqa: BLE001
                             errors.append((idx, exc))
+                            self._log().error(
+                                f"{node.node_id} fan-out item {idx + 1} failed: {exc}"
+                            )
                             if fail_fast:
                                 tg.cancel_scope.cancel()
 
@@ -359,3 +465,10 @@ class WorkflowExecutor:
             )
 
         raise ValueError(f"Unknown operation type: {op.type}")
+
+    def _failure_reason(self, outputs: dict[str, NodeOutput]) -> str:
+        for node_id, output in outputs.items():
+            if not output.success:
+                detail = output.output.strip() or f"exit code {output.exit_code}"
+                return f"node {node_id} failed: {detail}"
+        return "workflow halted before all nodes completed"
