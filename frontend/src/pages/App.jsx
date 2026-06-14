@@ -1,18 +1,19 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bot,
-  Check,
-  CircleDot,
   GitBranch,
   ListFilter,
   Loader2,
   MessageSquare,
+  Moon,
+  MoreVertical,
   Plus,
   RefreshCw,
   Search,
   Send,
-  Sparkles,
+  Sun,
+  Trash2,
   Waypoints,
   X,
 } from "lucide-react";
@@ -28,11 +29,21 @@ export default function App() {
   const [createState, setCreateState] = useState({ saving: false, error: "" });
   const [dirtyWorkflow, setDirtyWorkflow] = useState();
   const [saveState, setSaveState] = useState({ saving: false, error: "" });
+  const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
   const [runState, setRunState] = useState({ running: false, error: "", result: null });
+  const [logState, setLogState] = useState({ loading: false, error: "", text: "", path: null });
+  const [theme, setTheme] = useState(getInitialTheme);
+  const [workflowPaneWidth, setWorkflowPaneWidth] = useState(292);
+  const [chatPaneWidth, setChatPaneWidth] = useState(356);
   const saveRevisionRef = useRef(0);
+  const dirtyWorkflowRef = useRef();
+  const logRequestRef = useRef(0);
+  const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
 
-  async function loadWorkflows() {
-    setLoadState({ loading: true, error: "" });
+  const loadWorkflows = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setLoadState({ loading: true, error: "" });
+    }
     try {
       const response = await fetch("/api/workflows");
       if (!response.ok) {
@@ -40,7 +51,26 @@ export default function App() {
       }
       const payload = await response.json();
       const nextWorkflows = (payload.workflows ?? []).map(summarizeWorkflow);
-      setWorkflows(nextWorkflows);
+      setWorkflows((current) => {
+        const refreshedWorkflows = nextWorkflows.map((workflow) => {
+          const localWorkflow = current.find((candidate) => candidate.id === workflow.id);
+          return localWorkflow
+            ? summarizeWorkflow(mergeSavedWorkflow(localWorkflow, workflow))
+            : workflow;
+        });
+        const dirtyWorkflowId = dirtyWorkflowRef.current?.id;
+        const localDirtyWorkflow = dirtyWorkflowId
+          ? current.find((workflow) => workflow.id === dirtyWorkflowId)
+          : null;
+        const mergedWorkflows =
+          silent && localDirtyWorkflow
+            ? preserveLocalWorkflow(refreshedWorkflows, localDirtyWorkflow)
+            : refreshedWorkflows;
+
+        return silent && JSON.stringify(current) === JSON.stringify(mergedWorkflows)
+          ? current
+          : mergedWorkflows;
+      });
       setDataDir(payload.dataDir ?? "");
       setActiveWorkflowId((currentId) => {
         if (nextWorkflows.some((workflow) => workflow.id === currentId)) {
@@ -50,16 +80,106 @@ export default function App() {
       });
       setLoadState({ loading: false, error: "" });
     } catch (error) {
-      setLoadState({
-        loading: false,
-        error: error instanceof Error ? error.message : "Unable to load workflows",
-      });
+      if (!silent) {
+        setLoadState({
+          loading: false,
+          error: error instanceof Error ? error.message : "Unable to load workflows",
+        });
+      }
     }
-  }
+  }, []);
 
   useEffect(() => {
     loadWorkflows();
+  }, [loadWorkflows]);
+
+  useEffect(() => {
+    const intervalId = window.setInterval(() => {
+      loadWorkflows({ silent: true });
+    }, 2000);
+
+    return () => window.clearInterval(intervalId);
+  }, [loadWorkflows]);
+
+  useEffect(() => {
+    window.localStorage.setItem("gofer-ui-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (!topBarNotice.message) return undefined;
+
+    const timeoutId = window.setTimeout(() => {
+      setTopBarNotice({ type: "", message: "" });
+    }, 3500);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [topBarNotice.message]);
+
+  const loadLatestLog = useCallback(async (workflowId, { silent = false } = {}) => {
+    const requestId = logRequestRef.current + 1;
+    logRequestRef.current = requestId;
+    if (!silent) {
+      setLogState((current) => ({ ...current, loading: true, error: "" }));
+    }
+    try {
+      const response = await fetch(
+        `/api/workflows/${encodeURIComponent(workflowId)}/logs/latest`,
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      if (requestId !== logRequestRef.current) return;
+      const nextText = payload.log?.logText ?? "";
+      const nextPath = payload.log?.logPath ?? null;
+      setLogState((current) => {
+        if (
+          current.text === nextText &&
+          current.path === nextPath &&
+          current.error === "" &&
+          current.loading === false
+        ) {
+          return current;
+        }
+        return {
+          loading: false,
+          error: "",
+          text: nextText,
+          path: nextPath,
+        };
+      });
+    } catch (error) {
+      if (requestId !== logRequestRef.current) return;
+      if (!silent) {
+        setLogState((current) => ({
+          ...current,
+          loading: false,
+          error: error instanceof Error ? error.message : "Unable to load workflow log",
+        }));
+      }
+    }
   }, []);
+
+  useEffect(() => {
+    if (!activeWorkflow?.id) {
+      setLogState({ loading: false, error: "", text: "", path: null });
+      return;
+    }
+
+    loadLatestLog(activeWorkflow.id);
+  }, [activeWorkflow?.id, loadLatestLog]);
+
+  useEffect(() => {
+    if (!activeWorkflow?.id) {
+      return undefined;
+    }
+
+    const intervalId = window.setInterval(() => {
+      loadLatestLog(activeWorkflow.id, { silent: true });
+    }, 2000);
+
+    return () => window.clearInterval(intervalId);
+  }, [activeWorkflow?.id, loadLatestLog]);
 
   useEffect(() => {
     if (!dirtyWorkflow) return undefined;
@@ -81,8 +201,6 @@ export default function App() {
     });
   }, [query, workflows]);
 
-  const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
-
   function updateActiveWorkflow(nextWorkflow) {
     const summarizedWorkflow = summarizeWorkflow(nextWorkflow);
     setWorkflows((current) =>
@@ -91,7 +209,9 @@ export default function App() {
       ),
     );
     saveRevisionRef.current += 1;
-    setDirtyWorkflow({ id: summarizedWorkflow.id, revision: saveRevisionRef.current });
+    const nextDirtyWorkflow = { id: summarizedWorkflow.id, revision: saveRevisionRef.current };
+    dirtyWorkflowRef.current = nextDirtyWorkflow;
+    setDirtyWorkflow(nextDirtyWorkflow);
   }
 
   async function saveWorkflow(workflow, revision) {
@@ -107,6 +227,9 @@ export default function App() {
               : candidate,
           ),
         );
+        if (dirtyWorkflowRef.current?.id === workflow.id) {
+          dirtyWorkflowRef.current = undefined;
+        }
         setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
         setSaveState({ saving: false, error: "" });
       }
@@ -138,8 +261,10 @@ export default function App() {
   async function runWorkflowNow(workflow) {
     const workflowToRun = summarizeWorkflow(workflow);
     saveRevisionRef.current += 1;
+    dirtyWorkflowRef.current = undefined;
     setDirtyWorkflow(undefined);
-    setRunState({ running: true, error: "", result: null });
+    setRunState({ running: true, workflowId: workflowToRun.id, error: "", result: null });
+    setLogState((current) => ({ ...current, loading: true, error: "" }));
     setSaveState({ saving: true, error: "" });
 
     try {
@@ -164,10 +289,30 @@ export default function App() {
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
-      setRunState({ running: false, error: "", result: payload.run });
+      setRunState({ running: false, workflowId: savedWorkflow.id, error: "", result: payload.run });
+      setWorkflows((current) =>
+        current.map((candidate) =>
+          candidate.id === savedWorkflow.id
+            ? {
+                ...candidate,
+                status: payload.run?.success ? "Success" : "Error",
+                tags: [
+                  payload.run?.success ? "success" : "error",
+                  ...(candidate.tags ?? []).slice(1),
+                ],
+              }
+            : candidate,
+        ),
+      );
+      setLogState({
+        loading: false,
+        error: "",
+        text: payload.run?.logText ?? "",
+        path: payload.run?.logPath ?? null,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
-      setRunState({ running: false, error: message, result: null });
+      setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
       setSaveState((current) => ({ ...current, saving: false }));
     }
   }
@@ -201,28 +346,114 @@ export default function App() {
     }
   }
 
+  async function validateWorkflow(workflow) {
+    try {
+      await persistWorkflow(summarizeWorkflow(workflow));
+      setTopBarNotice({ type: "success", message: "Workflow is valid" });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Workflow validation failed",
+      });
+    }
+  }
+
+  async function importWorkflow(file) {
+    if (!file) return;
+    try {
+      const content = await file.text();
+      const response = await fetch("/api/workflows/import", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ content, filename: file.name }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+
+      const nextWorkflow = summarizeWorkflow(payload.workflow);
+      setWorkflows((current) => [...current, nextWorkflow]);
+      setActiveWorkflowId(nextWorkflow.id);
+      setTopBarNotice({ type: "success", message: `Imported ${nextWorkflow.name}` });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to import workflow",
+      });
+    }
+  }
+
+  async function deleteWorkflow(workflow) {
+    if (!workflow) return;
+    if (!window.confirm(`Delete workflow "${workflow.name}"?`)) return;
+
+    try {
+      const response = await fetch(`/api/workflows/${encodeURIComponent(workflow.id)}`, {
+        method: "DELETE",
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+
+      setWorkflows((current) => current.filter((candidate) => candidate.id !== workflow.id));
+      setActiveWorkflowId((currentId) => (currentId === workflow.id ? undefined : currentId));
+      setTopBarNotice({ type: "success", message: `Deleted ${workflow.name}` });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to delete workflow",
+      });
+    }
+  }
+
   return (
-    <main className="flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink">
+    <main className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}>
       <WorkflowSidebar
         activeWorkflowId={activeWorkflow?.id}
         dataDir={dataDir}
         loading={loadState.loading}
         query={query}
+        runState={runState}
         workflows={filteredWorkflows}
+        width={workflowPaneWidth}
         onQueryChange={setQuery}
         onCreate={() => setCreateDialogOpen(true)}
         onRefresh={loadWorkflows}
+        onResizeStart={(event) =>
+          startPaneResize(event, {
+            max: 420,
+            min: 240,
+            side: "right",
+            width: workflowPaneWidth,
+            onResize: setWorkflowPaneWidth,
+          })
+        }
         onSelect={setActiveWorkflowId}
       />
 
       <section className="flex min-w-0 flex-1 flex-col border-x border-line bg-[#f9fbfd]">
         {activeWorkflow ? (
           <>
-            <TopBar saveState={saveState} workflow={activeWorkflow} />
+            <TopBar
+              theme={theme}
+              workflow={activeWorkflow}
+              onDeleteWorkflow={() => deleteWorkflow(activeWorkflow)}
+              onToggleTheme={() =>
+                setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
+              }
+            />
             <DagCanvas
+              logState={logState}
+              notice={topBarNotice}
               runState={runState}
               workflow={activeWorkflow}
+              onImportWorkflow={importWorkflow}
               onRunWorkflow={runWorkflowNow}
+              onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
               onWorkflowChange={updateActiveWorkflow}
             />
           </>
@@ -231,7 +462,19 @@ export default function App() {
         )}
       </section>
 
-      <ChatPane workflow={activeWorkflow} />
+      <ChatPane
+        width={chatPaneWidth}
+        workflow={activeWorkflow}
+        onResizeStart={(event) =>
+          startPaneResize(event, {
+            max: 520,
+            min: 300,
+            side: "left",
+            width: chatPaneWidth,
+            onResize: setChatPaneWidth,
+          })
+        }
+      />
       <CreateWorkflowDialog
         error={createState.error}
         open={createDialogOpen}
@@ -248,10 +491,52 @@ export default function App() {
   );
 }
 
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function startPaneResize(event, { max, min, onResize, side, width }) {
+  event.preventDefault();
+  event.stopPropagation();
+
+  const startX = event.clientX;
+  const startWidth = width;
+  const previousCursor = document.body.style.cursor;
+  const previousUserSelect = document.body.style.userSelect;
+
+  document.body.style.cursor = "col-resize";
+  document.body.style.userSelect = "none";
+
+  function handlePointerMove(moveEvent) {
+    const delta = moveEvent.clientX - startX;
+    const nextWidth = side === "left" ? startWidth - delta : startWidth + delta;
+    onResize(clampNumber(nextWidth, min, max));
+  }
+
+  function handlePointerUp() {
+    document.body.style.cursor = previousCursor;
+    document.body.style.userSelect = previousUserSelect;
+    window.removeEventListener("pointermove", handlePointerMove);
+    window.removeEventListener("pointerup", handlePointerUp);
+  }
+
+  window.addEventListener("pointermove", handlePointerMove);
+  window.addEventListener("pointerup", handlePointerUp);
+}
+
+function getInitialTheme() {
+  if (typeof window === "undefined") return "light";
+  const savedTheme = window.localStorage.getItem("gofer-ui-theme");
+  if (savedTheme === "dark" || savedTheme === "light") {
+    return savedTheme;
+  }
+  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+}
+
 function summarizeWorkflow(workflow) {
   const agentCount = agentIdsForWorkflow(workflow).length;
   const operationTypes = [...new Set((workflow.nodes ?? []).map((node) => node.type))].sort();
-  const status = workflow.schedule ? "Scheduled" : "Ready";
+  const status = workflow.status ?? "Ready";
   return {
     ...workflow,
     description: `${workflow.nodes.length} nodes, ${workflow.edges.length} edges, ${agentCount} agents.${
@@ -289,19 +574,48 @@ function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
   };
 }
 
+function preserveLocalWorkflow(remoteWorkflows, localWorkflow) {
+  const foundWorkflow = remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id);
+  if (!foundWorkflow) {
+    return [...remoteWorkflows, localWorkflow];
+  }
+  return remoteWorkflows.map((workflow) =>
+    workflow.id === localWorkflow.id
+      ? summarizeWorkflow({
+          ...localWorkflow,
+          sourcePath: workflow.sourcePath ?? localWorkflow.sourcePath,
+          status: workflow.status ?? localWorkflow.status,
+          updatedAt: workflow.updatedAt ?? localWorkflow.updatedAt,
+        })
+      : workflow,
+  );
+}
+
 function WorkflowSidebar({
   activeWorkflowId,
   dataDir,
   loading,
   query,
+  runState,
   workflows,
   onCreate,
   onQueryChange,
   onRefresh,
+  onResizeStart,
   onSelect,
+  width,
 }) {
   return (
-    <aside className="flex w-[292px] shrink-0 flex-col border-r border-line bg-white">
+    <aside
+      className="relative flex shrink-0 flex-col border-r border-line bg-white"
+      style={{ width }}
+    >
+      <div
+        className="absolute right-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
+        role="separator"
+        title="Resize workflows pane"
+        onPointerDown={onResizeStart}
+      />
       <div className="border-b border-line px-5 py-4">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-3">
@@ -340,7 +654,7 @@ function WorkflowSidebar({
           Workflows
         </div>
         <button
-          className="grid h-8 w-8 place-items-center rounded-lg bg-ink text-white transition hover:bg-slate-700"
+          className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
           title="Create workflow"
           type="button"
           onClick={onCreate}
@@ -369,28 +683,13 @@ function WorkflowSidebar({
                     {workflow.description}
                   </p>
                 </div>
-                <StatusDot status={workflow.status} />
-              </div>
-              <div className="mt-3 grid grid-cols-3 gap-1.5 text-center text-[11px] font-medium text-slate-600">
-                <span className="rounded-md border border-slate-200 bg-white px-1.5 py-1">
-                  {workflow.nodes.length} nodes
-                </span>
-                <span className="rounded-md border border-slate-200 bg-white px-1.5 py-1">
-                  {workflow.edges.length} edges
-                </span>
-                <span className="rounded-md border border-slate-200 bg-white px-1.5 py-1">
-                  {agentIdsForWorkflow(workflow).length} agents
-                </span>
-              </div>
-              <div className="mt-3 flex flex-wrap gap-1.5">
-                {workflow.tags.map((tag) => (
-                  <span
-                    key={tag}
-                    className="rounded-md border border-slate-200 bg-white px-2 py-1 text-[11px] font-medium text-slate-600"
-                  >
-                    {tag}
-                  </span>
-                ))}
+                <StatusDot
+                  status={
+                    runState?.running && runState.workflowId === workflow.id
+                      ? "Running"
+                      : workflow.status
+                  }
+                />
               </div>
             </button>
           ))
@@ -412,16 +711,36 @@ function WorkflowSidebar({
   );
 }
 
-function TopBar({ saveState, workflow }) {
+function TopBar({
+  theme,
+  workflow,
+  onDeleteWorkflow,
+  onToggleTheme,
+}) {
+  const menuRef = useRef(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+
+  useEffect(() => {
+    if (!menuOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (menuRef.current?.contains(event.target)) return;
+      setMenuOpen(false);
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [menuOpen]);
+
   return (
-    <header className="flex h-[78px] shrink-0 items-center justify-between border-b border-line bg-white px-6">
-      <div className="min-w-0">
+    <header className="flex h-[62px] shrink-0 items-center justify-between bg-white px-6 pt-1">
+      <div className="min-w-0 pt-1">
         <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.14em] text-muted">
           <GitBranch size={14} />
           Visual DAG editor
         </div>
-        <div className="mt-1 flex items-center gap-3">
-          <h2 className="truncate text-xl font-semibold">{workflow.name}</h2>
+        <div className="mt-0.5 flex items-center gap-3">
+          <h2 className="truncate text-[19px] font-semibold">{workflow.name}</h2>
           <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
             {workflow.nodes.length} nodes
           </span>
@@ -431,50 +750,60 @@ function TopBar({ saveState, workflow }) {
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <span
-          className={`rounded-md border px-2 py-1 text-xs font-medium ${
-            saveState.error
-              ? "border-red-200 bg-red-50 text-red-700"
-              : saveState.saving
-                ? "border-amber-200 bg-amber-50 text-amber-700"
-                : "border-emerald-200 bg-emerald-50 text-emerald-700"
-          }`}
-        >
-          {saveState.error ? "Save failed" : saveState.saving ? "Saving" : "Saved"}
-        </span>
-        <button
-          className="inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300"
-          type="button"
-        >
-          <Sparkles size={16} />
-          Beautify
-        </button>
-        <button
-          className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700"
-          type="button"
-        >
-          <Check size={16} />
-          Validate
-        </button>
+        <div ref={menuRef} className="relative">
+          <button
+            className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+            title="More workflow actions"
+            type="button"
+            onClick={() => setMenuOpen((current) => !current)}
+          >
+            <MoreVertical size={16} />
+          </button>
+          {menuOpen ? (
+            <div className="absolute right-0 top-11 z-40 w-52 rounded-lg border border-line bg-white p-1 shadow-panel">
+              <button
+                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50"
+                type="button"
+                onClick={() => {
+                  onToggleTheme();
+                  setMenuOpen(false);
+                }}
+              >
+                {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
+                {theme === "dark" ? "Light mode" : "Dark mode"}
+              </button>
+              <button
+                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
+                type="button"
+                onClick={() => {
+                  onDeleteWorkflow();
+                  setMenuOpen(false);
+                }}
+              >
+                <Trash2 size={15} />
+                Delete workflow
+              </button>
+            </div>
+          ) : null}
+        </div>
       </div>
     </header>
   );
 }
 
-function ChatPane({ workflow }) {
+function ChatPane({ onResizeStart, width, workflow }) {
+  const chatScrollRef = useRef(null);
+  const conversationMenuRef = useRef(null);
   const [draft, setDraft] = useState("");
   const [providers, setProviders] = useState([]);
   const [providerId, setProviderId] = useState("codex");
   const [model, setModel] = useState("cli-default");
   const [chatState, setChatState] = useState({ sending: false, error: "" });
+  const [showTypingIndicator, setShowTypingIndicator] = useState(false);
+  const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const workflowName = workflow?.name ?? "No workflow selected";
-  const [messages, setMessages] = useState([
-    {
-      id: "welcome",
-      role: "assistant",
-      body: "Ask me to explain, edit, validate, or design this workflow. I will use the bundled Gofer Flow workflow-builder skill.",
-    },
-  ]);
+  const chatStorageKey = `gofer-flow-chat:${workflow?.id ?? "no-workflow"}`;
+  const [messages, setMessages] = useState(() => loadChatMessages(chatStorageKey));
 
   useEffect(() => {
     async function loadProviders() {
@@ -495,6 +824,51 @@ function ChatPane({ workflow }) {
     }
     loadProviders();
   }, []);
+
+  useEffect(() => {
+    setMessages(loadChatMessages(chatStorageKey));
+    setDraft("");
+    setChatState({ sending: false, error: "" });
+    setShowTypingIndicator(false);
+    setConversationMenuOpen(false);
+  }, [chatStorageKey]);
+
+  useEffect(() => {
+    window.localStorage.setItem(chatStorageKey, JSON.stringify(messages));
+  }, [chatStorageKey, messages]);
+
+  useEffect(() => {
+    if (!chatState.sending) {
+      setShowTypingIndicator(false);
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setShowTypingIndicator(true);
+    }, 2000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [chatState.sending]);
+
+  useEffect(() => {
+    if (!conversationMenuOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (conversationMenuRef.current?.contains(event.target)) return;
+      setConversationMenuOpen(false);
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [conversationMenuOpen]);
+
+  useEffect(() => {
+    if (!showTypingIndicator) return;
+
+    window.requestAnimationFrame(() => {
+      scrollElementIntoView("typing-indicator");
+    });
+  }, [showTypingIndicator]);
 
   const selectedProvider =
     providers.find((provider) => provider.id === providerId) ??
@@ -518,6 +892,9 @@ function ChatPane({ workflow }) {
     setMessages(nextMessages);
     setDraft("");
     setChatState({ sending: true, error: "" });
+    window.requestAnimationFrame(() => {
+      scrollMessageNearTop(userMessage.id);
+    });
 
     try {
       const response = await fetch("/api/chat", {
@@ -536,14 +913,18 @@ function ChatPane({ workflow }) {
       if (!response.ok) {
         throw new Error(payload.error || `Chat API returned ${response.status}`);
       }
+      const assistantMessageId = uniqueClientId();
       setMessages((current) => [
         ...current,
         {
-          id: uniqueClientId(),
+          id: assistantMessageId,
           role: "assistant",
           body: payload.message?.body ?? "",
         },
       ]);
+      window.requestAnimationFrame(() => {
+        scrollElementIntoView(assistantMessageId);
+      });
       setChatState({ sending: false, error: "" });
     } catch (error) {
       setChatState({
@@ -553,8 +934,49 @@ function ChatPane({ workflow }) {
     }
   }
 
+  function deleteConversation() {
+    const defaultMessages = defaultChatMessages();
+    window.localStorage.setItem(chatStorageKey, JSON.stringify(defaultMessages));
+    setMessages(defaultMessages);
+    setDraft("");
+    setChatState({ sending: false, error: "" });
+    setShowTypingIndicator(false);
+    setConversationMenuOpen(false);
+  }
+
+  function scrollMessageNearTop(messageId) {
+    const scrollContainer = chatScrollRef.current;
+    const messageElement = scrollContainer?.querySelector(`[data-message-id="${messageId}"]`);
+    if (!scrollContainer || !messageElement) return;
+
+    scrollContainer.scrollTo({
+      top: messageElement.offsetTop - 12,
+      behavior: "smooth",
+    });
+  }
+
+  function scrollElementIntoView(elementId) {
+    const scrollContainer = chatScrollRef.current;
+    const element = scrollContainer?.querySelector(`[data-message-id="${elementId}"]`);
+    if (!scrollContainer || !element) return;
+
+    element.scrollIntoView({
+      behavior: "smooth",
+      block: "nearest",
+    });
+  }
+
   return (
-    <aside className="flex w-[356px] shrink-0 flex-col border-l border-line bg-white">
+    <aside
+      className="relative flex shrink-0 flex-col border-l border-line bg-white"
+      style={{ width }}
+    >
+      <div
+        className="absolute left-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
+        role="separator"
+        title="Resize chat pane"
+        onPointerDown={onResizeStart}
+      />
       <div className="border-b border-line px-5 py-4">
         <div className="flex items-start gap-3">
           <span className="mt-0.5 grid h-9 w-9 place-items-center rounded-lg bg-slate-900 text-white">
@@ -566,15 +988,36 @@ function ChatPane({ workflow }) {
                 <h2 className="truncate text-base font-semibold">Workflow assistant</h2>
                 <p className="truncate text-xs text-muted">{workflowName}</p>
               </div>
-              <span
-                className={`shrink-0 rounded-md border px-2 py-1 text-[11px] font-medium ${
-                  selectedProvider.available
-                    ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                    : "border-red-200 bg-red-50 text-red-700"
-                }`}
-              >
-                {selectedProvider.available ? "Ready" : "Missing CLI"}
-              </span>
+              <div ref={conversationMenuRef} className="relative flex shrink-0 items-center gap-2">
+                <span
+                  className={`rounded-md border px-2 py-1 text-[11px] font-medium ${
+                    selectedProvider.available
+                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                      : "border-red-200 bg-red-50 text-red-700"
+                  }`}
+                >
+                  {selectedProvider.available ? "Ready" : "Missing CLI"}
+                </span>
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                  title="Conversation options"
+                  type="button"
+                  onClick={() => setConversationMenuOpen((current) => !current)}
+                >
+                  <MoreVertical size={15} />
+                </button>
+                {conversationMenuOpen ? (
+                  <div className="absolute right-0 top-10 z-40 w-44 rounded-lg border border-line bg-white p-1 shadow-panel">
+                    <button
+                      className="w-full rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
+                      type="button"
+                      onClick={deleteConversation}
+                    >
+                      Delete conversation
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
             <div className="mt-3 grid grid-cols-2 gap-2">
               <select
@@ -610,23 +1053,22 @@ function ChatPane({ workflow }) {
         </div>
       </div>
 
-      <div className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-5">
+      <div
+        ref={chatScrollRef}
+        className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-5"
+      >
         <div className="rounded-lg border border-line bg-slate-50 p-3">
-          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.14em] text-muted">
-            <CircleDot size={14} />
-            Context
-          </div>
-          <p className="mt-2 text-sm leading-6 text-slate-700">
-            {workflow?.description ?? "Select a workflow to set context."}
-          </p>
-          <p className="mt-2 text-xs leading-5 text-muted">
-            Gofer Flow skill context is injected server-side for every message.
+          <p className="text-sm leading-6 text-slate-700">
+            The workflow assistant understands Gofer workflows and can answer questions
+            about the current workflow, modify its nodes and edges, or create new
+            workflows from your request.
           </p>
         </div>
 
         {messages.map((message) => (
           <div
             key={message.id}
+            data-message-id={message.id}
             className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
           >
             <div
@@ -640,6 +1082,7 @@ function ChatPane({ workflow }) {
             </div>
           </div>
         ))}
+        {showTypingIndicator ? <TypingIndicator /> : null}
         {chatState.error ? (
           <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
             {chatState.error}
@@ -655,7 +1098,7 @@ function ChatPane({ workflow }) {
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+              if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 sendMessage();
               }
@@ -680,6 +1123,48 @@ function ChatPane({ workflow }) {
       </div>
     </aside>
   );
+}
+
+function TypingIndicator() {
+  return (
+    <div className="flex justify-start" data-message-id="typing-indicator">
+      <div className="max-w-[86%] rounded-lg border border-line bg-white px-3 py-2 text-sm leading-6 text-slate-700 shadow-sm">
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted">Workflow assistant is typing</span>
+          <span className="flex items-center gap-1">
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s]" />
+            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
+          </span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function defaultChatMessages() {
+  return [
+    {
+      id: "welcome",
+      role: "assistant",
+      body: "Ask me to explain, edit, validate, or design this workflow. I will use the bundled Gofer Flow workflow-builder skill.",
+    },
+  ];
+}
+
+function loadChatMessages(storageKey) {
+  try {
+    const storedMessages = JSON.parse(window.localStorage.getItem(storageKey) || "null");
+    if (
+      Array.isArray(storedMessages) &&
+      storedMessages.every((message) => message?.role && typeof message.body === "string")
+    ) {
+      return storedMessages;
+    }
+  } catch {
+    return defaultChatMessages();
+  }
+  return defaultChatMessages();
 }
 
 function uniqueClientId() {
@@ -796,16 +1281,21 @@ function EmptyWorkspace({ error, loading, onRefresh }) {
 }
 
 function StatusDot({ status }) {
+  const normalizedStatus = status || "Ready";
   const color = {
     Ready: "bg-emerald-500",
-    Draft: "bg-amber-500",
-    Scheduled: "bg-sky-500",
-  }[status];
+    Success: "bg-emerald-500",
+    Error: "bg-red-500",
+  }[normalizedStatus] ?? "bg-emerald-500";
 
   return (
     <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-line bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
-      <span className={`h-1.5 w-1.5 rounded-full ${color}`} />
-      {status}
+      {normalizedStatus === "Running" ? (
+        <Loader2 size={11} className="animate-spin text-muted" />
+      ) : (
+        <span className={`h-1.5 w-1.5 rounded-full ${color}`} />
+      )}
+      {normalizedStatus}
     </span>
   );
 }

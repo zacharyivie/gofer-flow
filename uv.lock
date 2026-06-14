@@ -227,6 +227,7 @@ dependencies = [
     { name = "sqlalchemy" },
     { name = "tomli-w" },
     { name = "typer" },
+    { name = "tzdata" },
 ]
 
 [package.optional-dependencies]
@@ -262,6 +263,7 @@ requires-dist = [
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "tomli-w", specifier = ">=1.0" },
     { name = "typer", extras = ["all"], specifier = ">=0.12" },
+    { name = "tzdata", specifier = ">=2026.2" },
 ]
 provides-extras = ["xlsx", "dev"]
 

@@ -11,7 +11,7 @@ from typing import Any
 import anyio
 
 from gofer.core.agent import Agent, AgentResult
-from gofer.core.graph import GraphNode, WorkflowGraph
+from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
@@ -311,8 +311,17 @@ class WorkflowExecutor:
             await anyio.sleep(node.retry_delay_seconds)
 
         if output is not None and not output.success:
-            if node.on_failure == "halt":
+            if node.on_failure == "halt" and not self._has_failure_route(node, output, graph):
                 halt_flag[0] = True
+
+    def _has_failure_route(
+        self, node: GraphNode, output: NodeOutput, graph: WorkflowGraph
+    ) -> bool:
+        for successor_id in graph._graph.successors(node.node_id):
+            edge = graph.get_edge_config(node.node_id, successor_id)
+            if edge.condition == EdgeConditionType.ON_FAILURE and edge.evaluate(output):
+                return True
+        return False
 
     def _resolve_pipe_stdin(
         self, node: GraphNode, ctx: ExecutionContext, graph: WorkflowGraph

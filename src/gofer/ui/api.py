@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any, overload
@@ -30,6 +31,10 @@ class WorkflowUpdateError(ValueError):
 
 
 class WorkflowRunError(ValueError):
+    pass
+
+
+class WorkflowLogError(ValueError):
     pass
 
 
@@ -83,6 +88,42 @@ def create_workflow_payload(name: str, data_dir: Path | None = None) -> dict[str
     return workflow_to_payload(workflow, path)
 
 
+def import_workflow_payload(content: str, data_dir: Path | None = None) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    base.mkdir(parents=True, exist_ok=True)
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as fh:
+            fh.write(content)
+            temp_path = Path(fh.name)
+
+        workflow = AgenticWorkflow.from_file(temp_path)
+        workflow.validate()
+        path = base / f"{workflow.config.id}.toml"
+        if path.exists():
+            raise WorkflowAlreadyExistsError(f"Workflow '{workflow.config.id}' already exists")
+        workflow.to_file(path)
+    except WorkflowAlreadyExistsError:
+        raise
+    except Exception as exc:
+        raise WorkflowCreateError(str(exc)) from exc
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+    return workflow_to_payload(workflow, path)
+
+
+def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    path = base / f"{workflow_id}.toml"
+    if not path.exists():
+        raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
+    path.unlink()
+    return {"workflowId": workflow_id, "deleted": True}
+
+
 def update_workflow_payload(
     workflow_id: str, payload: dict[str, Any], data_dir: Path | None = None
 ) -> dict[str, Any]:
@@ -131,6 +172,7 @@ async def run_workflow_payload(
         "success": result.success,
         "durationSeconds": result.duration_seconds,
         "logPath": str(result.log_path) if result.log_path else None,
+        "logText": result.log_path.read_text() if result.log_path else "",
         "nodeOutputs": {
             node_id: {
                 "success": output.success,
@@ -146,6 +188,27 @@ async def run_workflow_payload(
             for node_id, output in result.node_outputs.items()
         },
     }
+
+
+def latest_workflow_log_payload(
+    workflow_id: str, data_dir: Path | None = None
+) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    log_dir = base / "logs" / workflow_id
+    if not log_dir.exists():
+        return {"workflowId": workflow_id, "logPath": None, "logText": ""}
+
+    logs = sorted(log_dir.glob("*.log"), key=lambda path: (path.stat().st_mtime, path.name))
+    if not logs:
+        return {"workflowId": workflow_id, "logPath": None, "logText": ""}
+
+    latest = logs[-1]
+    try:
+        text = latest.read_text()
+    except OSError as exc:
+        raise WorkflowLogError(str(exc)) from exc
+
+    return {"workflowId": workflow_id, "logPath": str(latest), "logText": text}
 
 
 def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
@@ -253,7 +316,8 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         )
 
     schedule = _model_dump(workflow.config.schedule) if workflow.config.schedule else None
-    tags = [_workflow_status(schedule).lower()]
+    status = _latest_run_status(workflow.config.id, path)
+    tags = [status.lower()]
     operation_types = sorted({str(node["type"]) for node in nodes})
     tags.extend(operation_types[:2])
 
@@ -261,7 +325,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         "id": workflow.config.id,
         "name": workflow.config.name,
         "description": _workflow_description(workflow, schedule),
-        "status": _workflow_status(schedule),
+        "status": status,
         "updatedAt": _updated_at(path),
         "sourcePath": str(path) if path else None,
         "schedule": schedule,
@@ -352,6 +416,33 @@ def _workflow_description(workflow: AgenticWorkflow, schedule: dict[str, Any] | 
 
 def _workflow_status(schedule: dict[str, Any] | None) -> str:
     return "Scheduled" if schedule else "Ready"
+
+
+def _latest_run_status(workflow_id: str, path: Path | None) -> str:
+    if path is None:
+        return "Ready"
+
+    log_dir = path.parent / "logs" / workflow_id
+    if not log_dir.exists():
+        return "Ready"
+
+    logs = sorted(
+        log_dir.glob("*.log"),
+        key=lambda log_path: (log_path.stat().st_mtime, log_path.name),
+    )
+    if not logs:
+        return "Ready"
+
+    try:
+        last_line = logs[-1].read_text().splitlines()[-1]
+    except (IndexError, OSError):
+        return "Ready"
+
+    if f"{workflow_id} completed successfully" in last_line:
+        return "Success"
+    if f"{workflow_id} failed due to" in last_line:
+        return "Error"
+    return "Running"
 
 
 def _updated_at(path: Path | None) -> str:

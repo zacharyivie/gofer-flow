@@ -17,11 +17,18 @@ log = get_logger(__name__)
 def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str, Any]) -> None:
     wf = AgenticWorkflow.from_file(Path(workflow_path))
     from gofer.core.executor import WorkflowExecutor
+    from gofer.subscriptions.claude_code import ClaudeCodeSubscription
+    from gofer.subscriptions.codex import CodexSubscription
+
+    runtime_subscriptions = subscriptions or {
+        "claude_code": ClaudeCodeSubscription(),
+        "codex": CodexSubscription(),
+    }
 
     async def _exec() -> None:
         executor = WorkflowExecutor(
             wf,
-            subscriptions,
+            runtime_subscriptions,
             log_base_dir=Path(workflow_path).parent / "logs",
         )
         result = await executor.run()
@@ -105,8 +112,11 @@ class WorkflowScheduler:
             })
         return jobs
 
-    def start(self) -> None:
-        self._scheduler.start()
+    def start(self, paused: bool = False) -> None:
+        self._scheduler.start(paused=paused)
+
+    def resume(self) -> None:
+        self._scheduler.resume()
 
     def shutdown(self, wait: bool = True) -> None:
         self._scheduler.shutdown(wait=wait)

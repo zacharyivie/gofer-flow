@@ -18,6 +18,7 @@ dependencies = [
     "sqlalchemy>=2.0",
     "tomli-w>=1.0",
     "questionary>=2.0",
+    "tzdata>=2026.2",
 ]
 
 [project.optional-dependencies]
