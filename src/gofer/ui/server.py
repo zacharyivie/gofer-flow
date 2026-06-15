@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
+import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -56,6 +59,7 @@ def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> Non
 
 class GoferUiServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], data_dir: Path) -> None:
+        data_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(server_address, GoferUiRequestHandler)
         self.data_dir = data_dir
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
@@ -70,13 +74,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json({"ok": True})
+            self._send_json({
+                "ok": True,
+                "dataDir": str(self._default_data_dir()),
+            })
             return
 
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
-            payload = list_workflow_payloads(Path(data_dir) if data_dir else None)
+            payload = list_workflow_payloads(self._request_data_dir(query))
             self._send_json(payload)
             return
 
@@ -89,11 +95,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 "/logs/latest"
             )
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 payload = latest_workflow_log_payload(
                     workflow_id,
-                    Path(data_dir) if data_dir else None,
+                    self._request_data_dir(query),
                 )
             except WorkflowLogError as exc:
                 self._send_json({"error": str(exc)}, status=400)
@@ -108,12 +113,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/workflows/import":
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 body = self._read_json()
                 workflow = import_workflow_payload(
                     str(body.get("content", "")),
-                    Path(data_dir) if data_dir else None,
+                    self._request_data_dir(query),
                 )
             except WorkflowAlreadyExistsError as exc:
                 self._send_json({"error": str(exc)}, status=409)
@@ -128,12 +132,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 body = self._read_json()
                 workflow = create_workflow_payload(
                     str(body.get("name", "")),
-                    Path(data_dir) if data_dir else None,
+                    self._request_data_dir(query),
                 )
             except WorkflowAlreadyExistsError as exc:
                 self._send_json({"error": str(exc)}, status=409)
@@ -148,7 +151,6 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/chat":
             query = parse_qs(parsed.query)
-            chat_data_dir = Path(query["data_dir"][0]) if "data_dir" in query else get_data_dir()
             try:
                 body = self._read_json()
                 response = asyncio.run(
@@ -157,7 +159,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                         model=str(body.get("model", "cli-default")),
                         messages=body.get("messages") or [],
                         workflow=body.get("workflow"),
-                        data_dir=chat_data_dir,
+                        data_dir=self._request_data_dir(query),
                     )
                 )
             except (ChatProviderError, json.JSONDecodeError) as exc:
@@ -170,13 +172,12 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/run"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/run")
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 body = self._read_json()
                 run = asyncio.run(
                     run_workflow_payload(
                         workflow_id,
-                        Path(data_dir) if data_dir else None,
+                        self._request_data_dir(query),
                         dry_run=bool(body.get("dryRun", False)),
                     )
                 )
@@ -194,12 +195,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/workflows/"):
             workflow_id = parsed.path.removeprefix("/api/workflows/")
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 workflow = update_workflow_payload(
                     workflow_id,
                     self._read_json(),
-                    Path(data_dir) if data_dir else None,
+                    self._request_data_dir(query),
                 )
             except (WorkflowUpdateError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
@@ -216,11 +216,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if parsed.path.startswith("/api/workflows/"):
             workflow_id = parsed.path.removeprefix("/api/workflows/")
             query = parse_qs(parsed.query)
-            data_dir = query.get("data_dir", [None])[0]
             try:
                 payload = delete_workflow_payload(
                     workflow_id,
-                    Path(data_dir) if data_dir else None,
+                    self._request_data_dir(query),
                 )
             except WorkflowUpdateError as exc:
                 self._send_json({"error": str(exc)}, status=404)
@@ -247,6 +246,16 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if isinstance(server, GoferUiServer):
             server.sync_schedules()
 
+    def _default_data_dir(self) -> Path:
+        server = self.server
+        if isinstance(server, GoferUiServer):
+            return server.data_dir
+        return get_data_dir()
+
+    def _request_data_dir(self, query: dict[str, list[str]]) -> Path:
+        data_dir = query.get("data_dir", [None])[0]
+        return Path(data_dir) if data_dir else self._default_data_dir()
+
     def _read_json(self) -> dict[str, Any]:
         content_length = int(self.headers.get("Content-Length", "0"))
         raw_body = self.rfile.read(content_length)
@@ -266,12 +275,42 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
-    data_dir = get_data_dir()
-    server = GoferUiServer((host, port), data_dir)
+def ready_payload(server: GoferUiServer) -> dict[str, Any]:
+    host, port = server.server_address[:2]
+    return {
+        "host": host,
+        "port": port,
+        "dataDir": str(server.data_dir),
+    }
+
+
+def create_server(
+    host: str = "127.0.0.1",
+    port: int = 8765,
+    data_dir: Path | None = None,
+) -> GoferUiServer:
+    return GoferUiServer((host, port), data_dir or get_data_dir())
+
+
+def _install_shutdown_handlers(server: GoferUiServer) -> None:
+    def request_shutdown(signum: int, _frame: object) -> None:
+        log.info("Received signal %s; shutting down Gofer UI server", signum)
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(signum, request_shutdown)
+        except (OSError, ValueError):
+            log.debug("Could not install handler for signal %s", signum)
+
+
+def serve(host: str = "127.0.0.1", port: int = 8765, data_dir: Path | None = None) -> None:
+    server = create_server(host=host, port=port, data_dir=data_dir)
     server.scheduler.start(paused=True)
     server.sync_schedules()
     server.scheduler.resume()
+    _install_shutdown_handlers(server)
+    print(f"GOFER_UI_READY {json.dumps(ready_payload(server), sort_keys=True)}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -279,6 +318,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     finally:
         server.scheduler.shutdown(wait=False)
         server.server_close()
+        print("GOFER_UI_STOPPED", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

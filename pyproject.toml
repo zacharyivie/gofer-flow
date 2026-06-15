@@ -58,3 +58,8 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.21.0",
+]

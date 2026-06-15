@@ -1,0 +1,25 @@
+pkgbase = gofer-flow
+	pkgdesc = Local workflow automation studio for Gofer Flow
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/doonk/gofer-flow
+	arch = x86_64
+	license = custom
+	depends = fuse2
+	depends = gtk3
+	depends = hicolor-icon-theme
+	depends = libxss
+	depends = libxtst
+	depends = nss
+	depends = xdg-utils
+	options = !strip
+	source = gofer-flow
+	source = gofer-flow.desktop
+	source = gofer-flow.svg
+	sha256sums = d47d296d0ee293e7f2bc46c6997dd44b327c0699548c71b1d80abed020d97973
+	sha256sums = 3af3ff41ae4c9974e7f3e7b4d450384d02c3c57d8382585b8c2671012228dc89
+	sha256sums = 05f187078ee51f2c237ae4271d9383ff9dd5bc240bada6c8cc0361392730c553
+	source_x86_64 = Gofer-Flow-0.1.0-x86_64.AppImage::https://github.com/doonk/gofer-flow/releases/download/v0.1.0/Gofer-Flow-0.1.0-x86_64.AppImage
+	sha256sums_x86_64 = 4b25cea0265aeb1d7508ed3597c0955e51a0e77ddda40278834b75456d2f1696
+
+pkgname = gofer-flow

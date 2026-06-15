@@ -18,6 +18,7 @@ import {
   X,
 } from "lucide-react";
 import DagCanvas from "../components/DagCanvas.jsx";
+import { apiUrl } from "../lib/api.js";
 
 export default function App() {
   const [workflows, setWorkflows] = useState([]);
@@ -45,7 +46,7 @@ export default function App() {
       setLoadState({ loading: true, error: "" });
     }
     try {
-      const response = await fetch("/api/workflows");
+      const response = await fetch(apiUrl("/workflows"));
       if (!response.ok) {
         throw new Error(`Workflow API returned ${response.status}`);
       }
@@ -123,7 +124,7 @@ export default function App() {
     }
     try {
       const response = await fetch(
-        `/api/workflows/${encodeURIComponent(workflowId)}/logs/latest`,
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs/latest`),
       );
       const payload = await response.json();
       if (!response.ok) {
@@ -244,13 +245,16 @@ export default function App() {
   }
 
   async function persistWorkflow(workflow) {
-    const response = await fetch(`/api/workflows/${encodeURIComponent(workflow.id)}`, {
-      method: "PUT",
-      headers: {
-        "Content-Type": "application/json",
+    const response = await fetch(
+      apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(workflow),
       },
-      body: JSON.stringify(workflow),
-    });
+    );
     const payload = await response.json();
     if (!response.ok) {
       throw new Error(payload.error || `Workflow API returned ${response.status}`);
@@ -278,13 +282,16 @@ export default function App() {
       );
       setSaveState({ saving: false, error: "" });
 
-      const response = await fetch(`/api/workflows/${encodeURIComponent(savedWorkflow.id)}/run`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(savedWorkflow.id)}/run`),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ dryRun: false }),
         },
-        body: JSON.stringify({ dryRun: false }),
-      });
+      );
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
@@ -320,7 +327,7 @@ export default function App() {
   async function createWorkflow(name) {
     setCreateState({ saving: true, error: "" });
     try {
-      const response = await fetch("/api/workflows", {
+      const response = await fetch(apiUrl("/workflows"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -362,7 +369,7 @@ export default function App() {
     if (!file) return;
     try {
       const content = await file.text();
-      const response = await fetch("/api/workflows/import", {
+      const response = await fetch(apiUrl("/workflows/import"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -391,9 +398,12 @@ export default function App() {
     if (!window.confirm(`Delete workflow "${workflow.name}"?`)) return;
 
     try {
-      const response = await fetch(`/api/workflows/${encodeURIComponent(workflow.id)}`, {
-        method: "DELETE",
-      });
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
+        {
+          method: "DELETE",
+        },
+      );
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
@@ -808,7 +818,7 @@ function ChatPane({ onResizeStart, width, workflow }) {
   useEffect(() => {
     async function loadProviders() {
       try {
-        const response = await fetch("/api/chat/providers");
+        const response = await fetch(apiUrl("/chat/providers"));
         if (!response.ok) return;
         const payload = await response.json();
         const nextProviders = payload.providers ?? [];
@@ -897,7 +907,7 @@ function ChatPane({ onResizeStart, width, workflow }) {
     });
 
     try {
-      const response = await fetch("/api/chat", {
+      const response = await fetch(apiUrl("/chat"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

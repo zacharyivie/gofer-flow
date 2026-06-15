@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Gofer Flow
+Comment=Local workflow automation studio
+Exec=gofer-flow %U
+Terminal=false
+Type=Application
+Icon=gofer-flow
+StartupWMClass=gofer-flow
+Keywords=workflow;automation;dag;agents;gofer;
+Categories=Development;

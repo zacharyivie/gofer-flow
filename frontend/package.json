@@ -1,28 +1,149 @@
 {
   "name": "gofer-flow-ui",
   "version": "0.1.0",
+  "description": "Local workflow automation studio for Gofer Flow.",
+  "author": "Gofer Flow",
+  "homepage": "https://github.com/doonk/gofer-flow",
+  "desktopName": "gofer-flow",
   "private": true,
   "type": "module",
+  "main": "electron/main.js",
   "scripts": {
+    "backend:build": "node ../scripts/build-backend-binary.cjs",
     "dev": "vite",
+    "electron:dev": "concurrently -k -n vite,electron -c blue,green \"npm run dev -- --host 127.0.0.1 --port 5173 --strictPort\" \"wait-on http://127.0.0.1:5173 && node electron/dev-runner.cjs\"",
+    "electron:smoke": "npm run check:build && node electron/smoke.cjs",
     "build": "vite build",
+    "check:build": "vite build",
+    "dist": "npm run backend:build && npm run build && electron-builder",
+    "dist:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage deb rpm",
+    "dist:appimage": "npm run backend:build && npm run build && electron-builder --linux AppImage",
+    "dist:deb": "npm run backend:build && npm run build && electron-builder --linux deb",
+    "dist:rpm": "npm run backend:build && npm run build && electron-builder --linux rpm",
+    "dist:win": "npm run backend:build && npm run build && electron-builder --win nsis",
+    "dist:mac": "npm run backend:build && npm run build && electron-builder --mac dmg",
     "preview": "vite preview",
     "lint": "eslint ."
   },
+  "build": {
+    "appId": "com.goferflow.desktop",
+    "productName": "Gofer Flow",
+    "copyright": "Copyright © 2026 Gofer Flow",
+    "directories": {
+      "buildResources": "build-resources",
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "rpm"
+      ],
+      "category": "Development",
+      "description": "Local workflow automation studio for Gofer Flow.",
+      "desktop": {
+        "entry": {
+          "Name": "Gofer Flow",
+          "Comment": "Local workflow automation studio",
+          "Keywords": "workflow;automation;dag;agents;gofer;",
+          "StartupWMClass": "gofer-flow"
+        }
+      },
+      "executableName": "gofer-flow",
+      "icon": "build-resources/icons",
+      "maintainer": "Gofer Flow",
+      "packageCategory": "devel",
+      "artifactName": "Gofer-Flow-${version}-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "../dist/gof",
+          "to": "backend/gof"
+        }
+      ]
+    },
+    "deb": {
+      "packageName": "gofer-flow",
+      "depends": [
+        "libgtk-3-0",
+        "libnss3",
+        "libxss1",
+        "libxtst6",
+        "xdg-utils"
+      ],
+      "packageCategory": "devel",
+      "priority": "optional"
+    },
+    "rpm": {
+      "packageName": "gofer-flow",
+      "depends": [
+        "gtk3",
+        "nss",
+        "libXScrnSaver",
+        "libXtst",
+        "xdg-utils"
+      ],
+      "packageCategory": "Development/Tools"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "build-resources/icon.ico",
+      "artifactName": "Gofer-Flow-Setup-${version}.${ext}",
+      "extraResources": [
+        {
+          "from": "../dist/gof.exe",
+          "to": "backend/gof.exe"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "category": "public.app-category.developer-tools",
+      "icon": "build-resources/icon.icns",
+      "artifactName": "Gofer-Flow-${version}-${arch}.${ext}",
+      "extraResources": [
+        {
+          "from": "../dist/gof",
+          "to": "backend/gof"
+        }
+      ]
+    },
+    "dmg": {
+      "artifactName": "Gofer-Flow-${version}-${arch}.${ext}"
+    }
+  },
   "dependencies": {
+    "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.1",
-    "lucide-react": "^0.468.0"
+    "react-router-dom": "^6.30.1"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "^4.5.0",
     "autoprefixer": "^10.4.20",
+    "concurrently": "^9.2.1",
+    "electron": "^41.7.1",
+    "electron-builder": "^26.15.3",
     "eslint": "^9.16.0",
     "eslint-plugin-react": "^7.37.2",
     "eslint-plugin-react-hooks": "^5.1.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
-    "vite": "^5.4.11"
+    "vite": "^5.4.11",
+    "wait-on": "^9.0.10"
   }
 }

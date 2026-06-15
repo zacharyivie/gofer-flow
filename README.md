@@ -61,6 +61,36 @@ npm install
 npm run dev
 ```
 
+## Desktop App
+
+Linux desktop packages are built from the Electron app in `frontend/release`.
+Arch users will be able to install Gofer Flow from AUR after publication:
+
+```bash
+yay -S gofer-flow
+```
+
+The AUR packaging files live in `packaging/arch`.
+
+## Release Builds
+
+Release artifacts for Linux and Windows are built by the GitHub Actions workflow
+in `.github/workflows/release.yml`. It runs on `workflow_dispatch` and `v*` tags,
+builds the Python backend binary, builds the React frontend, packages Electron,
+and uploads installer artifacts with SHA-256 checksum files.
+
+Use the version bump script before tagging a release:
+
+```bash
+node scripts/bump-version.cjs 0.1.1
+```
+
+After building the release AppImage, update the Arch package checksum with:
+
+```bash
+node scripts/bump-version.cjs 0.1.1 --appimage-sha256 <sha256>
+```
+
 ## Data Directory
 
 By default, Gofer Flow stores workflows, agent files, prompts, scheduler state, and scheduler PID files in the OS user data directory:

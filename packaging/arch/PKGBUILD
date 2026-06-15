@@ -1,0 +1,44 @@
+# Maintainer: Gofer Flow <maintainers@goferflow.local>
+pkgname=gofer-flow
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Local workflow automation studio for Gofer Flow"
+arch=("x86_64")
+url="https://github.com/doonk/gofer-flow"
+license=("custom")
+depends=(
+  "fuse2"
+  "gtk3"
+  "hicolor-icon-theme"
+  "libxss"
+  "libxtst"
+  "nss"
+  "xdg-utils"
+)
+options=(!strip)
+source_x86_64=(
+  "Gofer-Flow-${pkgver}-x86_64.AppImage::${url}/releases/download/v${pkgver}/Gofer-Flow-${pkgver}-x86_64.AppImage"
+)
+source=(
+  "gofer-flow"
+  "gofer-flow.desktop"
+  "gofer-flow.svg"
+)
+sha256sums=(
+  "d47d296d0ee293e7f2bc46c6997dd44b327c0699548c71b1d80abed020d97973"
+  "3af3ff41ae4c9974e7f3e7b4d450384d02c3c57d8382585b8c2671012228dc89"
+  "05f187078ee51f2c237ae4271d9383ff9dd5bc240bada6c8cc0361392730c553"
+)
+sha256sums_x86_64=(
+  "4b25cea0265aeb1d7508ed3597c0955e51a0e77ddda40278834b75456d2f1696"
+)
+
+package() {
+  install -Dm755 "${srcdir}/Gofer-Flow-${pkgver}-x86_64.AppImage" \
+    "${pkgdir}/opt/gofer-flow/gofer-flow.AppImage"
+  install -Dm755 "${srcdir}/gofer-flow" "${pkgdir}/usr/bin/gofer-flow"
+  install -Dm644 "${srcdir}/gofer-flow.desktop" \
+    "${pkgdir}/usr/share/applications/gofer-flow.desktop"
+  install -Dm644 "${srcdir}/gofer-flow.svg" \
+    "${pkgdir}/usr/share/icons/hicolor/scalable/apps/gofer-flow.svg"
+}
