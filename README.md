@@ -101,6 +101,11 @@ By default, Gofer Flow stores workflows, agent files, prompts, scheduler state, 
 
 Many commands also include a hidden `--data-dir` option used by tests and automation.
 
+## License
+
+Gofer Flow is licensed under the Apache License, Version 2.0. See `LICENSE`
+and `NOTICE` for details.
+
 ## Workflow Commands
 
 ```bash

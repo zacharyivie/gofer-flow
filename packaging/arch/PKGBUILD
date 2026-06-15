@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Local workflow automation studio for Gofer Flow"
 arch=("x86_64")
 url="https://github.com/doonk/gofer-flow"
-license=("custom")
+license=("Apache-2.0")
 depends=(
   "fuse2"
   "gtk3"

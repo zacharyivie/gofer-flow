@@ -3,6 +3,7 @@
   "version": "0.1.0",
   "description": "Local workflow automation studio for Gofer Flow.",
   "author": "Gofer Flow",
+  "license": "Apache-2.0",
   "homepage": "https://github.com/doonk/gofer-flow",
   "desktopName": "gofer-flow",
   "private": true,
