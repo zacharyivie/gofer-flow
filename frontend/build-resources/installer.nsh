@@ -30,12 +30,13 @@ Function GoferCliPathPageCreate
     Abort
   ${EndIf}
 
-  !insertmacro MUI_HEADER_TEXT "Command line" "Choose whether to make gof available from terminals."
-
-  ${NSD_CreateLabel} 0 0 100% 24u "Gofer Flow includes the gof command line tool for running workflows from PowerShell, Command Prompt, scripts, and automation."
+  ${NSD_CreateLabel} 0 0 100% 12u "Command line"
   Pop $0
 
-  ${NSD_CreateCheckbox} 0 34u 100% 12u "Add gof CLI to my user PATH"
+  ${NSD_CreateLabel} 0 18u 100% 30u "Gofer Flow includes the gof command line tool for running workflows from PowerShell, Command Prompt, scripts, and automation."
+  Pop $0
+
+  ${NSD_CreateCheckbox} 0 56u 100% 12u "Add gof CLI to my user PATH"
   Pop $GoferCliPathCheckbox
   ${NSD_Check} $GoferCliPathCheckbox
 
