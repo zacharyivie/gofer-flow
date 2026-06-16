@@ -91,6 +91,6 @@ install -m 0644 %{_sourcedir}/LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 EOF
 
 rpmbuild --define "_topdir ${rpm_top}" -bb "${rpm_top}/SPECS/${package_name}.spec"
-cp "${rpm_top}/RPMS/x86_64/${package_name}-${version}-1."*.x86_64.rpm "${output_dir}/"
+cp "${rpm_top}/RPMS/x86_64/${package_name}-${version}-1"*.x86_64.rpm "${output_dir}/"
 
 echo "Built CLI packages in ${output_dir}"
