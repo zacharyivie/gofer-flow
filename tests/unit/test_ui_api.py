@@ -13,8 +13,10 @@ from gofer.ui.api import (
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_payloads,
+    list_workflow_run_logs_payload,
     run_workflow_payload,
     update_workflow_payload,
+    workflow_run_log_payload,
 )
 
 
@@ -265,6 +267,44 @@ def test_latest_workflow_log_payload_reads_last_run(tmp_path: Path) -> None:
     assert payload["logPath"]
     assert "latest-log started successfully" in payload["logText"]
     assert "hello" in payload["logText"]
+
+
+def test_list_workflow_run_logs_payload_returns_runs_newest_first(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    first = log_dir / "2026-06-13T10-00-00-0400.log"
+    second = log_dir / "2026-06-13T11-00-00-0400.log"
+    first.write_text(
+        "2026-06-13T10:00:00-04:00 - history-flow started successfully\n"
+        "2026-06-13T10:00:00-04:00 - INFO - history-flow completed successfully\n"
+    )
+    second.write_text(
+        "2026-06-13T11:00:00-04:00 - history-flow started successfully\n"
+        "2026-06-13T11:00:00-04:00 - ERROR - history-flow failed due to bad\n"
+    )
+
+    payload = list_workflow_run_logs_payload("history-flow", tmp_path)
+
+    assert [run["id"] for run in payload["runs"]] == [second.name, first.name]
+    assert payload["runs"][0]["status"] == "error"
+    assert payload["runs"][1]["status"] == "success"
+
+
+def test_workflow_run_log_payload_reads_specific_run(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text(
+        "2026-06-13T10:00:00-04:00 - history-flow started successfully\n"
+        "custom output\n"
+        "2026-06-13T10:00:00-04:00 - INFO - history-flow completed successfully\n"
+    )
+
+    payload = workflow_run_log_payload("history-flow", run.name, tmp_path)
+
+    assert payload["runId"] == run.name
+    assert payload["status"] == "success"
+    assert "custom output" in payload["logText"]
 
 
 def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:

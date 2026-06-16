@@ -1,15 +1,15 @@
 # Gofer Flow
 
-Gofer Flow is a Python CLI tool for defining and running DAG-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, and LLM agent calls into a directed acyclic graph.
+Gofer Flow is a Python CLI tool for defining and running graph-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, and LLM agent calls into directed graphs that may include recursive loops.
 
 The installed command is `gof`.
 
 ## What It Can Do
 
-- Run workflow nodes in topological order, with independent nodes in the same generation running concurrently.
+- Run workflow nodes from start nodes through conditional edges, including recursive loops for improve/review or retry-until-output workflows.
 - Execute `bash_command`, `shell_script`, `python_script`, and `agent` nodes.
 - Use Claude Code or Codex as agent backends through their local CLIs.
-- Validate workflow DAGs and reject cycles.
+- Validate workflow structure while allowing cycles and self-loops.
 - Show workflow structure in the terminal.
 - Create workflow scaffolds and build workflows through an interactive wizard.
 - Edit agents and workflows in an interactive terminal editor.
@@ -72,12 +72,41 @@ yay -S gofer-flow
 
 The AUR packaging files live in `packaging/arch`.
 
+On Windows, the normal installer includes the bundled `gof.exe` backend. During
+setup, the "Add gof CLI to my user PATH" option is checked by default so users
+can run `gof` from new PowerShell or Command Prompt sessions after installation.
+
+## CLI-Only Installs
+
+Release builds also publish standalone CLI binaries:
+
+- Linux: `gof-linux-x64`
+- Windows: `gof-windows-x64.exe`
+- Debian/Ubuntu: `gofer-flow-cli_<version>_amd64.deb`
+- Red Hat/Fedora: `gofer-flow-cli-<version>-1.<dist>.x86_64.rpm`
+- Arch/AUR: `gofer-flow-cli`
+
+These artifacts are intended for servers, CI, containers, and enterprise
+automation where the Electron frontend is unnecessary. A Linux container can
+install only the CLI with a pattern like:
+
+```dockerfile
+ADD gof-linux-x64 /usr/local/bin/gof
+RUN chmod +x /usr/local/bin/gof
+```
+
+Arch users can install the CLI-only package after AUR publication:
+
+```bash
+yay -S gofer-flow-cli
+```
+
 ## Release Builds
 
 Release artifacts for Linux and Windows are built by the GitHub Actions workflow
 in `.github/workflows/release.yml`. It runs on `workflow_dispatch` and `v*` tags,
 builds the Python backend binary, builds the React frontend, packages Electron,
-and uploads installer artifacts with SHA-256 checksum files.
+and uploads desktop installer plus CLI-only artifacts with SHA-256 checksum files.
 
 Use the version bump script before tagging a release:
 
@@ -88,7 +117,7 @@ node scripts/bump-version.cjs 0.1.1
 After building the release AppImage, update the Arch package checksum with:
 
 ```bash
-node scripts/bump-version.cjs 0.1.1 --appimage-sha256 <sha256>
+node scripts/bump-version.cjs 0.1.1 --appimage-sha256 <appimage-sha256> --cli-sha256 <cli-sha256>
 ```
 
 ## Data Directory
@@ -125,7 +154,7 @@ gof workflow list
 gof workflow validate daily-analysis
 gof workflow validate ./daily-analysis.toml
 
-# Show the workflow DAG
+# Show the workflow graph
 gof workflow show daily-analysis
 
 # Run a workflow

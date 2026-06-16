@@ -55,13 +55,18 @@ const defaultSettings = {
 };
 const minZoom = 0.45;
 const maxZoom = 1.8;
+const isWindows =
+  typeof navigator !== "undefined" &&
+  /win/i.test(`${navigator.userAgent} ${navigator.platform}`);
+const commandNodeLabel = isWindows ? "PowerShell command" : "Bash command";
+const defaultCommand = isWindows ? 'Write-Output "hello"' : "echo hello";
 
 function defaultOperation(type, nodeNumber = 1) {
   switch (type) {
     case "bash_command":
       return {
         type,
-        command: "echo hello",
+        command: defaultCommand,
         working_dir: "",
         env: {},
       };
@@ -108,7 +113,7 @@ function defaultAgentConfig(agentId) {
 function nodeMetaFromOperation(operation = {}) {
   switch (operation.type) {
     case "bash_command":
-      return operation.command || "bash command";
+      return operation.command || commandNodeLabel.toLowerCase();
     case "python_script":
     case "shell_script":
       return operation.script_path || "script";
@@ -163,7 +168,9 @@ export default function DagCanvas({
   runState,
   workflow,
   onImportWorkflow,
+  onLoadLatestLog,
   onRunWorkflow,
+  onSelectRunLog,
   onValidateWorkflow,
   onWorkflowChange,
 }) {
@@ -644,10 +651,37 @@ export default function DagCanvas({
                 const to = nodesById[edge.to];
                 if (!from || !to) return null;
 
-                const start = { x: from.x + 220, y: from.y + 48 };
-                const end = { x: to.x, y: to.y + 48 };
-                const middleX = start.x + Math.max(60, (end.x - start.x) / 2);
-                const path = `M ${start.x} ${start.y} C ${middleX} ${start.y}, ${middleX} ${end.y}, ${end.x} ${end.y}`;
+                const selfLoop = edge.from === edge.to;
+                const reciprocal = workflow.edges.some(
+                  (candidate) =>
+                    candidate.id !== edge.id &&
+                    candidate.from === edge.to &&
+                    candidate.to === edge.from,
+                );
+                const laneOffset = reciprocal
+                  ? stableEdgeDirection(edge.from, edge.to) * 44
+                  : 0;
+                const start = selfLoop
+                  ? { x: from.x + 166, y: from.y }
+                  : edgeGoesRight(from, to)
+                    ? { x: from.x + 220, y: from.y + 48 }
+                    : { x: from.x, y: from.y + 48 };
+                const end = selfLoop
+                  ? { x: from.x + 54, y: from.y }
+                  : edgeGoesRight(from, to)
+                    ? { x: to.x, y: to.y + 48 }
+                    : { x: to.x + 220, y: to.y + 48 };
+                const direction = end.x >= start.x ? 1 : -1;
+                const controlDistance = Math.max(80, Math.abs(end.x - start.x) / 2);
+                const path = selfLoop
+                  ? `M ${start.x} ${start.y} C ${start.x + 70} ${start.y - 70}, ${end.x - 70} ${end.y - 70}, ${end.x} ${end.y}`
+                  : `M ${start.x} ${start.y} C ${start.x + direction * controlDistance} ${start.y + laneOffset}, ${end.x - direction * controlDistance} ${end.y + laneOffset}, ${end.x} ${end.y}`;
+                const labelPosition = selfLoop
+                  ? { x: from.x + 110, y: from.y - 54 }
+                  : {
+                      x: (start.x + end.x) / 2,
+                      y: (start.y + end.y) / 2 + laneOffset - 12,
+                    };
 
                 return (
                   <g key={edge.id}>
@@ -660,8 +694,8 @@ export default function DagCanvas({
                       strokeWidth="2.5"
                     />
                     <text
-                      x={(start.x + end.x) / 2}
-                      y={(start.y + end.y) / 2 - 12}
+                      x={labelPosition.x}
+                      y={labelPosition.y}
                       className="fill-slate-500 text-[12px] font-medium"
                       textAnchor="middle"
                     >
@@ -715,9 +749,13 @@ export default function DagCanvas({
         height={logHeight}
         loading={logState?.loading}
         logPath={logState?.path}
+        runs={logState?.runs ?? []}
+        selectedRunId={logState?.selectedRunId}
         text={displayedLog}
         title={logTitle}
         onResizeStart={startLogResize}
+        onSelectRun={onSelectRunLog}
+        onShowLatest={onLoadLatestLog}
         onToggle={() => setLogCollapsed((current) => !current)}
       />
     </div>
@@ -806,12 +844,16 @@ function getNodeStatusFromLog(logText, nodeId) {
   if (!nodeLines) return null;
 
   if (nodeLines.includes("skipped")) return "skipped";
-  const finishedMatches = [...nodeLines.matchAll(/finished success=(true|false)/gi)];
-  if (finishedMatches.length) {
-    return finishedMatches.at(-1)?.[1].toLowerCase() === "true" ? "success" : "error";
+  const events = [
+    ...nodeLines.matchAll(/(?:run \d+ )?attempt \d+ started/gi),
+    ...nodeLines.matchAll(/(?:run \d+ )?attempt \d+ finished success=(true|false)/gi),
+  ].sort((left, right) => (left.index ?? 0) - (right.index ?? 0));
+  const latestEvent = events.at(-1);
+  if (!latestEvent) return null;
+  if (latestEvent[0].includes("started")) {
+    return "running";
   }
-  if (nodeLines.includes("attempt 1 started")) return "running";
-  return null;
+  return latestEvent[1].toLowerCase() === "true" ? "success" : "error";
 }
 
 function LogOverlay({
@@ -820,11 +862,17 @@ function LogOverlay({
   height,
   loading,
   logPath,
+  runs = [],
+  selectedRunId,
   onResizeStart,
+  onSelectRun,
+  onShowLatest,
   onToggle,
   text,
   title,
 }) {
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const historyRef = useRef(null);
   const displayText = error
     ? error
     : loading
@@ -832,6 +880,18 @@ function LogOverlay({
       : text?.trim()
         ? text.trim()
         : "No run log available.";
+
+  useEffect(() => {
+    if (!historyOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (historyRef.current?.contains(event.target)) return;
+      setHistoryOpen(false);
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [historyOpen]);
 
   return (
     <section
@@ -846,11 +906,18 @@ function LogOverlay({
           onPointerDown={onResizeStart}
         />
       ) : null}
-      <button
+      <div
         className="flex h-11 w-full items-center justify-between border-b border-line bg-[#f9fbfd] px-4 text-left transition hover:bg-slate-50"
+        role="button"
+        tabIndex={0}
         title={collapsed ? "Expand log" : "Collapse log"}
-        type="button"
         onClick={onToggle}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            onToggle();
+          }
+        }}
       >
         <div className="flex min-w-0 items-center gap-2">
           <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-teal-100 bg-teal-50 text-teal-700">
@@ -861,10 +928,79 @@ function LogOverlay({
             {logPath ? <p className="truncate text-[11px] text-muted">{logPath}</p> : null}
           </div>
         </div>
-        <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted">
-          {collapsed ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-        </span>
-      </button>
+        <div className="flex shrink-0 items-center gap-2">
+          {!collapsed ? (
+            <div
+              ref={historyRef}
+              className="relative flex items-center gap-1"
+              onClick={(event) => event.stopPropagation()}
+            >
+              <button
+                className={`h-7 rounded-md border px-2 text-[11px] font-medium transition ${
+                  selectedRunId
+                    ? "border-line bg-white text-muted hover:bg-slate-50"
+                    : "border-teal-200 bg-teal-50 text-teal-700"
+                }`}
+                type="button"
+                onClick={() => {
+                  setHistoryOpen(false);
+                  onShowLatest?.();
+                }}
+              >
+                Latest run
+              </button>
+              <button
+                className={`h-7 rounded-md border px-2 text-[11px] font-medium transition ${
+                  historyOpen
+                    ? "border-slate-300 bg-white text-ink"
+                    : "border-line bg-white text-muted hover:bg-slate-50"
+                }`}
+                type="button"
+                onClick={() => setHistoryOpen((current) => !current)}
+              >
+                All runs
+              </button>
+              {historyOpen ? (
+                <div className="absolute right-0 top-9 z-50 max-h-72 w-[310px] overflow-hidden rounded-lg border border-line bg-white shadow-panel">
+                  <div className="border-b border-line px-3 py-2 text-xs font-semibold text-muted">
+                    Previous runs
+                  </div>
+                  <div className="workflow-scrollbar max-h-60 overflow-y-auto">
+                    {runs.length ? (
+                      runs.map((run) => (
+                        <button
+                          key={run.id}
+                          className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:bg-slate-50 ${
+                            selectedRunId === run.id ? "bg-teal-50" : ""
+                          }`}
+                          type="button"
+                          onClick={() => {
+                            setHistoryOpen(false);
+                            onSelectRun?.(run.id);
+                          }}
+                        >
+                          <RunStatusDot status={run.status} />
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate font-medium text-ink">
+                              {formatRunLabel(run)}
+                            </div>
+                            <div className="truncate text-[11px] text-muted">{run.id}</div>
+                          </div>
+                        </button>
+                      ))
+                    ) : (
+                      <div className="px-3 py-4 text-xs text-muted">No previous runs.</div>
+                    )}
+                  </div>
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+          <span className="grid h-8 w-8 place-items-center rounded-md text-muted">
+            {collapsed ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          </span>
+        </div>
+      </div>
       <pre
         className="workflow-scrollbar overflow-auto whitespace-pre-wrap bg-white px-4 py-3 font-mono text-xs leading-5 text-slate-700"
         style={{ height: Math.max(0, height - 44) }}
@@ -873,6 +1009,29 @@ function LogOverlay({
       </pre>
     </section>
   );
+}
+
+function RunStatusDot({ status }) {
+  if (status === "running") {
+    return <Loader2 className="shrink-0 animate-spin text-blue-500" size={13} />;
+  }
+  const color =
+    status === "success"
+      ? "bg-emerald-500"
+      : status === "error"
+        ? "bg-red-500"
+        : "bg-slate-400";
+  return <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${color}`} />;
+}
+
+function formatRunLabel(run) {
+  if (!run?.startedAt) return "Run";
+  const date = new Date(run.startedAt);
+  if (Number.isNaN(date.getTime())) return run.startedAt;
+  return date.toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
 }
 
 function WorkflowNode({
@@ -1061,6 +1220,12 @@ function Inspector({
               {workflow.sourcePath ? (
                 <TextField label="Source path" value={workflow.sourcePath} readOnly />
               ) : null}
+              <NumberField
+                label="Max total node runs"
+                min="1"
+                value={workflow.maxTotalNodeRuns ?? 1000}
+                onChange={(value) => onWorkflowChange({ maxTotalNodeRuns: value || 1000 })}
+              />
             </InspectorSection>
 
             <InspectorSection title="Schedule">
@@ -1121,7 +1286,7 @@ function Inspector({
               value={node.type}
               options={[
                 ["agent", "Agent"],
-                ["bash_command", "Bash command"],
+                ["bash_command", commandNodeLabel],
                 ["python_script", "Python script"],
                 ["shell_script", "Shell script"],
               ]}
@@ -1158,7 +1323,7 @@ function Inspector({
           </InspectorSection>
 
           {operation.type === "bash_command" ? (
-            <InspectorSection title="Bash command">
+            <InspectorSection title={commandNodeLabel}>
               <TextareaField
                 label="Command"
                 rows={4}
@@ -1547,7 +1712,7 @@ function ConnectedEdgeEditor({
         <EdgeSelect
           value={edge.to}
           options={
-            draft ? [...blankOption, ...nodesForTo(node, nodes)] : endpointOptions(node, nodes, edge.to)
+            draft ? [...blankOption, ...nodesForTo(nodes)] : endpointOptions(nodes)
           }
           onChange={handleToChange}
         />
@@ -1555,8 +1720,8 @@ function ConnectedEdgeEditor({
           value={edge.from}
           options={
             draft
-              ? [...blankOption, ...nodesForFrom(node, nodes)]
-              : endpointOptions(node, nodes, edge.from)
+              ? [...blankOption, ...nodesForFrom(nodes)]
+              : endpointOptions(nodes)
           }
           onChange={handleFromChange}
         />
@@ -1586,25 +1751,16 @@ function ConnectedEdgeEditor({
   );
 }
 
-function endpointOptions(node, nodes, currentValue) {
-  return [
-    ...(currentValue === node.id ? [[node.id, node.label || node.id]] : []),
-    ...nodes
-      .filter((candidate) => candidate.id !== node.id)
-      .map((candidate) => [candidate.id, candidate.label || candidate.id]),
-  ];
+function endpointOptions(nodes) {
+  return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
-function nodesForTo(node, nodes) {
-  return nodes
-    .filter((candidate) => candidate.id !== node.id)
-    .map((candidate) => [candidate.id, candidate.label || candidate.id]);
+function nodesForTo(nodes) {
+  return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
-function nodesForFrom(node, nodes) {
-  return nodes
-    .filter((candidate) => candidate.id !== node.id)
-    .map((candidate) => [candidate.id, candidate.label || candidate.id]);
+function nodesForFrom(nodes) {
+  return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
 function uniqueEdgeId(edges, fromNodeId, toNodeId) {
@@ -1624,6 +1780,15 @@ function edgeLabel(condition = "always", outputPattern = "") {
   if (condition === "always") return "always";
   if (condition === "output_matches" && outputPattern) return `matches ${outputPattern}`;
   return condition.replaceAll("_", " ");
+}
+
+function edgeGoesRight(fromNode, toNode) {
+  if (fromNode.x !== toNode.x) return toNode.x >= fromNode.x;
+  return toNode.y >= fromNode.y;
+}
+
+function stableEdgeDirection(fromNodeId, toNodeId) {
+  return String(fromNodeId).localeCompare(String(toNodeId)) <= 0 ? -1 : 1;
 }
 
 function InspectorPanel({ children, open, subtitle, title, onToggle }) {

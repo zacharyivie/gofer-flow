@@ -101,7 +101,7 @@ def show(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Display the DAG structure of a workflow."""
+    """Display the graph structure of a workflow."""
     from gofer.cli.dag_renderer import render_workflow
 
     try:

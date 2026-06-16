@@ -211,12 +211,67 @@ def latest_workflow_log_payload(
     return {"workflowId": workflow_id, "logPath": str(latest), "logText": text}
 
 
+def list_workflow_run_logs_payload(
+    workflow_id: str, data_dir: Path | None = None
+) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    log_dir = base / "logs" / workflow_id
+    if not log_dir.exists():
+        return {"workflowId": workflow_id, "runs": []}
+
+    runs = []
+    logs = sorted(
+        log_dir.glob("*.log"),
+        key=lambda log_path: (log_path.stat().st_mtime, log_path.name),
+        reverse=True,
+    )
+    for log_path in logs:
+        runs.append(
+            {
+                "id": log_path.name,
+                "logPath": str(log_path),
+                "startedAt": _log_started_at(log_path),
+                "modifiedAt": log_path.stat().st_mtime,
+                "status": _log_status(log_path),
+            }
+        )
+
+    return {"workflowId": workflow_id, "runs": runs}
+
+
+def workflow_run_log_payload(
+    workflow_id: str, run_id: str, data_dir: Path | None = None
+) -> dict[str, Any]:
+    if "/" in run_id or "\\" in run_id:
+        raise WorkflowLogError("Invalid run log id")
+
+    base = data_dir or get_data_dir()
+    log_path = base / "logs" / workflow_id / run_id
+    if log_path.suffix != ".log" or not log_path.exists() or not log_path.is_file():
+        raise WorkflowLogError(f"Run log '{run_id}' not found")
+
+    try:
+        text = log_path.read_text()
+    except OSError as exc:
+        raise WorkflowLogError(str(exc)) from exc
+
+    return {
+        "workflowId": workflow_id,
+        "runId": run_id,
+        "logPath": str(log_path),
+        "logText": text,
+        "startedAt": _log_started_at(log_path),
+        "status": _log_status(log_path),
+    }
+
+
 def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
     workflow = AgenticWorkflow(
         WorkflowConfig(
             id=str(payload["id"]),
             name=str(payload.get("name") or payload["id"]),
             schedule=payload.get("schedule"),
+            max_total_node_runs=int(payload.get("maxTotalNodeRuns") or 1000),
         )
     )
 
@@ -329,6 +384,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         "updatedAt": _updated_at(path),
         "sourcePath": str(path) if path else None,
         "schedule": schedule,
+        "maxTotalNodeRuns": workflow.config.max_total_node_runs,
         "tags": tags,
         "agents": {
             agent_id: _model_dump(agent_config)
@@ -388,7 +444,7 @@ def _node_label(node_id: str) -> str:
 def _operation_meta(operation: dict[str, Any]) -> str:
     match operation.get("type"):
         case OperationType.BASH_COMMAND:
-            return str(operation.get("command", "bash command"))
+            return str(operation.get("command", "command"))
         case OperationType.PYTHON_SCRIPT | OperationType.SHELL_SCRIPT:
             return str(operation.get("script_path", "script"))
         case OperationType.AGENT:
@@ -433,16 +489,35 @@ def _latest_run_status(workflow_id: str, path: Path | None) -> str:
     if not logs:
         return "Ready"
 
-    try:
-        last_line = logs[-1].read_text().splitlines()[-1]
-    except (IndexError, OSError):
-        return "Ready"
-
-    if f"{workflow_id} completed successfully" in last_line:
+    status = _log_status(logs[-1])
+    if status == "success":
         return "Success"
-    if f"{workflow_id} failed due to" in last_line:
+    if status == "error":
         return "Error"
     return "Running"
+
+
+def _log_started_at(path: Path) -> str | None:
+    try:
+        first_line = path.read_text().splitlines()[0]
+    except (IndexError, OSError):
+        return None
+    return first_line.split(" - ", 1)[0] or None
+
+
+def _log_status(path: Path) -> str:
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        return "unknown"
+    if not lines:
+        return "unknown"
+    last_line = lines[-1].lower()
+    if "completed successfully" in last_line:
+        return "success"
+    if "failed due to" in last_line:
+        return "error"
+    return "running"
 
 
 def _updated_at(path: Path | None) -> str:

@@ -10,10 +10,11 @@ class CodexSubscription(Subscription):
         self, prompt: str, tools: list[str], mcp_servers: list[str]
     ) -> list[str]:
         return [
-            "codex",
+            shutil.which("codex") or "codex",
             "exec",
             "--color",
             "never",
+            "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
             prompt,

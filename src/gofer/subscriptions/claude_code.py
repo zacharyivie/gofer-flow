@@ -9,7 +9,7 @@ class ClaudeCodeSubscription(Subscription):
     def _build_command(
         self, prompt: str, tools: list[str], mcp_servers: list[str]
     ) -> list[str]:
-        cmd = ["claude", "--print", "-p", prompt]
+        cmd = [shutil.which("claude") or "claude", "--print", "-p", prompt]
         for tool in tools:
             cmd += ["--allowedTools", tool]
         for server in mcp_servers:

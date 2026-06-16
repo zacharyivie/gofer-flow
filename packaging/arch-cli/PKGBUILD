@@ -1,0 +1,19 @@
+# Maintainer: Gofer Flow <maintainers@goferflow.local>
+pkgname=gofer-flow-cli
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Command line workflow automation tool for Gofer Flow"
+arch=("x86_64")
+url="https://github.com/doonk/gofer-flow"
+license=("Apache-2.0")
+options=(!strip)
+source_x86_64=(
+  "gof-linux-x64-${pkgver}::${url}/releases/download/v${pkgver}/gof-linux-x64"
+)
+sha256sums_x86_64=(
+  "SKIP"
+)
+
+package() {
+  install -Dm755 "${srcdir}/gof-linux-x64-${pkgver}" "${pkgdir}/usr/bin/gof"
+}

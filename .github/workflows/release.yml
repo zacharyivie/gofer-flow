@@ -25,6 +25,7 @@ jobs:
               frontend/release/*.AppImage
               frontend/release/*.deb
               frontend/release/*.rpm
+              frontend/release/gof-linux-x64
               frontend/release/checksums-linux.txt
           - name: windows
             os: windows-latest
@@ -42,7 +43,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm
+          sudo apt-get install -y dpkg-dev rpm
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -73,12 +74,29 @@ jobs:
         working-directory: frontend
         run: npm run ${{ matrix.package-script }}
 
+      - name: Copy Linux CLI artifact
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          cp dist/gof frontend/release/gof-linux-x64
+          chmod +x frontend/release/gof-linux-x64
+
+      - name: Build Linux CLI packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: scripts/package-cli-linux.sh dist/gof frontend/release
+
+      - name: Copy Windows CLI artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item dist/gof.exe frontend/release/gof-windows-x64.exe
+
       - name: Generate Linux checksums
         if: runner.os == 'Linux'
         working-directory: frontend/release
         shell: bash
         run: |
-          sha256sum *.AppImage *.deb *.rpm > checksums-linux.txt
+          sha256sum *.AppImage *.deb *.rpm gof-linux-x64 > checksums-linux.txt
           cat checksums-linux.txt
 
       - name: Generate Windows checksums

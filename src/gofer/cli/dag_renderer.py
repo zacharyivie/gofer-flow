@@ -54,7 +54,7 @@ def _render_header(wf: AgenticWorkflow, console: Console) -> None:
     console.print(Panel(lines, expand=False))
 
 
-# ── DAG Visual ───────────────────────────────────────────────────────────────
+# ── Workflow Graph Visual ────────────────────────────────────────────────────
 
 
 def _render_dag(wf: AgenticWorkflow, console: Console) -> None:
@@ -77,7 +77,7 @@ def _render_dag(wf: AgenticWorkflow, console: Console) -> None:
             cells.append(_build_arrow_column(gen, generations[i + 1], wf.graph))
 
     grid.add_row(*cells)
-    console.print(Panel(grid, title="[bold]Workflow DAG[/bold]", expand=False))
+    console.print(Panel(grid, title="[bold]Workflow Graph[/bold]", expand=False))
 
 
 def _node_box(node: GraphNode) -> Panel:

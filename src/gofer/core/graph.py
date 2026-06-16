@@ -69,23 +69,24 @@ class WorkflowGraph:
         if to_id not in self._nodes:
             raise ValueError(f"Node '{to_id}' not found")
         self._graph.add_edge(from_id, to_id)
-        if not nx.is_directed_acyclic_graph(self._graph):
-            self._graph.remove_edge(from_id, to_id)
-            raise CycleError(f"Adding edge {from_id!r} → {to_id!r} would create a cycle")
         self._edges[(from_id, to_id)] = config or EdgeConfig(from_node=from_id, to_node=to_id)
 
     def get_edge_config(self, from_id: str, to_id: str) -> EdgeConfig:
         return self._edges.get((from_id, to_id), EdgeConfig(from_node=from_id, to_node=to_id))
 
     def topological_generations(self) -> list[list[GraphNode]]:
-        return [
-            [self._nodes[nid] for nid in gen]
-            for gen in nx.topological_generations(self._graph)
-        ]
+        try:
+            return [
+                [self._nodes[nid] for nid in gen]
+                for gen in nx.topological_generations(self._graph)
+            ]
+        except nx.NetworkXUnfeasible:
+            return [[node] for node in self._nodes.values()]
+
+    def nodes_in_order(self) -> list[GraphNode]:
+        return list(self._nodes.values())
 
     def validate(self) -> None:
-        if not nx.is_directed_acyclic_graph(self._graph):
-            raise CycleError("Workflow graph contains a cycle")
         missing = set(self._graph.nodes) - set(self._nodes)
         if missing:
             raise ValueError(f"Graph references unknown nodes: {missing}")

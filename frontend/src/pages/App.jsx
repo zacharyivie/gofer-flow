@@ -32,7 +32,14 @@ export default function App() {
   const [saveState, setSaveState] = useState({ saving: false, error: "" });
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
   const [runState, setRunState] = useState({ running: false, error: "", result: null });
-  const [logState, setLogState] = useState({ loading: false, error: "", text: "", path: null });
+  const [logState, setLogState] = useState({
+    loading: false,
+    error: "",
+    text: "",
+    path: null,
+    runs: [],
+    selectedRunId: null,
+  });
   const [theme, setTheme] = useState(getInitialTheme);
   const [workflowPaneWidth, setWorkflowPaneWidth] = useState(292);
   const [chatPaneWidth, setChatPaneWidth] = useState(356);
@@ -147,6 +154,8 @@ export default function App() {
           error: "",
           text: nextText,
           path: nextPath,
+          runs: current.runs,
+          selectedRunId: null,
         };
       });
     } catch (error) {
@@ -161,14 +170,82 @@ export default function App() {
     }
   }, []);
 
+  const loadRunLogs = useCallback(async (workflowId, { silent = false } = {}) => {
+    try {
+      const response = await fetch(apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs`));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setLogState((current) => {
+        const nextRuns = payload.runs ?? [];
+        if (silent && JSON.stringify(current.runs) === JSON.stringify(nextRuns)) {
+          return current;
+        }
+        return { ...current, runs: nextRuns };
+      });
+    } catch (error) {
+      if (!silent) {
+        setLogState((current) => ({
+          ...current,
+          error: error instanceof Error ? error.message : "Unable to load workflow runs",
+        }));
+      }
+    }
+  }, []);
+
+  const loadRunLog = useCallback(async (workflowId, runId) => {
+    const requestId = logRequestRef.current + 1;
+    logRequestRef.current = requestId;
+    setLogState((current) => ({
+      ...current,
+      loading: true,
+      error: "",
+      selectedRunId: runId,
+    }));
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs/${encodeURIComponent(runId)}`),
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      if (requestId !== logRequestRef.current) return;
+      setLogState((current) => ({
+        ...current,
+        loading: false,
+        error: "",
+        text: payload.log?.logText ?? "",
+        path: payload.log?.logPath ?? null,
+        selectedRunId: runId,
+      }));
+    } catch (error) {
+      if (requestId !== logRequestRef.current) return;
+      setLogState((current) => ({
+        ...current,
+        loading: false,
+        error: error instanceof Error ? error.message : "Unable to load workflow run",
+      }));
+    }
+  }, []);
+
   useEffect(() => {
     if (!activeWorkflow?.id) {
-      setLogState({ loading: false, error: "", text: "", path: null });
+      setLogState({
+        loading: false,
+        error: "",
+        text: "",
+        path: null,
+        runs: [],
+        selectedRunId: null,
+      });
       return;
     }
 
     loadLatestLog(activeWorkflow.id);
-  }, [activeWorkflow?.id, loadLatestLog]);
+    loadRunLogs(activeWorkflow.id);
+  }, [activeWorkflow?.id, loadLatestLog, loadRunLogs]);
 
   useEffect(() => {
     if (!activeWorkflow?.id) {
@@ -176,11 +253,14 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
-      loadLatestLog(activeWorkflow.id, { silent: true });
+      if (!logState.selectedRunId) {
+        loadLatestLog(activeWorkflow.id, { silent: true });
+      }
+      loadRunLogs(activeWorkflow.id, { silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [activeWorkflow?.id, loadLatestLog]);
+  }, [activeWorkflow?.id, loadLatestLog, loadRunLogs, logState.selectedRunId]);
 
   useEffect(() => {
     if (!dirtyWorkflow) return undefined;
@@ -268,7 +348,12 @@ export default function App() {
     dirtyWorkflowRef.current = undefined;
     setDirtyWorkflow(undefined);
     setRunState({ running: true, workflowId: workflowToRun.id, error: "", result: null });
-    setLogState((current) => ({ ...current, loading: true, error: "" }));
+    setLogState((current) => ({
+      ...current,
+      loading: true,
+      error: "",
+      selectedRunId: null,
+    }));
     setSaveState({ saving: true, error: "" });
 
     try {
@@ -316,7 +401,10 @@ export default function App() {
         error: "",
         text: payload.run?.logText ?? "",
         path: payload.run?.logPath ?? null,
+        runs: logState.runs,
+        selectedRunId: null,
       });
+      loadRunLogs(savedWorkflow.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
       setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
@@ -461,6 +549,8 @@ export default function App() {
               notice={topBarNotice}
               runState={runState}
               workflow={activeWorkflow}
+              onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
+              onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
               onImportWorkflow={importWorkflow}
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
@@ -747,7 +837,7 @@ function TopBar({
       <div className="min-w-0 pt-1">
         <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.14em] text-muted">
           <GitBranch size={14} />
-          Visual DAG editor
+          Visual workflow editor
         </div>
         <div className="mt-0.5 flex items-center gap-3">
           <h2 className="truncate text-[19px] font-semibold">{workflow.name}</h2>

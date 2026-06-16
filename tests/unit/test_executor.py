@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from gofer.core import executor as executor_module
 from gofer.core.agent import AgentConfig
-from gofer.core.executor import WorkflowExecutor
+from gofer.core.executor import WorkflowExecutor, command_shell_args
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode
 from gofer.core.operations import (
     AgentOperation,
@@ -24,6 +25,26 @@ def _bash_node(node_id: str, command: str = "true") -> GraphNode:
 
 def _make_workflow(wf_id: str = "test") -> AgenticWorkflow:
     return AgenticWorkflow(WorkflowConfig(id=wf_id, name="Test"))
+
+
+def test_command_shell_args_uses_bash_off_windows(monkeypatch) -> None:
+    monkeypatch.setattr(executor_module.sys, "platform", "linux")
+
+    assert command_shell_args("echo hello") == ["bash", "-c", "echo hello"]
+
+
+def test_command_shell_args_uses_powershell_on_windows(monkeypatch) -> None:
+    monkeypatch.setattr(executor_module.sys, "platform", "win32")
+
+    assert command_shell_args("Write-Output hello") == [
+        "powershell.exe",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Write-Output hello",
+    ]
 
 
 async def test_single_bash_node_succeeds(tmp_path: Path) -> None:
@@ -162,6 +183,56 @@ async def test_failure_route_runs_after_retries_are_exhausted(tmp_path: Path) ->
     assert "fail - attempt 2 started" in text
     assert "fail - attempt 3 started" in text
     assert text.index("fail - attempt 3 finished") < text.index("recover - attempt 1 started")
+
+
+async def test_self_loop_repeats_until_output_no_longer_matches(tmp_path: Path) -> None:
+    counter = tmp_path / "counter"
+    command = (
+        f"n=$(cat {counter} 2>/dev/null || echo 0); "
+        "n=$((n + 1)); "
+        f"echo $n > {counter}; "
+        'if [ "$n" -lt 3 ]; then echo retry; else echo done; fi'
+    )
+
+    wf = _make_workflow("recursive")
+    wf.add_operation(_bash_node("improve", command))
+    wf.then(
+        "improve",
+        "improve",
+        EdgeConfig(
+            from_node="improve",
+            to_node="improve",
+            condition=EdgeConditionType.OUTPUT_MATCHES,
+            output_pattern="retry",
+        ),
+    )
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert result.node_outputs["improve"].output.strip() == "done"
+    assert len(result.node_runs["improve"]) == 3
+    assert result.log_path is not None
+    text = result.log_path.read_text()
+    assert "improve - run 2 attempt 1 started" in text
+    assert "improve - run 3 attempt 1 finished success=True" in text
+
+
+async def test_recursive_workflow_stops_at_max_total_node_runs(tmp_path: Path) -> None:
+    wf = _make_workflow("runaway")
+    wf.add_operation(_bash_node("loop", "echo again"))
+    wf.then("loop", "loop")
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        max_total_node_runs=3,
+    ).run()
+
+    assert not result.success
+    assert result.log_path is not None
+    assert "maximum node run limit exceeded" in result.log_path.read_text()
 
 
 async def test_dry_run_does_not_execute(tmp_path: Path) -> None:

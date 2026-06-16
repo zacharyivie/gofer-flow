@@ -26,7 +26,8 @@ async def run_workflow_chat(
         raise ChatProviderError(f"Unknown provider '{provider}'")
 
     binary = "codex" if provider == "codex" else "claude"
-    if shutil.which(binary) is None:
+    binary_path = shutil.which(binary)
+    if binary_path is None:
         raise ChatProviderError(f"'{binary}' CLI is not available on PATH")
 
     prompt = build_chat_prompt(provider=provider, model=model, messages=messages, workflow=workflow)
@@ -34,14 +35,19 @@ async def run_workflow_chat(
         provider=provider,
         model=model,
         prompt=prompt,
+        binary_path=binary_path,
         data_dir=data_dir or get_data_dir(),
         working_dir=working_dir or Path.cwd(),
     )
-    returncode, stdout, stderr = await run_subprocess(
-        command,
-        cwd=working_dir or Path.cwd(),
-        timeout=300,
-    )
+    try:
+        returncode, stdout, stderr = await run_subprocess(
+            command,
+            cwd=working_dir or Path.cwd(),
+            timeout=300,
+        )
+    except OSError as exc:
+        raise ChatProviderError(f"Could not start '{binary}' CLI: {exc}") from exc
+
     if returncode != 0:
         raise ChatProviderError(stdout or stderr or f"Provider exited with {returncode}")
 
@@ -78,6 +84,7 @@ def _build_chat_command(
     provider: str,
     model: str,
     prompt: str,
+    binary_path: str | None = None,
     data_dir: Path | None = None,
     working_dir: Path | None = None,
 ) -> list[str]:
@@ -85,10 +92,11 @@ def _build_chat_command(
         data_dir = data_dir or get_data_dir()
         working_dir = working_dir or Path.cwd()
         command = [
-            "codex",
+            binary_path or "codex",
             "exec",
             "--color",
             "never",
+            "--skip-git-repo-check",
             "--sandbox",
             "workspace-write",
             "--cd",
@@ -101,7 +109,7 @@ def _build_chat_command(
         command.append(prompt)
         return command
 
-    command = ["claude", "--print", "-p", prompt]
+    command = [binary_path or "claude", "--print", "-p", prompt]
     if model != "cli-default":
         command += ["--model", model]
     return command

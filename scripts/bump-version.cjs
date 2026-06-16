@@ -6,11 +6,12 @@ const repoRoot = path.resolve(__dirname, "..");
 function usage(exitCode = 1) {
   const output = exitCode === 0 ? console.log : console.error;
   output(`Usage:
-  node scripts/bump-version.cjs <version> [--appimage-sha256 <sha256>]
+  node scripts/bump-version.cjs <version> [--appimage-sha256 <sha256>] [--cli-sha256 <sha256>]
 
 Examples:
   node scripts/bump-version.cjs 0.1.1
   node scripts/bump-version.cjs 0.1.1 --appimage-sha256 0123abcd...
+  node scripts/bump-version.cjs 0.1.1 --appimage-sha256 0123abcd... --cli-sha256 abcd0123...
 `);
   process.exit(exitCode);
 }
@@ -32,23 +33,42 @@ if (!semverPattern.test(version)) {
 }
 
 let appImageSha256;
+let cliSha256;
 for (let index = 1; index < args.length; index += 1) {
   const arg = args[index];
-  if (arg !== "--appimage-sha256") {
-    console.error(`Unknown argument: ${arg}`);
-    usage();
+  if (arg === "--appimage-sha256") {
+    appImageSha256 = args[index + 1];
+    index += 1;
+    if (!appImageSha256) {
+      console.error("--appimage-sha256 requires a checksum value.");
+      process.exit(1);
+    }
+    continue;
   }
 
-  appImageSha256 = args[index + 1];
-  index += 1;
-  if (!appImageSha256) {
-    console.error("--appimage-sha256 requires a checksum value.");
-    process.exit(1);
+  if (arg === "--cli-sha256") {
+    cliSha256 = args[index + 1];
+    index += 1;
+    if (!cliSha256) {
+      console.error("--cli-sha256 requires a checksum value.");
+      process.exit(1);
+    }
+    continue;
+  }
+
+  {
+    console.error(`Unknown argument: ${arg}`);
+    usage();
   }
 }
 
 if (appImageSha256 && !/^[a-fA-F0-9]{64}$/.test(appImageSha256)) {
   console.error("--appimage-sha256 must be a 64-character SHA-256 hex digest.");
+  process.exit(1);
+}
+
+if (cliSha256 && !/^[a-fA-F0-9]{64}$/.test(cliSha256)) {
+  console.error("--cli-sha256 must be a 64-character SHA-256 hex digest.");
   process.exit(1);
 }
 
@@ -123,6 +143,53 @@ updateTextFile("packaging/arch/.SRCINFO", (text) => {
   return next;
 });
 
+updateTextFile("packaging/arch-cli/PKGBUILD", (text) => {
+  let next = replaceOnce(
+    text,
+    /^pkgver=.*$/m,
+    `pkgver=${version}`,
+    "CLI PKGBUILD pkgver",
+  );
+
+  if (cliSha256) {
+    next = replaceOnce(
+      next,
+      /(sha256sums_x86_64=\(\n\s+")(?:[a-fA-F0-9]{64}|SKIP)("\n\))/,
+      `$1${cliSha256.toLowerCase()}$2`,
+      "CLI PKGBUILD checksum",
+    );
+  }
+
+  return next;
+});
+
+updateTextFile("packaging/arch-cli/.SRCINFO", (text) => {
+  let next = replaceAll(
+    text,
+    /pkgver = [^\n]+/g,
+    `pkgver = ${version}`,
+    "CLI .SRCINFO pkgver",
+  );
+
+  next = replaceOnce(
+    next,
+    /source_x86_64 = gof-linux-x64-[^:]+::https:\/\/github\.com\/doonk\/gofer-flow\/releases\/download\/v[^/]+\/gof-linux-x64/,
+    `source_x86_64 = gof-linux-x64-${version}::https://github.com/doonk/gofer-flow/releases/download/v${version}/gof-linux-x64`,
+    "CLI .SRCINFO source URL",
+  );
+
+  if (cliSha256) {
+    next = replaceOnce(
+      next,
+      /sha256sums_x86_64 = (?:[a-fA-F0-9]{64}|SKIP)/,
+      `sha256sums_x86_64 = ${cliSha256.toLowerCase()}`,
+      "CLI .SRCINFO checksum",
+    );
+  }
+
+  return next;
+});
+
 console.log(`Bumped Gofer Flow version to ${version}.`);
 for (const update of updates) {
   console.log(`- ${update}`);
@@ -131,6 +198,12 @@ for (const update of updates) {
 if (!appImageSha256) {
   console.log(
     "\nNote: Arch AppImage checksum was not changed. After building the release AppImage, run this script again with --appimage-sha256 <sha256> or update packaging/arch manually.",
+  );
+}
+
+if (!cliSha256) {
+  console.log(
+    "\nNote: Arch CLI checksum was not changed. After building the release CLI binary, run this script again with --cli-sha256 <sha256> or update packaging/arch-cli manually.",
   );
 }
 

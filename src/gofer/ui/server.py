@@ -12,7 +12,6 @@ from urllib.parse import parse_qs, urlparse
 
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.core.workflow import AgenticWorkflow
-from gofer.utils.logging import get_logger
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
@@ -24,12 +23,14 @@ from gofer.ui.api import (
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_payloads,
+    list_workflow_run_logs_payload,
     run_workflow_payload,
     update_workflow_payload,
+    workflow_run_log_payload,
 )
 from gofer.ui.chat import ChatProviderError, provider_payload, run_workflow_chat
+from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
-
 
 log = get_logger(__name__)
 
@@ -105,6 +106,38 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json({"log": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and "/logs/" in parsed.path:
+            remainder = parsed.path.removeprefix("/api/workflows/")
+            workflow_id, run_id = remainder.split("/logs/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                payload = workflow_run_log_payload(
+                    workflow_id,
+                    run_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=404)
+                return
+
+            self._send_json({"log": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/logs"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/logs")
+            query = parse_qs(parsed.query)
+            try:
+                payload = list_workflow_run_logs_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json(payload)
             return
 
         self._send_json({"error": "Not found"}, status=404)

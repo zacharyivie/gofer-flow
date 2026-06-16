@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gofer.core.graph import CycleError, GraphNode, WorkflowGraph
+from gofer.core.graph import GraphNode, WorkflowGraph
 from gofer.core.operations import BashCommandOperation, OperationType
 
 
@@ -45,21 +45,21 @@ def test_topological_generations_parallel() -> None:
     assert parallel_ids == {"left", "right"}
 
 
-def test_cycle_detection() -> None:
+def test_cycles_are_allowed() -> None:
     g = WorkflowGraph()
     for nid in ["a", "b", "c"]:
         g.add_node(_bash_node(nid))
     g.add_edge("a", "b")
     g.add_edge("b", "c")
-    with pytest.raises(CycleError):
-        g.add_edge("c", "a")
+    g.add_edge("c", "a")
+    g.validate()
 
 
-def test_self_loop_raises() -> None:
+def test_self_loop_is_allowed() -> None:
     g = WorkflowGraph()
     g.add_node(_bash_node("a"))
-    with pytest.raises(CycleError):
-        g.add_edge("a", "a")
+    g.add_edge("a", "a")
+    g.validate()
 
 
 def test_edge_to_unknown_node_raises() -> None:

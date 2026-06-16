@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import csv
 import json
+import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -30,6 +32,20 @@ from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess
 
 log = get_logger(__name__)
+
+
+def command_shell_args(command: str) -> list[str]:
+    if sys.platform == "win32":
+        return [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            command,
+        ]
+    return ["bash", "-c", command]
 
 
 def _load_tabular(path: Path) -> list[dict[str, object]]:
@@ -100,6 +116,11 @@ class NodeOutput:
 @dataclass
 class ExecutionContext:
     node_outputs: dict[str, NodeOutput] = field(default_factory=dict)
+    node_runs: dict[str, list[NodeOutput]] = field(default_factory=dict)
+
+    def record(self, output: NodeOutput) -> None:
+        self.node_outputs[output.node_id] = output
+        self.node_runs.setdefault(output.node_id, []).append(output)
 
     def resolve_dynamic_count(self, value: int | str) -> int:
         if isinstance(value, int):
@@ -126,6 +147,7 @@ class ExecutionResult:
     success: bool
     node_outputs: dict[str, NodeOutput]
     duration_seconds: float
+    node_runs: dict[str, list[NodeOutput]] = field(default_factory=dict)
     log_path: Path | None = None
 
 
@@ -180,11 +202,13 @@ class WorkflowExecutor:
         subscriptions: dict[str, Subscription],
         dry_run: bool = False,
         log_base_dir: Path | None = None,
+        max_total_node_runs: int | None = None,
     ) -> None:
         self._workflow = workflow
         self._subscriptions = subscriptions
         self._dry_run = dry_run
         self._log_base_dir = log_base_dir
+        self._max_total_node_runs = max_total_node_runs or workflow.config.max_total_node_runs
         self._run_log: WorkflowRunLog | None = None
 
     def _log(self) -> WorkflowRunLog:
@@ -199,46 +223,67 @@ class WorkflowExecutor:
         graph = self._workflow.graph
         start = time.monotonic()
         halted = False
-        skipped_nodes: set[str] = set()
+        halt_reason: str | None = None
+        total_node_runs = 0
+        run_counts: dict[str, int] = {}
         try:
             run_log.info(f"dry_run={self._dry_run}")
+            run_log.info(f"max_total_node_runs={self._max_total_node_runs}")
 
-            for generation in graph.topological_generations():
-                if halted:
+            queue: deque[str] = deque(self._initial_node_ids(graph))
+            queued_node_ids = set(queue)
+            run_log.info(f"start_nodes={list(queue)}")
+
+            while queue and not halted:
+                node_id = queue.popleft()
+                queued_node_ids.discard(node_id)
+                node = graph._nodes[node_id]
+                total_node_runs += 1
+                if total_node_runs > self._max_total_node_runs:
+                    halted = True
+                    halt_reason = (
+                        "maximum node run limit exceeded "
+                        f"({self._max_total_node_runs}); check recursive edges"
+                    )
+                    run_log.error(halt_reason)
                     break
-                gen_results: dict[str, NodeOutput] = {}
+
+                run_counts[node_id] = run_counts.get(node_id, 0) + 1
+                run_number = run_counts[node_id]
+                results: dict[str, NodeOutput] = {}
                 halt_flag: list[bool] = [False]
+                await self._run_node(node, ctx, results, halt_flag, graph, run_number)
 
-                async with anyio.create_task_group() as tg:
-                    for node in generation:
-                        if self._should_skip(node, ctx, skipped_nodes, graph):
-                            skipped_nodes.add(node.node_id)
-                            run_log.node(node.node_id, "skipped")
-                            gen_results[node.node_id] = NodeOutput(
-                                node_id=node.node_id,
-                                success=True,
-                                output="",
-                                exit_code=0,
-                                duration_seconds=0.0,
-                                skipped=True,
-                            )
-                        else:
-                            tg.start_soon(
-                                self._run_node, node, ctx, gen_results, halt_flag, graph
-                            )
-
-                ctx.node_outputs.update(gen_results)
+                output = results[node_id]
+                ctx.record(output)
                 if halt_flag[0]:
                     halted = True
+                    break
+
+                for successor_id in graph._graph.successors(node_id):
+                    edge = graph.get_edge_config(node_id, successor_id)
+                    if not edge.evaluate(output):
+                        continue
+                    if successor_id in queued_node_ids:
+                        continue
+                    queue.append(successor_id)
+                    queued_node_ids.add(successor_id)
+
+            for node_id in graph._nodes:
+                if node_id not in ctx.node_runs:
+                    run_log.node(node_id, "skipped")
 
             total = time.monotonic() - start
-            success = all(o.success for o in ctx.node_outputs.values() if not o.skipped)
-            reason = None if success else self._failure_reason(ctx.node_outputs)
+            success = not halted and all(
+                o.success for o in ctx.node_outputs.values() if not o.skipped
+            )
+            reason = None if success else halt_reason or self._failure_reason(ctx.node_outputs)
             run_log.complete(success, reason)
             return ExecutionResult(
                 workflow_id=self._workflow.config.id,
                 success=success,
                 node_outputs=ctx.node_outputs,
+                node_runs=ctx.node_runs,
                 duration_seconds=total,
                 log_path=run_log.path,
             )
@@ -246,23 +291,19 @@ class WorkflowExecutor:
             run_log.complete(False, str(exc))
             raise
 
-    def _should_skip(
-        self,
-        node: GraphNode,
-        ctx: ExecutionContext,
-        skipped_nodes: set[str],
-        graph: WorkflowGraph,
-    ) -> bool:
-        for pred_id in graph._graph.predecessors(node.node_id):
-            if pred_id in skipped_nodes:
-                return True
-            pred_output = ctx.node_outputs.get(pred_id)
-            if pred_output is None:
-                continue
-            edge = graph.get_edge_config(pred_id, node.node_id)
-            if not edge.evaluate(pred_output):
-                return True
-        return False
+    def _initial_node_ids(self, graph: WorkflowGraph) -> list[str]:
+        roots = [
+            node_id
+            for node_id in graph._nodes
+            if not [
+                pred_id
+                for pred_id in graph._graph.predecessors(node_id)
+                if pred_id != node_id
+            ]
+        ]
+        if roots:
+            return roots
+        return [next(iter(graph._nodes))] if graph._nodes else []
 
     async def _run_node(
         self,
@@ -271,10 +312,14 @@ class WorkflowExecutor:
         results: dict[str, NodeOutput],
         halt_flag: list[bool],
         graph: WorkflowGraph,
+        run_number: int = 1,
     ) -> None:
         if self._dry_run:
             log.info("[dry-run] would execute node %s", node.node_id)
-            self._log().node(node.node_id, "dry-run would execute")
+            self._log().node(
+                node.node_id,
+                self._run_log_message(run_number, "dry-run would execute"),
+            )
             results[node.node_id] = NodeOutput(
                 node_id=node.node_id, success=True, output="", exit_code=0, duration_seconds=0.0
             )
@@ -283,7 +328,10 @@ class WorkflowExecutor:
         attempt = 0
         output: NodeOutput | None = None
         while True:
-            self._log().node(node.node_id, f"attempt {attempt + 1} started")
+            self._log().node(
+                node.node_id,
+                self._run_log_message(run_number, f"attempt {attempt + 1} started"),
+            )
             try:
                 output = await self._execute_operation(node, ctx, graph)
             except Exception as exc:  # noqa: BLE001
@@ -299,20 +347,31 @@ class WorkflowExecutor:
             self._log().node_output(node.node_id, "node output", output.output)
             self._log().node(
                 node.node_id,
-                f"attempt {attempt + 1} finished success={output.success} "
-                f"exit_code={output.exit_code} duration={output.duration_seconds:.2f}s",
+                self._run_log_message(
+                    run_number,
+                    f"attempt {attempt + 1} finished success={output.success} "
+                    f"exit_code={output.exit_code} duration={output.duration_seconds:.2f}s",
+                ),
             )
             if output.success or attempt >= node.retry_count:
                 break
             attempt += 1
             self._log().node(
-                node.node_id, f"retrying after {node.retry_delay_seconds:.2f}s"
+                node.node_id,
+                self._run_log_message(
+                    run_number, f"retrying after {node.retry_delay_seconds:.2f}s"
+                ),
             )
             await anyio.sleep(node.retry_delay_seconds)
 
         if output is not None and not output.success:
             if node.on_failure == "halt" and not self._has_failure_route(node, output, graph):
                 halt_flag[0] = True
+
+    def _run_log_message(self, run_number: int, message: str) -> str:
+        if run_number == 1:
+            return message
+        return f"run {run_number} {message}"
 
     def _has_failure_route(
         self, node: GraphNode, output: NodeOutput, graph: WorkflowGraph
@@ -346,9 +405,11 @@ class WorkflowExecutor:
         if op.type == OperationType.BASH_COMMAND:
             assert isinstance(op, BashCommandOperation)
             stdin = self._resolve_pipe_stdin(node, ctx, graph)
+            cmd = command_shell_args(op.command)
             self._log().node(node.node_id, f"command: {op.command}")
+            self._log().node(node.node_id, f"command shell: {cmd[0]}")
             rc, stdout, stderr = await run_subprocess(
-                ["bash", "-c", op.command],
+                cmd,
                 cwd=op.working_dir,
                 env=op.env or None,
                 timeout=node.timeout_seconds,

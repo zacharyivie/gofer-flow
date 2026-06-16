@@ -22,6 +22,7 @@ class WorkflowConfig(BaseModel):
     id: str
     name: str
     schedule: ScheduleConfig | None = None
+    max_total_node_runs: int = 1000
 
 
 _op_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
@@ -63,7 +64,12 @@ class AgenticWorkflow:
         schedule = None
         if "schedule" in wf_data:
             schedule = ScheduleConfig(**wf_data["schedule"])
-        config = WorkflowConfig(id=wf_data["id"], name=wf_data["name"], schedule=schedule)
+        config = WorkflowConfig(
+            id=wf_data["id"],
+            name=wf_data["name"],
+            schedule=schedule,
+            max_total_node_runs=wf_data.get("max_total_node_runs", 1000),
+        )
         workflow = cls(config)
 
         for agent_id, agent_data in data.get("agents", {}).items():
@@ -135,6 +141,8 @@ class AgenticWorkflow:
         }
         if self.config.schedule:
             data["workflow"]["schedule"] = self.config.schedule.model_dump()
+        if self.config.max_total_node_runs != 1000:
+            data["workflow"]["max_total_node_runs"] = self.config.max_total_node_runs
 
         def _paths_to_str(obj: Any) -> Any:
             if isinstance(obj, Path):
@@ -153,20 +161,19 @@ class AgenticWorkflow:
 
         nodes = []
         edges = []
-        for gen in self.graph.topological_generations():
-            for node in gen:
-                node_dict = _paths_to_str(node.operation.model_dump(exclude_none=True))
-                node_dict["id"] = node.node_id
-                # Serialize GraphNode-level fields (only non-defaults to keep TOML clean)
-                if node.pipe_output:
-                    node_dict["pipe_output"] = True
-                if node.retry_count:
-                    node_dict["retry_count"] = node.retry_count
-                if node.retry_delay_seconds != 1.0:
-                    node_dict["retry_delay_seconds"] = node.retry_delay_seconds
-                if node.timeout_seconds is not None:
-                    node_dict["timeout_seconds"] = node.timeout_seconds
-                nodes.append(node_dict)
+        for node in self.graph.nodes_in_order():
+            node_dict = _paths_to_str(node.operation.model_dump(exclude_none=True))
+            node_dict["id"] = node.node_id
+            # Serialize GraphNode-level fields (only non-defaults to keep TOML clean)
+            if node.pipe_output:
+                node_dict["pipe_output"] = True
+            if node.retry_count:
+                node_dict["retry_count"] = node.retry_count
+            if node.retry_delay_seconds != 1.0:
+                node_dict["retry_delay_seconds"] = node.retry_delay_seconds
+            if node.timeout_seconds is not None:
+                node_dict["timeout_seconds"] = node.timeout_seconds
+            nodes.append(node_dict)
 
         data["nodes"] = nodes
 

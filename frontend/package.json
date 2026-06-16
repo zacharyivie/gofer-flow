@@ -107,7 +107,8 @@
     "nsis": {
       "oneClick": false,
       "perMachine": false,
-      "allowToChangeInstallationDirectory": true
+      "allowToChangeInstallationDirectory": true,
+      "include": "build-resources/installer.nsh"
     },
     "mac": {
       "target": [
