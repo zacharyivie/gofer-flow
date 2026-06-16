@@ -1,6 +1,8 @@
 !include LogicLib.nsh
-!include nsDialogs.nsh
 !include WinMessages.nsh
+
+!ifndef BUILD_UNINSTALLER
+!include nsDialogs.nsh
 
 Var GoferCliPathCheckbox
 Var GoferCliPathChoice
@@ -17,10 +19,6 @@ Var GoferCliPathChoice
   ${If} $GoferCliPathChoice == ${BST_CHECKED}
     Call AddGoferCliToUserPath
   ${EndIf}
-!macroend
-
-!macro customUnInstall
-  Call un.RemoveGoferCliFromUserPath
 !macroend
 
 Function GoferCliPathPageCreate
@@ -51,8 +49,15 @@ Function AddGoferCliToUserPath
   nsExec::ExecToLog "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $\"$$entry = '$INSTDIR\resources\backend'; $$path = [Environment]::GetEnvironmentVariable('Path', 'User'); $$parts = @($$path -split ';' | Where-Object { $$_ }); if ($$parts -notcontains $$entry) { $$parts += $$entry; [Environment]::SetEnvironmentVariable('Path', ($$parts -join ';'), 'User') }$\""
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 FunctionEnd
+!endif
+
+!ifdef BUILD_UNINSTALLER
+!macro customUnInstall
+  Call un.RemoveGoferCliFromUserPath
+!macroend
 
 Function un.RemoveGoferCliFromUserPath
   nsExec::ExecToLog "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $\"$$entry = '$INSTDIR\resources\backend'; $$path = [Environment]::GetEnvironmentVariable('Path', 'User'); $$parts = @($$path -split ';' | Where-Object { $$_ -and $$_ -ne $$entry }); [Environment]::SetEnvironmentVariable('Path', ($$parts -join ';'), 'User')$\""
   SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
 FunctionEnd
+!endif
