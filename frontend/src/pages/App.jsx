@@ -45,6 +45,7 @@ export default function App() {
   const [chatPaneWidth, setChatPaneWidth] = useState(356);
   const saveRevisionRef = useRef(0);
   const dirtyWorkflowRef = useRef();
+  const deletedWorkflowIdsRef = useRef(new Set());
   const logRequestRef = useRef(0);
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
 
@@ -58,7 +59,9 @@ export default function App() {
         throw new Error(`Workflow API returned ${response.status}`);
       }
       const payload = await response.json();
-      const nextWorkflows = (payload.workflows ?? []).map(summarizeWorkflow);
+      const nextWorkflows = (payload.workflows ?? [])
+        .filter((workflow) => !deletedWorkflowIdsRef.current.has(workflow.id))
+        .map(summarizeWorkflow);
       setWorkflows((current) => {
         const refreshedWorkflows = nextWorkflows.map((workflow) => {
           const localWorkflow = current.find((candidate) => candidate.id === workflow.id);
@@ -67,7 +70,7 @@ export default function App() {
             : workflow;
         });
         const dirtyWorkflowId = dirtyWorkflowRef.current?.id;
-        const localDirtyWorkflow = dirtyWorkflowId
+        const localDirtyWorkflow = dirtyWorkflowId && !deletedWorkflowIdsRef.current.has(dirtyWorkflowId)
           ? current.find((workflow) => workflow.id === dirtyWorkflowId)
           : null;
         const mergedWorkflows =
@@ -428,6 +431,7 @@ export default function App() {
       }
 
       const nextWorkflow = summarizeWorkflow(payload.workflow);
+      deletedWorkflowIdsRef.current.delete(nextWorkflow.id);
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
       setQuery("");
@@ -470,6 +474,7 @@ export default function App() {
       }
 
       const nextWorkflow = summarizeWorkflow(payload.workflow);
+      deletedWorkflowIdsRef.current.delete(nextWorkflow.id);
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
       setTopBarNotice({ type: "success", message: `Imported ${nextWorkflow.name}` });
@@ -486,6 +491,14 @@ export default function App() {
     if (!window.confirm(`Delete workflow "${workflow.name}"?`)) return;
 
     try {
+      deletedWorkflowIdsRef.current.add(workflow.id);
+      saveRevisionRef.current += 1;
+      if (dirtyWorkflowRef.current?.id === workflow.id) {
+        dirtyWorkflowRef.current = undefined;
+      }
+      setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
+      setSaveState((current) => ({ ...current, saving: false }));
+
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
         {
@@ -497,10 +510,14 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
 
+      const remainingWorkflows = workflows.filter((candidate) => candidate.id !== workflow.id);
       setWorkflows((current) => current.filter((candidate) => candidate.id !== workflow.id));
-      setActiveWorkflowId((currentId) => (currentId === workflow.id ? undefined : currentId));
+      setActiveWorkflowId((currentId) =>
+        currentId === workflow.id ? remainingWorkflows[0]?.id : currentId,
+      );
       setTopBarNotice({ type: "success", message: `Deleted ${workflow.name}` });
     } catch (error) {
+      deletedWorkflowIdsRef.current.delete(workflow.id);
       setTopBarNotice({
         type: "error",
         message: error instanceof Error ? error.message : "Unable to delete workflow",
