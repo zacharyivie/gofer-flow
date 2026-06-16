@@ -27,7 +27,7 @@ source=(
 sha256sums=('d47d296d0ee293e7f2bc46c6997dd44b327c0699548c71b1d80abed020d97973'
             '3af3ff41ae4c9974e7f3e7b4d450384d02c3c57d8382585b8c2671012228dc89'
             '05f187078ee51f2c237ae4271d9383ff9dd5bc240bada6c8cc0361392730c553')
-sha256sums_x86_64=('54877e67a42ef2264e8ccd5c5e1f12f168a454cc1731df6a71abb50b5b224a6b')
+sha256sums_x86_64=('ecd0abe89a201104dc68cf2263f75cfa71e8e0ccef324ee6d33597a57f3222ce')
 
 package() {
   install -Dm755 "${srcdir}/Gofer-Flow-${pkgver}-x86_64.AppImage" \

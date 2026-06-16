@@ -198,6 +198,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             except (ChatProviderError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Unhandled workflow assistant error")
+                self._send_json({"error": f"Workflow assistant failed: {exc}"}, status=500)
+                return
 
             self._send_json(response)
             return
