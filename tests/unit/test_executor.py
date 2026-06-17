@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import anyio
+
 from gofer.core import executor as executor_module
 from gofer.core.agent import AgentConfig
 from gofer.core.executor import WorkflowExecutor, command_shell_args
@@ -9,11 +11,22 @@ from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CommonLlmTaskOperation,
+    CopyFileOperation,
+    DeleteFileOperation,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
+    MoveFileOperation,
     OperationType,
     PythonScriptOperation,
+    PromptFileOperation,
+    ReadFileOperation,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
+from gofer.utils.run_state import request_workflow_stop, workflow_stop_path
 
 
 def _bash_node(node_id: str, command: str = "true") -> GraphNode:
@@ -54,6 +67,31 @@ async def test_single_bash_node_succeeds(tmp_path: Path) -> None:
     result = await executor.run()
     assert result.success
     assert "echo" in result.node_outputs
+
+
+async def test_stop_marker_interrupts_running_workflow(tmp_path: Path) -> None:
+    wf = _make_workflow("stop-marker")
+    wf.add_operation(_bash_node("sleep", "sleep 5"))
+    stop_file = workflow_stop_path("stop-marker", tmp_path)
+    run_result = None
+
+    async def run_workflow() -> None:
+        nonlocal run_result
+        run_result = await WorkflowExecutor(
+            wf,
+            {},
+            log_base_dir=tmp_path / "logs",
+            stop_file=stop_file,
+        ).run()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_workflow)
+        await anyio.sleep(0.2)
+        request_workflow_stop("stop-marker", tmp_path)
+
+    assert run_result is not None
+    assert not run_result.success
+    assert "stopped by user" in run_result.log_path.read_text()
 
 
 async def test_linear_execution_order(tmp_path: Path) -> None:
@@ -151,6 +189,212 @@ async def test_uncaught_python_exception_routes_to_on_failure_edge(tmp_path: Pat
     assert "ZeroDivisionError" in result.node_outputs["explode"].output
     assert result.node_outputs["recover"].success
     assert "python recovered" in result.node_outputs["recover"].output
+
+
+async def test_read_file_outputs_file_content(tmp_path: Path) -> None:
+    source = tmp_path / "input.txt"
+    source.write_text("hello from a file")
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="read",
+        operation=ReadFileOperation(type=OperationType.READ_FILE, path=source),
+    ))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert result.node_outputs["read"].output == "hello from a file"
+
+
+async def test_write_file_uses_piped_input_when_content_empty(tmp_path: Path) -> None:
+    destination = tmp_path / "out" / "result.txt"
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="produce",
+        operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="printf piped"),
+        pipe_output=True,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="write",
+        operation=WriteFileOperation(type=OperationType.WRITE_FILE, path=destination),
+    ))
+    wf.then("produce", "write")
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert destination.read_text() == "piped"
+    assert "wrote 5 characters" in result.node_outputs["write"].output
+
+
+async def test_copy_move_and_delete_file_nodes(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    copied = tmp_path / "copied.txt"
+    moved = tmp_path / "moved.txt"
+    source.write_text("contents")
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="copy",
+        operation=CopyFileOperation(
+            type=OperationType.COPY_FILE,
+            source_path=source,
+            destination_path=copied,
+        ),
+    ))
+    wf.add_operation(GraphNode(
+        node_id="move",
+        operation=MoveFileOperation(
+            type=OperationType.MOVE_FILE,
+            source_path=copied,
+            destination_path=moved,
+        ),
+    ))
+    wf.add_operation(GraphNode(
+        node_id="delete",
+        operation=DeleteFileOperation(
+            type=OperationType.DELETE_FILE,
+            path=moved,
+            use_trash=False,
+        ),
+    ))
+    wf.then("copy", "move")
+    wf.then("move", "delete")
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert source.read_text() == "contents"
+    assert not copied.exists()
+    assert not moved.exists()
+
+
+async def test_delete_file_uses_gofer_trash_by_default(tmp_path: Path, monkeypatch) -> None:
+    data_dir = tmp_path / "data"
+    target = tmp_path / "delete-me.txt"
+    target.write_text("trash me")
+    monkeypatch.setattr("gofer.core.executor.get_data_dir", lambda: data_dir)
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="trash",
+        operation=DeleteFileOperation(type=OperationType.DELETE_FILE, path=target),
+    ))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert not target.exists()
+    trashed = list((data_dir / "trash").iterdir())
+    assert len(trashed) == 1
+    assert trashed[0].read_text() == "trash me"
+
+
+async def test_prompt_file_node_renders_template_variables(tmp_path: Path) -> None:
+    output = tmp_path / "prompts" / "generated.md"
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="make-prompt",
+        operation=PromptFileOperation(
+            type=OperationType.PROMPT_FILE,
+            output_path=output,
+            template="Summarize {{topic}}",
+            variables={"topic": "gofer flow"},
+        ),
+    ))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert output.read_text() == "Summarize gofer flow"
+
+
+async def test_common_llm_task_uses_agent_subscription(tmp_path: Path) -> None:
+    sub = FakeSubscription(output="summary")
+    wf = _make_workflow()
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=tmp_path / "unused.md",
+    ))
+    wf.add_operation(GraphNode(
+        node_id="summarize",
+        operation=CommonLlmTaskOperation(
+            type=OperationType.COMMON_LLM_TASK,
+            agent_id="bot",
+            task="summarize",
+            target="README.md",
+            working_dir=tmp_path,
+        ),
+    ))
+
+    result = await WorkflowExecutor(
+        wf, {"claude_code": sub}, log_base_dir=tmp_path / "logs"
+    ).run()
+
+    assert result.success
+    assert result.node_outputs["summarize"].output == "summary"
+    assert "Summarize" in str(sub.calls[0]["prompt"])
+    assert "README.md" in str(sub.calls[0]["prompt"])
+
+
+async def test_agent_node_can_call_skill_without_prompt_path(tmp_path: Path) -> None:
+    sub = FakeSubscription(output="done")
+    wf = _make_workflow()
+    wf.register_agent(AgentConfig(
+        agent_id="builder",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=tmp_path / "unused.md",
+    ))
+    wf.add_operation(GraphNode(
+        node_id="skill",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="builder",
+            working_dir=tmp_path,
+            skill_name="gofer-flow-workflow-builder",
+        ),
+    ))
+
+    result = await WorkflowExecutor(
+        wf, {"claude_code": sub}, log_base_dir=tmp_path / "logs"
+    ).run()
+
+    assert result.success
+    assert sub.calls[0]["prompt"] == "/gofer-flow-workflow-builder"
+
+
+async def test_local_vectorize_and_search_nodes(tmp_path: Path) -> None:
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.txt").write_text("alpha beta gofer workflow")
+    (docs / "b.txt").write_text("zebra banana")
+    index = tmp_path / "index.json"
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="index",
+        operation=LocalVectorizeOperation(
+            type=OperationType.LOCAL_VECTORIZE,
+            source_path=docs,
+            index_path=index,
+            glob="*.txt",
+        ),
+    ))
+    wf.add_operation(GraphNode(
+        node_id="search",
+        operation=LocalSearchOperation(
+            type=OperationType.LOCAL_SEARCH,
+            index_path=index,
+            query="gofer workflow",
+            top_k=1,
+        ),
+    ))
+    wf.then("index", "search")
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert "a.txt" in result.node_outputs["search"].output
 
 
 async def test_failure_route_runs_after_retries_are_exhausted(tmp_path: Path) -> None:
@@ -269,6 +513,82 @@ async def test_agent_node_uses_subscription(tmp_path: Path) -> None:
     assert result.success
     assert "agent output" in result.node_outputs["agent-step"].output
     assert len(sub.calls) == 1
+
+
+async def test_agent_input_mapping_can_read_trigger_event_path(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Summarize {{file_path}}.")
+    sub = FakeSubscription(output="done")
+
+    wf = _make_workflow()
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+            input_mapping={"file_path": "trigger.events.0.path"},
+        ),
+    ))
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).with_trigger_context({
+        "type": "file_watch",
+        "events": [{"path": str(tmp_path / "input.txt"), "kind": "created"}],
+    }).run()
+
+    assert result.success
+    assert str(tmp_path / "input.txt") in str(sub.calls[0]["prompt"])
+
+
+async def test_agent_trigger_events_fan_source_runs_once_per_event(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Summarize {{path}}.")
+    sub = FakeSubscription(output="done")
+
+    wf = _make_workflow()
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+            fan_source=TriggerEventsFanSource(type="trigger_events"),
+        ),
+    ))
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).with_trigger_context({
+        "type": "file_watch",
+        "events": [
+            {"path": str(tmp_path / "a.txt"), "kind": "created"},
+            {"path": str(tmp_path / "b.txt"), "kind": "created"},
+        ],
+    }).run()
+
+    assert result.success
+    assert len(sub.calls) == 2
+    prompts = [str(call["prompt"]) for call in sub.calls]
+    assert str(tmp_path / "a.txt") in prompts[0]
+    assert str(tmp_path / "b.txt") in prompts[1]
 
 
 async def test_workflow_run_writes_success_log(tmp_path: Path) -> None:

@@ -5,6 +5,9 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from gofer.cli.main import app
+from gofer.core.workflow import AgenticWorkflow
+from gofer.ui.chat import workflow_chat_prompt_path
+from gofer.utils.run_state import workflow_stop_path
 
 runner = CliRunner()
 
@@ -51,6 +54,99 @@ def test_workflow_run_dry_run(tmp_path: Path) -> None:
     assert result.exit_code == 0
 
 
+def test_workflow_import_command(tmp_path: Path) -> None:
+    source = tmp_path / "source.toml"
+    source.write_text(
+        """
+[workflow]
+id = "import-me"
+name = "Import Me"
+
+[[nodes]]
+id = "hello"
+type = "bash_command"
+command = "echo hello"
+""".strip()
+    )
+    data_dir = tmp_path / "data"
+
+    result = runner.invoke(
+        app, ["workflow", "import", str(source), "--data-dir", str(data_dir)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert (data_dir / "import-me.toml").exists()
+
+
+def test_workflow_rm_cleans_state(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Clean Me", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+    log_dir = tmp_path / "logs" / "clean-me"
+    log_dir.mkdir(parents=True)
+    (log_dir / "2026-06-13T10-00-00-0400.log").write_text("old run\n")
+    chat_path = workflow_chat_prompt_path(tmp_path, "clean-me")
+    chat_path.parent.mkdir(parents=True)
+    chat_path.write_text("old chat\n")
+    stop_path = workflow_stop_path("clean-me", tmp_path)
+    stop_path.parent.mkdir(parents=True)
+    stop_path.write_text("stop\n")
+
+    result = runner.invoke(
+        app, ["workflow", "rm", "clean-me", "--yes", "--data-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert not (tmp_path / "clean-me.toml").exists()
+    assert not log_dir.exists()
+    assert not chat_path.exists()
+    assert not stop_path.exists()
+
+
+def test_workflow_logs_commands(tmp_path: Path) -> None:
+    toml = tmp_path / "history.toml"
+    toml.write_text(_SIMPLE_TOML.replace('id = "simple"', 'id = "history"'))
+    log_dir = tmp_path / "logs" / "history"
+    log_dir.mkdir(parents=True)
+    log = log_dir / "2026-06-13T10-00-00-0400.log"
+    log.write_text(
+        "2026-06-13T10:00:00-04:00 - history started successfully\n"
+        "hello from log\n"
+        "2026-06-13T10:00:01-04:00 - INFO - history completed successfully\n"
+    )
+
+    list_result = runner.invoke(
+        app, ["workflow", "logs", "list", "history", "--data-dir", str(tmp_path)]
+    )
+    latest_result = runner.invoke(
+        app, ["workflow", "logs", "latest", "history", "--data-dir", str(tmp_path)]
+    )
+    show_result = runner.invoke(
+        app,
+        ["workflow", "logs", "show", "history", log.name, "--data-dir", str(tmp_path)],
+    )
+
+    assert list_result.exit_code == 0, list_result.output
+    assert log.name in list_result.output
+    assert latest_result.exit_code == 0, latest_result.output
+    assert "hello from log" in latest_result.output
+    assert show_result.exit_code == 0, show_result.output
+    assert "history completed successfully" in show_result.output
+
+
+def test_workflow_stop_command_writes_stop_marker(tmp_path: Path) -> None:
+    toml = tmp_path / "stop-me.toml"
+    toml.write_text(_SIMPLE_TOML.replace('id = "simple"', 'id = "stop-me"'))
+
+    result = runner.invoke(
+        app, ["workflow", "stop", "stop-me", "--data-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert workflow_stop_path("stop-me", tmp_path).exists()
+
+
 def test_schedule_add_and_list(tmp_path: Path) -> None:
     db = tmp_path / "sched.db"
     toml = tmp_path / "wf.toml"
@@ -59,6 +155,20 @@ def test_schedule_add_and_list(tmp_path: Path) -> None:
     assert result.exit_code == 0
     result2 = runner.invoke(app, ["schedule", "list", "--db", str(db)])
     assert "simple" in result2.output
+
+
+def test_watch_list_shows_watched_workflows(tmp_path: Path) -> None:
+    toml = tmp_path / "watched.toml"
+    toml.write_text(
+        _SIMPLE_TOML
+        + '\n[workflow.watch]\npath = "inputs"\nglob = "*.txt"\nrecursive = true\n'
+    )
+
+    result = runner.invoke(app, ["watch", "list", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert "simple" in result.output
+    assert "*.txt" in result.output
 
 
 def test_agent_create_with_inline_prompt(tmp_path: Path) -> None:
@@ -162,3 +272,95 @@ def test_prompt_command_is_invalid() -> None:
     result = runner.invoke(app, ["prompt"])
     assert result.exit_code != 0
     assert "No such command" in result.output
+
+
+def test_workflow_mutation_commands_configure_agent_fanout(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Watch Summaries", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    prompt = tmp_path / "prompts" / "summarizer.md"
+    prompt.parent.mkdir()
+    prompt.write_text("Summarize {{path}}")
+
+    commands = [
+        [
+            "workflow", "set-watch", "watch-summaries",
+            "--path", str(tmp_path / "incoming"),
+            "--glob", "*.md",
+            "--mode", "fanout",
+            "--data-dir", str(tmp_path),
+        ],
+        [
+            "workflow", "add-agent", "watch-summaries",
+            "--id", "summarizer",
+            "--subscription", "codex",
+            "--working-dir", str(tmp_path),
+            "--prompt-path", str(prompt),
+            "--data-dir", str(tmp_path),
+        ],
+        [
+            "workflow", "add-node", "watch-summaries",
+            "--id", "summarize-added-files",
+            "--type", "agent",
+            "--agent-id", "summarizer",
+            "--prompt-path", str(prompt),
+            "--working-dir", str(tmp_path),
+            "--fan-source", "trigger-events",
+            "--fan-include-content",
+            "--fan-max-concurrency", "3",
+            "--data-dir", str(tmp_path),
+        ],
+    ]
+
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "watch-summaries.toml")
+    assert wf.config.watch is not None
+    assert wf.config.watch.mode == "fanout"
+    assert wf.config.watch.glob == "*.md"
+    assert "summarizer" in wf.agents
+    node = wf.graph._nodes["summarize-added-files"]
+    assert node.operation.type == "agent"
+    assert node.operation.fan_source is not None
+    assert node.operation.fan_source.type == "trigger_events"
+    assert node.operation.fan_source.include_content is True
+    assert node.operation.fan_source.max_concurrency == 3
+
+
+def test_workflow_recipe_watch_folder_summarize(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "recipe", "watch-folder-summarize",
+            "--name", "Summarize New Files",
+            "--watch-path", str(tmp_path / "incoming"),
+            "--glob", "*.txt",
+            "--provider", "codex",
+            "--working-dir", str(tmp_path),
+            "--max-concurrency", "2",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    workflow_path = tmp_path / "summarize-new-files.toml"
+    prompt_path = tmp_path / "prompts" / "summarize-new-files-summarizer.md"
+    assert workflow_path.exists()
+    assert prompt_path.exists()
+
+    wf = AgenticWorkflow.from_file(workflow_path)
+    assert wf.config.watch is not None
+    assert wf.config.watch.path == tmp_path / "incoming"
+    assert wf.config.watch.glob == "*.txt"
+    assert wf.config.watch.mode == "fanout"
+    assert wf.agents["summarizer"].subscription == "codex"
+    node = wf.graph._nodes["summarize-added-files"]
+    assert node.operation.type == "agent"
+    assert node.operation.fan_source is not None
+    assert node.operation.fan_source.type == "trigger_events"
+    assert node.operation.fan_source.include_content is True
+    assert node.operation.fan_source.max_concurrency == 2

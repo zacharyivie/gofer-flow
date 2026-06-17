@@ -10,6 +10,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const distIndexPath = path.join(__dirname, "..", "dist", "index.html");
 
+if (process.platform === "linux" && !process.env.GTK_USE_PORTAL) {
+  process.env.GTK_USE_PORTAL = "0";
+}
+
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
 
@@ -29,6 +33,7 @@ let backendLogStream;
 const expectedBackendStops = new WeakSet();
 let isQuitting = false;
 let activeApiBaseUrl;
+let selectedDataDir;
 let mainWindow;
 let backendErrorWindow;
 
@@ -106,10 +111,15 @@ function startBackend() {
 
   return new Promise((resolve, reject) => {
     const backendCommand = getBackendCommand();
-    const args = [...backendCommand.args, "ui", "serve", "--port", "0"];
-    if (process.env.GOFER_DATA_DIR) {
-      args.push("--data-dir", process.env.GOFER_DATA_DIR);
-    }
+    const args = [
+      ...backendCommand.args,
+      "ui",
+      "serve",
+      "--port",
+      "0",
+      "--data-dir",
+      getGoferDataDir(),
+    ];
 
     const child = spawn(backendCommand.command, args, {
       cwd: repoRoot,
@@ -215,6 +225,61 @@ function defaultPackagedBackendPath() {
   }
 
   return path.join(repoRoot, "dist", BACKEND_EXECUTABLE_NAME);
+}
+
+function getGoferDataDir() {
+  if (selectedDataDir) {
+    return selectedDataDir;
+  }
+
+  if (process.env.GOFER_DATA_DIR) {
+    return process.env.GOFER_DATA_DIR;
+  }
+
+  const persistedDataDir = readPersistedDataDir();
+  if (persistedDataDir) {
+    selectedDataDir = persistedDataDir;
+    process.env.GOFER_DATA_DIR = persistedDataDir;
+    return persistedDataDir;
+  }
+
+  if (process.platform === "win32") {
+    return path.join(app.getPath("appData"), "gofer");
+  }
+
+  if (process.platform === "darwin") {
+    return path.join(app.getPath("appData"), "gofer");
+  }
+
+  return path.join(
+    process.env.XDG_DATA_HOME || path.join(app.getPath("home"), ".local", "share"),
+    "gofer",
+  );
+}
+
+function readPersistedDataDir() {
+  try {
+    const payload = JSON.parse(fs.readFileSync(dataDirConfigPath(), "utf8"));
+    return typeof payload.dataDir === "string" && payload.dataDir.trim()
+      ? payload.dataDir
+      : "";
+  } catch {
+    return "";
+  }
+}
+
+function writePersistedDataDir(dataDir) {
+  const configPath = dataDirConfigPath();
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(
+    configPath,
+    `${JSON.stringify({ dataDir }, null, 2)}\n`,
+    "utf8",
+  );
+}
+
+function dataDirConfigPath() {
+  return path.join(app.getPath("userData"), "settings.json");
 }
 
 function stopBackend() {
@@ -478,6 +543,111 @@ function setupApplicationMenu() {
 function setupIpcHandlers() {
   ipcMain.handle("gofer:restart-backend", restartBackend);
   ipcMain.handle("gofer:open-logs", openLogsFolder);
+  ipcMain.handle("gofer:get-data-dir", getGoferDataDir);
+  ipcMain.handle("gofer:list-directory", listDirectory);
+  ipcMain.handle("gofer:open-path", openPath);
+  ipcMain.handle("gofer:set-data-dir", setDataDir);
+  ipcMain.handle("gofer:select-path", selectPath);
+}
+
+async function openPath(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+
+  const result = await shell.openPath(options.targetPath);
+  if (result) {
+    throw new Error(result);
+  }
+  return { opened: true };
+}
+
+async function setDataDir(_event, options = {}) {
+  if (!options.dataDir || typeof options.dataDir !== "string") {
+    throw new Error("A data directory path is required.");
+  }
+
+  selectedDataDir = path.resolve(options.dataDir);
+  process.env.GOFER_DATA_DIR = selectedDataDir;
+  fs.mkdirSync(selectedDataDir, { recursive: true });
+  writePersistedDataDir(selectedDataDir);
+  await restartBackend();
+  return { dataDir: selectedDataDir };
+}
+
+async function listDirectory(_event, options = {}) {
+  const directory = resolvePickerDefaultPath(options.currentPath);
+  fs.mkdirSync(directory, { recursive: true });
+  const entries = await fs.promises.readdir(directory, { withFileTypes: true });
+
+  return {
+    directory,
+    parent: path.dirname(directory) === directory ? null : path.dirname(directory),
+    entries: entries
+      .map((entry) => ({
+        hidden: entry.name.startsWith("."),
+        isDirectory: entry.isDirectory(),
+        isFile: entry.isFile(),
+        name: entry.name,
+        path: path.join(directory, entry.name),
+      }))
+      .sort((left, right) => {
+        if (left.isDirectory !== right.isDirectory) {
+          return left.isDirectory ? -1 : 1;
+        }
+        return left.name.localeCompare(right.name);
+      }),
+  };
+}
+
+async function selectPath(_event, options = {}) {
+  const parentWindow =
+    mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+  const defaultPath = resolvePickerDefaultPath(options.currentPath);
+  fs.mkdirSync(defaultPath, { recursive: true });
+  const result = await dialog.showOpenDialog(parentWindow, {
+    defaultPath,
+    properties: ["openFile", "openDirectory", "showHiddenFiles", "createDirectory"],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return null;
+  }
+
+  return result.filePaths[0];
+}
+
+function resolvePickerDefaultPath(currentPath) {
+  if (!currentPath || typeof currentPath !== "string") {
+    return getGoferDataDir();
+  }
+
+  let candidate = currentPath.trim();
+  if (!candidate) {
+    return getGoferDataDir();
+  }
+
+  if (!path.isAbsolute(candidate)) {
+    candidate = path.resolve(getGoferDataDir(), candidate);
+  }
+
+  if (fs.existsSync(candidate)) {
+    try {
+      return fs.statSync(candidate).isDirectory() ? candidate : path.dirname(candidate);
+    } catch {
+      return path.dirname(candidate);
+    }
+  }
+
+  let parent = path.dirname(candidate);
+  while (parent && parent !== path.dirname(parent)) {
+    if (fs.existsSync(parent)) {
+      return parent;
+    }
+    parent = path.dirname(parent);
+  }
+
+  return getGoferDataDir();
 }
 
 async function restartBackend() {

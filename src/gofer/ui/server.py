@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
@@ -20,15 +21,22 @@ from gofer.ui.api import (
     WorkflowUpdateError,
     create_workflow_payload,
     delete_workflow_payload,
+    delete_workflow_chat_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     run_workflow_payload,
+    stop_workflow_run_payload,
     update_workflow_payload,
     workflow_run_log_payload,
 )
-from gofer.ui.chat import ChatProviderError, provider_payload, run_workflow_chat
+from gofer.ui.chat import (
+    ChatProviderError,
+    provider_payload,
+    run_workflow_chat,
+    stream_workflow_chat,
+)
 from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
 
@@ -58,15 +66,40 @@ def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> Non
             scheduler.remove_workflow(job["id"])
 
 
+def sync_workflow_watchers(data_dir: Path, watcher: WorkflowWatcher) -> None:
+    data_dir.mkdir(parents=True, exist_ok=True)
+    active_watch_ids: set[str] = set()
+
+    for path in sorted(data_dir.glob("*.toml")):
+        try:
+            workflow = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        if workflow.config.watch is None:
+            continue
+        try:
+            watcher.add_workflow(workflow, path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Skipping invalid watcher in %s: %s", path, exc)
+            continue
+        active_watch_ids.add(workflow.config.id)
+
+    for watched in watcher.list_workflows():
+        if watched["id"] not in active_watch_ids:
+            watcher.remove_workflow(watched["id"])
+
+
 class GoferUiServer(ThreadingHTTPServer):
     def __init__(self, server_address: tuple[str, int], data_dir: Path) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(server_address, GoferUiRequestHandler)
         self.data_dir = data_dir
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
+        self.watcher = WorkflowWatcher()
 
     def sync_schedules(self) -> None:
         sync_workflow_schedules(self.data_dir, self.scheduler)
+        sync_workflow_watchers(self.data_dir, self.watcher)
 
 
 class GoferUiRequestHandler(BaseHTTPRequestHandler):
@@ -83,6 +116,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
+            self._sync_schedules()
             payload = list_workflow_payloads(self._request_data_dir(query))
             self._send_json(payload)
             return
@@ -182,6 +216,23 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"workflow": workflow}, status=201)
             return
 
+        if parsed.path == "/api/chat/stream":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+            except json.JSONDecodeError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_stream_headers()
+            asyncio.run(
+                self._stream_chat_response(
+                    body=body,
+                    data_dir=self._request_data_dir(query),
+                )
+            )
+            return
+
         if parsed.path == "/api/chat":
             query = parse_qs(parsed.query)
             try:
@@ -204,6 +255,14 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(response)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/stop"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/stop")
+            query = parse_qs(parsed.query)
+            self._send_json(
+                stop_workflow_run_payload(workflow_id, self._request_data_dir(query))
+            )
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/run"):
@@ -250,6 +309,16 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/chat"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/chat")
+            query = parse_qs(parsed.query)
+            payload = delete_workflow_chat_payload(
+                workflow_id,
+                self._request_data_dir(query),
+            )
+            self._send_json(payload)
+            return
+
         if parsed.path.startswith("/api/workflows/"):
             workflow_id = parsed.path.removeprefix("/api/workflows/")
             query = parse_qs(parsed.query)
@@ -283,6 +352,25 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if isinstance(server, GoferUiServer):
             server.sync_schedules()
 
+    async def _stream_chat_response(self, body: dict[str, Any], data_dir: Path) -> None:
+        try:
+            async for event in stream_workflow_chat(
+                provider=str(body.get("provider", "codex")),
+                model=str(body.get("model", "cli-default")),
+                messages=body.get("messages") or [],
+                workflow=body.get("workflow"),
+                data_dir=data_dir,
+            ):
+                self._write_stream_event(event)
+        except ChatProviderError as exc:
+            self._write_stream_event({"type": "error", "error": str(exc)})
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Unhandled workflow assistant stream error")
+            self._write_stream_event({
+                "type": "error",
+                "error": f"Workflow assistant failed: {exc}",
+            })
+
     def _default_data_dir(self) -> Path:
         server = self.server
         if isinstance(server, GoferUiServer):
@@ -310,6 +398,18 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_stream_headers(self) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def _write_stream_event(self, event: dict[str, Any]) -> None:
+        self.wfile.write(json.dumps(event).encode("utf-8") + b"\n")
+        self.wfile.flush()
 
 
 def ready_payload(server: GoferUiServer) -> dict[str, Any]:
@@ -346,6 +446,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765, data_dir: Path | None = Non
     server.scheduler.start(paused=True)
     server.sync_schedules()
     server.scheduler.resume()
+    server.watcher.start()
     _install_shutdown_handlers(server)
     print(f"GOFER_UI_READY {json.dumps(ready_payload(server), sort_keys=True)}", flush=True)
     try:
@@ -353,6 +454,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765, data_dir: Path | None = Non
     except KeyboardInterrupt:
         pass
     finally:
+        server.watcher.shutdown(wait=False)
         server.scheduler.shutdown(wait=False)
         server.server_close()
         print("GOFER_UI_STOPPED", file=sys.stderr, flush=True)

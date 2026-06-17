@@ -11,12 +11,23 @@ from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CommonLlmTaskOperation,
+    CopyFileOperation,
     CountFanSource,
+    DeleteFileOperation,
     DirectoryFanSource,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
+    MoveFileOperation,
+    OpenResourceOperation,
     Operation,
+    PromptFileOperation,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
     TabularFanSource,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
 
 if TYPE_CHECKING:
@@ -108,6 +119,26 @@ def _op_icon_color(op: Operation) -> tuple[str, str]:
         return "py", "green"
     if isinstance(op, ShellScriptOperation):
         return "sh", "yellow"
+    if isinstance(op, ReadFileOperation):
+        return "r", "blue"
+    if isinstance(op, WriteFileOperation):
+        return "w", "green"
+    if isinstance(op, CopyFileOperation):
+        return "cp", "blue"
+    if isinstance(op, MoveFileOperation):
+        return "mv", "yellow"
+    if isinstance(op, DeleteFileOperation):
+        return "rm", "red"
+    if isinstance(op, OpenResourceOperation):
+        return "↗", "blue"
+    if isinstance(op, PromptFileOperation):
+        return "pr", "magenta"
+    if isinstance(op, CommonLlmTaskOperation):
+        return "llm", "magenta"
+    if isinstance(op, LocalVectorizeOperation):
+        return "idx", "green"
+    if isinstance(op, LocalSearchOperation):
+        return "srch", "blue"
     if isinstance(op, AgentOperation):
         return "@", "magenta"
     return "?", "white"
@@ -121,7 +152,30 @@ def _op_detail(op: Operation) -> str:
         return op.script_path.name
     if isinstance(op, ShellScriptOperation):
         return op.script_path.name
+    if isinstance(op, ReadFileOperation):
+        return f"read {op.path.name}"
+    if isinstance(op, WriteFileOperation):
+        return f"write {op.path.name}"
+    if isinstance(op, CopyFileOperation):
+        return f"{op.source_path.name} → {op.destination_path.name}"
+    if isinstance(op, MoveFileOperation):
+        return f"{op.source_path.name} → {op.destination_path.name}"
+    if isinstance(op, DeleteFileOperation):
+        return f"delete {op.path.name}"
+    if isinstance(op, OpenResourceOperation):
+        target = op.target
+        return target[:28] + "…" if len(target) > 29 else target
+    if isinstance(op, PromptFileOperation):
+        return f"write {op.output_path.name}"
+    if isinstance(op, CommonLlmTaskOperation):
+        return f"{op.task} via {op.agent_id}"
+    if isinstance(op, LocalVectorizeOperation):
+        return f"index {op.source_path.name}"
+    if isinstance(op, LocalSearchOperation):
+        return f"search {op.index_path.name}"
     if isinstance(op, AgentOperation):
+        if op.skill_name:
+            return f"{op.agent_id} /{op.skill_name}"
         if op.fan_source is None:
             detail = op.agent_id
             if op.dynamic_count != 1:
@@ -133,6 +187,8 @@ def _op_detail(op: Operation) -> str:
             return f"{op.agent_id} ↦ {op.fan_source.path.name}/"
         if isinstance(op.fan_source, CountFanSource):
             return f"{op.agent_id} ×{op.fan_source.count}"
+        if isinstance(op.fan_source, TriggerEventsFanSource):
+            return f"{op.agent_id} ↦ trigger events"
     return ""
 
 
@@ -218,6 +274,8 @@ def _fan_out_cell(op: Operation) -> str:
         return f"dir glob={op.fan_source.glob}"
     if isinstance(op.fan_source, CountFanSource):
         return f"count={op.fan_source.count}"
+    if isinstance(op.fan_source, TriggerEventsFanSource):
+        return "trigger events"
     return "—"
 
 

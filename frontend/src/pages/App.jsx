@@ -2,6 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bot,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Copy,
+  FolderOpen,
   GitBranch,
   ListFilter,
   Loader2,
@@ -17,7 +22,7 @@ import {
   Waypoints,
   X,
 } from "lucide-react";
-import DagCanvas from "../components/DagCanvas.jsx";
+import DagCanvas, { PathPickerDialog } from "../components/DagCanvas.jsx";
 import { apiUrl } from "../lib/api.js";
 
 export default function App() {
@@ -28,6 +33,7 @@ export default function App() {
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createState, setCreateState] = useState({ saving: false, error: "" });
+  const [dataDirPickerOpen, setDataDirPickerOpen] = useState(false);
   const [dirtyWorkflow, setDirtyWorkflow] = useState();
   const [saveState, setSaveState] = useState({ saving: false, error: "" });
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
@@ -412,6 +418,34 @@ export default function App() {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
       setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
       setSaveState((current) => ({ ...current, saving: false }));
+      loadLatestLog(workflowToRun.id, { silent: true });
+      loadRunLogs(workflowToRun.id, { silent: true });
+    }
+  }
+
+  async function stopWorkflowRun(workflow) {
+    if (!workflow?.id || !runState.running || runState.workflowId !== workflow.id) return;
+
+    setRunState((current) => ({ ...current, stopping: true }));
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/stop`),
+        { method: "POST" },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setTopBarNotice({
+        type: payload.stopped ? "success" : "error",
+        message: payload.stopped ? "Stopping workflow run..." : payload.message || "No active run",
+      });
+    } catch (error) {
+      setRunState((current) => ({ ...current, stopping: false }));
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to stop workflow run",
+      });
     }
   }
 
@@ -498,6 +532,24 @@ export default function App() {
       }
       setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
       setSaveState((current) => ({ ...current, saving: false }));
+      window.localStorage.removeItem(`gofer-flow-chat:${workflow.id}`);
+      setRunState((current) =>
+        current.workflowId === workflow.id
+          ? { running: false, error: "", result: null }
+          : current,
+      );
+      setLogState((current) =>
+        activeWorkflow?.id === workflow.id
+          ? {
+              loading: false,
+              error: "",
+              text: "",
+              path: null,
+              runs: [],
+              selectedRunId: null,
+            }
+          : current,
+      );
 
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
@@ -525,6 +577,27 @@ export default function App() {
     }
   }
 
+  async function changeDataDir(nextDataDir) {
+    if (!window.goferDesktop?.setDataDir) {
+      setTopBarNotice({
+        type: "error",
+        message: "Changing the app data folder is only available in the desktop app",
+      });
+      return;
+    }
+
+    try {
+      setDataDirPickerOpen(false);
+      setTopBarNotice({ type: "success", message: "Switching app data folder..." });
+      await window.goferDesktop.setDataDir(nextDataDir);
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to change app data folder",
+      });
+    }
+  }
+
   return (
     <main className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}>
       <WorkflowSidebar
@@ -537,6 +610,8 @@ export default function App() {
         width={workflowPaneWidth}
         onQueryChange={setQuery}
         onCreate={() => setCreateDialogOpen(true)}
+        onDataDirPick={() => setDataDirPickerOpen(true)}
+        onDeleteWorkflow={deleteWorkflow}
         onRefresh={loadWorkflows}
         onResizeStart={(event) =>
           startPaneResize(event, {
@@ -556,7 +631,6 @@ export default function App() {
             <TopBar
               theme={theme}
               workflow={activeWorkflow}
-              onDeleteWorkflow={() => deleteWorkflow(activeWorkflow)}
               onToggleTheme={() =>
                 setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
               }
@@ -571,6 +645,7 @@ export default function App() {
               onImportWorkflow={importWorkflow}
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
+              onStopWorkflow={stopWorkflowRun}
               onWorkflowChange={updateActiveWorkflow}
             />
           </>
@@ -604,6 +679,14 @@ export default function App() {
         }}
         onCreate={createWorkflow}
       />
+      {dataDirPickerOpen ? (
+        <PathPickerDialog
+          currentPath={dataDir}
+          label="app data folder"
+          onClose={() => setDataDirPickerOpen(false)}
+          onSelect={changeDataDir}
+        />
+      ) : null}
     </main>
   );
 }
@@ -658,6 +741,7 @@ function summarizeWorkflow(workflow) {
     ...workflow,
     description: `${workflow.nodes.length} nodes, ${workflow.edges.length} edges, ${agentCount} agents.${
       workflow.schedule ? ` Scheduled with ${workflow.schedule.cron_expression}.` : ""
+    }${workflow.watch ? ` Watching ${workflow.watch.path}.` : ""
     }`,
     status,
     tags: [status.toLowerCase(), ...operationTypes.slice(0, 2)],
@@ -716,12 +800,33 @@ function WorkflowSidebar({
   runState,
   workflows,
   onCreate,
+  onDataDirPick,
+  onDeleteWorkflow,
   onQueryChange,
   onRefresh,
   onResizeStart,
   onSelect,
   width,
 }) {
+  const [dataDirCopied, setDataDirCopied] = useState(false);
+
+  async function copyDataDir() {
+    if (!dataDir) return;
+
+    try {
+      await navigator.clipboard.writeText(dataDir);
+      setDataDirCopied(true);
+      window.setTimeout(() => setDataDirCopied(false), 1400);
+    } catch {
+      // Clipboard failures are non-critical; the path remains visible for manual copy.
+    }
+  }
+
+  async function openDataDir() {
+    if (!dataDir) return;
+    await window.goferDesktop?.openPath?.(dataDir);
+  }
+
   return (
     <aside
       className="relative flex shrink-0 flex-col border-r border-line bg-white"
@@ -783,32 +888,18 @@ function WorkflowSidebar({
       <div className="workflow-scrollbar flex-1 space-y-2 overflow-y-auto px-3 pb-4">
         {workflows.length ? (
           workflows.map((workflow) => (
-            <button
+            <WorkflowListItem
               key={workflow.id}
-              className={`w-full rounded-lg border p-3 text-left transition ${
-                workflow.id === activeWorkflowId
-                  ? "border-teal-200 bg-teal-50 shadow-sm"
-                  : "border-transparent bg-white hover:border-line hover:bg-slate-50"
-              }`}
-              type="button"
-              onClick={() => onSelect(workflow.id)}
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-semibold">{workflow.name}</p>
-                  <p className="text-clamp-2 mt-1 text-xs leading-5 text-muted">
-                    {workflow.description}
-                  </p>
-                </div>
-                <StatusDot
-                  status={
-                    runState?.running && runState.workflowId === workflow.id
-                      ? "Running"
-                      : workflow.status
-                  }
-                />
-              </div>
-            </button>
+              active={workflow.id === activeWorkflowId}
+              status={
+                runState?.running && runState.workflowId === workflow.id
+                  ? "Running"
+                  : workflow.status
+              }
+              workflow={workflow}
+              onDelete={() => onDeleteWorkflow(workflow)}
+              onSelect={() => onSelect(workflow.id)}
+            />
           ))
         ) : (
           <div className="rounded-lg border border-dashed border-line bg-slate-50 p-4 text-sm leading-6 text-muted">
@@ -818,22 +909,38 @@ function WorkflowSidebar({
       </div>
 
       {dataDir ? (
-        <div className="border-t border-line px-5 py-3 text-xs leading-5 text-muted">
-          <span className="block truncate" title={dataDir}>
+        <div className="flex items-center gap-2 border-t border-line px-5 py-3 text-xs leading-5 text-muted">
+          <button
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
+            title={dataDirCopied ? "Copied" : "Copy app data folder path"}
+            type="button"
+            onClick={copyDataDir}
+          >
+            {dataDirCopied ? <Check size={14} /> : <Copy size={14} />}
+          </button>
+          <button
+            className="min-w-0 flex-1 truncate text-left text-teal-700 underline-offset-2 transition hover:text-teal-800 hover:underline"
+            title={dataDir}
+            type="button"
+            onClick={openDataDir}
+          >
             {dataDir}
-          </span>
+          </button>
+          <button
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
+            title="Change app data folder"
+            type="button"
+            onClick={onDataDirPick}
+          >
+            <FolderOpen size={15} />
+          </button>
         </div>
       ) : null}
     </aside>
   );
 }
 
-function TopBar({
-  theme,
-  workflow,
-  onDeleteWorkflow,
-  onToggleTheme,
-}) {
+function WorkflowListItem({ active, onDelete, onSelect, status, workflow }) {
   const menuRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
 
@@ -849,6 +956,67 @@ function TopBar({
     return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [menuOpen]);
 
+  return (
+    <div
+      className={`group relative w-full rounded-lg border text-left transition ${
+        active
+          ? "border-teal-200 bg-teal-50 shadow-sm"
+          : "border-transparent bg-white hover:border-line hover:bg-slate-50"
+      }`}
+    >
+      <button
+        className="w-full rounded-lg p-3 pr-10 text-left"
+        type="button"
+        onClick={onSelect}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="truncate text-sm font-semibold">{workflow.name}</p>
+            <p className="text-clamp-2 mt-1 text-xs leading-5 text-muted">
+              {workflow.description}
+            </p>
+          </div>
+          <StatusDot status={status} />
+        </div>
+      </button>
+      <div ref={menuRef} className="absolute right-2 top-2">
+        <button
+          className="grid h-7 w-7 place-items-center rounded-md text-muted opacity-70 transition hover:bg-slate-100 hover:text-ink group-hover:opacity-100 dark:hover:bg-[#2a2a2a]"
+          title="Workflow actions"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setMenuOpen((current) => !current);
+          }}
+        >
+          <MoreVertical size={14} />
+        </button>
+        {menuOpen ? (
+          <div className="absolute right-0 top-8 z-40 w-44 rounded-lg border border-line bg-white p-1 shadow-panel">
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50 dark:hover:bg-[#3a2424]"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setMenuOpen(false);
+                onDelete();
+              }}
+            >
+              <Trash2 size={15} />
+              Delete workflow
+            </button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function TopBar({
+  theme,
+  workflow,
+  onToggleTheme,
+}) {
   return (
     <header className="flex h-[62px] shrink-0 items-center justify-between bg-white px-6 pt-1">
       <div className="min-w-0 pt-1">
@@ -867,42 +1035,14 @@ function TopBar({
         </div>
       </div>
       <div className="flex items-center gap-2">
-        <div ref={menuRef} className="relative">
-          <button
-            className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-            title="More workflow actions"
-            type="button"
-            onClick={() => setMenuOpen((current) => !current)}
-          >
-            <MoreVertical size={16} />
-          </button>
-          {menuOpen ? (
-            <div className="absolute right-0 top-11 z-40 w-52 rounded-lg border border-line bg-white p-1 shadow-panel">
-              <button
-                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50"
-                type="button"
-                onClick={() => {
-                  onToggleTheme();
-                  setMenuOpen(false);
-                }}
-              >
-                {theme === "dark" ? <Sun size={15} /> : <Moon size={15} />}
-                {theme === "dark" ? "Light mode" : "Dark mode"}
-              </button>
-              <button
-                className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
-                type="button"
-                onClick={() => {
-                  onDeleteWorkflow();
-                  setMenuOpen(false);
-                }}
-              >
-                <Trash2 size={15} />
-                Delete workflow
-              </button>
-            </div>
-          ) : null}
-        </div>
+        <button
+          className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+          title={theme === "dark" ? "Light mode" : "Dark mode"}
+          type="button"
+          onClick={onToggleTheme}
+        >
+          {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+        </button>
       </div>
     </header>
   );
@@ -915,12 +1055,20 @@ function ChatPane({ onResizeStart, width, workflow }) {
   const [providers, setProviders] = useState([]);
   const [providerId, setProviderId] = useState("codex");
   const [model, setModel] = useState("cli-default");
-  const [chatState, setChatState] = useState({ sending: false, error: "" });
-  const [showTypingIndicator, setShowTypingIndicator] = useState(false);
+  const [chatStateByWorkflow, setChatStateByWorkflow] = useState({});
+  const [showTypingByWorkflow, setShowTypingByWorkflow] = useState({});
+  const [typingDelayByWorkflow, setTypingDelayByWorkflow] = useState({});
+  const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const workflowName = workflow?.name ?? "No workflow selected";
-  const chatStorageKey = `gofer-flow-chat:${workflow?.id ?? "no-workflow"}`;
-  const [messages, setMessages] = useState(() => loadChatMessages(chatStorageKey));
+  const workflowId = workflow?.id ?? "no-workflow";
+  const chatStorageKey = chatStorageKeyFor(workflowId);
+  const [messagesByWorkflow, setMessagesByWorkflow] = useState({});
+  const messages = messagesByWorkflow[workflowId] ?? loadChatMessages(chatStorageKey);
+  const chatState = chatStateByWorkflow[workflowId] ?? { sending: false, error: "" };
+  const showTypingIndicator = Boolean(showTypingByWorkflow[workflowId]);
+  const typingDelayKey = typingDelayByWorkflow[workflowId] ?? 0;
+  const chatItems = useMemo(() => buildChatItems(messages), [messages]);
 
   useEffect(() => {
     async function loadProviders() {
@@ -943,29 +1091,28 @@ function ChatPane({ onResizeStart, width, workflow }) {
   }, []);
 
   useEffect(() => {
-    setMessages(loadChatMessages(chatStorageKey));
+    setMessagesByWorkflow((current) =>
+      current[workflowId]
+        ? current
+        : { ...current, [workflowId]: loadChatMessages(chatStorageKey) },
+    );
     setDraft("");
-    setChatState({ sending: false, error: "" });
-    setShowTypingIndicator(false);
+    setExpandedThoughtGroups({});
     setConversationMenuOpen(false);
-  }, [chatStorageKey]);
-
-  useEffect(() => {
-    window.localStorage.setItem(chatStorageKey, JSON.stringify(messages));
-  }, [chatStorageKey, messages]);
+  }, [chatStorageKey, workflowId]);
 
   useEffect(() => {
     if (!chatState.sending) {
-      setShowTypingIndicator(false);
+      setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: false }));
       return undefined;
     }
 
     const timeoutId = window.setTimeout(() => {
-      setShowTypingIndicator(true);
+      setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: true }));
     }, 2000);
 
     return () => window.clearTimeout(timeoutId);
-  }, [chatState.sending]);
+  }, [chatState.sending, typingDelayKey, workflowId]);
 
   useEffect(() => {
     if (!conversationMenuOpen) return undefined;
@@ -999,22 +1146,59 @@ function ChatPane({ onResizeStart, width, workflow }) {
   async function sendMessage() {
     const text = draft.trim();
     if (!text || chatState.sending) return;
+    const targetWorkflow = workflow;
+    const targetWorkflowId = workflowId;
+    const targetStorageKey = chatStorageKeyFor(targetWorkflowId);
+    const targetMessages = messagesByWorkflow[targetWorkflowId] ?? loadChatMessages(targetStorageKey);
 
     const userMessage = {
       id: uniqueClientId(),
       role: "user",
       body: text,
     };
-    const nextMessages = [...messages, userMessage];
-    setMessages(nextMessages);
+    const nextMessages = [...targetMessages, userMessage];
+    updateWorkflowMessages(targetWorkflowId, nextMessages);
     setDraft("");
-    setChatState({ sending: true, error: "" });
+    setChatStateByWorkflow((current) => ({
+      ...current,
+      [targetWorkflowId]: { sending: true, error: "" },
+    }));
+    const thoughtGroupId = uniqueClientId();
     window.requestAnimationFrame(() => {
       scrollMessageNearTop(userMessage.id);
     });
 
+    function appendAssistantMessage(body, kind = "final", extra = {}) {
+      const assistantMessageId = uniqueClientId();
+      updateWorkflowMessages(targetWorkflowId, (current) => [
+        ...current,
+        {
+          id: assistantMessageId,
+          role: "assistant",
+          kind,
+          body,
+          ...extra,
+        },
+      ]);
+      window.requestAnimationFrame(() => {
+        scrollElementIntoView(
+          kind === "thought" && extra.groupId
+            ? `thought-group-${extra.groupId}`
+            : assistantMessageId,
+        );
+      });
+    }
+
+    function restartTypingDelay() {
+      setShowTypingByWorkflow((current) => ({ ...current, [targetWorkflowId]: false }));
+      setTypingDelayByWorkflow((current) => ({
+        ...current,
+        [targetWorkflowId]: (current[targetWorkflowId] ?? 0) + 1,
+      }));
+    }
+
     try {
-      const response = await fetch(apiUrl("/chat"), {
+      const response = await fetch(apiUrl("/chat/stream"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -1023,42 +1207,128 @@ function ChatPane({ onResizeStart, width, workflow }) {
           provider: providerId,
           model,
           messages: nextMessages.map(({ role, body }) => ({ role, body })),
-          workflow,
+          workflow: targetWorkflow,
         }),
       });
-      const payload = await response.json();
       if (!response.ok) {
+        const payload = await response.json();
         throw new Error(payload.error || `Chat API returned ${response.status}`);
       }
-      const assistantMessageId = uniqueClientId();
-      setMessages((current) => [
+      if (!response.body) {
+        throw new Error("Chat API did not provide a response stream");
+      }
+
+      let finalReceived = false;
+      const decoder = new TextDecoder();
+      const reader = response.body.getReader();
+      let buffer = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (value) {
+          buffer += decoder.decode(value, { stream: !done });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+          for (const line of lines) {
+            const event = parseChatStreamEvent(line);
+            if (!event) continue;
+
+            if (event.type === "thought") {
+              const thought = String(event.text ?? "").trim();
+              if (!thought) continue;
+              appendAssistantMessage(thought, "thought", { groupId: thoughtGroupId });
+              restartTypingDelay();
+            } else if (event.type === "final") {
+              finalReceived = true;
+              const body = event.message?.body ?? "";
+              if (body.trim()) {
+                appendAssistantMessage(body, "final");
+              }
+            } else if (event.type === "error") {
+              throw new Error(event.error || "Workflow assistant failed");
+            }
+          }
+        }
+        if (done) break;
+      }
+
+      if (buffer.trim()) {
+        const event = parseChatStreamEvent(buffer);
+        if (event?.type === "final") {
+          finalReceived = true;
+          const body = event.message?.body ?? "";
+          if (body.trim()) appendAssistantMessage(body, "final");
+        } else if (event?.type === "error") {
+          throw new Error(event.error || "Workflow assistant failed");
+        }
+      }
+
+      if (!finalReceived) {
+        throw new Error("Workflow assistant stream ended without a final response");
+      }
+      setChatStateByWorkflow((current) => ({
         ...current,
-        {
-          id: assistantMessageId,
-          role: "assistant",
-          body: payload.message?.body ?? "",
-        },
-      ]);
-      window.requestAnimationFrame(() => {
-        scrollElementIntoView(assistantMessageId);
-      });
-      setChatState({ sending: false, error: "" });
+        [targetWorkflowId]: { sending: false, error: "" },
+      }));
     } catch (error) {
-      setChatState({
-        sending: false,
-        error: error instanceof Error ? error.message : "Unable to send message",
-      });
+      setChatStateByWorkflow((current) => ({
+        ...current,
+        [targetWorkflowId]: {
+          sending: false,
+          error: error instanceof Error ? error.message : "Unable to send message",
+        },
+      }));
     }
   }
 
-  function deleteConversation() {
+  function updateWorkflowMessages(targetWorkflowId, nextValue) {
+    setMessagesByWorkflow((current) => {
+      const currentMessages =
+        current[targetWorkflowId] ?? loadChatMessages(chatStorageKeyFor(targetWorkflowId));
+      const nextMessages =
+        typeof nextValue === "function" ? nextValue(currentMessages) : nextValue;
+      window.localStorage.setItem(
+        chatStorageKeyFor(targetWorkflowId),
+        JSON.stringify(nextMessages),
+      );
+      return { ...current, [targetWorkflowId]: nextMessages };
+    });
+  }
+
+  async function deleteConversation() {
     const defaultMessages = defaultChatMessages();
-    window.localStorage.setItem(chatStorageKey, JSON.stringify(defaultMessages));
-    setMessages(defaultMessages);
+    window.localStorage.setItem(chatStorageKeyFor(workflowId), JSON.stringify(defaultMessages));
+    setMessagesByWorkflow((current) => ({ ...current, [workflowId]: defaultMessages }));
     setDraft("");
-    setChatState({ sending: false, error: "" });
-    setShowTypingIndicator(false);
+    setChatStateByWorkflow((current) => ({
+      ...current,
+      [workflowId]: { sending: false, error: "" },
+    }));
+    setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: false }));
+    setTypingDelayByWorkflow((current) => ({ ...current, [workflowId]: 0 }));
+    setExpandedThoughtGroups({});
     setConversationMenuOpen(false);
+
+    if (!workflow?.id) return;
+
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/chat`),
+        { method: "DELETE" },
+      );
+      if (!response.ok) {
+        const payload = await response.json();
+        throw new Error(payload.error || `Chat API returned ${response.status}`);
+      }
+    } catch (error) {
+      setChatStateByWorkflow((current) => ({
+        ...current,
+        [workflowId]: {
+          sending: false,
+          error: error instanceof Error ? error.message : "Unable to delete chat handoff file",
+        },
+      }));
+    }
   }
 
   function scrollMessageNearTop(messageId) {
@@ -1182,23 +1452,23 @@ function ChatPane({ onResizeStart, width, workflow }) {
           </p>
         </div>
 
-        {messages.map((message) => (
-          <div
-            key={message.id}
-            data-message-id={message.id}
-            className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
-          >
-            <div
-              className={`max-w-[86%] rounded-lg px-3 py-2 text-sm leading-6 ${
-                message.role === "user"
-                  ? "bg-brand text-white"
-                  : "border border-line bg-white text-slate-700 shadow-sm"
-              }`}
-            >
-              <pre className="whitespace-pre-wrap font-sans">{message.body}</pre>
-            </div>
-          </div>
-        ))}
+        {chatItems.map((item) =>
+          item.type === "thought-group" ? (
+            <ThoughtGroup
+              key={item.id}
+              expanded={Boolean(expandedThoughtGroups[item.id])}
+              thoughts={item.thoughts}
+              onToggle={() =>
+                setExpandedThoughtGroups((current) => ({
+                  ...current,
+                  [item.id]: !current[item.id],
+                }))
+              }
+            />
+          ) : (
+            <ChatMessageBubble key={item.message.id} message={item.message} />
+          ),
+        )}
         {showTypingIndicator ? <TypingIndicator /> : null}
         {chatState.error ? (
           <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
@@ -1227,7 +1497,7 @@ function ChatPane({ onResizeStart, width, workflow }) {
               {selectedProvider.name} · {model}
             </div>
             <button
-              className="grid h-8 w-8 place-items-center rounded-lg bg-ink text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+              className="grid h-8 w-8 place-items-center rounded-lg bg-ink text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:border dark:border-[#3a3a3d] dark:bg-[#2d2d30] dark:text-[#f2f2f2] dark:hover:border-[#4a4a4f] dark:hover:bg-[#37373d] dark:disabled:border-[#2a2a2a] dark:disabled:bg-[#242426] dark:disabled:text-[#777]"
               disabled={chatState.sending || !draft.trim()}
               title="Send message"
               type="button"
@@ -1259,6 +1529,108 @@ function TypingIndicator() {
   );
 }
 
+function ChatMessageBubble({ message }) {
+  return (
+    <div
+      data-message-id={message.id}
+      className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+    >
+      <div
+        className={`max-w-[86%] rounded-lg px-3 py-2 text-sm leading-6 ${
+          message.role === "user"
+            ? "bg-brand text-white"
+            : "border border-line bg-white text-slate-700 shadow-sm"
+        }`}
+      >
+        <pre className="whitespace-pre-wrap font-sans">{message.body}</pre>
+      </div>
+    </div>
+  );
+}
+
+function ThoughtGroup({ expanded, onToggle, thoughts }) {
+  const count = thoughts.length;
+  const showBottomToggle = expanded && count >= 3;
+  const tokenSummary = extractThoughtTokenSummary(thoughts);
+
+  return (
+    <div className="flex justify-start" data-message-id={thoughts[0]?.groupAnchorId}>
+      <div className="max-w-[86%] rounded-lg border border-line bg-slate-50 text-sm text-slate-700 shadow-sm dark:bg-[#252526] dark:text-[#d4d4d4]">
+        <button
+          className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-slate-100 dark:hover:bg-[#2d2d30]"
+          type="button"
+          onClick={onToggle}
+        >
+          <span className="min-w-0">
+            <span className="block text-xs font-semibold uppercase tracking-[0.08em] text-muted">
+              {expanded ? "Hide thoughts" : "Show thoughts"} ({count})
+            </span>
+            {tokenSummary ? (
+              <span className="mt-0.5 block text-[11px] font-normal normal-case tracking-normal text-muted/80">
+                {tokenSummary}
+              </span>
+            ) : null}
+          </span>
+          <span className="grid h-6 w-6 place-items-center rounded-md text-muted transition">
+            {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+          </span>
+        </button>
+        <div
+          className={`grid transition-all duration-200 ease-out ${
+            expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+          }`}
+        >
+          <div className="overflow-hidden">
+            <div className="space-y-2 border-t border-line px-3 py-3">
+              {thoughts.map((thought, index) => (
+                <div
+                  key={thought.id}
+                  className="rounded-md bg-white px-3 py-2 text-xs leading-5 text-slate-600 dark:bg-[#1e1e1e] dark:text-[#c8c8c8]"
+                >
+                  <div className="mb-1 font-semibold text-muted">Thought {index + 1}</div>
+                  <pre className="whitespace-pre-wrap font-sans">{thought.body}</pre>
+                </div>
+              ))}
+              {showBottomToggle ? (
+                <button
+                  className="mt-2 flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left transition hover:bg-slate-100 dark:hover:bg-[#2d2d30]"
+                  type="button"
+                  onClick={onToggle}
+                >
+                  <span className="min-w-0">
+                    <span className="block text-xs font-semibold uppercase tracking-[0.08em] text-muted">
+                      Hide thoughts ({count})
+                    </span>
+                    {tokenSummary ? (
+                      <span className="mt-0.5 block text-[11px] font-normal normal-case tracking-normal text-muted/80">
+                        {tokenSummary}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className="grid h-6 w-6 place-items-center rounded-md text-muted">
+                    <ChevronUp size={15} />
+                  </span>
+                </button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function extractThoughtTokenSummary(thoughts) {
+  const tokenPattern =
+    /(?:tokens?\s*(?:used|spent|total)?\s*[:=]?\s*([\d,.]+k?)|([\d,.]+k?)\s*tokens?\s*(?:used|spent)?)/i;
+  for (const thought of thoughts) {
+    const match = String(thought?.body ?? "").match(tokenPattern);
+    const value = match?.[1] || match?.[2];
+    if (value) return `${value} tokens`;
+  }
+  return "";
+}
+
 function defaultChatMessages() {
   return [
     {
@@ -1267,6 +1639,10 @@ function defaultChatMessages() {
       body: "Ask me to explain, edit, validate, or design this workflow. I will use the bundled Gofer Flow workflow-builder skill.",
     },
   ];
+}
+
+function chatStorageKeyFor(workflowId) {
+  return `gofer-flow-chat:${workflowId ?? "no-workflow"}`;
 }
 
 function loadChatMessages(storageKey) {
@@ -1282,6 +1658,51 @@ function loadChatMessages(storageKey) {
     return defaultChatMessages();
   }
   return defaultChatMessages();
+}
+
+function buildChatItems(messages) {
+  const items = [];
+  let index = 0;
+
+  while (index < messages.length) {
+    const message = messages[index];
+    if (message.kind !== "thought") {
+      items.push({ type: "message", message });
+      index += 1;
+      continue;
+    }
+
+    const groupId = message.groupId || `legacy-${message.id}`;
+    const thoughts = [];
+    while (
+      index < messages.length &&
+      messages[index].kind === "thought" &&
+      (messages[index].groupId || `legacy-${messages[index].id}`) === groupId
+    ) {
+      thoughts.push({
+        ...messages[index],
+        groupAnchorId: `thought-group-${groupId}`,
+      });
+      index += 1;
+    }
+    items.push({
+      id: `thought-group-${groupId}`,
+      type: "thought-group",
+      thoughts,
+    });
+  }
+
+  return items;
+}
+
+function parseChatStreamEvent(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
 }
 
 function uniqueClientId() {

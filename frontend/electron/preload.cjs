@@ -1,4 +1,4 @@
-const { contextBridge } = require("electron");
+const { contextBridge, ipcRenderer } = require("electron");
 
 const API_BASE_URL_ARG = "--gofer-api-base-url=";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8765";
@@ -24,3 +24,24 @@ function isSafeLocalHttpUrl(value) {
 }
 
 contextBridge.exposeInMainWorld("goferApiBaseUrl", readApiBaseUrl());
+contextBridge.exposeInMainWorld("goferDesktop", {
+  getDataDir: () => ipcRenderer.invoke("gofer:get-data-dir"),
+  listDirectory: (options = {}) =>
+    ipcRenderer.invoke("gofer:list-directory", {
+      currentPath:
+        typeof options.currentPath === "string" ? options.currentPath : "",
+    }),
+  openPath: (targetPath) =>
+    ipcRenderer.invoke("gofer:open-path", {
+      targetPath: typeof targetPath === "string" ? targetPath : "",
+    }),
+  setDataDir: (dataDir) =>
+    ipcRenderer.invoke("gofer:set-data-dir", {
+      dataDir: typeof dataDir === "string" ? dataDir : "",
+    }),
+  selectPath: (options = {}) =>
+    ipcRenderer.invoke("gofer:select-path", {
+      currentPath:
+        typeof options.currentPath === "string" ? options.currentPath : "",
+    }),
+});

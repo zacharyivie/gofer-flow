@@ -7,7 +7,13 @@ from urllib.request import Request, urlopen
 
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.ui import server as server_module
-from gofer.ui.server import create_server, ready_payload, sync_workflow_schedules
+from gofer.core.watcher import WorkflowWatcher
+from gofer.ui.server import (
+    create_server,
+    ready_payload,
+    sync_workflow_schedules,
+    sync_workflow_watchers,
+)
 
 
 def test_ui_server_syncs_workflow_schedules(tmp_path) -> None:
@@ -72,6 +78,31 @@ command = "echo hello"
     sync_workflow_schedules(tmp_path, scheduler)
 
     assert scheduler.list_workflows() == []
+
+
+def test_ui_server_syncs_workflow_watchers(tmp_path) -> None:
+    workflow_path = tmp_path / "watched.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "watched"
+name = "Watched"
+
+[workflow.watch]
+path = "inputs"
+glob = "*.txt"
+
+[[nodes]]
+id = "hello"
+type = "bash_command"
+command = "echo hello"
+""".strip()
+    )
+    watcher = WorkflowWatcher()
+
+    sync_workflow_watchers(tmp_path, watcher)
+
+    assert [item["id"] for item in watcher.list_workflows()] == ["watched"]
 
 
 def test_ui_server_dynamic_port_reports_bound_port(tmp_path) -> None:

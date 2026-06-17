@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import shutil
 import tempfile
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Any, overload
@@ -15,7 +17,9 @@ from gofer.core.operations import Operation, OperationType
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
+from gofer.ui.chat import delete_workflow_chat_prompt
 from gofer.utils.paths import get_data_dir
+from gofer.utils.run_state import request_workflow_stop, workflow_stop_path
 
 
 class WorkflowAlreadyExistsError(ValueError):
@@ -43,6 +47,8 @@ _subscriptions = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
 }
+_active_run_stop_events: dict[tuple[str, str], threading.Event] = {}
+_active_run_lock = threading.Lock()
 
 
 def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
@@ -121,6 +127,17 @@ def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> d
     if not path.exists():
         raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
     path.unlink()
+    shutil.rmtree(base / "logs" / workflow_id, ignore_errors=True)
+    delete_workflow_chat_prompt(base, workflow_id)
+    return {"workflowId": workflow_id, "deleted": True}
+
+
+def delete_workflow_chat_payload(
+    workflow_id: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    delete_workflow_chat_prompt(base, workflow_id)
     return {"workflowId": workflow_id, "deleted": True}
 
 
@@ -155,6 +172,13 @@ async def run_workflow_payload(
     if not path.exists():
         raise WorkflowRunError(f"Workflow '{workflow_id}' not found")
 
+    run_key = _run_key(base, workflow_id)
+    cancel_event = threading.Event()
+    with _active_run_lock:
+        if run_key in _active_run_stop_events:
+            raise WorkflowRunError(f"Workflow '{workflow_id}' is already running")
+        _active_run_stop_events[run_key] = cancel_event
+
     try:
         workflow = AgenticWorkflow.from_file(path)
         workflow.validate()
@@ -163,9 +187,14 @@ async def run_workflow_payload(
             _subscriptions,
             dry_run=dry_run,
             log_base_dir=base / "logs",
+            cancel_event=cancel_event,
+            stop_file=workflow_stop_path(workflow_id, base),
         ).run()
     except Exception as exc:
         raise WorkflowRunError(str(exc)) from exc
+    finally:
+        with _active_run_lock:
+            _active_run_stop_events.pop(run_key, None)
 
     return {
         "workflowId": result.workflow_id,
@@ -188,6 +217,34 @@ async def run_workflow_payload(
             for node_id, output in result.node_outputs.items()
         },
     }
+
+
+def stop_workflow_run_payload(
+    workflow_id: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    with _active_run_lock:
+        cancel_event = _active_run_stop_events.get(_run_key(base, workflow_id))
+
+    if cancel_event is None:
+        path = base / f"{workflow_id}.toml"
+        if not path.exists():
+            return {"workflowId": workflow_id, "stopped": False, "message": "No active run"}
+        request_workflow_stop(workflow_id, base)
+        return {
+            "workflowId": workflow_id,
+            "stopped": True,
+            "message": "Stop requested",
+        }
+
+    cancel_event.set()
+    request_workflow_stop(workflow_id, base)
+    return {"workflowId": workflow_id, "stopped": True}
+
+
+def _run_key(data_dir: Path, workflow_id: str) -> tuple[str, str]:
+    return (str(data_dir.resolve()), workflow_id)
 
 
 def latest_workflow_log_payload(
@@ -271,6 +328,7 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
             id=str(payload["id"]),
             name=str(payload.get("name") or payload["id"]),
             schedule=payload.get("schedule"),
+            watch=payload.get("watch"),
             max_total_node_runs=int(payload.get("maxTotalNodeRuns") or 1000),
         )
     )
@@ -371,6 +429,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         )
 
     schedule = _model_dump(workflow.config.schedule) if workflow.config.schedule else None
+    watch = _model_dump(workflow.config.watch) if workflow.config.watch else None
     status = _latest_run_status(workflow.config.id, path)
     tags = [status.lower()]
     operation_types = sorted({str(node["type"]) for node in nodes})
@@ -379,11 +438,12 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
     return {
         "id": workflow.config.id,
         "name": workflow.config.name,
-        "description": _workflow_description(workflow, schedule),
+        "description": _workflow_description(workflow, schedule, watch),
         "status": status,
         "updatedAt": _updated_at(path),
         "sourcePath": str(path) if path else None,
         "schedule": schedule,
+        "watch": watch,
         "maxTotalNodeRuns": workflow.config.max_total_node_runs,
         "tags": tags,
         "agents": {
@@ -428,6 +488,13 @@ def _clean_operation_data(data: dict[str, Any]) -> dict[str, Any]:
         data["args"] = data.get("args") or []
     if op_type == OperationType.AGENT and not data.get("fan_source"):
         data["fan_source"] = None
+    if op_type == OperationType.AGENT:
+        if not data.get("prompt_path"):
+            data.pop("prompt_path", None)
+        if not data.get("skill_name"):
+            data.pop("skill_name", None)
+    if op_type == OperationType.PROMPT_FILE and not data.get("template_path"):
+        data.pop("template_path", None)
     return data
 
 
@@ -447,9 +514,38 @@ def _operation_meta(operation: dict[str, Any]) -> str:
             return str(operation.get("command", "command"))
         case OperationType.PYTHON_SCRIPT | OperationType.SHELL_SCRIPT:
             return str(operation.get("script_path", "script"))
+        case OperationType.READ_FILE:
+            return f"read {operation.get('path', 'file')}"
+        case OperationType.WRITE_FILE:
+            return f"write {operation.get('path', 'file')}"
+        case OperationType.COPY_FILE:
+            return (
+                f"copy {operation.get('source_path', 'source')} "
+                f"to {operation.get('destination_path', 'destination')}"
+            )
+        case OperationType.MOVE_FILE:
+            return (
+                f"move {operation.get('source_path', 'source')} "
+                f"to {operation.get('destination_path', 'destination')}"
+            )
+        case OperationType.DELETE_FILE:
+            return f"delete {operation.get('path', 'file')}"
+        case OperationType.OPEN_RESOURCE:
+            return f"open {operation.get('target', 'target')}"
+        case OperationType.PROMPT_FILE:
+            return f"prompt {operation.get('output_path', 'file')}"
+        case OperationType.COMMON_LLM_TASK:
+            return f"{operation.get('task', 'summarize')} with {operation.get('agent_id', 'agent')}"
+        case OperationType.LOCAL_VECTORIZE:
+            return f"index {operation.get('source_path', 'files')}"
+        case OperationType.LOCAL_SEARCH:
+            return f"search {operation.get('index_path', 'index')}"
         case OperationType.AGENT:
             agent_id = operation.get("agent_id", "agent")
             prompt_path = operation.get("prompt_path")
+            skill_name = operation.get("skill_name")
+            if skill_name:
+                return f"{agent_id} · /{skill_name}"
             return f"{agent_id} · {prompt_path}" if prompt_path else str(agent_id)
     return str(operation.get("type", "operation"))
 
@@ -462,12 +558,17 @@ def _edge_label(condition: str, output_pattern: str | None) -> str:
     return condition.replace("_", " ")
 
 
-def _workflow_description(workflow: AgenticWorkflow, schedule: dict[str, Any] | None) -> str:
+def _workflow_description(
+    workflow: AgenticWorkflow,
+    schedule: dict[str, Any] | None,
+    watch: dict[str, Any] | None,
+) -> str:
     node_count = len(list(workflow.graph._graph.nodes()))
     edge_count = len(list(workflow.graph._graph.edges()))
     agent_count = len(workflow.agents)
     schedule_text = f" Scheduled with {schedule['cron_expression']}." if schedule else ""
-    return f"{node_count} nodes, {edge_count} edges, {agent_count} agents.{schedule_text}"
+    watch_text = f" Watching {watch['path']}." if watch else ""
+    return f"{node_count} nodes, {edge_count} edges, {agent_count} agents.{schedule_text}{watch_text}"
 
 
 def _workflow_status(schedule: dict[str, Any] | None) -> str:

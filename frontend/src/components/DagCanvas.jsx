@@ -8,12 +8,24 @@ import {
   ChevronDown,
   ChevronUp,
   Command,
+  Copy,
+  Database,
   Download,
+  ExternalLink,
+  FilePenLine,
+  Files,
+  FileText,
+  FileX,
+  FolderOpen,
   LocateFixed,
   Loader2,
+  MoveRight,
   Play,
   Plus,
   Route,
+  Search,
+  Sparkles,
+  Square,
   Terminal,
   Trash2,
   Upload,
@@ -45,6 +57,66 @@ const nodeStyles = {
     border: "border-sky-200",
     chip: "bg-sky-50 text-sky-700 border-sky-100",
   },
+  read_file: {
+    icon: FileText,
+    accent: "bg-cyan-700",
+    border: "border-cyan-200",
+    chip: "bg-cyan-50 text-cyan-700 border-cyan-100",
+  },
+  write_file: {
+    icon: FilePenLine,
+    accent: "bg-emerald-700",
+    border: "border-emerald-200",
+    chip: "bg-emerald-50 text-emerald-700 border-emerald-100",
+  },
+  copy_file: {
+    icon: Files,
+    accent: "bg-indigo-700",
+    border: "border-indigo-200",
+    chip: "bg-indigo-50 text-indigo-700 border-indigo-100",
+  },
+  move_file: {
+    icon: MoveRight,
+    accent: "bg-violet-700",
+    border: "border-violet-200",
+    chip: "bg-violet-50 text-violet-700 border-violet-100",
+  },
+  delete_file: {
+    icon: FileX,
+    accent: "bg-rose-700",
+    border: "border-rose-200",
+    chip: "bg-rose-50 text-rose-700 border-rose-100",
+  },
+  open_resource: {
+    icon: ExternalLink,
+    accent: "bg-blue-700",
+    border: "border-blue-200",
+    chip: "bg-blue-50 text-blue-700 border-blue-100",
+  },
+  prompt_file: {
+    icon: FilePenLine,
+    accent: "bg-fuchsia-700",
+    border: "border-fuchsia-200",
+    chip: "bg-fuchsia-50 text-fuchsia-700 border-fuchsia-100",
+  },
+  common_llm_task: {
+    icon: Sparkles,
+    accent: "bg-orange-700",
+    border: "border-orange-200",
+    chip: "bg-orange-50 text-orange-700 border-orange-100",
+  },
+  local_vectorize: {
+    icon: Database,
+    accent: "bg-lime-700",
+    border: "border-lime-200",
+    chip: "bg-lime-50 text-lime-700 border-lime-100",
+  },
+  local_search: {
+    icon: Search,
+    accent: "bg-purple-700",
+    border: "border-purple-200",
+    chip: "bg-purple-50 text-purple-700 border-purple-100",
+  },
 };
 
 const defaultSettings = {
@@ -55,6 +127,10 @@ const defaultSettings = {
 };
 const minZoom = 0.45;
 const maxZoom = 1.8;
+const graphWorldSize = 20000;
+const graphWorldOffset = graphWorldSize / 2;
+const nodeWidth = 220;
+const nodeHeight = 96;
 const isWindows =
   typeof navigator !== "undefined" &&
   /win/i.test(`${navigator.userAgent} ${navigator.platform}`);
@@ -84,6 +160,93 @@ function defaultOperation(type, nodeNumber = 1) {
         args: [],
         env: {},
       };
+    case "read_file":
+      return {
+        type,
+        path: "data/input.txt",
+        encoding: "utf-8",
+        errors: "strict",
+      };
+    case "write_file":
+      return {
+        type,
+        path: "data/output.txt",
+        content: "",
+        encoding: "utf-8",
+        create_dirs: true,
+        overwrite: true,
+        append: false,
+      };
+    case "copy_file":
+      return {
+        type,
+        source_path: "data/input.txt",
+        destination_path: "data/output.txt",
+        create_dirs: true,
+        overwrite: false,
+      };
+    case "move_file":
+      return {
+        type,
+        source_path: "data/input.txt",
+        destination_path: "data/archive/input.txt",
+        create_dirs: true,
+        overwrite: false,
+      };
+    case "delete_file":
+      return {
+        type,
+        path: "data/old.txt",
+        use_trash: true,
+        recursive: false,
+        missing_ok: false,
+      };
+    case "open_resource":
+      return {
+        type,
+        target: "https://example.com",
+        resource_type: "auto",
+        args: [],
+      };
+    case "prompt_file":
+      return {
+        type,
+        output_path: `prompts/generated-${nodeNumber}.md`,
+        template: "Use this context:\n\n{{_piped_input}}",
+        template_path: "",
+        variables: {},
+        encoding: "utf-8",
+        create_dirs: true,
+        overwrite: true,
+      };
+    case "common_llm_task":
+      return {
+        type,
+        agent_id: `agent-${nodeNumber}`,
+        task: "summarize",
+        target: "",
+        instructions: "",
+        working_dir: ".",
+        input_mapping: {},
+      };
+    case "local_vectorize":
+      return {
+        type,
+        source_path: "docs",
+        index_path: "indexes/docs.json",
+        glob: "**/*",
+        recursive: true,
+        chunk_size: 1200,
+        chunk_overlap: 120,
+        encoding: "utf-8",
+      };
+    case "local_search":
+      return {
+        type,
+        index_path: "indexes/docs.json",
+        query: "",
+        top_k: 5,
+      };
     case "agent":
     default:
       return {
@@ -91,6 +254,7 @@ function defaultOperation(type, nodeNumber = 1) {
         agent_id: `agent-${nodeNumber}`,
         prompt_path: `prompts/agent-${nodeNumber}.md`,
         working_dir: ".",
+        skill_name: "",
         dynamic_count: 1,
         input_mapping: {},
         fan_source: null,
@@ -117,7 +281,28 @@ function nodeMetaFromOperation(operation = {}) {
     case "python_script":
     case "shell_script":
       return operation.script_path || "script";
+    case "read_file":
+      return `read ${operation.path || "file"}`;
+    case "write_file":
+      return `write ${operation.path || "file"}`;
+    case "copy_file":
+      return `copy ${operation.source_path || "source"} to ${operation.destination_path || "destination"}`;
+    case "move_file":
+      return `move ${operation.source_path || "source"} to ${operation.destination_path || "destination"}`;
+    case "delete_file":
+      return `delete ${operation.path || "file"}`;
+    case "open_resource":
+      return `open ${operation.target || "target"}`;
+    case "prompt_file":
+      return `prompt ${operation.output_path || "file"}`;
+    case "common_llm_task":
+      return `${operation.task || "summarize"} with ${operation.agent_id || "agent"}`;
+    case "local_vectorize":
+      return `index ${operation.source_path || "files"}`;
+    case "local_search":
+      return `search ${operation.index_path || "index"}`;
     case "agent":
+      if (operation.skill_name) return `${operation.agent_id || "agent"} · /${operation.skill_name}`;
       return operation.prompt_path
         ? `${operation.agent_id || "agent"} · ${operation.prompt_path}`
         : operation.agent_id || "agent";
@@ -171,6 +356,7 @@ export default function DagCanvas({
   onLoadLatestLog,
   onRunWorkflow,
   onSelectRunLog,
+  onStopWorkflow,
   onValidateWorkflow,
   onWorkflowChange,
 }) {
@@ -241,7 +427,11 @@ export default function DagCanvas({
       meta: nodeMetaFromOperation(operation),
     };
 
-    if (operation.type === "agent" && patch.agent_id && !workflow.agents?.[patch.agent_id]) {
+    if (
+      (operation.type === "agent" || operation.type === "common_llm_task") &&
+      patch.agent_id &&
+      !workflow.agents?.[patch.agent_id]
+    ) {
       onWorkflowChange({
         ...workflow,
         agents: {
@@ -280,7 +470,10 @@ export default function DagCanvas({
       },
       meta: nodeMetaFromOperation(nextOperation),
     };
-    if (type === "agent" && !workflow.agents?.[nextOperation.agent_id]) {
+    if (
+      (type === "agent" || type === "common_llm_task") &&
+      !workflow.agents?.[nextOperation.agent_id]
+    ) {
       onWorkflowChange({
         ...workflow,
         agents: {
@@ -361,8 +554,8 @@ export default function DagCanvas({
   function handleNodePointerMove(event, nodeId) {
     if (draggingNodeId !== nodeId) return;
     updateNode(nodeId, {
-      x: Math.max(24, Math.min(940, nodesById[nodeId].x + event.movementX / viewport.scale)),
-      y: Math.max(24, Math.min(470, nodesById[nodeId].y + event.movementY / viewport.scale)),
+      x: nodesById[nodeId].x + event.movementX / viewport.scale,
+      y: nodesById[nodeId].y + event.movementY / viewport.scale,
     });
   }
 
@@ -547,6 +740,15 @@ export default function DagCanvas({
               {currentWorkflowRunning ? <Loader2 size={17} className="animate-spin" /> : <Play size={17} />}
             </button>
             <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={!currentWorkflowRunning || Boolean(runState?.stopping)}
+              title="Stop workflow run"
+              type="button"
+              onClick={() => onStopWorkflow(workflow)}
+            >
+              <Square size={15} fill="currentColor" strokeWidth={1.7} />
+            </button>
+            <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
               title="Add node"
               type="button"
@@ -627,13 +829,24 @@ export default function DagCanvas({
           onPointerCancel={handleCanvasPointerUp}
           onWheel={handleCanvasWheel}
         >
+          <WorkflowTriggerStrip schedule={workflow.schedule} watch={workflow.watch} />
           <div
-            className="absolute left-0 top-0 h-[620px] w-[1080px] origin-top-left"
+            className="absolute left-0 top-0 h-0 w-0 origin-top-left overflow-visible"
             style={{
               transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
             }}
           >
-            <svg className="pointer-events-none absolute inset-0 h-full w-full" aria-hidden="true">
+            <svg
+              className="pointer-events-none absolute overflow-visible"
+              aria-hidden="true"
+              style={{
+                left: -graphWorldOffset,
+                top: -graphWorldOffset,
+                width: graphWorldSize,
+                height: graphWorldSize,
+              }}
+              viewBox={`0 0 ${graphWorldSize} ${graphWorldSize}`}
+            >
               <defs>
                 <marker
                   id="arrowhead"
@@ -646,64 +859,45 @@ export default function DagCanvas({
                   <path d="M0,0 L0,6 L9,3 z" fill="#718096" />
                 </marker>
               </defs>
-              {workflow.edges.map((edge) => {
-                const from = nodesById[edge.from];
-                const to = nodesById[edge.to];
-                if (!from || !to) return null;
+              <g transform={`translate(${graphWorldOffset} ${graphWorldOffset})`}>
+                {workflow.edges.map((edge) => {
+                  const from = nodesById[edge.from];
+                  const to = nodesById[edge.to];
+                  if (!from || !to) return null;
 
-                const selfLoop = edge.from === edge.to;
-                const reciprocal = workflow.edges.some(
-                  (candidate) =>
-                    candidate.id !== edge.id &&
-                    candidate.from === edge.to &&
-                    candidate.to === edge.from,
-                );
-                const laneOffset = reciprocal
-                  ? stableEdgeDirection(edge.from, edge.to) * 44
-                  : 0;
-                const start = selfLoop
-                  ? { x: from.x + 166, y: from.y }
-                  : edgeGoesRight(from, to)
-                    ? { x: from.x + 220, y: from.y + 48 }
-                    : { x: from.x, y: from.y + 48 };
-                const end = selfLoop
-                  ? { x: from.x + 54, y: from.y }
-                  : edgeGoesRight(from, to)
-                    ? { x: to.x, y: to.y + 48 }
-                    : { x: to.x + 220, y: to.y + 48 };
-                const direction = end.x >= start.x ? 1 : -1;
-                const controlDistance = Math.max(80, Math.abs(end.x - start.x) / 2);
-                const path = selfLoop
-                  ? `M ${start.x} ${start.y} C ${start.x + 70} ${start.y - 70}, ${end.x - 70} ${end.y - 70}, ${end.x} ${end.y}`
-                  : `M ${start.x} ${start.y} C ${start.x + direction * controlDistance} ${start.y + laneOffset}, ${end.x - direction * controlDistance} ${end.y + laneOffset}, ${end.x} ${end.y}`;
-                const labelPosition = selfLoop
-                  ? { x: from.x + 110, y: from.y - 54 }
-                  : {
-                      x: (start.x + end.x) / 2,
-                      y: (start.y + end.y) / 2 + laneOffset - 12,
-                    };
+                  const reciprocal = workflow.edges.some(
+                    (candidate) =>
+                      candidate.id !== edge.id &&
+                      candidate.from === edge.to &&
+                      candidate.to === edge.from,
+                  );
+                  const laneOffset = reciprocal
+                    ? stableEdgeDirection(edge.from, edge.to) * 44
+                    : 0;
+                  const geometry = edgeGeometry(from, to, edge.from === edge.to, laneOffset);
 
-                return (
-                  <g key={edge.id}>
-                    <path
-                      d={path}
-                      fill="none"
-                      markerEnd="url(#arrowhead)"
-                      stroke="#718096"
-                      strokeLinecap="round"
-                      strokeWidth="2.5"
-                    />
-                    <text
-                      x={labelPosition.x}
-                      y={labelPosition.y}
-                      className="fill-slate-500 text-[12px] font-medium"
-                      textAnchor="middle"
-                    >
-                      {edge.label}
-                    </text>
-                  </g>
-                );
-              })}
+                  return (
+                    <g key={edge.id}>
+                      <path
+                        d={geometry.path}
+                        fill="none"
+                        markerEnd="url(#arrowhead)"
+                        stroke="#718096"
+                        strokeLinecap="round"
+                        strokeWidth="2.5"
+                      />
+                      <text
+                        x={geometry.label.x}
+                        y={geometry.label.y}
+                        className="fill-slate-500 text-[12px] font-medium"
+                        textAnchor="middle"
+                      >
+                        {edge.label}
+                      </text>
+                    </g>
+                  );
+                })}
+              </g>
             </svg>
 
             {workflow.nodes.map((node) => (
@@ -758,6 +952,32 @@ export default function DagCanvas({
         onShowLatest={onLoadLatestLog}
         onToggle={() => setLogCollapsed((current) => !current)}
       />
+    </div>
+  );
+}
+
+function WorkflowTriggerStrip({ schedule, watch }) {
+  if (!schedule && !watch) return null;
+
+  return (
+    <div className="pointer-events-none absolute left-5 top-5 z-20 flex max-w-[calc(100%-40px)] flex-wrap gap-2">
+      {schedule ? (
+        <div className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95">
+          <CalendarDays size={14} className="text-teal-600" />
+          <span className="truncate">
+            Starts on schedule: {schedule.cron_expression}
+          </span>
+        </div>
+      ) : null}
+      {watch ? (
+        <div className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95">
+          <FolderOpen size={14} className="text-teal-600" />
+          <span className="truncate">
+            Starts when files change: {watch.path}{watch.glob ? `/${watch.glob}` : ""}
+            {watch.mode ? ` (${watch.mode})` : ""}
+          </span>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1152,10 +1372,11 @@ function Inspector({
   const operation = node?.operation ?? defaultOperation(node?.type ?? "agent");
   const settings = { ...defaultSettings, ...(node?.settings ?? {}) };
   const agentConfig =
-    operation.type === "agent"
+    operation.type === "agent" || operation.type === "common_llm_task"
       ? agents[operation.agent_id] ?? defaultAgentConfig(operation.agent_id || "agent")
       : null;
   const schedule = workflow.schedule ?? null;
+  const watch = workflow.watch ?? null;
   const connectedEdges = node
     ? edges.filter((edge) => edge.from === node.id || edge.to === node.id)
     : [];
@@ -1170,6 +1391,18 @@ function Inspector({
     const currentSchedule = schedule ?? { cron_expression: "0 9 * * *", timezone: "UTC" };
     const nextSchedule = { ...currentSchedule, ...patch };
     onWorkflowChange({ schedule: nextSchedule });
+  }
+
+  function updateWorkflowWatch(patch) {
+    const currentWatch = watch ?? {
+      path: ".",
+      glob: "*",
+      recursive: false,
+      debounce_seconds: 1,
+      mode: "batch",
+      max_concurrency: 1,
+    };
+    onWorkflowChange({ watch: { ...currentWatch, ...patch } });
   }
 
   return (
@@ -1263,6 +1496,76 @@ function Inspector({
                 </p>
               )}
             </InspectorSection>
+
+            <InspectorSection title="File watcher">
+              <ToggleField
+                checked={Boolean(watch)}
+                label="Watch files"
+                onChange={(checked) =>
+                  onWorkflowChange({
+                    watch: checked
+                      ? watch ?? {
+                          path: ".",
+                          glob: "*",
+                          recursive: false,
+                          debounce_seconds: 1,
+                          mode: "batch",
+                          max_concurrency: 1,
+                        }
+                      : null,
+                  })
+                }
+              />
+              {watch ? (
+                <>
+                  <TextField
+                    label="Path"
+                    value={watch.path ?? ""}
+                    onChange={(value) => updateWorkflowWatch({ path: value })}
+                    pathPicker
+                    placeholder="."
+                  />
+                  <TextField
+                    label="Glob"
+                    value={watch.glob ?? "*"}
+                    onChange={(value) => updateWorkflowWatch({ glob: value })}
+                    placeholder="*"
+                  />
+                  <ToggleField
+                    checked={Boolean(watch.recursive)}
+                    label="Recursive"
+                    onChange={(checked) => updateWorkflowWatch({ recursive: checked })}
+                  />
+                  <SelectField
+                    label="Mode"
+                    value={watch.mode ?? "batch"}
+                    options={[
+                      ["batch", "Batch changes into one run"],
+                      ["queue", "Queue one run per file"],
+                      ["fanout", "Fan-out changed files"],
+                    ]}
+                    onChange={(value) => updateWorkflowWatch({ mode: value })}
+                  />
+                  <NumberField
+                    label="Max concurrency"
+                    min="1"
+                    value={watch.max_concurrency ?? 1}
+                    onChange={(value) => updateWorkflowWatch({ max_concurrency: value || 1 })}
+                  />
+                  <NumberField
+                    label="Debounce seconds"
+                    min="0"
+                    step="0.1"
+                    value={watch.debounce_seconds ?? 1}
+                    onChange={(value) => updateWorkflowWatch({ debounce_seconds: value || 0 })}
+                  />
+                </>
+              ) : (
+                <p className="text-sm leading-6 text-muted">
+                  Turn file watching on to run this workflow when a watched file changes.
+                </p>
+              )}
+            </InspectorSection>
           </div>
         </InspectorPanel>
 
@@ -1289,6 +1592,16 @@ function Inspector({
                 ["bash_command", commandNodeLabel],
                 ["python_script", "Python script"],
                 ["shell_script", "Shell script"],
+                ["read_file", "Read file"],
+                ["write_file", "Write file"],
+                ["copy_file", "Copy file"],
+                ["move_file", "Move file"],
+                ["delete_file", "Delete file"],
+                ["open_resource", "Open app / URL / file"],
+                ["prompt_file", "Prompt file"],
+                ["common_llm_task", "Common LLM task"],
+                ["local_vectorize", "Local vector index"],
+                ["local_search", "Local search"],
               ]}
               onChange={onTypeChange}
             />
@@ -1334,6 +1647,7 @@ function Inspector({
                 label="Working directory"
                 value={operation.working_dir ?? ""}
                 onChange={(value) => onOperationChange({ working_dir: value })}
+                pathPicker
                 placeholder="."
               />
               <KeyValueField
@@ -1352,6 +1666,7 @@ function Inspector({
                 label="Script path"
                 value={operation.script_path ?? ""}
                 onChange={(value) => onOperationChange({ script_path: value })}
+                pathPicker
               />
               <ListField
                 label="Arguments"
@@ -1363,6 +1678,314 @@ function Inspector({
                 label="Environment"
                 value={operation.env ?? {}}
                 onChange={(value) => onOperationChange({ env: value })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "read_file" ? (
+            <InspectorSection title="Read file">
+              <TextField
+                label="Path"
+                value={operation.path ?? ""}
+                onChange={(value) => onOperationChange({ path: value })}
+                pathPicker
+              />
+              <TextField
+                label="Encoding"
+                value={operation.encoding ?? "utf-8"}
+                onChange={(value) => onOperationChange({ encoding: value })}
+              />
+              <SelectField
+                label="Decode errors"
+                value={operation.errors ?? "strict"}
+                options={[
+                  ["strict", "Fail on invalid text"],
+                  ["replace", "Replace invalid text"],
+                  ["ignore", "Ignore invalid text"],
+                ]}
+                onChange={(value) => onOperationChange({ errors: value })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "write_file" ? (
+            <InspectorSection title="Write file">
+              <TextField
+                label="Path"
+                value={operation.path ?? ""}
+                onChange={(value) => onOperationChange({ path: value })}
+                pathPicker
+              />
+              <TextareaField
+                label="Content"
+                rows={5}
+                value={operation.content ?? ""}
+                onChange={(value) => onOperationChange({ content: value })}
+                placeholder="Leave empty to write piped input"
+              />
+              <TextField
+                label="Encoding"
+                value={operation.encoding ?? "utf-8"}
+                onChange={(value) => onOperationChange({ encoding: value })}
+              />
+              <ToggleField
+                checked={operation.create_dirs !== false}
+                label="Create parent folders"
+                onChange={(checked) => onOperationChange({ create_dirs: checked })}
+              />
+              <ToggleField
+                checked={operation.overwrite !== false}
+                label="Overwrite existing file"
+                onChange={(checked) => onOperationChange({ overwrite: checked })}
+              />
+              <ToggleField
+                checked={Boolean(operation.append)}
+                label="Append instead of replace"
+                onChange={(checked) => onOperationChange({ append: checked })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "copy_file" || operation.type === "move_file" ? (
+            <InspectorSection title={operation.type === "copy_file" ? "Copy file" : "Move file"}>
+              <TextField
+                label="Source path"
+                value={operation.source_path ?? ""}
+                onChange={(value) => onOperationChange({ source_path: value })}
+                pathPicker
+              />
+              <TextField
+                label="Destination path"
+                value={operation.destination_path ?? ""}
+                onChange={(value) => onOperationChange({ destination_path: value })}
+                pathPicker
+              />
+              <ToggleField
+                checked={operation.create_dirs !== false}
+                label="Create parent folders"
+                onChange={(checked) => onOperationChange({ create_dirs: checked })}
+              />
+              <ToggleField
+                checked={Boolean(operation.overwrite)}
+                label="Overwrite existing destination"
+                onChange={(checked) => onOperationChange({ overwrite: checked })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "delete_file" ? (
+            <InspectorSection title="Delete file">
+              <TextField
+                label="Path"
+                value={operation.path ?? ""}
+                onChange={(value) => onOperationChange({ path: value })}
+                pathPicker
+              />
+              <ToggleField
+                checked={operation.use_trash !== false}
+                label="Move to Gofer trash"
+                onChange={(checked) => onOperationChange({ use_trash: checked })}
+              />
+              <ToggleField
+                checked={Boolean(operation.recursive)}
+                label="Allow recursive folder delete"
+                onChange={(checked) => onOperationChange({ recursive: checked })}
+              />
+              <ToggleField
+                checked={Boolean(operation.missing_ok)}
+                label="Succeed if missing"
+                onChange={(checked) => onOperationChange({ missing_ok: checked })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "open_resource" ? (
+            <InspectorSection title="Open app / URL / file">
+              <TextField
+                label="Target"
+                value={operation.target ?? ""}
+                onChange={(value) => onOperationChange({ target: value })}
+                pathPicker
+                placeholder="File, folder, URL, or app path"
+              />
+              <SelectField
+                label="Type"
+                value={operation.resource_type ?? "auto"}
+                options={[
+                  ["auto", "Auto"],
+                  ["file", "File"],
+                  ["folder", "Folder"],
+                  ["url", "URL"],
+                  ["app", "App"],
+                ]}
+                onChange={(value) => onOperationChange({ resource_type: value })}
+              />
+              <ListField
+                label="App arguments"
+                value={operation.args ?? []}
+                onChange={(value) => onOperationChange({ args: value })}
+                placeholder="--flag, value"
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "prompt_file" ? (
+            <InspectorSection title="Prompt file">
+              <TextField
+                label="Output path"
+                value={operation.output_path ?? ""}
+                onChange={(value) => onOperationChange({ output_path: value })}
+                pathPicker
+              />
+              <TextField
+                label="Template path"
+                value={operation.template_path ?? ""}
+                onChange={(value) => onOperationChange({ template_path: value })}
+                pathPicker
+                placeholder="Optional"
+              />
+              <TextareaField
+                label="Inline template"
+                rows={5}
+                value={operation.template ?? ""}
+                onChange={(value) => onOperationChange({ template: value })}
+                placeholder="Use {{variables}} and {{_piped_input}}"
+              />
+              <KeyValueField
+                label="Variables"
+                value={operation.variables ?? {}}
+                onChange={(value) => onOperationChange({ variables: value })}
+              />
+              <TextField
+                label="Encoding"
+                value={operation.encoding ?? "utf-8"}
+                onChange={(value) => onOperationChange({ encoding: value })}
+              />
+              <ToggleField
+                checked={operation.create_dirs !== false}
+                label="Create parent folders"
+                onChange={(checked) => onOperationChange({ create_dirs: checked })}
+              />
+              <ToggleField
+                checked={operation.overwrite !== false}
+                label="Overwrite existing file"
+                onChange={(checked) => onOperationChange({ overwrite: checked })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "common_llm_task" ? (
+            <>
+              <InspectorSection title="Common LLM task">
+                <TextField
+                  label="Agent ID"
+                  value={operation.agent_id ?? ""}
+                  onChange={(value) => onOperationChange({ agent_id: value })}
+                />
+                <SelectField
+                  label="Task"
+                  value={operation.task ?? "summarize"}
+                  options={[
+                    ["summarize", "Summarize"],
+                    ["review", "Review"],
+                    ["explain", "Explain"],
+                    ["extract", "Extract"],
+                    ["rewrite", "Rewrite"],
+                    ["classify", "Classify"],
+                  ]}
+                  onChange={(value) => onOperationChange({ task: value })}
+                />
+                <TextareaField
+                  label="Target"
+                  rows={3}
+                  value={operation.target ?? ""}
+                  onChange={(value) => onOperationChange({ target: value })}
+                  placeholder="Text, file path, URL, or leave blank for piped input"
+                />
+                <TextareaField
+                  label="Instructions"
+                  rows={4}
+                  value={operation.instructions ?? ""}
+                  onChange={(value) => onOperationChange({ instructions: value })}
+                />
+                <TextField
+                  label="Working directory"
+                  value={operation.working_dir ?? ""}
+                  onChange={(value) => onOperationChange({ working_dir: value })}
+                  pathPicker
+                />
+                <KeyValueField
+                  label="Input mapping"
+                  value={operation.input_mapping ?? {}}
+                  onChange={(value) => onOperationChange({ input_mapping: value })}
+                />
+              </InspectorSection>
+              <AgentConfigSection
+                agentConfig={agentConfig}
+                agentId={operation.agent_id}
+                onAgentChange={onAgentChange}
+              />
+            </>
+          ) : null}
+
+          {operation.type === "local_vectorize" ? (
+            <InspectorSection title="Local vector index">
+              <TextField
+                label="Source path"
+                value={operation.source_path ?? ""}
+                onChange={(value) => onOperationChange({ source_path: value })}
+                pathPicker
+              />
+              <TextField
+                label="Index path"
+                value={operation.index_path ?? ""}
+                onChange={(value) => onOperationChange({ index_path: value })}
+                pathPicker
+              />
+              <TextField
+                label="Glob"
+                value={operation.glob ?? "**/*"}
+                onChange={(value) => onOperationChange({ glob: value })}
+              />
+              <ToggleField
+                checked={operation.recursive !== false}
+                label="Recursive"
+                onChange={(checked) => onOperationChange({ recursive: checked })}
+              />
+              <NumberField
+                label="Chunk size"
+                min="100"
+                value={operation.chunk_size ?? 1200}
+                onChange={(value) => onOperationChange({ chunk_size: value || 1200 })}
+              />
+              <NumberField
+                label="Chunk overlap"
+                min="0"
+                value={operation.chunk_overlap ?? 120}
+                onChange={(value) => onOperationChange({ chunk_overlap: value || 0 })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "local_search" ? (
+            <InspectorSection title="Local search">
+              <TextField
+                label="Index path"
+                value={operation.index_path ?? ""}
+                onChange={(value) => onOperationChange({ index_path: value })}
+                pathPicker
+              />
+              <TextareaField
+                label="Query"
+                rows={3}
+                value={operation.query ?? ""}
+                onChange={(value) => onOperationChange({ query: value })}
+              />
+              <NumberField
+                label="Top K"
+                min="1"
+                value={operation.top_k ?? 5}
+                onChange={(value) => onOperationChange({ top_k: value || 5 })}
               />
             </InspectorSection>
           ) : null}
@@ -1379,11 +2002,20 @@ function Inspector({
                   label="Prompt path"
                   value={operation.prompt_path ?? ""}
                   onChange={(value) => onOperationChange({ prompt_path: value })}
+                  pathPicker
+                  placeholder="Optional when using a skill"
+                />
+                <TextField
+                  label="Skill name"
+                  value={operation.skill_name ?? ""}
+                  onChange={(value) => onOperationChange({ skill_name: value })}
+                  placeholder="gofer-flow-workflow-builder"
                 />
                 <TextField
                   label="Working directory"
                   value={operation.working_dir ?? ""}
                   onChange={(value) => onOperationChange({ working_dir: value })}
+                  pathPicker
                 />
                 <TextField
                   label="Dynamic count"
@@ -1406,6 +2038,7 @@ function Inspector({
                     ["count", "Count"],
                     ["tabular", "Tabular file"],
                     ["directory", "Directory"],
+                    ["trigger_events", "Trigger events"],
                   ]}
                   onChange={(value) =>
                     onOperationChange({
@@ -1433,6 +2066,7 @@ function Inspector({
                         fan_source: { ...operation.fan_source, path: value },
                       })
                     }
+                    pathPicker
                   />
                 ) : null}
                 {operation.fan_source?.type === "directory" ? (
@@ -1445,6 +2079,7 @@ function Inspector({
                           fan_source: { ...operation.fan_source, path: value },
                         })
                       }
+                      pathPicker
                     />
                     <TextField
                       label="Glob"
@@ -1465,6 +2100,17 @@ function Inspector({
                       }
                     />
                   </>
+                ) : null}
+                {operation.fan_source?.type === "trigger_events" ? (
+                  <ToggleField
+                    checked={Boolean(operation.fan_source.include_content)}
+                    label="Include file content"
+                    onChange={(checked) =>
+                      onOperationChange({
+                        fan_source: { ...operation.fan_source, include_content: checked },
+                      })
+                    }
+                  />
                 ) : null}
                 {operation.fan_source ? (
                   <>
@@ -1492,41 +2138,10 @@ function Inspector({
               </InspectorSection>
 
               <InspectorSection title="Agent config">
-                <SelectField
-                  label="Subscription"
-                  value={agentConfig.subscription}
-                  options={[
-                    ["codex", "Codex"],
-                    ["claude_code", "Claude Code"],
-                  ]}
-                  onChange={(value) => onAgentChange(operation.agent_id, { subscription: value })}
-                />
-                <TextField
-                  label="Prompt path"
-                  value={agentConfig.prompt_path ?? ""}
-                  onChange={(value) => onAgentChange(operation.agent_id, { prompt_path: value })}
-                />
-                <TextField
-                  label="Working directory"
-                  value={agentConfig.working_dir ?? ""}
-                  onChange={(value) => onAgentChange(operation.agent_id, { working_dir: value })}
-                />
-                <ListField
-                  label="Tools"
-                  value={agentConfig.tools ?? []}
-                  onChange={(value) => onAgentChange(operation.agent_id, { tools: value })}
-                  placeholder="Read, Write, Bash"
-                />
-                <ListField
-                  label="MCP servers"
-                  value={agentConfig.mcp_servers ?? []}
-                  onChange={(value) => onAgentChange(operation.agent_id, { mcp_servers: value })}
-                  placeholder="server-a, server-b"
-                />
-                <KeyValueField
-                  label="Environment"
-                  value={agentConfig.env ?? {}}
-                  onChange={(value) => onAgentChange(operation.agent_id, { env: value })}
+                <AgentConfigFields
+                  agentConfig={agentConfig}
+                  agentId={operation.agent_id}
+                  onAgentChange={onAgentChange}
                 />
               </InspectorSection>
             </>
@@ -1620,6 +2235,8 @@ function defaultFanSource(type) {
         max_concurrency: 16,
         fail_fast: false,
       };
+    case "trigger_events":
+      return { type, include_content: false, max_concurrency: 16, fail_fast: false };
     default:
       return null;
   }
@@ -1763,6 +2380,64 @@ function nodesForFrom(nodes) {
   return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
+function AgentConfigSection({ agentConfig, agentId, onAgentChange }) {
+  if (!agentConfig) return null;
+  return (
+    <InspectorSection title="Agent config">
+      <AgentConfigFields
+        agentConfig={agentConfig}
+        agentId={agentId}
+        onAgentChange={onAgentChange}
+      />
+    </InspectorSection>
+  );
+}
+
+function AgentConfigFields({ agentConfig, agentId, onAgentChange }) {
+  return (
+    <>
+      <SelectField
+        label="Subscription"
+        value={agentConfig.subscription}
+        options={[
+          ["codex", "Codex"],
+          ["claude_code", "Claude Code"],
+        ]}
+        onChange={(value) => onAgentChange(agentId, { subscription: value })}
+      />
+      <TextField
+        label="Prompt path"
+        value={agentConfig.prompt_path ?? ""}
+        onChange={(value) => onAgentChange(agentId, { prompt_path: value })}
+        pathPicker
+      />
+      <TextField
+        label="Working directory"
+        value={agentConfig.working_dir ?? ""}
+        onChange={(value) => onAgentChange(agentId, { working_dir: value })}
+        pathPicker
+      />
+      <ListField
+        label="Tools"
+        value={agentConfig.tools ?? []}
+        onChange={(value) => onAgentChange(agentId, { tools: value })}
+        placeholder="Read, Write, Bash"
+      />
+      <ListField
+        label="MCP servers"
+        value={agentConfig.mcp_servers ?? []}
+        onChange={(value) => onAgentChange(agentId, { mcp_servers: value })}
+        placeholder="server-a, server-b"
+      />
+      <KeyValueField
+        label="Environment"
+        value={agentConfig.env ?? {}}
+        onChange={(value) => onAgentChange(agentId, { env: value })}
+      />
+    </>
+  );
+}
+
 function uniqueEdgeId(edges, fromNodeId, toNodeId) {
   const baseId = `${fromNodeId}-${toNodeId}`;
   if (!edges.some((edge) => edge.id === baseId)) {
@@ -1782,13 +2457,72 @@ function edgeLabel(condition = "always", outputPattern = "") {
   return condition.replaceAll("_", " ");
 }
 
-function edgeGoesRight(fromNode, toNode) {
-  if (fromNode.x !== toNode.x) return toNode.x >= fromNode.x;
-  return toNode.y >= fromNode.y;
-}
-
 function stableEdgeDirection(fromNodeId, toNodeId) {
   return String(fromNodeId).localeCompare(String(toNodeId)) <= 0 ? -1 : 1;
+}
+
+function edgeGeometry(fromNode, toNode, selfLoop, laneOffset = 0) {
+  if (selfLoop) {
+    const start = { x: fromNode.x + nodeWidth - 52, y: fromNode.y + 8 };
+    const end = { x: fromNode.x + 52, y: fromNode.y + 8 };
+    return {
+      path: `M ${start.x} ${start.y} C ${start.x + 76} ${start.y - 84}, ${end.x - 76} ${end.y - 84}, ${end.x} ${end.y}`,
+      label: { x: fromNode.x + nodeWidth / 2, y: fromNode.y - 58 },
+    };
+  }
+
+  const fromCenter = {
+    x: fromNode.x + nodeWidth / 2,
+    y: fromNode.y + nodeHeight / 2,
+  };
+  const toCenter = {
+    x: toNode.x + nodeWidth / 2,
+    y: toNode.y + nodeHeight / 2,
+  };
+  const dx = toCenter.x - fromCenter.x;
+  const dy = toCenter.y - fromCenter.y;
+  const horizontal = Math.abs(dx) >= Math.abs(dy);
+
+  const start = horizontal
+    ? {
+        x: dx >= 0 ? fromNode.x + nodeWidth : fromNode.x,
+        y: fromCenter.y,
+      }
+    : {
+        x: fromCenter.x,
+        y: dy >= 0 ? fromNode.y + nodeHeight : fromNode.y,
+      };
+  const end = horizontal
+    ? {
+        x: dx >= 0 ? toNode.x : toNode.x + nodeWidth,
+        y: toCenter.y,
+      }
+    : {
+        x: toCenter.x,
+        y: dy >= 0 ? toNode.y : toNode.y + nodeHeight,
+      };
+
+  const controlDistance = Math.max(80, (horizontal ? Math.abs(end.x - start.x) : Math.abs(end.y - start.y)) / 2);
+  const direction = horizontal ? Math.sign(end.x - start.x) || 1 : Math.sign(end.y - start.y) || 1;
+  const c1 = horizontal
+    ? { x: start.x + direction * controlDistance, y: start.y + laneOffset }
+    : { x: start.x + laneOffset, y: start.y + direction * controlDistance };
+  const c2 = horizontal
+    ? { x: end.x - direction * controlDistance, y: end.y + laneOffset }
+    : { x: end.x + laneOffset, y: end.y - direction * controlDistance };
+
+  return {
+    path: `M ${start.x} ${start.y} C ${c1.x} ${c1.y}, ${c2.x} ${c2.y}, ${end.x} ${end.y}`,
+    label: horizontal
+      ? {
+          x: (start.x + end.x) / 2,
+          y: (start.y + end.y) / 2 + laneOffset - 12,
+        }
+      : {
+          x: (start.x + end.x) / 2 + laneOffset,
+          y: (start.y + end.y) / 2 - 12,
+        },
+  };
 }
 
 function InspectorPanel({ children, open, subtitle, title, onToggle }) {
@@ -1823,18 +2557,256 @@ function InspectorSection({ children, title }) {
   );
 }
 
-function TextField({ label, onChange, placeholder, readOnly = false, value }) {
+function TextField({ label, onChange, pathPicker = false, placeholder, readOnly = false, value }) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const canPickPath = pathPicker && !readOnly && typeof onChange === "function";
+
+  async function handlePathPick(event) {
+    event.preventDefault();
+    event.stopPropagation();
+
+    if (window.goferDesktop?.listDirectory) {
+      setPickerOpen(true);
+      return;
+    }
+
+    try {
+      const selectedPath = await window.goferDesktop?.selectPath?.({
+        currentPath: value ?? "",
+      });
+      if (selectedPath) {
+        onChange(selectedPath);
+      }
+    } catch (error) {
+      console.error("Failed to select path", error);
+    }
+  }
+
   return (
-    <label className="block">
-      <span className="text-xs font-medium text-muted">{label}</span>
-      <input
-        className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500 read-only:bg-slate-50"
-        placeholder={placeholder}
-        readOnly={readOnly}
-        value={value ?? ""}
-        onChange={(event) => onChange?.(event.target.value)}
-      />
-    </label>
+    <>
+      <label className="block">
+        <span className="text-xs font-medium text-muted">{label}</span>
+        <span className="relative mt-1 block">
+          <input
+            className={`h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500 read-only:bg-slate-50 ${
+              canPickPath ? "pr-10" : ""
+            }`}
+            placeholder={placeholder}
+            readOnly={readOnly}
+            value={value ?? ""}
+            onChange={(event) => onChange?.(event.target.value)}
+          />
+          {canPickPath ? (
+            <button
+              aria-label={`Choose ${label.toLowerCase()}`}
+              className="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-strong dark:hover:bg-[#2a2a2a]"
+              title={`Choose ${label.toLowerCase()}`}
+              type="button"
+              onClick={handlePathPick}
+            >
+              <FolderOpen size={17} strokeWidth={1.9} />
+            </button>
+          ) : null}
+        </span>
+      </label>
+      {pickerOpen ? (
+        <PathPickerDialog
+          currentPath={value ?? ""}
+          label={label}
+          onClose={() => setPickerOpen(false)}
+          onSelect={(selectedPath) => {
+            onChange(selectedPath);
+            setPickerOpen(false);
+          }}
+        />
+      ) : null}
+    </>
+  );
+}
+
+export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
+  const [directory, setDirectory] = useState("");
+  const [entries, setEntries] = useState([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [parent, setParent] = useState(null);
+  const [pathCopied, setPathCopied] = useState(false);
+  const [selectedPath, setSelectedPath] = useState(currentPath ?? "");
+
+  useEffect(() => {
+    loadDirectory(currentPath);
+  }, [currentPath]);
+
+  async function loadDirectory(nextPath) {
+    setLoading(true);
+    setError("");
+    try {
+      const payload = await window.goferDesktop.listDirectory({
+        currentPath: nextPath ?? "",
+      });
+      setDirectory(payload.directory);
+      setParent(payload.parent);
+      setEntries(payload.entries ?? []);
+      setSelectedPath(payload.directory);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : String(loadError));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function copyCurrentPath() {
+    if (!directory) return;
+
+    try {
+      await navigator.clipboard.writeText(directory);
+      setPathCopied(true);
+      window.setTimeout(() => setPathCopied(false), 1400);
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : "Unable to copy path");
+    }
+  }
+
+  async function openCurrentPath() {
+    if (!directory) return;
+
+    try {
+      await window.goferDesktop?.openPath?.(directory);
+    } catch (openError) {
+      setError(openError instanceof Error ? openError.message : "Unable to open path");
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[70] grid place-items-center bg-slate-950/35 px-4">
+      <div className="flex max-h-[78vh] w-full max-w-[680px] flex-col rounded-lg border border-line bg-white shadow-panel">
+        <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-strong">Choose {label.toLowerCase()}</h2>
+            <div className="mt-1 flex min-w-0 items-center gap-1.5">
+              <button
+                className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-[#2a2a2a]"
+                disabled={!directory}
+                title={pathCopied ? "Copied" : "Copy path"}
+                type="button"
+                onClick={copyCurrentPath}
+              >
+                {pathCopied ? <Check size={13} /> : <Copy size={13} />}
+              </button>
+              <button
+                className="min-w-0 truncate text-left text-xs text-teal-700 underline-offset-2 transition hover:text-teal-800 hover:underline disabled:cursor-not-allowed disabled:text-muted disabled:no-underline"
+                disabled={!directory}
+                title={directory}
+                type="button"
+                onClick={openCurrentPath}
+              >
+                {directory || "Loading..."}
+              </button>
+            </div>
+          </div>
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
+            title="Close"
+            type="button"
+            onClick={onClose}
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 border-b border-line px-4 py-2">
+          <button
+            className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!parent || loading}
+            type="button"
+            onClick={() => loadDirectory(parent)}
+          >
+            Up
+          </button>
+          <button
+            className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={loading}
+            type="button"
+            onClick={async () => {
+              const dataDir = await window.goferDesktop.getDataDir();
+              loadDirectory(dataDir);
+            }}
+          >
+            Gofer data
+          </button>
+          <button
+            className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!directory}
+            type="button"
+            onClick={() => onSelect(directory)}
+          >
+            Choose current folder
+          </button>
+        </div>
+
+        <div className="min-h-[260px] flex-1 overflow-y-auto p-2">
+          {loading ? (
+            <div className="flex h-40 items-center justify-center text-sm text-muted">
+              <Loader2 size={16} className="mr-2 animate-spin" />
+              Loading folder
+            </div>
+          ) : null}
+          {error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+              {error}
+            </div>
+          ) : null}
+          {!loading && !error && entries.length === 0 ? (
+            <div className="flex h-40 items-center justify-center text-sm text-muted">
+              This folder is empty.
+            </div>
+          ) : null}
+          {!loading && !error
+            ? entries.map((entry) => (
+                <button
+                  key={entry.path}
+                  className={`flex w-full items-center gap-3 rounded-md px-3 py-2 text-left text-sm transition hover:bg-slate-50 ${
+                    selectedPath === entry.path ? "bg-slate-100 text-strong" : "text-slate-700"
+                  }`}
+                  type="button"
+                  onClick={() =>
+                    entry.isDirectory ? loadDirectory(entry.path) : setSelectedPath(entry.path)
+                  }
+                >
+                  <FolderOpen
+                    className={entry.isDirectory ? "text-teal-600" : "text-muted"}
+                    size={16}
+                  />
+                  <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+                  {entry.hidden ? <span className="text-[11px] text-muted">hidden</span> : null}
+                </button>
+              ))
+            : null}
+        </div>
+
+        <div className="flex items-center justify-between gap-3 border-t border-line px-4 py-3">
+          <p className="min-w-0 truncate text-xs text-muted">{selectedPath || directory}</p>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+              type="button"
+              onClick={onClose}
+            >
+              Cancel
+            </button>
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={!selectedPath}
+              type="button"
+              onClick={() => onSelect(selectedPath)}
+            >
+              <Check size={15} />
+              Choose
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
 

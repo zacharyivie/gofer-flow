@@ -27,16 +27,32 @@ from gofer.core.graph import GraphNode
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CopyFileOperation,
+    DeleteFileOperation,
+    MoveFileOperation,
+    OpenResourceOperation,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
-from gofer.core.workflow import AgenticWorkflow, ScheduleConfig
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig
 
 # ── Field descriptor types ───────────────────────────────────────────────────
 
 
 _AnyOp = (
-    BashCommandOperation | PythonScriptOperation | ShellScriptOperation | AgentOperation
+    BashCommandOperation
+    | PythonScriptOperation
+    | ShellScriptOperation
+    | ReadFileOperation
+    | WriteFileOperation
+    | CopyFileOperation
+    | MoveFileOperation
+    | DeleteFileOperation
+    | OpenResourceOperation
+    | AgentOperation
 )
 
 
@@ -380,11 +396,18 @@ class FieldEditorApp:
 
 def workflow_to_sections(wf: AgenticWorkflow) -> list[Section]:
     sched = wf.config.schedule
+    watch = wf.config.watch
     wf_fields: list[FieldDescriptor] = [
         FieldDescriptor(
             "config.id", "ID", FieldKind.STRING, wf.config.id, read_only=True
         ),
         FieldDescriptor("config.name", "Name", FieldKind.STRING, wf.config.name),
+        FieldDescriptor(
+            "config.max_total_node_runs",
+            "Max Total Node Runs",
+            FieldKind.INT,
+            wf.config.max_total_node_runs,
+        ),
         FieldDescriptor(
             "config.schedule.cron_expression",
             "Cron Expression",
@@ -398,6 +421,46 @@ def workflow_to_sections(wf: AgenticWorkflow) -> list[Section]:
             FieldKind.STRING,
             sched.timezone if sched else "UTC",
             optional=True,
+        ),
+        FieldDescriptor(
+            "config.watch.path",
+            "Watch Path",
+            FieldKind.PATH,
+            watch.path if watch else None,
+            optional=True,
+        ),
+        FieldDescriptor(
+            "config.watch.glob",
+            "Watch Glob",
+            FieldKind.STRING,
+            watch.glob if watch else "*",
+            optional=True,
+        ),
+        FieldDescriptor(
+            "config.watch.recursive",
+            "Watch Recursive",
+            FieldKind.BOOL,
+            watch.recursive if watch else False,
+            default=False,
+        ),
+        FieldDescriptor(
+            "config.watch.debounce_seconds",
+            "Watch Debounce Seconds",
+            FieldKind.FLOAT,
+            watch.debounce_seconds if watch else 1.0,
+        ),
+        FieldDescriptor(
+            "config.watch.mode",
+            "Watch Mode",
+            FieldKind.CHOICE,
+            watch.mode if watch else "batch",
+            choices=["batch", "queue", "fanout"],
+        ),
+        FieldDescriptor(
+            "config.watch.max_concurrency",
+            "Watch Max Concurrency",
+            FieldKind.INT,
+            watch.max_concurrency if watch else 1,
         ),
     ]
     sections: list[Section] = [Section("Workflow", wf_fields)]
@@ -447,7 +510,7 @@ def _node_to_section(node: GraphNode) -> Section:
 
 def _operation_fields(
     node_id: str,
-    op: BashCommandOperation | PythonScriptOperation | ShellScriptOperation | AgentOperation,
+    op: _AnyOp,
 ) -> list[FieldDescriptor]:
     prefix = f"nodes.{node_id}"
     node_id_fd = FieldDescriptor(
@@ -498,6 +561,84 @@ def _operation_fields(
             ),
         ]
 
+    if isinstance(op, ReadFileOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.path", "Path", FieldKind.PATH, op.path),
+            FieldDescriptor(
+                f"{prefix}.encoding", "Encoding", FieldKind.STRING, op.encoding
+            ),
+            FieldDescriptor(f"{prefix}.errors", "Errors", FieldKind.STRING, op.errors),
+        ]
+
+    if isinstance(op, WriteFileOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.path", "Path", FieldKind.PATH, op.path),
+            FieldDescriptor(f"{prefix}.content", "Content", FieldKind.STRING, op.content),
+            FieldDescriptor(
+                f"{prefix}.encoding", "Encoding", FieldKind.STRING, op.encoding
+            ),
+            FieldDescriptor(
+                f"{prefix}.create_dirs", "Create Dirs", FieldKind.BOOL, op.create_dirs
+            ),
+            FieldDescriptor(
+                f"{prefix}.overwrite", "Overwrite", FieldKind.BOOL, op.overwrite
+            ),
+            FieldDescriptor(f"{prefix}.append", "Append", FieldKind.BOOL, op.append),
+        ]
+
+    if isinstance(op, (CopyFileOperation, MoveFileOperation)):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.source_path", "Source Path", FieldKind.PATH, op.source_path
+            ),
+            FieldDescriptor(
+                f"{prefix}.destination_path",
+                "Destination Path",
+                FieldKind.PATH,
+                op.destination_path,
+            ),
+            FieldDescriptor(
+                f"{prefix}.create_dirs", "Create Dirs", FieldKind.BOOL, op.create_dirs
+            ),
+            FieldDescriptor(
+                f"{prefix}.overwrite", "Overwrite", FieldKind.BOOL, op.overwrite
+            ),
+        ]
+
+    if isinstance(op, DeleteFileOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.path", "Path", FieldKind.PATH, op.path),
+            FieldDescriptor(
+                f"{prefix}.use_trash", "Use Trash", FieldKind.BOOL, op.use_trash
+            ),
+            FieldDescriptor(
+                f"{prefix}.recursive", "Recursive", FieldKind.BOOL, op.recursive
+            ),
+            FieldDescriptor(
+                f"{prefix}.missing_ok", "Missing OK", FieldKind.BOOL, op.missing_ok
+            ),
+        ]
+
+    if isinstance(op, OpenResourceOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.target", "Target", FieldKind.STRING, op.target),
+            FieldDescriptor(
+                f"{prefix}.resource_type",
+                "Resource Type",
+                FieldKind.CHOICE,
+                op.resource_type,
+                choices=["auto", "file", "folder", "url", "app"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.args", "Arguments", FieldKind.LIST_STR, list(op.args)
+            ),
+        ]
+
     # AgentOperation
     return [
         node_id_fd,
@@ -532,7 +673,25 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
     cron: str | None = fm.get("config.schedule.cron_expression") or None
     tz: str = fm.get("config.schedule.timezone") or "UTC"
     schedule = ScheduleConfig(cron_expression=cron, timezone=tz) if cron else None
-    wf.config = wf.config.model_copy(update={"name": new_name, "schedule": schedule})
+    watch_path = fm.get("config.watch.path")
+    watch = None
+    if watch_path:
+        watch = WatchConfig(
+            path=_as_path(watch_path, Path(".")),
+            glob=fm.get("config.watch.glob") or "*",
+            recursive=bool(fm.get("config.watch.recursive")),
+            debounce_seconds=float(fm.get("config.watch.debounce_seconds") or 1.0),
+            mode=fm.get("config.watch.mode") or "batch",
+            max_concurrency=int(fm.get("config.watch.max_concurrency") or 1),
+        )
+    wf.config = wf.config.model_copy(
+        update={
+            "name": new_name,
+            "schedule": schedule,
+            "watch": watch,
+            "max_total_node_runs": int(fm.get("config.max_total_node_runs") or 1000),
+        }
+    )
 
     for gen in wf.graph.topological_generations():
         for node in gen:
@@ -561,6 +720,58 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     script_path=_as_path(fm.get(f"{p}.script_path"), op.script_path),
                     args=fm.get(f"{p}.args") or [],
                     env=fm.get(f"{p}.env") or {},
+                )
+            elif isinstance(op, ReadFileOperation):
+                new_op = ReadFileOperation(
+                    type=op.type,
+                    path=_as_path(fm.get(f"{p}.path"), op.path),
+                    encoding=fm.get(f"{p}.encoding") or op.encoding,
+                    errors=fm.get(f"{p}.errors") or op.errors,
+                )
+            elif isinstance(op, WriteFileOperation):
+                new_op = WriteFileOperation(
+                    type=op.type,
+                    path=_as_path(fm.get(f"{p}.path"), op.path),
+                    content=fm.get(f"{p}.content") or "",
+                    encoding=fm.get(f"{p}.encoding") or op.encoding,
+                    create_dirs=bool(fm.get(f"{p}.create_dirs")),
+                    overwrite=bool(fm.get(f"{p}.overwrite")),
+                    append=bool(fm.get(f"{p}.append")),
+                )
+            elif isinstance(op, CopyFileOperation):
+                new_op = CopyFileOperation(
+                    type=op.type,
+                    source_path=_as_path(fm.get(f"{p}.source_path"), op.source_path),
+                    destination_path=_as_path(
+                        fm.get(f"{p}.destination_path"), op.destination_path
+                    ),
+                    create_dirs=bool(fm.get(f"{p}.create_dirs")),
+                    overwrite=bool(fm.get(f"{p}.overwrite")),
+                )
+            elif isinstance(op, MoveFileOperation):
+                new_op = MoveFileOperation(
+                    type=op.type,
+                    source_path=_as_path(fm.get(f"{p}.source_path"), op.source_path),
+                    destination_path=_as_path(
+                        fm.get(f"{p}.destination_path"), op.destination_path
+                    ),
+                    create_dirs=bool(fm.get(f"{p}.create_dirs")),
+                    overwrite=bool(fm.get(f"{p}.overwrite")),
+                )
+            elif isinstance(op, DeleteFileOperation):
+                new_op = DeleteFileOperation(
+                    type=op.type,
+                    path=_as_path(fm.get(f"{p}.path"), op.path),
+                    use_trash=bool(fm.get(f"{p}.use_trash")),
+                    recursive=bool(fm.get(f"{p}.recursive")),
+                    missing_ok=bool(fm.get(f"{p}.missing_ok")),
+                )
+            elif isinstance(op, OpenResourceOperation):
+                new_op = OpenResourceOperation(
+                    type=op.type,
+                    target=fm.get(f"{p}.target") or op.target,
+                    resource_type=fm.get(f"{p}.resource_type") or op.resource_type,
+                    args=fm.get(f"{p}.args") or [],
                 )
             else:
                 dc_raw = fm.get(f"{p}.dynamic_count", "1")

@@ -9,15 +9,18 @@ from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
     create_workflow_payload,
+    delete_workflow_chat_payload,
     delete_workflow_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     run_workflow_payload,
+    stop_workflow_run_payload,
     update_workflow_payload,
     workflow_run_log_payload,
 )
+from gofer.ui.chat import workflow_chat_prompt_path
 
 
 def test_list_workflow_payloads_serializes_real_nodes_and_edges(tmp_path: Path) -> None:
@@ -124,13 +127,32 @@ command = "echo hello"
     assert (tmp_path / "imported.toml").exists()
 
 
-def test_delete_workflow_payload_removes_toml(tmp_path: Path) -> None:
+def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     create_workflow_payload("Delete Me", tmp_path)
+    log_dir = tmp_path / "logs" / "delete-me"
+    log_dir.mkdir(parents=True)
+    (log_dir / "2026-06-13T10-00-00-0400.log").write_text("old run\n")
+    chat_prompt_path = workflow_chat_prompt_path(tmp_path, "delete-me")
+    chat_prompt_path.parent.mkdir(parents=True)
+    chat_prompt_path.write_text("old chat prompt\n")
 
     result = delete_workflow_payload("delete-me", tmp_path)
 
     assert result == {"workflowId": "delete-me", "deleted": True}
     assert not (tmp_path / "delete-me.toml").exists()
+    assert not log_dir.exists()
+    assert not chat_prompt_path.exists()
+
+
+def test_delete_workflow_chat_payload_removes_prompt_handoff_file(tmp_path: Path) -> None:
+    chat_prompt_path = workflow_chat_prompt_path(tmp_path, "chatty")
+    chat_prompt_path.parent.mkdir(parents=True)
+    chat_prompt_path.write_text("old chat prompt\n")
+
+    result = delete_workflow_chat_payload("chatty", tmp_path)
+
+    assert result == {"workflowId": "chatty", "deleted": True}
+    assert not chat_prompt_path.exists()
 
 
 def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path) -> None:
@@ -198,6 +220,25 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
     assert reloaded["edges"][0]["condition"] == "on_success"
 
 
+def test_update_workflow_payload_persists_file_watcher(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Watched", tmp_path)
+    workflow["watch"] = {
+        "path": "inputs",
+        "glob": "*.txt",
+        "recursive": True,
+        "debounce_seconds": 0.5,
+        "mode": "queue",
+        "max_concurrency": 2,
+    }
+
+    saved = update_workflow_payload("watched", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert saved["watch"] == workflow["watch"]
+    assert reloaded["watch"] == workflow["watch"]
+    assert "Watching inputs" in reloaded["description"]
+
+
 def test_run_workflow_payload_supports_dry_run(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Runnable", tmp_path)
     workflow["nodes"] = [
@@ -244,6 +285,52 @@ def test_run_workflow_payload_writes_node_output_to_log(tmp_path: Path) -> None:
     assert "hello - stdout:" in text
     assert "hello" in text
     assert "hello - node output:" in text
+
+
+def test_stop_workflow_run_payload_reports_no_active_run(tmp_path: Path) -> None:
+    result = stop_workflow_run_payload("not-running", tmp_path)
+
+    assert result == {
+        "workflowId": "not-running",
+        "stopped": False,
+        "message": "No active run",
+    }
+
+
+async def test_stop_workflow_run_payload_stops_active_run(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Stop Me", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "sleep",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "sleep 5",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("stop-me", workflow, tmp_path)
+    run_result = None
+
+    async def run_workflow() -> None:
+        nonlocal run_result
+        run_result = await run_workflow_payload("stop-me", tmp_path, False)
+
+    with anyio.fail_after(3):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_workflow)
+            for _ in range(30):
+                await anyio.sleep(0.05)
+                stop_result = stop_workflow_run_payload("stop-me", tmp_path)
+                if stop_result["stopped"]:
+                    break
+            else:  # pragma: no cover
+                raise AssertionError("Run did not become active")
+
+    assert run_result is not None
+    assert run_result["success"] is False
+    assert "stopped by user" in run_result["logText"] or "Process stopped by user" in run_result["logText"]
 
 
 def test_latest_workflow_log_payload_reads_last_run(tmp_path: Path) -> None:

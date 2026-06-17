@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import threading
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -17,11 +18,16 @@ class Subscription(ABC):
         mcp_servers: list[str],
         env: dict[str, str],
         timeout: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> AgentResult:
         cmd = self._build_command(prompt, tools, mcp_servers)
         start = time.monotonic()
         returncode, stdout, stderr = await run_subprocess(
-            cmd, cwd=working_dir, env=env, timeout=timeout
+            cmd,
+            cancel_event=cancel_event,
+            cwd=working_dir,
+            env=env,
+            timeout=timeout,
         )
         duration = time.monotonic() - start
         return AgentResult(

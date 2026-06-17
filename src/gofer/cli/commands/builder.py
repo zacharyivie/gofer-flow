@@ -19,15 +19,22 @@ from gofer.core.graph import CycleError, EdgeConditionType, EdgeConfig, GraphNod
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    CopyFileOperation,
     CountFanSource,
+    DeleteFileOperation,
     DirectoryFanSource,
     FanSource,
+    MoveFileOperation,
+    OpenResourceOperation,
     OperationType,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
     TabularFanSource,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
-from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig, WorkflowConfig
 from gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
 from gofer.utils.paths import get_data_dir
 from gofer.utils.registry import list_all_agents
@@ -71,7 +78,39 @@ class WorkflowBuilder:
             if cron:
                 schedule = ScheduleConfig(cron_expression=cron, timezone=tz or "UTC")
 
-        return WorkflowConfig(id=wf_id, name=name, schedule=schedule)
+        watch = None
+        if questionary.confirm("Add a file/folder watcher?", default=False).ask():
+            path_str = questionary.text("Path to watch:").ask()
+            if path_str:
+                glob = questionary.text("File pattern:", default="*").ask() or "*"
+                recursive = questionary.confirm("Watch folders recursively?", default=False).ask()
+                mode = questionary.select(
+                    "Watcher mode:",
+                    choices=["batch", "queue", "fanout"],
+                    default="batch",
+                ).ask() or "batch"
+                max_concurrency_str = questionary.text(
+                    "Max watcher run concurrency:", default="1"
+                ).ask()
+                debounce_str = questionary.text("Debounce seconds:", default="1.0").ask()
+                try:
+                    debounce_seconds = float(debounce_str or "1.0")
+                except ValueError:
+                    debounce_seconds = 1.0
+                try:
+                    max_concurrency = int(max_concurrency_str or "1")
+                except ValueError:
+                    max_concurrency = 1
+                watch = WatchConfig(
+                    path=Path(path_str),
+                    glob=glob,
+                    recursive=recursive,
+                    debounce_seconds=debounce_seconds,
+                    mode=mode,
+                    max_concurrency=max_concurrency,
+                )
+
+        return WorkflowConfig(id=wf_id, name=name, schedule=schedule, watch=watch)
 
     def _ask_nodes(self) -> None:
         console.print("\n[bold]Add nodes[/bold]")
@@ -90,7 +129,18 @@ class WorkflowBuilder:
 
         node_type = questionary.select(
             "Node type:",
-            choices=["bash_command", "python_script", "shell_script", "agent"],
+            choices=[
+                "bash_command",
+                "python_script",
+                "shell_script",
+                "read_file",
+                "write_file",
+                "copy_file",
+                "move_file",
+                "delete_file",
+                "open_resource",
+                "agent",
+            ],
         ).ask()
 
         node: GraphNode | None = None
@@ -101,9 +151,7 @@ class WorkflowBuilder:
                 return
             working_dir_str = questionary.text("Working directory (optional):").ask()
             pipe_output = questionary.confirm("Pipe output to next node?", default=False).ask()
-            op: (
-                BashCommandOperation | PythonScriptOperation | ShellScriptOperation | AgentOperation
-            ) = BashCommandOperation(
+            op = BashCommandOperation(
                 type=OperationType.BASH_COMMAND,
                 command=command,
                 working_dir=Path(working_dir_str) if working_dir_str else None,
@@ -126,6 +174,90 @@ class WorkflowBuilder:
                     type=OperationType.SHELL_SCRIPT, script_path=Path(script_path_str), args=args
                 )
             node = GraphNode(node_id=node_id, operation=op, pipe_output=pipe_output)
+
+        elif node_type == "read_file":
+            path_str = questionary.text("File path:").ask()
+            if not path_str:
+                return
+            op = ReadFileOperation(type=OperationType.READ_FILE, path=Path(path_str))
+            node = GraphNode(node_id=node_id, operation=op, pipe_output=True)
+
+        elif node_type == "write_file":
+            path_str = questionary.text("File path:").ask()
+            if not path_str:
+                return
+            content = questionary.text(
+                "Content (leave empty to use piped input):", default=""
+            ).ask()
+            create_dirs = questionary.confirm("Create parent folders?", default=True).ask()
+            overwrite = questionary.confirm("Overwrite existing file?", default=True).ask()
+            append = questionary.confirm("Append instead of replace?", default=False).ask()
+            op = WriteFileOperation(
+                type=OperationType.WRITE_FILE,
+                path=Path(path_str),
+                content=content or "",
+                create_dirs=create_dirs,
+                overwrite=overwrite,
+                append=append,
+            )
+            node = GraphNode(node_id=node_id, operation=op)
+
+        elif node_type in ("copy_file", "move_file"):
+            source_str = questionary.text("Source path:").ask()
+            destination_str = questionary.text("Destination path:").ask()
+            if not source_str or not destination_str:
+                return
+            create_dirs = questionary.confirm("Create parent folders?", default=True).ask()
+            overwrite = questionary.confirm("Overwrite destination?", default=False).ask()
+            if node_type == "copy_file":
+                op = CopyFileOperation(
+                    type=OperationType.COPY_FILE,
+                    source_path=Path(source_str),
+                    destination_path=Path(destination_str),
+                    create_dirs=create_dirs,
+                    overwrite=overwrite,
+                )
+            else:
+                op = MoveFileOperation(
+                    type=OperationType.MOVE_FILE,
+                    source_path=Path(source_str),
+                    destination_path=Path(destination_str),
+                    create_dirs=create_dirs,
+                    overwrite=overwrite,
+                )
+            node = GraphNode(node_id=node_id, operation=op)
+
+        elif node_type == "delete_file":
+            path_str = questionary.text("Path to delete:").ask()
+            if not path_str:
+                return
+            use_trash = questionary.confirm("Move to Gofer trash?", default=True).ask()
+            recursive = questionary.confirm("Allow recursive folder delete?", default=False).ask()
+            missing_ok = questionary.confirm("Succeed if missing?", default=False).ask()
+            op = DeleteFileOperation(
+                type=OperationType.DELETE_FILE,
+                path=Path(path_str),
+                use_trash=use_trash,
+                recursive=recursive,
+                missing_ok=missing_ok,
+            )
+            node = GraphNode(node_id=node_id, operation=op)
+
+        elif node_type == "open_resource":
+            target = questionary.text("File, folder, URL, or app to open:").ask()
+            if not target:
+                return
+            resource_type = questionary.select(
+                "Resource type:", choices=["auto", "file", "folder", "url", "app"]
+            ).ask()
+            args_str = questionary.text("App arguments (space-separated, optional):").ask()
+            op = OpenResourceOperation(
+                type=OperationType.OPEN_RESOURCE,
+                target=target,
+                resource_type=resource_type or "auto",
+                args=args_str.split() if args_str else [],
+            )
+            node = GraphNode(node_id=node_id, operation=op)
 
         elif node_type == "agent":
             agent_source = questionary.select(
@@ -232,6 +364,7 @@ class WorkflowBuilder:
                 "Fixed number of times",
                 "Row in a CSV/TSV file",
                 "File in a directory",
+                "File watcher trigger event",
             ],
         ).ask()
         if source_type is None:
@@ -281,6 +414,17 @@ class WorkflowBuilder:
                 type="directory",
                 path=Path(path_str),
                 glob=glob,
+                include_content=include_content,
+                max_concurrency=max_concurrency,
+                fail_fast=fail_fast,
+            )
+
+        if source_type == "File watcher trigger event":
+            include_content = questionary.confirm(
+                "Pass file contents to the agent prompt?", default=False
+            ).ask()
+            return TriggerEventsFanSource(
+                type="trigger_events",
                 include_content=include_content,
                 max_concurrency=max_concurrency,
                 fail_fast=fail_fast,

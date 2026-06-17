@@ -10,6 +10,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from gofer.core.workflow import AgenticWorkflow
 from gofer.utils.logging import get_logger
+from gofer.utils.run_state import workflow_stop_path
 
 log = get_logger(__name__)
 
@@ -30,6 +31,7 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
             wf,
             runtime_subscriptions,
             log_base_dir=Path(workflow_path).parent / "logs",
+            stop_file=workflow_stop_path(workflow_id, Path(workflow_path).parent),
         )
         result = await executor.run()
         log.info("Workflow %s finished: success=%s", workflow_id, result.success)

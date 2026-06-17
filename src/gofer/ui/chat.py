@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 import shutil
+from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 
 from gofer.utils.paths import get_data_dir
-from gofer.utils.process import run_subprocess
+from gofer.utils.process import run_subprocess, stream_subprocess
 
 ProviderName = Literal["codex", "claude_code"]
 
@@ -30,19 +32,30 @@ async def run_workflow_chat(
     if binary_path is None:
         raise ChatProviderError(f"'{binary}' CLI is not available on PATH")
 
+    resolved_data_dir = data_dir or get_data_dir()
+    resolved_working_dir = working_dir or resolved_data_dir
+    resolved_working_dir.mkdir(parents=True, exist_ok=True)
     prompt = build_chat_prompt(provider=provider, model=model, messages=messages, workflow=workflow)
+    prompt = _prepare_prompt_for_cli(
+        provider=provider,
+        binary_path=binary_path,
+        data_dir=resolved_data_dir,
+        messages=messages,
+        prompt=prompt,
+        workflow=workflow,
+    )
     command = _build_chat_command(
         provider=provider,
         model=model,
         prompt=prompt,
         binary_path=binary_path,
-        data_dir=data_dir or get_data_dir(),
-        working_dir=working_dir or Path.cwd(),
+        data_dir=resolved_data_dir,
+        working_dir=resolved_working_dir,
     )
     try:
         returncode, stdout, stderr = await run_subprocess(
             command,
-            cwd=working_dir or Path.cwd(),
+            cwd=resolved_working_dir,
             timeout=300,
         )
     except OSError as exc:
@@ -59,6 +72,93 @@ async def run_workflow_chat(
             "body": stdout or stderr,
         },
     }
+
+
+async def stream_workflow_chat(
+    provider: str,
+    model: str,
+    messages: list[dict[str, str]],
+    workflow: dict[str, Any] | None,
+    working_dir: Path | None = None,
+    data_dir: Path | None = None,
+) -> AsyncIterator[dict[str, Any]]:
+    if provider not in {"codex", "claude_code"}:
+        raise ChatProviderError(f"Unknown provider '{provider}'")
+
+    binary = "codex" if provider == "codex" else "claude"
+    binary_path = shutil.which(binary)
+    if binary_path is None:
+        raise ChatProviderError(f"'{binary}' CLI is not available on PATH")
+
+    resolved_data_dir = data_dir or get_data_dir()
+    resolved_working_dir = working_dir or resolved_data_dir
+    resolved_working_dir.mkdir(parents=True, exist_ok=True)
+    prompt = build_chat_prompt(provider=provider, model=model, messages=messages, workflow=workflow)
+    prompt = _prepare_prompt_for_cli(
+        provider=provider,
+        binary_path=binary_path,
+        data_dir=resolved_data_dir,
+        messages=messages,
+        prompt=prompt,
+        workflow=workflow,
+    )
+    command = _build_chat_command(
+        provider=provider,
+        model=model,
+        prompt=prompt,
+        binary_path=binary_path,
+        data_dir=resolved_data_dir,
+        working_dir=resolved_working_dir,
+    )
+
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    try:
+        async for event in stream_subprocess(
+            command,
+            cwd=resolved_working_dir,
+            timeout=300,
+        ):
+            if event["type"] == "chunk":
+                text = event["text"]
+                if not text:
+                    continue
+                if event["stream"] == "stdout":
+                    stdout_chunks.append(text)
+                else:
+                    stderr_chunks.append(text)
+                yield {
+                    "type": "thought",
+                    "provider": provider,
+                    "model": model,
+                    "stream": event["stream"],
+                    "text": text,
+                }
+                continue
+
+            returncode = event["returncode"] if event["returncode"] is not None else 1
+            stdout = "".join(stdout_chunks)
+            stderr = "".join(stderr_chunks)
+            if returncode != 0:
+                yield {
+                    "type": "error",
+                    "provider": provider,
+                    "model": model,
+                    "error": stdout or stderr or f"Provider exited with {returncode}",
+                }
+                return
+            yield {
+                "type": "final",
+                "provider": provider,
+                "model": model,
+                "message": {
+                    "role": "assistant",
+                    "body": stdout or stderr,
+                },
+            }
+            return
+    except OSError as exc:
+        raise ChatProviderError(f"Could not start '{binary}' CLI: {exc}") from exc
 
 
 def provider_payload() -> dict[str, Any]:
@@ -113,6 +213,68 @@ def _build_chat_command(
     if model != "cli-default":
         command += ["--model", model]
     return command
+
+
+def _prepare_prompt_for_cli(
+    *,
+    provider: str,
+    binary_path: str,
+    data_dir: Path,
+    messages: list[dict[str, str]],
+    prompt: str,
+    workflow: dict[str, Any] | None,
+) -> str:
+    if provider != "codex" or not _uses_windows_command_shim(binary_path):
+        return prompt
+
+    workflow_id = _workflow_id_for_chat(workflow)
+    prompt_path = workflow_chat_prompt_path(data_dir, workflow_id)
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(prompt, encoding="utf-8")
+    latest_user_message = _latest_user_message(messages)
+    return (
+        "Read the complete Gofer Flow assistant prompt, workflow context, and "
+        f"conversation from this file: {prompt_path}. Then answer the latest user "
+        f"message: {_single_line(latest_user_message)}"
+    )
+
+
+def delete_workflow_chat_prompt(data_dir: Path, workflow_id: str) -> None:
+    workflow_chat_prompt_path(data_dir, workflow_id).unlink(missing_ok=True)
+
+
+def workflow_chat_prompt_path(data_dir: Path, workflow_id: str) -> Path:
+    return data_dir / ".gofer-chat-prompts" / f"{_safe_chat_prompt_stem(workflow_id)}.md"
+
+
+def _workflow_id_for_chat(workflow: dict[str, Any] | None) -> str:
+    if isinstance(workflow, dict) and workflow.get("id"):
+        return str(workflow["id"])
+    return "no-workflow"
+
+
+def _safe_chat_prompt_stem(workflow_id: str) -> str:
+    safe_name = "".join(
+        character if character.isalnum() or character in {"-", "_"} else "-"
+        for character in workflow_id.strip().lower()
+    ).strip("-")
+    digest = sha256(workflow_id.encode("utf-8")).hexdigest()[:12]
+    return f"{safe_name or 'workflow'}-{digest}"
+
+
+def _uses_windows_command_shim(binary_path: str) -> bool:
+    return Path(binary_path.lower()).suffix in {".cmd", ".bat"}
+
+
+def _latest_user_message(messages: list[dict[str, str]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return message.get("body", "")
+    return ""
+
+
+def _single_line(value: str) -> str:
+    return " ".join(value.split())
 
 
 def build_chat_prompt(

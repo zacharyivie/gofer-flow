@@ -3,7 +3,7 @@ from __future__ import annotations
 import tomllib
 import warnings
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomli_w as _tomli_w
 from pydantic import BaseModel, TypeAdapter
@@ -18,10 +18,20 @@ class ScheduleConfig(BaseModel):
     timezone: str = "UTC"
 
 
+class WatchConfig(BaseModel):
+    path: Path
+    glob: str = "*"
+    recursive: bool = False
+    debounce_seconds: float = 1.0
+    mode: Literal["batch", "queue", "fanout"] = "batch"
+    max_concurrency: int = 1
+
+
 class WorkflowConfig(BaseModel):
     id: str
     name: str
     schedule: ScheduleConfig | None = None
+    watch: WatchConfig | None = None
     max_total_node_runs: int = 1000
 
 
@@ -64,10 +74,14 @@ class AgenticWorkflow:
         schedule = None
         if "schedule" in wf_data:
             schedule = ScheduleConfig(**wf_data["schedule"])
+        watch = None
+        if "watch" in wf_data:
+            watch = WatchConfig(**wf_data["watch"])
         config = WorkflowConfig(
             id=wf_data["id"],
             name=wf_data["name"],
             schedule=schedule,
+            watch=watch,
             max_total_node_runs=wf_data.get("max_total_node_runs", 1000),
         )
         workflow = cls(config)
@@ -139,11 +153,6 @@ class AgenticWorkflow:
                 "name": self.config.name,
             }
         }
-        if self.config.schedule:
-            data["workflow"]["schedule"] = self.config.schedule.model_dump()
-        if self.config.max_total_node_runs != 1000:
-            data["workflow"]["max_total_node_runs"] = self.config.max_total_node_runs
-
         def _paths_to_str(obj: Any) -> Any:
             if isinstance(obj, Path):
                 return str(obj)
@@ -152,6 +161,13 @@ class AgenticWorkflow:
             if isinstance(obj, list):
                 return [_paths_to_str(i) for i in obj]
             return obj
+
+        if self.config.schedule:
+            data["workflow"]["schedule"] = self.config.schedule.model_dump()
+        if self.config.watch:
+            data["workflow"]["watch"] = _paths_to_str(self.config.watch.model_dump())
+        if self.config.max_total_node_runs != 1000:
+            data["workflow"]["max_total_node_runs"] = self.config.max_total_node_runs
 
         if self.agents:
             data["agents"] = {
