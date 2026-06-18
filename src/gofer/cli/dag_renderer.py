@@ -16,6 +16,8 @@ from gofer.core.operations import (
     CountFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
+    FileOperation,
+    FolderOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     MoveFileOperation,
@@ -129,6 +131,10 @@ def _op_icon_color(op: Operation) -> tuple[str, str]:
         return "mv", "yellow"
     if isinstance(op, DeleteFileOperation):
         return "rm", "red"
+    if isinstance(op, FileOperation):
+        return "file", "blue"
+    if isinstance(op, FolderOperation):
+        return "dir", "yellow"
     if isinstance(op, OpenResourceOperation):
         return "↗", "blue"
     if isinstance(op, PromptFileOperation):
@@ -162,6 +168,10 @@ def _op_detail(op: Operation) -> str:
         return f"{op.source_path.name} → {op.destination_path.name}"
     if isinstance(op, DeleteFileOperation):
         return f"delete {op.path.name}"
+    if isinstance(op, FileOperation):
+        return op.path.name
+    if isinstance(op, FolderOperation):
+        return op.path.name
     if isinstance(op, OpenResourceOperation):
         target = op.target
         return target[:28] + "…" if len(target) > 29 else target

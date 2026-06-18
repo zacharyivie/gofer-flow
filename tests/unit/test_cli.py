@@ -45,6 +45,69 @@ def test_workflow_create(tmp_path: Path) -> None:
     assert len(created) == 1
 
 
+def test_workflow_add_file_and_folder_nodes(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Path Flow", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    commands = [
+        [
+            "workflow", "add-node", "path-flow",
+            "--id", "source-file",
+            "--type", "file",
+            "--path", "data/input.txt",
+            "--data-dir", str(tmp_path),
+        ],
+        [
+            "workflow", "add-node", "path-flow",
+            "--id", "source-folder",
+            "--type", "folder",
+            "--path", "data",
+            "--data-dir", str(tmp_path),
+        ],
+    ]
+
+    for command in commands:
+        result = runner.invoke(app, command)
+        assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "path-flow.toml")
+    assert wf.graph._nodes["source-file"].operation.type == "file"
+    assert wf.graph._nodes["source-folder"].operation.type == "folder"
+
+
+def test_workflow_rename_and_duplicate_commands(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Original", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "rename", "original",
+            "--name", "Renamed",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "original.toml").exists()
+    wf = AgenticWorkflow.from_file(tmp_path / "original.toml")
+    assert wf.config.id == "original"
+    assert wf.config.name == "Renamed"
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "duplicate", "original",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "renamed-2.toml").exists()
+
+
 def test_workflow_run_dry_run(tmp_path: Path) -> None:
     f = tmp_path / "wf.toml"
     f.write_text(_SIMPLE_TOML)

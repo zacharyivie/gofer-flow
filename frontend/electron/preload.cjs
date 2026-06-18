@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 const API_BASE_URL_ARG = "--gofer-api-base-url=";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8765";
@@ -30,11 +30,21 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     ipcRenderer.invoke("gofer:list-directory", {
       currentPath:
         typeof options.currentPath === "string" ? options.currentPath : "",
+      create: options.create !== false,
     }),
   openPath: (targetPath) =>
     ipcRenderer.invoke("gofer:open-path", {
       targetPath: typeof targetPath === "string" ? targetPath : "",
     }),
+  revealPath: (targetPath) =>
+    ipcRenderer.invoke("gofer:reveal-path", {
+      targetPath: typeof targetPath === "string" ? targetPath : "",
+    }),
+  getPathInfo: (targetPath) =>
+    ipcRenderer.invoke("gofer:path-info", {
+      targetPath: typeof targetPath === "string" ? targetPath : "",
+    }),
+  getDroppedFilePath: (file) => webUtils.getPathForFile(file) || "",
   setDataDir: (dataDir) =>
     ipcRenderer.invoke("gofer:set-data-dir", {
       dataDir: typeof dataDir === "string" ? dataDir : "",

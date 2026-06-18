@@ -29,6 +29,8 @@ from gofer.core.operations import (
     DeleteFileOperation,
     DirectoryFanSource,
     FanSource,
+    FileOperation,
+    FolderOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     MoveFileOperation,
@@ -48,7 +50,7 @@ from gofer.subscriptions.base import Subscription
 from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess
-from gofer.utils.run_state import clear_workflow_stop
+from gofer.utils.run_state import clear_workflow_stop, workflow_run_stop_path
 
 log = get_logger(__name__)
 
@@ -314,7 +316,7 @@ class WorkflowRunLog:
     def __init__(self, workflow_id: str, base_dir: Path | None = None) -> None:
         self.workflow_id = workflow_id
         self.started_at = datetime.now().astimezone()
-        timestamp = self.started_at.strftime("%Y-%m-%dT%H-%M-%S%z")
+        timestamp = self.started_at.strftime("%Y-%m-%dT%H-%M-%S%f%z")
         root = base_dir or get_data_dir() / "logs"
         self.path = root / workflow_id / f"{timestamp}.log"
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -373,6 +375,7 @@ class WorkflowExecutor:
         self._pass_cancel_event = cancel_event is not None or stop_file is not None
         self._cancel_event = cancel_event or threading.Event()
         self._stop_file = stop_file
+        self._run_stop_file: Path | None = None
         self._stop_monitor_done = threading.Event()
         self._trigger_context: dict[str, Any] = {}
         self._run_log: WorkflowRunLog | None = None
@@ -394,6 +397,14 @@ class WorkflowExecutor:
         monitor = self._start_stop_monitor()
         self._run_log = WorkflowRunLog(self._workflow.config.id, self._log_base_dir)
         run_log = self._log()
+        if self._stop_file is not None:
+            data_dir = self._stop_file.parent.parent
+            self._run_stop_file = workflow_run_stop_path(
+                self._workflow.config.id,
+                run_log.path.name,
+                data_dir,
+            )
+            self._run_stop_file.unlink(missing_ok=True)
         ctx = ExecutionContext(trigger=self._trigger_context)
         graph = self._workflow.graph
         start = time.monotonic()
@@ -478,7 +489,8 @@ class WorkflowExecutor:
             if monitor is not None:
                 monitor.join(timeout=1)
             if self._stop_file is not None:
-                self._stop_file.unlink(missing_ok=True)
+                if self._run_stop_file is not None:
+                    self._run_stop_file.unlink(missing_ok=True)
 
     def _start_stop_monitor(self) -> threading.Thread | None:
         if self._stop_file is None:
@@ -486,7 +498,10 @@ class WorkflowExecutor:
 
         def monitor() -> None:
             while not self._stop_monitor_done.wait(0.1):
-                if self._stop_file and self._stop_file.exists():
+                if (
+                    (self._stop_file and self._stop_file.exists())
+                    or (self._run_stop_file and self._run_stop_file.exists())
+                ):
                     self._cancel_event.set()
                     return
 
@@ -739,6 +754,30 @@ class WorkflowExecutor:
                 _remove_path(op.path, recursive=op.recursive)
                 output = f"deleted {op.path}"
             self._log().node(node.node_id, output)
+            return NodeOutput(
+                node_id=node.node_id,
+                success=True,
+                output=output,
+                exit_code=0,
+                duration_seconds=time.monotonic() - start,
+            )
+
+        elif op.type == OperationType.FILE:
+            assert isinstance(op, FileOperation)
+            output = str(op.path)
+            self._log().node(node.node_id, f"file path: {output}")
+            return NodeOutput(
+                node_id=node.node_id,
+                success=True,
+                output=output,
+                exit_code=0,
+                duration_seconds=time.monotonic() - start,
+            )
+
+        elif op.type == OperationType.FOLDER:
+            assert isinstance(op, FolderOperation)
+            output = str(op.path)
+            self._log().node(node.node_id, f"folder path: {output}")
             return NodeOutput(
                 node_id=node.node_id,
                 success=True,
@@ -1030,6 +1069,7 @@ class WorkflowExecutor:
         return bool(
             (self._cancel_event and self._cancel_event.is_set())
             or (self._stop_file and self._stop_file.exists())
+            or (self._run_stop_file and self._run_stop_file.exists())
         )
 
     def _failure_reason(self, outputs: dict[str, NodeOutput]) -> str:

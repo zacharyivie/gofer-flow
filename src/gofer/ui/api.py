@@ -19,7 +19,11 @@ from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
 from gofer.ui.chat import delete_workflow_chat_prompt
 from gofer.utils.paths import get_data_dir
-from gofer.utils.run_state import request_workflow_stop, workflow_stop_path
+from gofer.utils.run_state import (
+    request_workflow_run_stop,
+    request_workflow_stop,
+    workflow_stop_path,
+)
 
 
 class WorkflowAlreadyExistsError(ValueError):
@@ -47,7 +51,7 @@ _subscriptions = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
 }
-_active_run_stop_events: dict[tuple[str, str], threading.Event] = {}
+_active_run_stop_events: dict[tuple[str, str], set[threading.Event]] = {}
 _active_run_lock = threading.Lock()
 
 
@@ -64,15 +68,35 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
         try:
             workflow = AgenticWorkflow.from_file(path)
         except Exception as exc:
-            errors.append({"path": str(path), "message": str(exc)})
-            continue
-
-        if workflow.agents and not list(workflow.graph._graph.nodes()):
+            error = {"path": str(path), "message": str(exc)}
+            errors.append(error)
+            workflows.append(invalid_workflow_payload(path, str(exc)))
             continue
 
         workflows.append(workflow_to_payload(workflow, path))
 
     return {"dataDir": str(base), "workflows": workflows, "errors": errors}
+
+
+def invalid_workflow_payload(path: Path, message: str) -> dict[str, Any]:
+    workflow_id = _slugify(path.stem)
+    return {
+        "id": workflow_id,
+        "name": path.stem.replace("-", " ").replace("_", " ").title(),
+        "description": f"Invalid workflow TOML: {message}",
+        "status": "Error",
+        "updatedAt": _updated_at(path),
+        "sourcePath": str(path),
+        "schedule": None,
+        "watch": None,
+        "maxTotalNodeRuns": 1000,
+        "tags": ["error", "invalid"],
+        "agents": {},
+        "nodes": [],
+        "edges": [],
+        "invalid": True,
+        "validationError": message,
+    }
 
 
 def create_workflow_payload(name: str, data_dir: Path | None = None) -> dict[str, Any]:
@@ -132,6 +156,92 @@ def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> d
     return {"workflowId": workflow_id, "deleted": True}
 
 
+def rename_workflow_payload(
+    workflow_id: str,
+    name: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    workflow_name = name.strip()
+    if not workflow_name:
+        raise WorkflowUpdateError("Workflow name is required")
+
+    base = data_dir or get_data_dir()
+    path = base / f"{workflow_id}.toml"
+    if not path.exists():
+        raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
+
+    workflow = AgenticWorkflow.from_file(path)
+    workflow.config.name = workflow_name
+    workflow.to_file(path)
+    return workflow_to_payload(workflow, path)
+
+
+def _next_duplicate_name(original_name: str, base: Path) -> tuple[str, str]:
+    candidate_number = 2
+    while True:
+        candidate_name = f"{original_name}-{candidate_number}"
+        candidate_id = _slugify(candidate_name)
+        if not (base / f"{candidate_id}.toml").exists():
+            return candidate_name, candidate_id
+        candidate_number += 1
+
+
+def _replace_workflow_header_value(text: str, key: str, value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    pattern = re.compile(
+        rf"(^\[workflow\]\s*(?:(?!^\[).)*?^){key}\s*=\s*(['\"]).*?\2",
+        re.MULTILINE | re.DOTALL,
+    )
+    replacement = rf'\1{key} = "{escaped}"'
+    next_text, count = pattern.subn(replacement, text, count=1)
+    if count:
+        return next_text
+    return re.sub(
+        r"(^\[workflow\]\s*)",
+        rf'\1{key} = "{escaped}"\n',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
+def _copy_workflow_toml_with_identity(
+    source_path: Path,
+    target_path: Path,
+    workflow_id: str,
+    workflow_name: str,
+) -> None:
+    text = source_path.read_text(encoding="utf-8")
+    text = _replace_workflow_header_value(text, "id", workflow_id)
+    text = _replace_workflow_header_value(text, "name", workflow_name)
+    target_path.write_text(text, encoding="utf-8")
+
+
+def duplicate_workflow_payload(
+    workflow_id: str,
+    name: str | None = None,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    base = data_dir or get_data_dir()
+    path = base / f"{workflow_id}.toml"
+    if not path.exists():
+        raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
+
+    source = AgenticWorkflow.from_file(path)
+    if name and name.strip():
+        candidate_name = name.strip()
+        candidate_id = _slugify(candidate_name)
+        if (base / f"{candidate_id}.toml").exists():
+            raise WorkflowAlreadyExistsError(f"Workflow '{candidate_id}' already exists")
+    else:
+        candidate_name, candidate_id = _next_duplicate_name(source.config.name, base)
+
+    target_path = base / f"{candidate_id}.toml"
+    _copy_workflow_toml_with_identity(path, target_path, candidate_id, candidate_name)
+    duplicated = AgenticWorkflow.from_file(target_path)
+    return workflow_to_payload(duplicated, target_path)
+
+
 def delete_workflow_chat_payload(
     workflow_id: str,
     data_dir: Path | None = None,
@@ -175,9 +285,7 @@ async def run_workflow_payload(
     run_key = _run_key(base, workflow_id)
     cancel_event = threading.Event()
     with _active_run_lock:
-        if run_key in _active_run_stop_events:
-            raise WorkflowRunError(f"Workflow '{workflow_id}' is already running")
-        _active_run_stop_events[run_key] = cancel_event
+        _active_run_stop_events.setdefault(run_key, set()).add(cancel_event)
 
     try:
         workflow = AgenticWorkflow.from_file(path)
@@ -194,7 +302,11 @@ async def run_workflow_payload(
         raise WorkflowRunError(str(exc)) from exc
     finally:
         with _active_run_lock:
-            _active_run_stop_events.pop(run_key, None)
+            events = _active_run_stop_events.get(run_key)
+            if events is not None:
+                events.discard(cancel_event)
+                if not events:
+                    _active_run_stop_events.pop(run_key, None)
 
     return {
         "workflowId": result.workflow_id,
@@ -222,12 +334,30 @@ async def run_workflow_payload(
 def stop_workflow_run_payload(
     workflow_id: str,
     data_dir: Path | None = None,
+    run_id: str | None = None,
 ) -> dict[str, Any]:
     base = data_dir or get_data_dir()
-    with _active_run_lock:
-        cancel_event = _active_run_stop_events.get(_run_key(base, workflow_id))
+    if run_id:
+        log_path = base / "logs" / workflow_id / run_id
+        if not log_path.exists() or _log_status(log_path) != "running":
+            return {
+                "workflowId": workflow_id,
+                "runId": run_id,
+                "stopped": False,
+                "message": "No active run",
+            }
+        request_workflow_run_stop(workflow_id, run_id, base)
+        return {
+            "workflowId": workflow_id,
+            "runId": run_id,
+            "stopped": True,
+            "message": "Stop requested",
+        }
 
-    if cancel_event is None:
+    with _active_run_lock:
+        cancel_events = tuple(_active_run_stop_events.get(_run_key(base, workflow_id), ()))
+
+    if not cancel_events:
         path = base / f"{workflow_id}.toml"
         if not path.exists():
             return {"workflowId": workflow_id, "stopped": False, "message": "No active run"}
@@ -238,7 +368,8 @@ def stop_workflow_run_payload(
             "message": "Stop requested",
         }
 
-    cancel_event.set()
+    for cancel_event in cancel_events:
+        cancel_event.set()
     request_workflow_stop(workflow_id, base)
     return {"workflowId": workflow_id, "stopped": True}
 
@@ -530,6 +661,10 @@ def _operation_meta(operation: dict[str, Any]) -> str:
             )
         case OperationType.DELETE_FILE:
             return f"delete {operation.get('path', 'file')}"
+        case OperationType.FILE:
+            return str(operation.get("path", "file"))
+        case OperationType.FOLDER:
+            return str(operation.get("path", "folder"))
         case OperationType.OPEN_RESOURCE:
             return f"open {operation.get('target', 'target')}"
         case OperationType.PROMPT_FILE:

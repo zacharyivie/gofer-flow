@@ -11,16 +11,19 @@ from gofer.ui.api import (
     create_workflow_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
+    duplicate_workflow_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
+    rename_workflow_payload,
     run_workflow_payload,
     stop_workflow_run_payload,
     update_workflow_payload,
     workflow_run_log_payload,
 )
 from gofer.ui.chat import workflow_chat_prompt_path
+from gofer.utils.run_state import workflow_run_stop_path
 
 
 def test_list_workflow_payloads_serializes_real_nodes_and_edges(tmp_path: Path) -> None:
@@ -80,8 +83,38 @@ def test_list_workflow_payloads_reports_invalid_workflows(tmp_path: Path) -> Non
 
     payload = list_workflow_payloads(tmp_path)
 
-    assert payload["workflows"] == []
+    assert len(payload["workflows"]) == 1
+    workflow = payload["workflows"][0]
+    assert workflow["id"] == "broken"
+    assert workflow["name"] == "Broken"
+    assert workflow["invalid"] is True
+    assert workflow["status"] == "Error"
+    assert workflow["sourcePath"] == str(tmp_path / "broken.toml")
+    assert workflow["validationError"]
     assert payload["errors"][0]["path"] == str(tmp_path / "broken.toml")
+
+
+def test_list_workflow_payloads_includes_empty_workflows(tmp_path: Path) -> None:
+    (tmp_path / "empty-with-agent.toml").write_text(
+        """
+[workflow]
+id = "empty-with-agent"
+name = "Empty With Agent"
+
+[agents.codex_agent]
+subscription = "codex"
+working_dir = "."
+""".strip()
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+
+    assert len(payload["workflows"]) == 1
+    workflow = payload["workflows"][0]
+    assert workflow["id"] == "empty-with-agent"
+    assert workflow["name"] == "Empty With Agent"
+    assert workflow["nodes"] == []
+    assert workflow["edges"] == []
 
 
 def test_create_workflow_payload_writes_real_workflow(tmp_path: Path) -> None:
@@ -125,6 +158,47 @@ command = "echo hello"
 
     assert workflow["id"] == "imported"
     assert (tmp_path / "imported.toml").exists()
+
+
+def test_rename_workflow_payload_updates_label_without_changing_id(tmp_path: Path) -> None:
+    create_workflow_payload("Original", tmp_path)
+
+    renamed = rename_workflow_payload("original", "Better Name", tmp_path)
+
+    assert renamed["id"] == "original"
+    assert renamed["name"] == "Better Name"
+    assert (tmp_path / "original.toml").exists()
+    assert 'name = "Better Name"' in (tmp_path / "original.toml").read_text()
+
+
+def test_duplicate_workflow_payload_creates_copy(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Original", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo hello",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("original", workflow, tmp_path)
+
+    source_text = (tmp_path / "original.toml").read_text()
+    duplicated = duplicate_workflow_payload("original", None, tmp_path)
+
+    assert duplicated["id"] == "original-2"
+    assert duplicated["name"] == "Original-2"
+    assert (tmp_path / "original.toml").exists()
+    duplicate_text = (tmp_path / "original-2.toml").read_text()
+    assert duplicate_text == source_text.replace(
+        'id = "original"',
+        'id = "original-2"',
+        1,
+    ).replace('name = "Original"', 'name = "Original-2"', 1)
+    assert duplicated["nodes"][0]["id"] == "hello"
 
 
 def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
@@ -297,6 +371,26 @@ def test_stop_workflow_run_payload_reports_no_active_run(tmp_path: Path) -> None
     }
 
 
+def test_stop_workflow_run_payload_stops_specific_running_log(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "stop-me"
+    log_dir.mkdir(parents=True)
+    run_id = "2026-06-17T12-00-00-0400.log"
+    (log_dir / run_id).write_text(
+        "2026-06-17T12:00:00-04:00 - stop-me started successfully\n",
+        encoding="utf-8",
+    )
+
+    result = stop_workflow_run_payload("stop-me", tmp_path, run_id=run_id)
+
+    assert result == {
+        "workflowId": "stop-me",
+        "runId": run_id,
+        "stopped": True,
+        "message": "Stop requested",
+    }
+    assert workflow_run_stop_path("stop-me", run_id, tmp_path).exists()
+
+
 async def test_stop_workflow_run_payload_stops_active_run(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Stop Me", tmp_path)
     workflow["nodes"] = [
@@ -331,6 +425,43 @@ async def test_stop_workflow_run_payload_stops_active_run(tmp_path: Path) -> Non
     assert run_result is not None
     assert run_result["success"] is False
     assert "stopped by user" in run_result["logText"] or "Process stopped by user" in run_result["logText"]
+
+
+async def test_run_workflow_payload_allows_concurrent_runs(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Concurrent", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "sleep",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "sleep 5",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("concurrent", workflow, tmp_path)
+    run_results = []
+
+    async def run_workflow() -> None:
+        run_results.append(await run_workflow_payload("concurrent", tmp_path, False))
+
+    with anyio.fail_after(4):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_workflow)
+            tg.start_soon(run_workflow)
+            for _ in range(40):
+                await anyio.sleep(0.05)
+                logs = list_workflow_run_logs_payload("concurrent", tmp_path)["runs"]
+                if sum(run["status"] == "running" for run in logs) == 2:
+                    break
+            else:  # pragma: no cover
+                raise AssertionError("Concurrent workflow runs did not both become active")
+            stop_workflow_run_payload("concurrent", tmp_path)
+
+    assert len(run_results) == 2
+    assert all(run["success"] is False for run in run_results)
+    assert len(list_workflow_run_logs_payload("concurrent", tmp_path)["runs"]) == 2
 
 
 def test_latest_workflow_log_payload_reads_last_run(tmp_path: Path) -> None:

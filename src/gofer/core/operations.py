@@ -17,6 +17,8 @@ class OperationType(StrEnum):
     COPY_FILE = "copy_file"
     MOVE_FILE = "move_file"
     DELETE_FILE = "delete_file"
+    FILE = "file"
+    FOLDER = "folder"
     OPEN_RESOURCE = "open_resource"
     PROMPT_FILE = "prompt_file"
     COMMON_LLM_TASK = "common_llm_task"
@@ -122,6 +124,16 @@ class DeleteFileOperation(BaseModel):
     missing_ok: bool = False
 
 
+class FileOperation(BaseModel):
+    type: Literal[OperationType.FILE]
+    path: Path
+
+
+class FolderOperation(BaseModel):
+    type: Literal[OperationType.FOLDER]
+    path: Path
+
+
 class OpenResourceOperation(BaseModel):
     type: Literal[OperationType.OPEN_RESOURCE]
     target: str
@@ -188,6 +200,8 @@ Operation = Annotated[
     | CopyFileOperation
     | MoveFileOperation
     | DeleteFileOperation
+    | FileOperation
+    | FolderOperation
     | OpenResourceOperation
     | PromptFileOperation
     | CommonLlmTaskOperation

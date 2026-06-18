@@ -8,12 +8,14 @@ from urllib.request import Request, urlopen
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.ui import server as server_module
 from gofer.core.watcher import WorkflowWatcher
+from gofer.ui.chat import workflow_chat_prompt_path
 from gofer.ui.server import (
     create_server,
     ready_payload,
     sync_workflow_schedules,
     sync_workflow_watchers,
 )
+from gofer.utils.run_state import workflow_run_stop_path
 
 
 def test_ui_server_syncs_workflow_schedules(tmp_path) -> None:
@@ -178,6 +180,88 @@ def test_ui_server_chat_unhandled_error_returns_json(monkeypatch, tmp_path) -> N
             assert payload["error"] == "Workflow assistant failed: boom"
         else:  # pragma: no cover
             raise AssertionError("Expected HTTP 500")
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_ui_server_stops_specific_running_workflow_log(tmp_path) -> None:
+    log_dir = tmp_path / "logs" / "stop-me"
+    log_dir.mkdir(parents=True)
+    run_id = "2026-06-17T12-00-00-0400.log"
+    (log_dir / run_id).write_text(
+        "2026-06-17T12:00:00-04:00 - stop-me started successfully\n",
+        encoding="utf-8",
+    )
+    server = create_server(host="127.0.0.1", port=0, data_dir=tmp_path)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address[:2]
+        request = Request(
+            f"http://{host}:{port}/api/workflows/stop-me/runs/{run_id}/stop",
+            method="POST",
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 200
+        assert payload["stopped"] is True
+        assert workflow_run_stop_path("stop-me", run_id, tmp_path).exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_ui_server_delete_global_chat_prompt(tmp_path) -> None:
+    chat_path = workflow_chat_prompt_path(tmp_path, "workflow-assistant")
+    chat_path.parent.mkdir(parents=True)
+    chat_path.write_text("old chat prompt\n", encoding="utf-8")
+    server = create_server(host="127.0.0.1", port=0, data_dir=tmp_path)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address[:2]
+        request = Request(
+            f"http://{host}:{port}/api/chat",
+            method="DELETE",
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 200
+        assert payload == {"workflowId": "workflow-assistant", "deleted": True}
+        assert not chat_path.exists()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_ui_server_delete_thread_chat_prompt(tmp_path) -> None:
+    chat_path = workflow_chat_prompt_path(tmp_path, "workflow-assistant:thread-1")
+    chat_path.parent.mkdir(parents=True)
+    chat_path.write_text("old thread prompt\n", encoding="utf-8")
+    server = create_server(host="127.0.0.1", port=0, data_dir=tmp_path)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    try:
+        host, port = server.server_address[:2]
+        request = Request(
+            f"http://{host}:{port}/api/chat/threads/thread-1",
+            method="DELETE",
+        )
+        with urlopen(request, timeout=2) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+
+        assert response.status == 200
+        assert payload == {"workflowId": "workflow-assistant:thread-1", "deleted": True}
+        assert not chat_path.exists()
     finally:
         server.shutdown()
         thread.join(timeout=2)

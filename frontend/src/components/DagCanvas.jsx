@@ -87,6 +87,18 @@ const nodeStyles = {
     border: "border-rose-200",
     chip: "bg-rose-50 text-rose-700 border-rose-100",
   },
+  file: {
+    icon: FileText,
+    accent: "bg-slate-700",
+    border: "border-slate-200",
+    chip: "bg-slate-100 text-slate-700 border-slate-200",
+  },
+  folder: {
+    icon: FolderOpen,
+    accent: "bg-amber-700",
+    border: "border-amber-200",
+    chip: "bg-amber-50 text-amber-700 border-amber-100",
+  },
   open_resource: {
     icon: ExternalLink,
     accent: "bg-blue-700",
@@ -201,6 +213,16 @@ function defaultOperation(type, nodeNumber = 1) {
         recursive: false,
         missing_ok: false,
       };
+    case "file":
+      return {
+        type,
+        path: "",
+      };
+    case "folder":
+      return {
+        type,
+        path: "",
+      };
     case "open_resource":
       return {
         type,
@@ -291,6 +313,10 @@ function nodeMetaFromOperation(operation = {}) {
       return `move ${operation.source_path || "source"} to ${operation.destination_path || "destination"}`;
     case "delete_file":
       return `delete ${operation.path || "file"}`;
+    case "file":
+      return operation.path || "file";
+    case "folder":
+      return operation.path || "folder";
     case "open_resource":
       return `open ${operation.target || "target"}`;
     case "prompt_file":
@@ -309,6 +335,18 @@ function nodeMetaFromOperation(operation = {}) {
     default:
       return "operation";
   }
+}
+
+function pathBasename(pathValue = "") {
+  const normalized = String(pathValue).replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).at(-1) || normalized || "path";
+}
+
+function fileExtension(pathValue = "") {
+  const name = pathBasename(pathValue);
+  const index = name.lastIndexOf(".");
+  if (index <= 0 || index === name.length - 1) return "";
+  return name.slice(index + 1).toUpperCase();
 }
 
 function clamp(value, min, max) {
@@ -356,12 +394,14 @@ export default function DagCanvas({
   onLoadLatestLog,
   onRunWorkflow,
   onSelectRunLog,
+  onStopRunLog,
   onStopWorkflow,
   onValidateWorkflow,
   onWorkflowChange,
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
+  const nodeDragMovedRef = useRef(false);
   const [selectedNodeId, setSelectedNodeId] = useState();
   const [draggingNodeId, setDraggingNodeId] = useState(null);
   const [panningPointerId, setPanningPointerId] = useState(null);
@@ -369,9 +409,18 @@ export default function DagCanvas({
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [inspectorWidth, setInspectorWidth] = useState(340);
   const [logHeight, setLogHeight] = useState(240);
+  const [expandedFolderNodes, setExpandedFolderNodes] = useState({});
+  const [folderNodeEntries, setFolderNodeEntries] = useState({});
+  const [runMenuOpen, setRunMenuOpen] = useState(false);
+  const [selectedEdgeId, setSelectedEdgeId] = useState(null);
+  const [draftEdge, setDraftEdge] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const invalidWorkflow = Boolean(workflow.invalid);
+  const workflowNodes = workflow.nodes ?? [];
+  const workflowEdges = workflow.edges ?? [];
 
-  const selectedNode = workflow.nodes.find((node) => node.id === selectedNodeId);
+  const selectedNode = workflowNodes.find((node) => node.id === selectedNodeId);
+  const selectedEdge = workflowEdges.find((edge) => edge.id === selectedEdgeId);
   const runResult = runState?.result?.workflowId === workflow.id ? runState.result : null;
   const selectedNodeOutput = selectedNodeId ? runResult?.nodeOutputs?.[selectedNodeId] : null;
   const workflowLogText =
@@ -381,15 +430,21 @@ export default function DagCanvas({
     : workflowLogText;
   const logTitle = selectedNodeId ? `${selectedNodeId} last run` : "Workflow log";
   const nodeStatuses = useMemo(() => {
-    return getNodeStatuses(workflow.nodes, runResult, workflowLogText);
-  }, [runResult, workflow.nodes, workflowLogText]);
-  const currentWorkflowRunning = runState?.running && runState.workflowId === workflow.id;
+    return getNodeStatuses(workflowNodes, runResult, workflowLogText);
+  }, [runResult, workflowNodes, workflowLogText]);
+  const currentWorkflowRunning =
+    runState?.running && runState.workflowId === workflow.id;
+  const workflowHasRunningRuns = currentWorkflowRunning || logState?.runs?.some(
+    (run) => run.status === "running",
+  );
   const nodesById = useMemo(() => {
-    return Object.fromEntries(workflow.nodes.map((node) => [node.id, node]));
-  }, [workflow.nodes]);
+    return Object.fromEntries(workflowNodes.map((node) => [node.id, node]));
+  }, [workflowNodes]);
 
   useEffect(() => {
     setSelectedNodeId(undefined);
+    setSelectedEdgeId(null);
+    setDraftEdge(null);
     setDraggingNodeId(null);
     setPanningPointerId(null);
     setViewport({ x: 0, y: 0, scale: 1 });
@@ -400,6 +455,35 @@ export default function DagCanvas({
       setSelectedNodeId(undefined);
     }
   }, [nodesById, selectedNodeId]);
+
+  useEffect(() => {
+    if (selectedEdgeId && !workflowEdges.some((edge) => edge.id === selectedEdgeId)) {
+      setSelectedEdgeId(null);
+    }
+  }, [selectedEdgeId, workflowEdges]);
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (!selectedEdgeId || event.defaultPrevented) return;
+      const target = event.target;
+      const tagName = target?.tagName?.toLowerCase?.();
+      if (
+        target?.isContentEditable ||
+        tagName === "input" ||
+        tagName === "textarea" ||
+        tagName === "select"
+      ) {
+        return;
+      }
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteEdge(selectedEdgeId);
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [selectedEdgeId, workflowEdges]);
 
   useEffect(() => {
     if (!panningPointerId) return undefined;
@@ -414,7 +498,7 @@ export default function DagCanvas({
   function updateNode(nodeId, patch) {
     onWorkflowChange({
       ...workflow,
-      nodes: workflow.nodes.map((node) => (node.id === nodeId ? { ...node, ...patch } : node)),
+      nodes: workflowNodes.map((node) => (node.id === nodeId ? { ...node, ...patch } : node)),
     });
   }
 
@@ -438,7 +522,7 @@ export default function DagCanvas({
           ...(workflow.agents ?? {}),
           [patch.agent_id]: defaultAgentConfig(patch.agent_id),
         },
-        nodes: workflow.nodes.map((currentNode) =>
+        nodes: workflowNodes.map((currentNode) =>
           currentNode.id === nodeId ? { ...currentNode, ...nextNodePatch } : currentNode,
         ),
       });
@@ -460,7 +544,7 @@ export default function DagCanvas({
   }
 
   function updateNodeType(nodeId, type) {
-    const nextOperation = defaultOperation(type, workflow.nodes.length + 1);
+    const nextOperation = defaultOperation(type, workflowNodes.length + 1);
     const nextNode = {
       type,
       operation: nextOperation,
@@ -480,7 +564,7 @@ export default function DagCanvas({
           ...(workflow.agents ?? {}),
           [nextOperation.agent_id]: defaultAgentConfig(nextOperation.agent_id),
         },
-        nodes: workflow.nodes.map((node) => (node.id === nodeId ? { ...node, ...nextNode } : node)),
+        nodes: workflowNodes.map((node) => (node.id === nodeId ? { ...node, ...nextNode } : node)),
       });
       return;
     }
@@ -502,8 +586,8 @@ export default function DagCanvas({
   }
 
   function addNode() {
-    const nextNumber = nextAvailableNodeNumber(workflow.nodes);
-    const nextAgentNumber = nextAvailableAgentNumber(workflow.nodes, workflow.agents);
+    const nextNumber = nextAvailableNodeNumber(workflowNodes);
+    const nextAgentNumber = nextAvailableAgentNumber(workflowNodes, workflow.agents);
     const nextOperation = defaultOperation("agent", nextAgentNumber);
     const newNode = {
       id: `node-${nextNumber}`,
@@ -521,9 +605,70 @@ export default function DagCanvas({
         ...(workflow.agents ?? {}),
         [newNode.operation.agent_id]: defaultAgentConfig(newNode.operation.agent_id),
       },
-      nodes: [...workflow.nodes, newNode],
+      nodes: [...workflowNodes, newNode],
     });
     setSelectedNodeId(newNode.id);
+  }
+
+  async function handleCanvasDrop(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (invalidWorkflow) return;
+
+    const droppedFiles = Array.from(event.dataTransfer?.files ?? []);
+    if (!droppedFiles.length) return;
+
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+
+    const newNodes = [];
+    let nextNumber = nextAvailableNodeNumber(workflowNodes);
+    const usedNodeIds = new Set(workflowNodes.map((node) => node.id));
+
+    for (const [index, file] of droppedFiles.entries()) {
+      const droppedPath =
+        window.goferDesktop?.getDroppedFilePath?.(file) ||
+        file.path ||
+        file.webkitRelativePath;
+      if (!droppedPath) continue;
+
+      let info = null;
+      try {
+        info = await window.goferDesktop?.getPathInfo?.(droppedPath);
+      } catch (error) {
+        console.error("Failed to inspect dropped path", error);
+      }
+
+      const path = info?.path ?? droppedPath;
+      const kind = info?.isDirectory ? "folder" : "file";
+      const operation = { type: kind, path };
+      const worldX = (event.clientX - rect.left - viewport.x) / viewport.scale;
+      const worldY = (event.clientY - rect.top - viewport.y) / viewport.scale;
+      while (usedNodeIds.has(`node-${nextNumber}`)) {
+        nextNumber += 1;
+      }
+      const nodeId = `node-${nextNumber}`;
+      usedNodeIds.add(nodeId);
+      newNodes.push({
+        id: nodeId,
+        label: info?.basename ?? pathBasename(path),
+        type: kind,
+        operation,
+        settings: defaultSettings,
+        meta: nodeMetaFromOperation(operation),
+        x: worldX + index * 28,
+        y: worldY + index * 28,
+      });
+      nextNumber += 1;
+    }
+
+    if (newNodes.length) {
+      onWorkflowChange({
+        ...workflow,
+        nodes: [...workflowNodes, ...newNodes],
+      });
+      setSelectedNodeId(newNodes.at(-1).id);
+    }
   }
 
   function deleteSelectedNode() {
@@ -534,41 +679,122 @@ export default function DagCanvas({
   function deleteNode(nodeId) {
     onWorkflowChange({
       ...workflow,
-      nodes: workflow.nodes.filter((node) => node.id !== nodeId),
-      edges: workflow.edges.filter(
+      nodes: workflowNodes.filter((node) => node.id !== nodeId),
+      edges: workflowEdges.filter(
         (edge) => edge.from !== nodeId && edge.to !== nodeId,
       ),
     });
     setSelectedNodeId((currentId) =>
-      currentId === nodeId ? workflow.nodes.find((node) => node.id !== nodeId)?.id : currentId,
+      currentId === nodeId ? workflowNodes.find((node) => node.id !== nodeId)?.id : currentId,
     );
   }
 
   function handleNodePointerDown(event, nodeId) {
     if (event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    nodeDragMovedRef.current = false;
     setSelectedNodeId(nodeId);
+    setSelectedEdgeId(null);
     setDraggingNodeId(nodeId);
   }
 
   function handleNodePointerMove(event, nodeId) {
     if (draggingNodeId !== nodeId) return;
+    if (Math.abs(event.movementX) > 1 || Math.abs(event.movementY) > 1) {
+      nodeDragMovedRef.current = true;
+    }
     updateNode(nodeId, {
       x: nodesById[nodeId].x + event.movementX / viewport.scale,
       y: nodesById[nodeId].y + event.movementY / viewport.scale,
     });
   }
 
-  function handleNodePointerUp(event) {
+  function handleNodePointerUp(event, nodeId) {
+    if (draftEdge && nodeId) {
+      event.preventDefault();
+      event.stopPropagation();
+      addEdge(draftEdge.from, nodeId, "always");
+      setDraftEdge(null);
+      return;
+    }
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     setDraggingNodeId(null);
   }
 
+  async function handleNodeDoubleClick(node) {
+    if (nodeDragMovedRef.current) {
+      nodeDragMovedRef.current = false;
+      return;
+    }
+
+    if (node.type === "file") {
+      const path = node.operation?.path;
+      if (path) {
+        try {
+          await window.goferDesktop?.revealPath?.(path);
+        } catch (error) {
+          console.error("Failed to reveal file node path", error);
+        }
+      }
+      return;
+    }
+
+    if (node.type === "folder") {
+      const folderPath = node.operation?.path;
+      if (!folderPath) {
+        setFolderNodeEntries((current) => ({
+          ...current,
+          [node.id]: {
+            loaded: true,
+            error: "Choose an absolute folder path.",
+            entries: [],
+          },
+        }));
+        setExpandedFolderNodes((current) => ({
+          ...current,
+          [node.id]: true,
+        }));
+        return;
+      }
+      const nextExpanded = !expandedFolderNodes[node.id];
+      setExpandedFolderNodes((current) => ({
+        ...current,
+        [node.id]: nextExpanded,
+      }));
+      if (nextExpanded && !folderNodeEntries[node.id]?.loaded) {
+        try {
+          const listing = await window.goferDesktop?.listDirectory?.({
+            currentPath: folderPath,
+            create: false,
+          });
+          setFolderNodeEntries((current) => ({
+            ...current,
+            [node.id]: {
+              loaded: true,
+              entries: listing?.entries ?? [],
+            },
+          }));
+        } catch (error) {
+          setFolderNodeEntries((current) => ({
+            ...current,
+            [node.id]: {
+              loaded: true,
+              error: error instanceof Error ? error.message : "Unable to read folder",
+              entries: [],
+            },
+          }));
+        }
+      }
+    }
+  }
+
   function handleCanvasPointerDown(event) {
+    if (draftEdge) return;
     if (event.button === 0) {
       setSelectedNodeId(undefined);
+      setSelectedEdgeId(null);
     }
 
     if (event.button === 0 || event.button === 2) {
@@ -579,6 +805,22 @@ export default function DagCanvas({
   }
 
   function handleCanvasPointerMove(event) {
+    if (draftEdge) {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      setDraftEdge((current) =>
+        current
+          ? {
+              ...current,
+              to: {
+                x: (event.clientX - rect.left - viewport.x) / viewport.scale,
+                y: (event.clientY - rect.top - viewport.y) / viewport.scale,
+              },
+            }
+          : current,
+      );
+      return;
+    }
     if (panningPointerId !== event.pointerId) return;
     event.preventDefault();
     setViewport((current) => ({
@@ -589,11 +831,48 @@ export default function DagCanvas({
   }
 
   function handleCanvasPointerUp(event) {
+    if (draftEdge) {
+      setDraftEdge(null);
+      return;
+    }
     if (panningPointerId !== event.pointerId) return;
     if (event.currentTarget.hasPointerCapture(event.pointerId)) {
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     setPanningPointerId(null);
+  }
+
+  function handleConnectorPointerDown(event, nodeId) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const fromNode = nodesById[nodeId];
+    const start = {
+      x: fromNode.x + nodeWidth,
+      y: fromNode.y + nodeHeight / 2,
+    };
+    setSelectedNodeId(undefined);
+    setSelectedEdgeId(null);
+    setDraftEdge({
+      from: nodeId,
+      start,
+      to: {
+        x: (event.clientX - rect.left - viewport.x) / viewport.scale,
+        y: (event.clientY - rect.top - viewport.y) / viewport.scale,
+      },
+    });
+  }
+
+  function handleConnectorPointerUp(event, nodeId) {
+    if (!draftEdge || event.button !== 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (draftEdge.from && nodeId) {
+      addEdge(draftEdge.from, nodeId, "always");
+    }
+    setDraftEdge(null);
   }
 
   function handleCanvasWheel(event) {
@@ -618,8 +897,9 @@ export default function DagCanvas({
   function deleteEdge(edgeId) {
     onWorkflowChange({
       ...workflow,
-      edges: workflow.edges.filter((edge) => edge.id !== edgeId),
+      edges: workflowEdges.filter((edge) => edge.id !== edgeId),
     });
+    setSelectedEdgeId((currentId) => (currentId === edgeId ? null : currentId));
   }
 
   function addEdge(fromNodeId, toNodeId, condition, outputPattern = null) {
@@ -627,12 +907,13 @@ export default function DagCanvas({
 
     const nextCondition = condition || "always";
     const nextOutputPattern = nextCondition === "output_matches" ? outputPattern || "" : null;
+    const nextEdgeId = uniqueEdgeId(workflowEdges, fromNodeId, toNodeId);
     onWorkflowChange({
       ...workflow,
       edges: [
-        ...workflow.edges,
+        ...workflowEdges,
         {
-          id: uniqueEdgeId(workflow.edges, fromNodeId, toNodeId),
+          id: nextEdgeId,
           from: fromNodeId,
           to: toNodeId,
           label: edgeLabel(nextCondition, nextOutputPattern),
@@ -641,12 +922,14 @@ export default function DagCanvas({
         },
       ],
     });
+    setSelectedNodeId(undefined);
+    setSelectedEdgeId(nextEdgeId);
   }
 
   function updateEdge(edgeId, patch) {
     onWorkflowChange({
       ...workflow,
-      edges: workflow.edges.map((edge) => {
+      edges: workflowEdges.map((edge) => {
         if (edge.id !== edgeId) return edge;
         const nextEdge = { ...edge, ...patch };
         return {
@@ -732,24 +1015,38 @@ export default function DagCanvas({
             />
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={Boolean(currentWorkflowRunning)}
-              title="Run workflow now"
+              disabled={invalidWorkflow}
+              title={
+                workflowHasRunningRuns
+                  ? "Start another workflow run"
+                  : "Run workflow now"
+              }
               type="button"
               onClick={() => onRunWorkflow(workflow)}
             >
-              {currentWorkflowRunning ? <Loader2 size={17} className="animate-spin" /> : <Play size={17} />}
+              <Play size={17} />
             </button>
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!currentWorkflowRunning || Boolean(runState?.stopping)}
-              title="Stop workflow run"
+              disabled={invalidWorkflow || !workflowHasRunningRuns || Boolean(runState?.stopping)}
+              title="Stop all runs"
               type="button"
               onClick={() => onStopWorkflow(workflow)}
             >
               <Square size={15} fill="currentColor" strokeWidth={1.7} />
             </button>
+            <ToolbarRunSelector
+              open={runMenuOpen}
+              runs={logState?.runs ?? []}
+              selectedRunId={logState?.selectedRunId}
+              onOpenChange={setRunMenuOpen}
+              onSelectRun={onSelectRunLog}
+              onShowLatest={onLoadLatestLog}
+              onStopRun={onStopRunLog}
+            />
             <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={invalidWorkflow}
               title="Add node"
               type="button"
               onClick={addNode}
@@ -766,7 +1063,7 @@ export default function DagCanvas({
             </button>
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedNode}
+              disabled={invalidWorkflow || !selectedNode}
               title="Delete selected node"
               type="button"
               onClick={deleteSelectedNode}
@@ -791,7 +1088,8 @@ export default function DagCanvas({
             </button>
             <div className="relative">
               <button
-                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={invalidWorkflow}
                 title="Validate workflow"
                 type="button"
                 onClick={onValidateWorkflow}
@@ -827,115 +1125,164 @@ export default function DagCanvas({
           onPointerMove={handleCanvasPointerMove}
           onPointerUp={handleCanvasPointerUp}
           onPointerCancel={handleCanvasPointerUp}
+          onDragOver={(event) => {
+            if (!invalidWorkflow) {
+              event.preventDefault();
+            }
+          }}
+          onDrop={handleCanvasDrop}
           onWheel={handleCanvasWheel}
         >
           <WorkflowTriggerStrip schedule={workflow.schedule} watch={workflow.watch} />
-          <div
-            className="absolute left-0 top-0 h-0 w-0 origin-top-left overflow-visible"
-            style={{
-              transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
-            }}
-          >
-            <svg
-              className="pointer-events-none absolute overflow-visible"
-              aria-hidden="true"
+          {invalidWorkflow ? (
+            <InvalidWorkflowCanvas workflow={workflow} />
+          ) : (
+            <div
+              className="absolute left-0 top-0 h-0 w-0 origin-top-left overflow-visible"
               style={{
-                left: -graphWorldOffset,
-                top: -graphWorldOffset,
-                width: graphWorldSize,
-                height: graphWorldSize,
+                transform: `translate(${viewport.x}px, ${viewport.y}px) scale(${viewport.scale})`,
               }}
-              viewBox={`0 0 ${graphWorldSize} ${graphWorldSize}`}
             >
-              <defs>
-                <marker
-                  id="arrowhead"
-                  markerHeight="10"
-                  markerWidth="10"
-                  orient="auto"
-                  refX="8"
-                  refY="3"
-                >
-                  <path d="M0,0 L0,6 L9,3 z" fill="#718096" />
-                </marker>
-              </defs>
-              <g transform={`translate(${graphWorldOffset} ${graphWorldOffset})`}>
-                {workflow.edges.map((edge) => {
-                  const from = nodesById[edge.from];
-                  const to = nodesById[edge.to];
-                  if (!from || !to) return null;
+              <svg
+                className="absolute overflow-visible"
+                aria-hidden="true"
+                style={{
+                  left: -graphWorldOffset,
+                  top: -graphWorldOffset,
+                  width: graphWorldSize,
+                  height: graphWorldSize,
+                  pointerEvents: "none",
+                }}
+                viewBox={`0 0 ${graphWorldSize} ${graphWorldSize}`}
+              >
+                <defs>
+                  <marker
+                    id="arrowhead"
+                    markerHeight="10"
+                    markerWidth="10"
+                    orient="auto"
+                    refX="8"
+                    refY="3"
+                  >
+                    <path d="M0,0 L0,6 L9,3 z" fill="#718096" />
+                  </marker>
+                </defs>
+                <g transform={`translate(${graphWorldOffset} ${graphWorldOffset})`}>
+                  {workflowEdges.map((edge) => {
+                    const from = nodesById[edge.from];
+                    const to = nodesById[edge.to];
+                    if (!from || !to) return null;
 
-                  const reciprocal = workflow.edges.some(
-                    (candidate) =>
-                      candidate.id !== edge.id &&
-                      candidate.from === edge.to &&
-                      candidate.to === edge.from,
-                  );
-                  const laneOffset = reciprocal
-                    ? stableEdgeDirection(edge.from, edge.to) * 44
-                    : 0;
-                  const geometry = edgeGeometry(from, to, edge.from === edge.to, laneOffset);
+                    const reciprocal = workflowEdges.some(
+                      (candidate) =>
+                        candidate.id !== edge.id &&
+                        candidate.from === edge.to &&
+                        candidate.to === edge.from,
+                    );
+                    const laneOffset = reciprocal
+                      ? stableEdgeDirection(edge.from, edge.to) * 44
+                      : 0;
+                    const geometry = edgeGeometry(from, to, edge.from === edge.to, laneOffset);
 
-                  return (
-                    <g key={edge.id}>
-                      <path
-                        d={geometry.path}
-                        fill="none"
-                        markerEnd="url(#arrowhead)"
-                        stroke="#718096"
-                        strokeLinecap="round"
-                        strokeWidth="2.5"
-                      />
-                      <text
-                        x={geometry.label.x}
-                        y={geometry.label.y}
-                        className="fill-slate-500 text-[12px] font-medium"
-                        textAnchor="middle"
-                      >
-                        {edge.label}
-                      </text>
-                    </g>
-                  );
-                })}
-              </g>
-            </svg>
+                    return (
+                      <g key={edge.id}>
+                        <path
+                          d={geometry.path}
+                          fill="none"
+                          stroke="transparent"
+                          strokeLinecap="round"
+                          strokeWidth="16"
+                          style={{ pointerEvents: "stroke" }}
+                          onPointerDown={(event) => {
+                            event.preventDefault();
+                            event.stopPropagation();
+                            setSelectedNodeId(undefined);
+                            setSelectedEdgeId(edge.id);
+                          }}
+                        />
+                        <path
+                          d={geometry.path}
+                          fill="none"
+                          markerEnd="url(#arrowhead)"
+                          stroke={selectedEdgeId === edge.id ? "#0f766e" : "#718096"}
+                          strokeLinecap="round"
+                          strokeWidth={selectedEdgeId === edge.id ? "4" : "2.5"}
+                          style={{ pointerEvents: "none" }}
+                        />
+                        <text
+                          x={geometry.label.x}
+                          y={geometry.label.y}
+                          className={`text-[12px] font-medium ${
+                            selectedEdgeId === edge.id ? "fill-teal-700" : "fill-slate-500"
+                          }`}
+                          style={{ pointerEvents: "none" }}
+                          textAnchor="middle"
+                        >
+                          {edge.label}
+                        </text>
+                      </g>
+                    );
+                  })}
+                  {draftEdge ? (
+                    <path
+                      d={draftEdgePath(draftEdge)}
+                      fill="none"
+                      markerEnd="url(#arrowhead)"
+                      stroke="#0f766e"
+                      strokeDasharray="6 6"
+                      strokeLinecap="round"
+                      strokeWidth="3"
+                      style={{ pointerEvents: "none" }}
+                    />
+                  ) : null}
+                </g>
+              </svg>
 
-            {workflow.nodes.map((node) => (
-              <WorkflowNode
-                key={node.id}
-                node={node}
-                selected={selectedNodeId === node.id}
-                status={nodeStatuses[node.id]}
-                onDelete={deleteNode}
-                onPointerDown={handleNodePointerDown}
-                onPointerMove={handleNodePointerMove}
-                onPointerUp={handleNodePointerUp}
-              />
-            ))}
-          </div>
+              {workflowNodes.map((node) => (
+                <WorkflowNode
+                  key={node.id}
+                  node={node}
+                  selected={selectedNodeId === node.id}
+                  status={nodeStatuses[node.id]}
+                  expanded={Boolean(expandedFolderNodes[node.id])}
+                  folderEntries={folderNodeEntries[node.id]}
+                  onDelete={deleteNode}
+                  onDoubleClick={handleNodeDoubleClick}
+                  onConnectorPointerDown={handleConnectorPointerDown}
+                  onConnectorPointerUp={handleConnectorPointerUp}
+                  onPointerDown={handleNodePointerDown}
+                  onPointerMove={handleNodePointerMove}
+                  onPointerUp={handleNodePointerUp}
+                />
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
-        <Inspector
-          agents={workflow.agents ?? {}}
-          edges={workflow.edges}
-          collapsed={inspectorCollapsed}
-          node={selectedNode}
-          nodes={workflow.nodes}
-          workflow={workflow}
-          width={inspectorWidth}
-          onAddEdge={addEdge}
-          onDeleteEdge={deleteEdge}
-          onAgentChange={updateAgentConfig}
-          onEdgeChange={updateEdge}
-          onResizeStart={startInspectorResize}
-          onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
-          onOperationChange={(patch) => updateNodeOperation(selectedNode.id, patch)}
-          onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
-          onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
-          onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
-          onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
-        />
+        {!invalidWorkflow ? (
+          <Inspector
+            agents={workflow.agents ?? {}}
+            edges={workflowEdges}
+            collapsed={inspectorCollapsed}
+            edge={selectedEdge}
+            node={selectedNode}
+            nodes={workflowNodes}
+            workflow={workflow}
+            width={inspectorWidth}
+            onAddEdge={addEdge}
+            onDeleteEdge={deleteEdge}
+            onAgentChange={updateAgentConfig}
+            onEdgeChange={updateEdge}
+            onResizeStart={startInspectorResize}
+            onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
+            onOperationChange={(patch) => updateNodeOperation(selectedNode.id, patch)}
+            onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
+            onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
+            onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
+            onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
+          />
+        ) : null}
       </div>
       <LogOverlay
         collapsed={logCollapsed}
@@ -950,8 +1297,68 @@ export default function DagCanvas({
         onResizeStart={startLogResize}
         onSelectRun={onSelectRunLog}
         onShowLatest={onLoadLatestLog}
+        onStopRun={onStopRunLog}
         onToggle={() => setLogCollapsed((current) => !current)}
       />
+    </div>
+  );
+}
+
+function InvalidWorkflowCanvas({ workflow }) {
+  const [copied, setCopied] = useState(false);
+  const sourcePath = workflow.sourcePath || `${workflow.id}.toml`;
+  const message =
+    workflow.validationError ||
+    workflow.description ||
+    "The workflow TOML could not be parsed or validated.";
+  const markdown = [
+    "# Gofer Flow workflow TOML validation error",
+    "",
+    `Workflow file: \`${sourcePath}\``,
+    "",
+    "```text",
+    message,
+    "```",
+    "",
+  ].join("\n");
+
+  async function copyMarkdown() {
+    try {
+      await navigator.clipboard?.writeText(markdown);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="absolute inset-0 z-10 grid place-items-center p-6">
+      <section className="flex max-h-[72%] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-red-200 bg-red-50/95 shadow-panel backdrop-blur dark:border-red-950 dark:bg-[#241b1b]/95">
+        <div className="flex items-start justify-between gap-4 border-b border-red-200 px-4 py-3 dark:border-red-950">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-red-800 dark:text-red-200">
+              Invalid workflow TOML
+            </h3>
+            <p className="mt-1 truncate text-xs text-red-700/80 dark:text-red-200/70">
+              {sourcePath}
+            </p>
+          </div>
+          <button
+            className="inline-flex shrink-0 items-center gap-2 rounded-md border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 transition hover:bg-red-100 dark:border-red-900 dark:bg-[#2b2222] dark:text-red-200 dark:hover:bg-[#362828]"
+            type="button"
+            onClick={copyMarkdown}
+          >
+            <Copy size={14} />
+            {copied ? "Copied" : "Copy markdown"}
+          </button>
+        </div>
+        <div className="workflow-scrollbar min-h-0 overflow-y-auto px-4 py-3">
+          <pre className="whitespace-pre-wrap font-mono text-xs leading-5 text-red-900 dark:text-red-100">
+            {message}
+          </pre>
+        </div>
+      </section>
     </div>
   );
 }
@@ -1076,6 +1483,127 @@ function getNodeStatusFromLog(logText, nodeId) {
   return latestEvent[1].toLowerCase() === "true" ? "success" : "error";
 }
 
+function ToolbarRunSelector({
+  onOpenChange,
+  onSelectRun,
+  onShowLatest,
+  onStopRun,
+  open,
+  runs,
+  selectedRunId,
+}) {
+  const menuRef = useRef(null);
+  const selectedRun = runs.find((run) => run.id === selectedRunId);
+  const activeRun = selectedRun ?? runs[0];
+  const label = selectedRun ? formatRunLabel(selectedRun) : "Latest run";
+  const status = activeRun?.status ?? "idle";
+
+  useEffect(() => {
+    if (!open) return undefined;
+
+    function handlePointerDown(event) {
+      if (!menuRef.current?.contains(event.target)) {
+        onOpenChange(false);
+      }
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [onOpenChange, open]);
+
+  return (
+    <div ref={menuRef} className="relative">
+      <button
+        className={`flex h-8 items-center gap-2 rounded-lg border px-2 text-xs font-medium transition ${
+          open
+            ? "border-slate-300 bg-white text-ink"
+            : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+        }`}
+        title="Select workflow run"
+        type="button"
+        onClick={() => onOpenChange(!open)}
+      >
+        <RunStatusDot status={status} />
+        <span className="max-w-[112px] truncate">{label}</span>
+        <ChevronDown size={14} />
+      </button>
+      {open ? (
+        <div className="absolute left-0 top-9 z-50 w-[300px] overflow-hidden rounded-lg border border-line bg-white shadow-panel">
+          <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
+            <span className="truncate text-xs font-semibold text-ink">
+              {selectedRun ? formatRunLabel(selectedRun) : "Latest run"}
+            </span>
+            {selectedRun?.status === "running" ? (
+              <button
+                className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line bg-white text-red-600 transition hover:border-red-200 hover:bg-red-50"
+                title="Stop this run"
+                type="button"
+                onClick={() => onStopRun?.(selectedRun.id)}
+              >
+                <Square size={12} fill="currentColor" strokeWidth={1.7} />
+              </button>
+            ) : null}
+          </div>
+          <div className="workflow-scrollbar max-h-60 overflow-y-auto py-1">
+            <button
+              className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:bg-slate-50 ${
+                selectedRunId ? "" : "bg-teal-50"
+              }`}
+              type="button"
+              onClick={() => {
+                onOpenChange(false);
+                onShowLatest?.();
+              }}
+            >
+              <RunStatusDot status={runs[0]?.status ?? "idle"} />
+              <span className="truncate font-medium text-ink">Latest run</span>
+            </button>
+            {runs.length ? (
+              runs.map((run) => (
+                <div
+                  key={run.id}
+                  className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:bg-slate-50 ${
+                    selectedRunId === run.id ? "bg-teal-50" : ""
+                  }`}
+                >
+                  <button
+                    className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                    type="button"
+                    onClick={() => {
+                      onOpenChange(false);
+                      onSelectRun?.(run.id);
+                    }}
+                  >
+                    <RunStatusDot status={run.status} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-medium text-ink">
+                        {formatRunLabel(run)}
+                      </div>
+                      <div className="truncate text-[11px] text-muted">{run.id}</div>
+                    </div>
+                  </button>
+                  {run.status === "running" ? (
+                    <button
+                      className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line bg-white text-red-600 transition hover:border-red-200 hover:bg-red-50"
+                      title="Stop this run"
+                      type="button"
+                      onClick={() => onStopRun?.(run.id)}
+                    >
+                      <Square size={12} fill="currentColor" strokeWidth={1.7} />
+                    </button>
+                  ) : null}
+                </div>
+              ))
+            ) : (
+              <div className="px-3 py-3 text-xs text-muted">No workflow runs yet.</div>
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function LogOverlay({
   collapsed,
   error,
@@ -1087,6 +1615,7 @@ function LogOverlay({
   onResizeStart,
   onSelectRun,
   onShowLatest,
+  onStopRun,
   onToggle,
   text,
   title,
@@ -1188,25 +1717,39 @@ function LogOverlay({
                   <div className="workflow-scrollbar max-h-60 overflow-y-auto">
                     {runs.length ? (
                       runs.map((run) => (
-                        <button
+                        <div
                           key={run.id}
                           className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:bg-slate-50 ${
                             selectedRunId === run.id ? "bg-teal-50" : ""
                           }`}
-                          type="button"
-                          onClick={() => {
-                            setHistoryOpen(false);
-                            onSelectRun?.(run.id);
-                          }}
                         >
-                          <RunStatusDot status={run.status} />
-                          <div className="min-w-0 flex-1">
-                            <div className="truncate font-medium text-ink">
-                              {formatRunLabel(run)}
+                          <button
+                            className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                            type="button"
+                            onClick={() => {
+                              setHistoryOpen(false);
+                              onSelectRun?.(run.id);
+                            }}
+                          >
+                            <RunStatusDot status={run.status} />
+                            <div className="min-w-0 flex-1">
+                              <div className="truncate font-medium text-ink">
+                                {formatRunLabel(run)}
+                              </div>
+                              <div className="truncate text-[11px] text-muted">{run.id}</div>
                             </div>
-                            <div className="truncate text-[11px] text-muted">{run.id}</div>
-                          </div>
-                        </button>
+                          </button>
+                          {run.status === "running" ? (
+                            <button
+                              className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line bg-white text-red-600 transition hover:border-red-200 hover:bg-red-50"
+                              title="Stop this run"
+                              type="button"
+                              onClick={() => onStopRun?.(run.id)}
+                            >
+                              <Square size={12} fill="currentColor" strokeWidth={1.7} />
+                            </button>
+                          ) : null}
+                        </div>
                       ))
                     ) : (
                       <div className="px-3 py-4 text-xs text-muted">No previous runs.</div>
@@ -1255,7 +1798,12 @@ function formatRunLabel(run) {
 }
 
 function WorkflowNode({
+  expanded,
+  folderEntries,
   node,
+  onConnectorPointerDown,
+  onConnectorPointerUp,
+  onDoubleClick,
   onDelete,
   selected,
   status,
@@ -1265,6 +1813,14 @@ function WorkflowNode({
 }) {
   const style = nodeStyles[node.type] ?? nodeStyles.agent;
   const Icon = style.icon;
+  const isFileNode = node.type === "file";
+  const isFolderNode = node.type === "folder";
+  const extension = isFileNode ? fileExtension(node.operation?.path) : "";
+  const title = isFileNode
+    ? "Double click to open"
+    : isFolderNode
+      ? "Double click to expand"
+      : undefined;
 
   return (
     <article
@@ -1272,18 +1828,35 @@ function WorkflowNode({
         selected ? "border-teal-500 ring-4 ring-teal-100" : style.border
       }`}
       style={{ left: node.x, top: node.y }}
+      title={title}
+      onDoubleClick={(event) => {
+        event.stopPropagation();
+        onDoubleClick?.(node);
+      }}
       onPointerDown={(event) => {
         if (event.button !== 0) return;
         event.stopPropagation();
         onPointerDown(event, node.id);
       }}
       onPointerMove={(event) => onPointerMove(event, node.id)}
-      onPointerUp={onPointerUp}
+      onPointerUp={(event) => onPointerUp(event, node.id)}
     >
+      <button
+        className="absolute -right-2 top-1/2 z-10 h-4 w-4 -translate-y-1/2 rounded-full border border-teal-300 bg-white shadow-sm transition hover:scale-110 hover:border-teal-500 hover:bg-teal-50"
+        title="Drag to connect"
+        type="button"
+        onPointerDown={(event) => onConnectorPointerDown?.(event, node.id)}
+        onPointerUp={(event) => onConnectorPointerUp?.(event, node.id)}
+      />
       <div className="flex items-start justify-between gap-3">
         <div className="flex min-w-0 items-start gap-3">
-          <span className={`grid h-9 w-9 shrink-0 place-items-center rounded-lg text-white ${style.accent}`}>
+          <span className={`relative grid h-9 w-9 shrink-0 place-items-center rounded-lg text-white ${style.accent}`}>
             <Icon size={18} />
+            {extension ? (
+              <span className="absolute -bottom-1 -right-1 rounded bg-white px-1 text-[8px] font-bold leading-3 text-slate-700 shadow-sm">
+                {extension.slice(0, 4)}
+              </span>
+            ) : null}
           </span>
           <div className="min-w-0">
             <h3 className="truncate text-sm font-semibold">{node.label}</h3>
@@ -1311,7 +1884,43 @@ function WorkflowNode({
           {node.type}
         </span>
       </div>
+      {isFolderNode && expanded ? (
+        <FolderNodePreview state={folderEntries} />
+      ) : null}
     </article>
+  );
+}
+
+function FolderNodePreview({ state }) {
+  if (!state?.loaded) {
+    return <div className="mt-3 text-[11px] text-muted">Loading folder...</div>;
+  }
+
+  if (state.error) {
+    return <div className="mt-3 text-[11px] text-red-600">{state.error}</div>;
+  }
+
+  const entries = state.entries ?? [];
+
+  return (
+    <div className="workflow-scrollbar mt-3 max-h-36 overflow-auto rounded-md border border-line bg-slate-50 p-2">
+      {entries.length ? (
+        <div className="space-y-1">
+          {entries.map((entry) => (
+            <div key={entry.path} className="flex min-w-0 items-center gap-2 text-[11px] text-slate-700">
+              {entry.isDirectory ? (
+                <FolderOpen size={12} className="shrink-0 text-amber-600" />
+              ) : (
+                <FileText size={12} className="shrink-0 text-slate-500" />
+              )}
+              <span className="truncate">{entry.name}</span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-[11px] text-muted">No visible children.</div>
+      )}
+    </div>
   );
 }
 
@@ -1348,6 +1957,7 @@ const compactEdgeConditionOptions = [
 function Inspector({
   agents,
   collapsed,
+  edge,
   edges,
   node,
   nodes,
@@ -1365,7 +1975,8 @@ function Inspector({
   onWorkflowChange,
   width,
 }) {
-  const [workflowSettingsOpen, setWorkflowSettingsOpen] = useState(!node);
+  const [workflowSettingsOpen, setWorkflowSettingsOpen] = useState(!node && !edge);
+  const [edgeInspectorOpen, setEdgeInspectorOpen] = useState(Boolean(edge));
   const [nodeInspectorOpen, setNodeInspectorOpen] = useState(Boolean(node));
   const [cronPickerOpen, setCronPickerOpen] = useState(false);
   const [draftEdge, setDraftEdge] = useState(null);
@@ -1382,10 +1993,11 @@ function Inspector({
     : [];
 
   useEffect(() => {
-    setWorkflowSettingsOpen(!node);
+    setWorkflowSettingsOpen(!node && !edge);
+    setEdgeInspectorOpen(Boolean(edge));
     setNodeInspectorOpen(Boolean(node));
     setDraftEdge(null);
-  }, [node?.id]);
+  }, [edge?.id, node?.id]);
 
   function updateWorkflowSchedule(patch) {
     const currentSchedule = schedule ?? { cron_expression: "0 9 * * *", timezone: "UTC" };
@@ -1569,6 +2181,60 @@ function Inspector({
           </div>
         </InspectorPanel>
 
+        {edge ? (
+          <InspectorPanel
+            open={edgeInspectorOpen}
+            subtitle={`${edge.from} -> ${edge.to}`}
+            title="Edge inspector"
+            onToggle={() => setEdgeInspectorOpen((current) => !current)}
+          >
+            <div className="space-y-4 p-4">
+              <InspectorSection title="Relationship">
+                <SelectField
+                  label="Type"
+                  value={edge.condition ?? "always"}
+                  options={edgeConditionOptions}
+                  onChange={(value) =>
+                    onEdgeChange(edge.id, {
+                      condition: value,
+                      outputPattern:
+                        value === "output_matches" ? edge.outputPattern ?? "" : null,
+                    })
+                  }
+                />
+                {edge.condition === "output_matches" ? (
+                  <TextField
+                    value={edge.outputPattern ?? ""}
+                    onChange={(value) => onEdgeChange(edge.id, { outputPattern: value })}
+                    placeholder="Regex pattern"
+                  />
+                ) : null}
+              </InspectorSection>
+
+              <InspectorSection title="Endpoints">
+                <SelectField
+                  label="Source"
+                  value={edge.from}
+                  options={nodes.map((candidate) => [
+                    candidate.id,
+                    candidate.label || candidate.id,
+                  ])}
+                  onChange={(value) => onEdgeChange(edge.id, { from: value })}
+                />
+                <SelectField
+                  label="Target"
+                  value={edge.to}
+                  options={nodes.map((candidate) => [
+                    candidate.id,
+                    candidate.label || candidate.id,
+                  ])}
+                  onChange={(value) => onEdgeChange(edge.id, { to: value })}
+                />
+              </InspectorSection>
+            </div>
+          </InspectorPanel>
+        ) : null}
+
         {node ? (
           <InspectorPanel
             open={nodeInspectorOpen}
@@ -1597,6 +2263,8 @@ function Inspector({
                 ["copy_file", "Copy file"],
                 ["move_file", "Move file"],
                 ["delete_file", "Delete file"],
+                ["file", "File path"],
+                ["folder", "Folder path"],
                 ["open_resource", "Open app / URL / file"],
                 ["prompt_file", "Prompt file"],
                 ["common_llm_task", "Common LLM task"],
@@ -1795,6 +2463,30 @@ function Inspector({
                 checked={Boolean(operation.missing_ok)}
                 label="Succeed if missing"
                 onChange={(checked) => onOperationChange({ missing_ok: checked })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "file" ? (
+            <InspectorSection title="File path">
+              <TextField
+                label="Path"
+                value={operation.path ?? ""}
+                onChange={(value) => onOperationChange({ path: value })}
+                pathPicker
+                placeholder="/absolute/path/to/file"
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "folder" ? (
+            <InspectorSection title="Folder path">
+              <TextField
+                label="Path"
+                value={operation.path ?? ""}
+                onChange={(value) => onOperationChange({ path: value })}
+                pathPicker
+                placeholder="/absolute/path/to/folder"
               />
             </InspectorSection>
           ) : null}
@@ -2523,6 +3215,15 @@ function edgeGeometry(fromNode, toNode, selfLoop, laneOffset = 0) {
           y: (start.y + end.y) / 2 - 12,
         },
   };
+}
+
+function draftEdgePath(draftEdge) {
+  const start = draftEdge.start;
+  const end = draftEdge.to;
+  const dx = end.x - start.x;
+  const controlDistance = Math.max(80, Math.abs(dx) / 2);
+  const direction = Math.sign(dx) || 1;
+  return `M ${start.x} ${start.y} C ${start.x + direction * controlDistance} ${start.y}, ${end.x - direction * controlDistance} ${end.y}, ${end.x} ${end.y}`;
 }
 
 function InspectorPanel({ children, open, subtitle, title, onToggle }) {

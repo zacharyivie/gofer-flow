@@ -546,6 +546,8 @@ function setupIpcHandlers() {
   ipcMain.handle("gofer:get-data-dir", getGoferDataDir);
   ipcMain.handle("gofer:list-directory", listDirectory);
   ipcMain.handle("gofer:open-path", openPath);
+  ipcMain.handle("gofer:reveal-path", revealPath);
+  ipcMain.handle("gofer:path-info", pathInfo);
   ipcMain.handle("gofer:set-data-dir", setDataDir);
   ipcMain.handle("gofer:select-path", selectPath);
 }
@@ -555,11 +557,54 @@ async function openPath(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const result = await shell.openPath(options.targetPath);
+  const result = await shell.openPath(resolveExactPath(options.targetPath));
   if (result) {
     throw new Error(result);
   }
   return { opened: true };
+}
+
+async function revealPath(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+
+  const targetPath = resolveExactPath(options.targetPath);
+  if (fs.existsSync(targetPath)) {
+    shell.showItemInFolder(targetPath);
+    return { opened: true };
+  }
+
+  const parentPath = path.dirname(targetPath);
+  if (fs.existsSync(parentPath)) {
+    const result = await shell.openPath(parentPath);
+    if (result) {
+      throw new Error(result);
+    }
+    return { opened: true };
+  }
+
+  throw new Error(`Path does not exist: ${targetPath}`);
+}
+
+async function pathInfo(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+
+  const targetPath = resolveExactPath(options.targetPath);
+  const stat = await fs.promises.stat(targetPath);
+  return pathInfoFromStat(targetPath, stat);
+}
+
+function pathInfoFromStat(targetPath, stat) {
+  return {
+    basename: path.basename(targetPath),
+    extension: path.extname(targetPath),
+    isDirectory: stat.isDirectory(),
+    isFile: stat.isFile(),
+    path: targetPath,
+  };
 }
 
 async function setDataDir(_event, options = {}) {
@@ -576,8 +621,12 @@ async function setDataDir(_event, options = {}) {
 }
 
 async function listDirectory(_event, options = {}) {
-  const directory = resolvePickerDefaultPath(options.currentPath);
-  fs.mkdirSync(directory, { recursive: true });
+  const directory = options.create === false
+    ? resolveExactPath(options.currentPath)
+    : resolvePickerDefaultPath(options.currentPath);
+  if (options.create !== false) {
+    fs.mkdirSync(directory, { recursive: true });
+  }
   const entries = await fs.promises.readdir(directory, { withFileTypes: true });
 
   return {
@@ -598,6 +647,21 @@ async function listDirectory(_event, options = {}) {
         return left.name.localeCompare(right.name);
       }),
   };
+}
+
+function resolveExactPath(currentPath) {
+  if (!currentPath || typeof currentPath !== "string") {
+    return getGoferDataDir();
+  }
+
+  const candidate = currentPath.trim();
+  if (!candidate) {
+    return getGoferDataDir();
+  }
+
+  return path.isAbsolute(candidate)
+    ? path.resolve(candidate)
+    : path.resolve(getGoferDataDir(), candidate);
 }
 
 async function selectPath(_event, options = {}) {

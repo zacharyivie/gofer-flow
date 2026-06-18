@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
+  ArrowLeft,
   Bot,
   Check,
   ChevronDown,
@@ -14,9 +15,12 @@ import {
   Moon,
   MoreVertical,
   Plus,
+  PencilLine,
+  Play,
   RefreshCw,
   Search,
   Send,
+  Square,
   Sun,
   Trash2,
   Waypoints,
@@ -203,15 +207,17 @@ export default function App() {
     }
   }, []);
 
-  const loadRunLog = useCallback(async (workflowId, runId) => {
+  const loadRunLog = useCallback(async (workflowId, runId, { silent = false } = {}) => {
     const requestId = logRequestRef.current + 1;
     logRequestRef.current = requestId;
-    setLogState((current) => ({
-      ...current,
-      loading: true,
-      error: "",
-      selectedRunId: runId,
-    }));
+    if (!silent) {
+      setLogState((current) => ({
+        ...current,
+        loading: true,
+        error: "",
+        selectedRunId: runId,
+      }));
+    }
     try {
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs/${encodeURIComponent(runId)}`),
@@ -231,11 +237,13 @@ export default function App() {
       }));
     } catch (error) {
       if (requestId !== logRequestRef.current) return;
-      setLogState((current) => ({
-        ...current,
-        loading: false,
-        error: error instanceof Error ? error.message : "Unable to load workflow run",
-      }));
+      if (!silent) {
+        setLogState((current) => ({
+          ...current,
+          loading: false,
+          error: error instanceof Error ? error.message : "Unable to load workflow run",
+        }));
+      }
     }
   }, []);
 
@@ -262,14 +270,16 @@ export default function App() {
     }
 
     const intervalId = window.setInterval(() => {
-      if (!logState.selectedRunId) {
+      if (logState.selectedRunId) {
+        loadRunLog(activeWorkflow.id, logState.selectedRunId, { silent: true });
+      } else {
         loadLatestLog(activeWorkflow.id, { silent: true });
       }
       loadRunLogs(activeWorkflow.id, { silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [activeWorkflow?.id, loadLatestLog, loadRunLogs, logState.selectedRunId]);
+  }, [activeWorkflow?.id, loadLatestLog, loadRunLog, loadRunLogs, logState.selectedRunId]);
 
   useEffect(() => {
     if (!dirtyWorkflow) return undefined;
@@ -424,7 +434,7 @@ export default function App() {
   }
 
   async function stopWorkflowRun(workflow) {
-    if (!workflow?.id || !runState.running || runState.workflowId !== workflow.id) return;
+    if (!workflow?.id) return;
 
     setRunState((current) => ({ ...current, stopping: true }));
     try {
@@ -438,10 +448,42 @@ export default function App() {
       }
       setTopBarNotice({
         type: payload.stopped ? "success" : "error",
-        message: payload.stopped ? "Stopping workflow run..." : payload.message || "No active run",
+        message: payload.stopped ? "Stopping workflow runs..." : payload.message || "No active run",
       });
+      setRunState((current) => ({
+        ...current,
+        stopping: false,
+      }));
+      loadRunLogs(workflow.id, { silent: true });
     } catch (error) {
       setRunState((current) => ({ ...current, stopping: false }));
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to stop workflow run",
+      });
+    }
+  }
+
+  async function stopWorkflowRunLog(workflowId, runId) {
+    if (!workflowId || !runId) return;
+
+    try {
+      const response = await fetch(
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}/stop`,
+        ),
+        { method: "POST" },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setTopBarNotice({
+        type: payload.stopped ? "success" : "error",
+        message: payload.stopped ? "Stopping workflow run..." : payload.message || "No active run",
+      });
+      loadRunLogs(workflowId, { silent: true });
+    } catch (error) {
       setTopBarNotice({
         type: "error",
         message: error instanceof Error ? error.message : "Unable to stop workflow run",
@@ -532,7 +574,6 @@ export default function App() {
       }
       setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
       setSaveState((current) => ({ ...current, saving: false }));
-      window.localStorage.removeItem(`gofer-flow-chat:${workflow.id}`);
       setRunState((current) =>
         current.workflowId === workflow.id
           ? { running: false, error: "", result: null }
@@ -577,6 +618,89 @@ export default function App() {
     }
   }
 
+  async function renameWorkflow(workflow, nextName) {
+    if (!workflow) return;
+    if (!nextName || nextName.trim() === workflow.name) return;
+
+    try {
+      if (dirtyWorkflowRef.current?.id === workflow.id) {
+        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current));
+        dirtyWorkflowRef.current = undefined;
+        setDirtyWorkflow(undefined);
+      }
+
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/rename`),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ name: nextName.trim() }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+
+      const renamed = summarizeWorkflow(payload.workflow);
+      deletedWorkflowIdsRef.current.delete(renamed.id);
+      setWorkflows((current) =>
+        current.map((candidate) =>
+          candidate.id === workflow.id ? renamed : candidate,
+        ),
+      );
+      setActiveWorkflowId((currentId) =>
+        currentId === workflow.id ? renamed.id : currentId,
+      );
+      setTopBarNotice({ type: "success", message: `Renamed to ${renamed.name}` });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to rename workflow",
+      });
+    }
+  }
+
+  async function duplicateWorkflow(workflow) {
+    if (!workflow) return;
+
+    try {
+      if (dirtyWorkflowRef.current?.id === workflow.id) {
+        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current));
+        dirtyWorkflowRef.current = undefined;
+        setDirtyWorkflow(undefined);
+      }
+
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/duplicate`),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({}),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+
+      const duplicated = summarizeWorkflow(payload.workflow);
+      deletedWorkflowIdsRef.current.delete(duplicated.id);
+      setWorkflows((current) => [...current, duplicated]);
+      setActiveWorkflowId(duplicated.id);
+      setTopBarNotice({ type: "success", message: `Duplicated ${workflow.name}` });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to duplicate workflow",
+      });
+    }
+  }
+
   async function changeDataDir(nextDataDir) {
     if (!window.goferDesktop?.setDataDir) {
       setTopBarNotice({
@@ -612,7 +736,10 @@ export default function App() {
         onCreate={() => setCreateDialogOpen(true)}
         onDataDirPick={() => setDataDirPickerOpen(true)}
         onDeleteWorkflow={deleteWorkflow}
+        onDuplicateWorkflow={duplicateWorkflow}
         onRefresh={loadWorkflows}
+        onRenameWorkflow={renameWorkflow}
+        onRunWorkflow={runWorkflowNow}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 420,
@@ -642,6 +769,7 @@ export default function App() {
               workflow={activeWorkflow}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
+              onStopRunLog={(runId) => stopWorkflowRunLog(activeWorkflow.id, runId)}
               onImportWorkflow={importWorkflow}
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
@@ -656,7 +784,9 @@ export default function App() {
 
       <ChatPane
         width={chatPaneWidth}
+        activeWorkflowId={activeWorkflow?.id}
         workflow={activeWorkflow}
+        workflows={workflows}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 520,
@@ -734,6 +864,17 @@ function getInitialTheme() {
 }
 
 function summarizeWorkflow(workflow) {
+  if (workflow.invalid) {
+    return {
+      ...workflow,
+      agents: workflow.agents ?? {},
+      nodes: workflow.nodes ?? [],
+      edges: workflow.edges ?? [],
+      description: workflow.description || `Invalid workflow TOML: ${workflow.validationError}`,
+      status: "Error",
+      tags: ["error", "invalid"],
+    };
+  }
   const agentCount = agentIdsForWorkflow(workflow).length;
   const operationTypes = [...new Set((workflow.nodes ?? []).map((node) => node.type))].sort();
   const status = workflow.status ?? "Ready";
@@ -802,9 +943,12 @@ function WorkflowSidebar({
   onCreate,
   onDataDirPick,
   onDeleteWorkflow,
+  onDuplicateWorkflow,
   onQueryChange,
   onRefresh,
+  onRenameWorkflow,
   onResizeStart,
+  onRunWorkflow,
   onSelect,
   width,
 }) {
@@ -898,6 +1042,9 @@ function WorkflowSidebar({
               }
               workflow={workflow}
               onDelete={() => onDeleteWorkflow(workflow)}
+              onDuplicate={() => onDuplicateWorkflow(workflow)}
+              onRename={(name) => onRenameWorkflow(workflow, name)}
+              onRun={() => onRunWorkflow(workflow)}
               onSelect={() => onSelect(workflow.id)}
             />
           ))
@@ -940,9 +1087,21 @@ function WorkflowSidebar({
   );
 }
 
-function WorkflowListItem({ active, onDelete, onSelect, status, workflow }) {
+function WorkflowListItem({
+  active,
+  onDelete,
+  onDuplicate,
+  onRename,
+  onRun,
+  onSelect,
+  status,
+  workflow,
+}) {
   const menuRef = useRef(null);
+  const nameInputRef = useRef(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [draftName, setDraftName] = useState(workflow.name);
 
   useEffect(() => {
     if (!menuOpen) return undefined;
@@ -956,6 +1115,33 @@ function WorkflowListItem({ active, onDelete, onSelect, status, workflow }) {
     return () => window.removeEventListener("pointerdown", handlePointerDown);
   }, [menuOpen]);
 
+  useEffect(() => {
+    setDraftName(workflow.name);
+  }, [workflow.name]);
+
+  useEffect(() => {
+    if (!renaming) return;
+    nameInputRef.current?.focus();
+    nameInputRef.current?.select();
+  }, [renaming]);
+
+  function commitRename() {
+    const nextName = draftName.trim();
+    setRenaming(false);
+    if (!nextName) {
+      setDraftName(workflow.name);
+      return;
+    }
+    if (nextName !== workflow.name) {
+      onRename(nextName);
+    }
+  }
+
+  function cancelRename() {
+    setRenaming(false);
+    setDraftName(workflow.name);
+  }
+
   return (
     <div
       className={`group relative w-full rounded-lg border text-left transition ${
@@ -964,21 +1150,53 @@ function WorkflowListItem({ active, onDelete, onSelect, status, workflow }) {
           : "border-transparent bg-white hover:border-line hover:bg-slate-50"
       }`}
     >
-      <button
+      <div
+        role="button"
+        tabIndex={0}
         className="w-full rounded-lg p-3 pr-10 text-left"
-        type="button"
-        onClick={onSelect}
+        onClick={() => {
+          if (!renaming) {
+            onSelect();
+          }
+        }}
+        onKeyDown={(event) => {
+          if (!renaming && (event.key === "Enter" || event.key === " ")) {
+            event.preventDefault();
+            onSelect();
+          }
+        }}
       >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
-            <p className="truncate text-sm font-semibold">{workflow.name}</p>
+            {renaming ? (
+              <input
+                ref={nameInputRef}
+                className="w-full rounded-md border border-teal-300 bg-white px-2 py-1 text-sm font-semibold text-ink outline-none ring-2 ring-teal-100"
+                value={draftName}
+                onBlur={commitRename}
+                onChange={(event) => setDraftName(event.target.value)}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    event.currentTarget.blur();
+                  }
+                  if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelRename();
+                  }
+                }}
+              />
+            ) : (
+              <p className="truncate text-sm font-semibold">{workflow.name}</p>
+            )}
             <p className="text-clamp-2 mt-1 text-xs leading-5 text-muted">
               {workflow.description}
             </p>
           </div>
           <StatusDot status={status} />
         </div>
-      </button>
+      </div>
       <div ref={menuRef} className="absolute right-2 top-2">
         <button
           className="grid h-7 w-7 place-items-center rounded-md text-muted opacity-70 transition hover:bg-slate-100 hover:text-ink group-hover:opacity-100 dark:hover:bg-[#2a2a2a]"
@@ -992,7 +1210,44 @@ function WorkflowListItem({ active, onDelete, onSelect, status, workflow }) {
           <MoreVertical size={14} />
         </button>
         {menuOpen ? (
-          <div className="absolute right-0 top-8 z-40 w-44 rounded-lg border border-line bg-white p-1 shadow-panel">
+          <div className="absolute right-0 top-8 z-40 w-48 rounded-lg border border-line bg-white p-1 shadow-panel">
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setMenuOpen(false);
+                onRun();
+              }}
+            >
+              <Play size={15} />
+              Run workflow
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setMenuOpen(false);
+                setRenaming(true);
+              }}
+            >
+              <PencilLine size={15} />
+              Rename workflow
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setMenuOpen(false);
+                onDuplicate();
+              }}
+            >
+              <Copy size={15} />
+              Duplicate workflow
+            </button>
+            <div className="my-1 border-t border-line" />
             <button
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50 dark:hover:bg-[#3a2424]"
               type="button"
@@ -1017,6 +1272,8 @@ function TopBar({
   workflow,
   onToggleTheme,
 }) {
+  const nodeCount = workflow.nodes?.length ?? 0;
+  const edgeCount = workflow.edges?.length ?? 0;
   return (
     <header className="flex h-[62px] shrink-0 items-center justify-between bg-white px-6 pt-1">
       <div className="min-w-0 pt-1">
@@ -1027,11 +1284,13 @@ function TopBar({
         <div className="mt-0.5 flex items-center gap-3">
           <h2 className="truncate text-[19px] font-semibold">{workflow.name}</h2>
           <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
-            {workflow.nodes.length} nodes
+            {workflow.invalid ? "Invalid TOML" : `${nodeCount} nodes`}
           </span>
-          <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
-            {workflow.edges.length} edges
-          </span>
+          {!workflow.invalid ? (
+            <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
+              {edgeCount} edges
+            </span>
+          ) : null}
         </div>
       </div>
       <div className="flex items-center gap-2">
@@ -1048,26 +1307,41 @@ function TopBar({
   );
 }
 
-function ChatPane({ onResizeStart, width, workflow }) {
+function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows }) {
   const chatScrollRef = useRef(null);
   const conversationMenuRef = useRef(null);
   const [draft, setDraft] = useState("");
   const [providers, setProviders] = useState([]);
   const [providerId, setProviderId] = useState("codex");
   const [model, setModel] = useState("cli-default");
-  const [chatStateByWorkflow, setChatStateByWorkflow] = useState({});
-  const [showTypingByWorkflow, setShowTypingByWorkflow] = useState({});
-  const [typingDelayByWorkflow, setTypingDelayByWorkflow] = useState({});
+  const [threads, setThreads] = useState(loadChatThreads);
+  const [activeThreadId, setActiveThreadId] = useState(null);
+  const [messagesByThread, setMessagesByThread] = useState({});
+  const [chatStateByThread, setChatStateByThread] = useState({});
+  const [showTypingByThread, setShowTypingByThread] = useState({});
+  const [typingDelayByThread, setTypingDelayByThread] = useState({});
   const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
-  const workflowName = workflow?.name ?? "No workflow selected";
-  const workflowId = workflow?.id ?? "no-workflow";
-  const chatStorageKey = chatStorageKeyFor(workflowId);
-  const [messagesByWorkflow, setMessagesByWorkflow] = useState({});
-  const messages = messagesByWorkflow[workflowId] ?? loadChatMessages(chatStorageKey);
-  const chatState = chatStateByWorkflow[workflowId] ?? { sending: false, error: "" };
-  const showTypingIndicator = Boolean(showTypingByWorkflow[workflowId]);
-  const typingDelayKey = typingDelayByWorkflow[workflowId] ?? 0;
+  const chatAbortControllersRef = useRef({});
+  const workflowName = workflow?.name ?? "All workflows";
+  const activeThread = threads.find((thread) => thread.id === activeThreadId);
+  const messages = activeThreadId
+    ? messagesByThread[activeThreadId] ?? loadChatMessages(chatStorageKeyFor(activeThreadId))
+    : [];
+  const chatState = activeThreadId
+    ? chatStateByThread[activeThreadId] ?? { sending: false, error: "" }
+    : { sending: false, error: "" };
+  const showTypingIndicator = Boolean(activeThreadId && showTypingByThread[activeThreadId]);
+  const typingDelayKey = activeThreadId ? typingDelayByThread[activeThreadId] ?? 0 : 0;
+  const workflowContext = useMemo(
+    () => ({
+      id: activeThreadId ? `workflow-assistant:${activeThreadId}` : "workflow-assistant",
+      chatThreadId: activeThreadId,
+      selectedWorkflowId: activeWorkflowId ?? null,
+      workflows: workflows ?? [],
+    }),
+    [activeThreadId, activeWorkflowId, workflows],
+  );
   const chatItems = useMemo(() => buildChatItems(messages), [messages]);
 
   useEffect(() => {
@@ -1091,28 +1365,39 @@ function ChatPane({ onResizeStart, width, workflow }) {
   }, []);
 
   useEffect(() => {
-    setMessagesByWorkflow((current) =>
-      current[workflowId]
+    if (!activeThreadId) {
+      setDraft("");
+      setConversationMenuOpen(false);
+      return;
+    }
+
+    setMessagesByThread((current) =>
+      current[activeThreadId]
         ? current
-        : { ...current, [workflowId]: loadChatMessages(chatStorageKey) },
+        : {
+            ...current,
+            [activeThreadId]: loadChatMessages(chatStorageKeyFor(activeThreadId)),
+          },
     );
     setDraft("");
     setExpandedThoughtGroups({});
     setConversationMenuOpen(false);
-  }, [chatStorageKey, workflowId]);
+  }, [activeThreadId]);
 
   useEffect(() => {
+    if (!activeThreadId) return undefined;
+
     if (!chatState.sending) {
-      setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: false }));
+      setShowTypingByThread((current) => ({ ...current, [activeThreadId]: false }));
       return undefined;
     }
 
     const timeoutId = window.setTimeout(() => {
-      setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: true }));
+      setShowTypingByThread((current) => ({ ...current, [activeThreadId]: true }));
     }, 2000);
 
     return () => window.clearTimeout(timeoutId);
-  }, [chatState.sending, typingDelayKey, workflowId]);
+  }, [activeThreadId, chatState.sending, typingDelayKey]);
 
   useEffect(() => {
     if (!conversationMenuOpen) return undefined;
@@ -1145,23 +1430,21 @@ function ChatPane({ onResizeStart, width, workflow }) {
 
   async function sendMessage() {
     const text = draft.trim();
-    if (!text || chatState.sending) return;
-    const targetWorkflow = workflow;
-    const targetWorkflowId = workflowId;
-    const targetStorageKey = chatStorageKeyFor(targetWorkflowId);
-    const targetMessages = messagesByWorkflow[targetWorkflowId] ?? loadChatMessages(targetStorageKey);
+    if (!activeThreadId || !text || chatState.sending) return;
+    const targetThreadId = activeThreadId;
 
     const userMessage = {
       id: uniqueClientId(),
       role: "user",
       body: text,
     };
-    const nextMessages = [...targetMessages, userMessage];
-    updateWorkflowMessages(targetWorkflowId, nextMessages);
+    const nextMessages = [...messages, userMessage];
+    updateThreadMessages(targetThreadId, nextMessages);
+    updateThreadTitleFromMessage(targetThreadId, text);
     setDraft("");
-    setChatStateByWorkflow((current) => ({
+    setChatStateByThread((current) => ({
       ...current,
-      [targetWorkflowId]: { sending: true, error: "" },
+      [targetThreadId]: { sending: true, error: "" },
     }));
     const thoughtGroupId = uniqueClientId();
     window.requestAnimationFrame(() => {
@@ -1170,7 +1453,7 @@ function ChatPane({ onResizeStart, width, workflow }) {
 
     function appendAssistantMessage(body, kind = "final", extra = {}) {
       const assistantMessageId = uniqueClientId();
-      updateWorkflowMessages(targetWorkflowId, (current) => [
+      updateThreadMessages(targetThreadId, (current) => [
         ...current,
         {
           id: assistantMessageId,
@@ -1190,24 +1473,31 @@ function ChatPane({ onResizeStart, width, workflow }) {
     }
 
     function restartTypingDelay() {
-      setShowTypingByWorkflow((current) => ({ ...current, [targetWorkflowId]: false }));
-      setTypingDelayByWorkflow((current) => ({
+      setShowTypingByThread((current) => ({ ...current, [targetThreadId]: false }));
+      setTypingDelayByThread((current) => ({
         ...current,
-        [targetWorkflowId]: (current[targetWorkflowId] ?? 0) + 1,
+        [targetThreadId]: (current[targetThreadId] ?? 0) + 1,
       }));
     }
 
     try {
+      const abortController = new AbortController();
+      chatAbortControllersRef.current[targetThreadId] = abortController;
       const response = await fetch(apiUrl("/chat/stream"), {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
+        signal: abortController.signal,
         body: JSON.stringify({
           provider: providerId,
           model,
           messages: nextMessages.map(({ role, body }) => ({ role, body })),
-          workflow: targetWorkflow,
+          workflow: {
+            ...workflowContext,
+            id: `workflow-assistant:${targetThreadId}`,
+            chatThreadId: targetThreadId,
+          },
         }),
       });
       if (!response.ok) {
@@ -1266,54 +1556,116 @@ function ChatPane({ onResizeStart, width, workflow }) {
       if (!finalReceived) {
         throw new Error("Workflow assistant stream ended without a final response");
       }
-      setChatStateByWorkflow((current) => ({
+      setChatStateByThread((current) => ({
         ...current,
-        [targetWorkflowId]: { sending: false, error: "" },
+        [targetThreadId]: { sending: false, error: "" },
       }));
     } catch (error) {
-      setChatStateByWorkflow((current) => ({
+      if (error instanceof DOMException && error.name === "AbortError") {
+        appendAssistantMessage("Workflow assistant stopped.", "final");
+        setChatStateByThread((current) => ({
+          ...current,
+          [targetThreadId]: { sending: false, error: "" },
+        }));
+        return;
+      }
+      setChatStateByThread((current) => ({
         ...current,
-        [targetWorkflowId]: {
+        [targetThreadId]: {
           sending: false,
           error: error instanceof Error ? error.message : "Unable to send message",
         },
       }));
+    } finally {
+      if (chatAbortControllersRef.current[targetThreadId]) {
+        delete chatAbortControllersRef.current[targetThreadId];
+      }
     }
   }
 
-  function updateWorkflowMessages(targetWorkflowId, nextValue) {
-    setMessagesByWorkflow((current) => {
+  function stopAssistant(threadId) {
+    chatAbortControllersRef.current[threadId]?.abort();
+    setShowTypingByThread((current) => ({ ...current, [threadId]: false }));
+  }
+
+  function updateThreadMessages(threadId, nextValue) {
+    setMessagesByThread((current) => {
       const currentMessages =
-        current[targetWorkflowId] ?? loadChatMessages(chatStorageKeyFor(targetWorkflowId));
+        current[threadId] ?? loadChatMessages(chatStorageKeyFor(threadId));
       const nextMessages =
         typeof nextValue === "function" ? nextValue(currentMessages) : nextValue;
-      window.localStorage.setItem(
-        chatStorageKeyFor(targetWorkflowId),
-        JSON.stringify(nextMessages),
-      );
-      return { ...current, [targetWorkflowId]: nextMessages };
+      window.localStorage.setItem(chatStorageKeyFor(threadId), JSON.stringify(nextMessages));
+      return { ...current, [threadId]: nextMessages };
     });
   }
 
-  async function deleteConversation() {
-    const defaultMessages = defaultChatMessages();
-    window.localStorage.setItem(chatStorageKeyFor(workflowId), JSON.stringify(defaultMessages));
-    setMessagesByWorkflow((current) => ({ ...current, [workflowId]: defaultMessages }));
+  function createThread() {
+    const now = new Date().toISOString();
+    const thread = {
+      id: uniqueClientId(),
+      title: "New thread",
+      createdAt: now,
+      updatedAt: now,
+    };
+    const nextThreads = [thread, ...threads];
+    persistChatThreads(nextThreads);
+    setThreads(nextThreads);
+    setActiveThreadId(thread.id);
     setDraft("");
-    setChatStateByWorkflow((current) => ({
-      ...current,
-      [workflowId]: { sending: false, error: "" },
-    }));
-    setShowTypingByWorkflow((current) => ({ ...current, [workflowId]: false }));
-    setTypingDelayByWorkflow((current) => ({ ...current, [workflowId]: 0 }));
+  }
+
+  function updateThreadTitleFromMessage(threadId, message) {
+    setThreads((currentThreads) => {
+      const nextThreads = currentThreads.map((thread) =>
+        thread.id === threadId
+          ? {
+              ...thread,
+              title: thread.title === "New thread" ? threadTitleFromMessage(message) : thread.title,
+              updatedAt: new Date().toISOString(),
+            }
+          : thread,
+      );
+      persistChatThreads(nextThreads);
+      return nextThreads;
+    });
+  }
+
+  async function deleteThread(threadId) {
+    const nextThreads = threads.filter((thread) => thread.id !== threadId);
+    persistChatThreads(nextThreads);
+    setThreads(nextThreads);
+    window.localStorage.removeItem(chatStorageKeyFor(threadId));
+    setMessagesByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setChatStateByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setShowTypingByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setTypingDelayByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    chatAbortControllersRef.current[threadId]?.abort();
+    delete chatAbortControllersRef.current[threadId];
+    if (activeThreadId === threadId) {
+      setActiveThreadId(null);
+    }
     setExpandedThoughtGroups({});
     setConversationMenuOpen(false);
 
-    if (!workflow?.id) return;
-
     try {
       const response = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/chat`),
+        apiUrl(`/chat/threads/${encodeURIComponent(threadId)}`),
         { method: "DELETE" },
       );
       if (!response.ok) {
@@ -1321,13 +1673,14 @@ function ChatPane({ onResizeStart, width, workflow }) {
         throw new Error(payload.error || `Chat API returned ${response.status}`);
       }
     } catch (error) {
-      setChatStateByWorkflow((current) => ({
-        ...current,
-        [workflowId]: {
-          sending: false,
-          error: error instanceof Error ? error.message : "Unable to delete chat handoff file",
-        },
-      }));
+      const message =
+        error instanceof Error ? error.message : "Unable to delete chat handoff file";
+      if (activeThreadId === threadId) {
+        setChatStateByThread((current) => ({
+          ...current,
+          [threadId]: { sending: false, error: message },
+        }));
+      }
     }
   }
 
@@ -1371,9 +1724,27 @@ function ChatPane({ onResizeStart, width, workflow }) {
           </span>
           <div className="min-w-0 flex-1">
             <div className="flex items-center justify-between gap-2">
-              <div className="min-w-0">
-                <h2 className="truncate text-base font-semibold">Workflow assistant</h2>
-                <p className="truncate text-xs text-muted">{workflowName}</p>
+              <div className="flex min-w-0 items-center gap-2">
+                {activeThread ? (
+                  <button
+                    className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                    title="Back to threads"
+                    type="button"
+                    onClick={() => setActiveThreadId(null)}
+                  >
+                    <ArrowLeft size={15} />
+                  </button>
+                ) : null}
+                <div className="min-w-0">
+                  <h2 className="truncate text-base font-semibold">Workflow assistant</h2>
+                  <p className="truncate text-xs text-muted">
+                    {activeThread
+                      ? activeThread.title
+                      : workflow
+                        ? `${workflowName} selected`
+                        : "No workflow selected"}
+                  </p>
+                </div>
               </div>
               <div ref={conversationMenuRef} className="relative flex shrink-0 items-center gap-2">
                 <span
@@ -1398,9 +1769,10 @@ function ChatPane({ onResizeStart, width, workflow }) {
                     <button
                       className="w-full rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
                       type="button"
-                      onClick={deleteConversation}
+                      disabled={!activeThread}
+                      onClick={() => activeThread && deleteThread(activeThread.id)}
                     >
-                      Delete conversation
+                      Delete thread
                     </button>
                   </div>
                 ) : null}
@@ -1444,71 +1816,158 @@ function ChatPane({ onResizeStart, width, workflow }) {
         ref={chatScrollRef}
         className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-5"
       >
-        <div className="rounded-lg border border-line bg-slate-50 p-3">
-          <p className="text-sm leading-6 text-slate-700">
-            The workflow assistant understands Gofer workflows and can answer questions
-            about the current workflow, modify its nodes and edges, or create new
-            workflows from your request.
-          </p>
-        </div>
-
-        {chatItems.map((item) =>
-          item.type === "thought-group" ? (
-            <ThoughtGroup
-              key={item.id}
-              expanded={Boolean(expandedThoughtGroups[item.id])}
-              thoughts={item.thoughts}
-              onToggle={() =>
-                setExpandedThoughtGroups((current) => ({
-                  ...current,
-                  [item.id]: !current[item.id],
-                }))
-              }
-            />
-          ) : (
-            <ChatMessageBubble key={item.message.id} message={item.message} />
-          ),
-        )}
-        {showTypingIndicator ? <TypingIndicator /> : null}
-        {chatState.error ? (
-          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
-            {chatState.error}
-          </div>
-        ) : null}
-      </div>
-
-      <div className="border-t border-line p-4">
-        <div className="rounded-lg border border-line bg-slate-50 p-2">
-          <textarea
-            className="h-20 w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-slate-400"
-            placeholder="Ask about this workflow"
-            value={draft}
-            onChange={(event) => setDraft(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter" && !event.shiftKey) {
-                event.preventDefault();
-                sendMessage();
-              }
-            }}
+        {!activeThread ? (
+          <ThreadList
+            threads={threads}
+            onCreate={createThread}
+            onDelete={deleteThread}
+            onOpen={setActiveThreadId}
           />
-          <div className="flex items-center justify-between px-1">
-            <div className="flex items-center gap-2 text-xs text-muted">
-              <MessageSquare size={14} />
-              {selectedProvider.name} · {model}
+        ) : (
+          <>
+            <div className="rounded-lg border border-line bg-slate-50 p-3">
+              <p className="text-sm leading-6 text-slate-700">
+                The workflow assistant understands all workflows in the open workspace.
+                It can answer questions, create and modify workflows, run them, and
+                handle anything else available through the Gofer Flow CLI.
+              </p>
             </div>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg bg-ink text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60 dark:border dark:border-[#3a3a3d] dark:bg-[#2d2d30] dark:text-[#f2f2f2] dark:hover:border-[#4a4a4f] dark:hover:bg-[#37373d] dark:disabled:border-[#2a2a2a] dark:disabled:bg-[#242426] dark:disabled:text-[#777]"
-              disabled={chatState.sending || !draft.trim()}
-              title="Send message"
-              type="button"
-              onClick={sendMessage}
-            >
-              {chatState.sending ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
-            </button>
+
+            {chatItems.map((item) =>
+              item.type === "thought-group" ? (
+                <ThoughtGroup
+                  key={item.id}
+                  expanded={Boolean(expandedThoughtGroups[item.id])}
+                  thoughts={item.thoughts}
+                  onToggle={() =>
+                    setExpandedThoughtGroups((current) => ({
+                      ...current,
+                      [item.id]: !current[item.id],
+                    }))
+                  }
+                />
+              ) : (
+                <ChatMessageBubble key={item.message.id} message={item.message} />
+              ),
+            )}
+            {showTypingIndicator ? <TypingIndicator /> : null}
+            {chatState.error ? (
+              <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
+                {chatState.error}
+              </div>
+            ) : null}
+          </>
+        )}
+      </div>
+
+      {activeThread ? (
+        <div className="border-t border-line p-4">
+          <div className="rounded-lg border border-line bg-slate-50 p-2">
+            <textarea
+              className="h-20 w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-muted"
+              disabled={chatState.sending}
+              placeholder="Ask about your workflows"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  sendMessage();
+                }
+              }}
+            />
+            <div className="flex items-center justify-between px-1">
+              <div className="flex items-center gap-2 text-xs text-muted">
+                <MessageSquare size={14} />
+                {selectedProvider.name} · {model}
+              </div>
+              <button
+                className={`grid h-8 w-8 place-items-center rounded-lg transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                  chatState.sending
+                    ? "border border-line bg-white text-red-600 hover:border-red-200 hover:bg-red-50"
+                    : "bg-ink text-white hover:bg-slate-700 dark:border dark:border-[#3a3a3d] dark:bg-[#2d2d30] dark:text-[#f2f2f2] dark:hover:border-[#4a4a4f] dark:hover:bg-[#37373d] dark:disabled:border-[#2a2a2a] dark:disabled:bg-[#242426] dark:disabled:text-[#777]"
+                }`}
+                disabled={!chatState.sending && !draft.trim()}
+                title={chatState.sending ? "Stop workflow assistant" : "Send message"}
+                type="button"
+                onClick={() =>
+                  chatState.sending
+                    ? activeThreadId && stopAssistant(activeThreadId)
+                    : sendMessage()
+                }
+              >
+                {chatState.sending ? (
+                  <Square size={13} fill="currentColor" strokeWidth={1.7} />
+                ) : (
+                  <Send size={15} />
+                )}
+              </button>
+            </div>
           </div>
         </div>
-      </div>
+      ) : null}
     </aside>
+  );
+}
+
+function ThreadList({ onCreate, onDelete, onOpen, threads }) {
+  if (threads.length) {
+    return (
+      <div className="space-y-2">
+        <button
+          className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+          type="button"
+          onClick={onCreate}
+        >
+          <Plus size={14} />
+          New thread
+        </button>
+
+        <div className="space-y-2">
+          {threads.map((thread) => (
+            <div
+              key={thread.id}
+              className="group flex items-center gap-2 rounded-lg border border-line bg-white p-2 transition hover:bg-slate-50"
+            >
+              <button
+                className="min-w-0 flex-1 px-2 py-1 text-left"
+                type="button"
+                onClick={() => onOpen(thread.id)}
+              >
+                <div className="truncate text-sm font-medium text-ink">{thread.title}</div>
+                <div className="mt-0.5 text-xs text-muted">{formatThreadDate(thread.updatedAt)}</div>
+              </button>
+              <button
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted opacity-70 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
+                title="Delete thread"
+                type="button"
+                onClick={() => onDelete(thread.id)}
+              >
+                <Trash2 size={15} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-line bg-slate-50 p-4">
+      <p className="text-sm leading-6 text-slate-700">
+        The workflow assistant understands all workflows in the open workspace. It can
+        answer questions, create and modify workflows, run them, and handle anything
+        else available through the Gofer Flow CLI. Start a new thread to begin.
+      </p>
+      <button
+        className="mt-4 inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-ink transition hover:border-slate-300 hover:bg-slate-50"
+        type="button"
+        onClick={onCreate}
+      >
+        <Plus size={15} />
+        New thread
+      </button>
+    </div>
   );
 }
 
@@ -1631,18 +2090,49 @@ function extractThoughtTokenSummary(thoughts) {
   return "";
 }
 
-function defaultChatMessages() {
-  return [
-    {
-      id: "welcome",
-      role: "assistant",
-      body: "Ask me to explain, edit, validate, or design this workflow. I will use the bundled Gofer Flow workflow-builder skill.",
-    },
-  ];
+const chatThreadsStorageKey = "gofer-flow-chat-threads";
+
+function loadChatThreads() {
+  try {
+    const storedThreads = JSON.parse(window.localStorage.getItem(chatThreadsStorageKey) || "[]");
+    if (
+      Array.isArray(storedThreads) &&
+      storedThreads.every((thread) => thread?.id && typeof thread.title === "string")
+    ) {
+      return storedThreads;
+    }
+  } catch {
+    return [];
+  }
+  return [];
 }
 
-function chatStorageKeyFor(workflowId) {
-  return `gofer-flow-chat:${workflowId ?? "no-workflow"}`;
+function persistChatThreads(threads) {
+  window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(threads));
+}
+
+function threadTitleFromMessage(message) {
+  const words = message.trim().split(/\s+/).slice(0, 8);
+  const title = words.join(" ");
+  return title.length < message.trim().length ? `${title}...` : title || "New thread";
+}
+
+function formatThreadDate(value) {
+  if (!value) return "No messages yet";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "No messages yet";
+  return date.toLocaleString([], {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+function defaultChatMessages() {
+  return [];
+}
+
+function chatStorageKeyFor(threadId) {
+  return `gofer-flow-chat-thread:${threadId}`;
 }
 
 function loadChatMessages(storageKey) {

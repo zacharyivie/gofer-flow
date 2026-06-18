@@ -7,6 +7,8 @@ description: Create, modify, validate, and dry-run Gofer Flow workflows from a u
 
 Use this skill to turn a user's automation request into a real Gofer Flow workflow. Prefer non-interactive CLI commands for creation, discovery, mutation, validation, preview, and dry runs. Edit TOML directly only when the CLI does not expose the required setting. The interactive builder is useful for humans but is inefficient for coding agents.
 
+If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path, use that exact path for every CLI command instead of bare `gof`. This avoids PATH and sandbox differences in packaged desktop installs. In examples below, replace `gof` with the provided executable path when one is available.
+
 ## Workflow
 
 1. Clarify only what is necessary: manual trigger, cron schedule, file/folder watcher, required inputs, expected output, whether real execution is allowed, and whether agent nodes should use `codex` or `claude_code`.
@@ -271,6 +273,32 @@ missing_ok = false
 ```
 
 Prefer `use_trash = true` unless the user explicitly requests permanent deletion.
+
+`file` and `folder`:
+
+Use these when the workflow needs to pass a local file or folder path as data without reading,
+copying, moving, deleting, or opening it. The node output is the configured path string.
+
+```toml
+[[nodes]]
+id = "source-file"
+type = "file"
+path = "data/input.txt"
+pipe_output = true
+
+[[nodes]]
+id = "source-folder"
+type = "folder"
+path = "data"
+pipe_output = true
+```
+
+CLI examples:
+
+```bash
+gof workflow add-node my-flow --id source-file --type file --path data/input.txt --pipe-output
+gof workflow add-node my-flow --id source-folder --type folder --path data --pipe-output
+```
 
 `open_resource`:
 

@@ -14,6 +14,8 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     DeleteFileOperation,
+    FileOperation,
+    FolderOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     MoveFileOperation,
@@ -26,7 +28,11 @@ from gofer.core.operations import (
 )
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
-from gofer.utils.run_state import request_workflow_stop, workflow_stop_path
+from gofer.utils.run_state import (
+    request_workflow_run_stop,
+    request_workflow_stop,
+    workflow_stop_path,
+)
 
 
 def _bash_node(node_id: str, command: str = "true") -> GraphNode:
@@ -88,6 +94,41 @@ async def test_stop_marker_interrupts_running_workflow(tmp_path: Path) -> None:
         tg.start_soon(run_workflow)
         await anyio.sleep(0.2)
         request_workflow_stop("stop-marker", tmp_path)
+
+    assert run_result is not None
+    assert not run_result.success
+    assert "stopped by user" in run_result.log_path.read_text()
+
+
+async def test_run_stop_marker_interrupts_specific_running_workflow(tmp_path: Path) -> None:
+    wf = _make_workflow("run-stop-marker")
+    wf.add_operation(_bash_node("sleep", "sleep 5"))
+    stop_file = workflow_stop_path("run-stop-marker", tmp_path)
+    run_result = None
+
+    async def run_workflow() -> None:
+        nonlocal run_result
+        run_result = await WorkflowExecutor(
+            wf,
+            {},
+            log_base_dir=tmp_path / "logs",
+            stop_file=stop_file,
+        ).run()
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(run_workflow)
+        for _ in range(40):
+            await anyio.sleep(0.05)
+            log_files = list((tmp_path / "logs" / "run-stop-marker").glob("*.log"))
+            if log_files:
+                request_workflow_run_stop(
+                    "run-stop-marker",
+                    log_files[0].name,
+                    tmp_path,
+                )
+                break
+        else:  # pragma: no cover
+            raise AssertionError("Run log was not created")
 
     assert run_result is not None
     assert not run_result.success
@@ -266,6 +307,28 @@ async def test_copy_move_and_delete_file_nodes(tmp_path: Path) -> None:
     assert source.read_text() == "contents"
     assert not copied.exists()
     assert not moved.exists()
+
+
+async def test_file_and_folder_nodes_output_paths(tmp_path: Path) -> None:
+    source = tmp_path / "input.txt"
+    folder = tmp_path / "docs"
+    source.write_text("hello", encoding="utf-8")
+    folder.mkdir()
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="file",
+        operation=FileOperation(type=OperationType.FILE, path=source),
+    ))
+    wf.add_operation(GraphNode(
+        node_id="folder",
+        operation=FolderOperation(type=OperationType.FOLDER, path=folder),
+    ))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert result.node_outputs["file"].output == str(source)
+    assert result.node_outputs["folder"].output == str(folder)
 
 
 async def test_delete_file_uses_gofer_trash_by_default(tmp_path: Path, monkeypatch) -> None:

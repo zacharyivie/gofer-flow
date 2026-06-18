@@ -22,6 +22,8 @@ from gofer.core.operations import (
     CountFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
+    FileOperation,
+    FolderOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     MoveFileOperation,
@@ -46,6 +48,8 @@ from gofer.ui.api import (
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_run_logs_payload,
+    duplicate_workflow_payload,
+    rename_workflow_payload,
     workflow_run_log_payload,
 )
 from gofer.ui.chat import delete_workflow_chat_prompt
@@ -319,6 +323,14 @@ def _operation_from_options(
                 recursive=recursive,
                 missing_ok=missing_ok,
             )
+        case OperationType.FILE:
+            if path is None:
+                raise typer.BadParameter("--path is required for file nodes")
+            return FileOperation(type=OperationType.FILE, path=path)
+        case OperationType.FOLDER:
+            if path is None:
+                raise typer.BadParameter("--path is required for folder nodes")
+            return FolderOperation(type=OperationType.FOLDER, path=path)
         case OperationType.OPEN_RESOURCE:
             if target is None:
                 raise typer.BadParameter("--target is required for open_resource nodes")
@@ -398,8 +410,8 @@ def _operation_from_options(
     raise typer.BadParameter(
         "node type must be one of "
         "bash_command, python_script, shell_script, agent, read_file, write_file, "
-        "copy_file, move_file, delete_file, open_resource, prompt_file, common_llm_task, "
-        "local_vectorize, local_search"
+        "copy_file, move_file, delete_file, file, folder, open_resource, prompt_file, "
+        "common_llm_task, local_vectorize, local_search"
     )
 
 
@@ -771,7 +783,7 @@ def add_node(
         None, "--script-path", help="Script path for script nodes"
     ),
     path_value: Path | None = typer.Option(
-        None, "--path", help="Path for read/write/delete nodes"
+        None, "--path", help="Path for read/write/delete/file/folder nodes"
     ),
     source_path: Path | None = typer.Option(
         None, "--source-path", help="Source path for copy/move nodes"
@@ -1008,8 +1020,6 @@ def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidd
             wf = AgenticWorkflow.from_file(path)
         except Exception:
             continue
-        if wf.agents and not list(wf.graph._graph.nodes()):
-            continue
         schedule = wf.config.schedule.cron_expression if wf.config.schedule else "—"
         rows.append((
             wf.config.id,
@@ -1090,6 +1100,42 @@ def rm(
     workflow_stop_path(wf.config.id, cleanup_base).unlink(missing_ok=True)
     delete_workflow_chat_prompt(cleanup_base, wf.config.id)
     console.print(f"[green]Deleted[/green] {path}")
+
+
+@app.command("rename")
+def rename(
+    workflow: str = typer.Argument(..., help="Workflow ID"),
+    name: str = typer.Option(..., "--name", help="New workflow name"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Rename a workflow and update its ID to match the new name."""
+    try:
+        saved = rename_workflow_payload(workflow, name, data_dir)
+    except (WorkflowAlreadyExistsError, WorkflowUpdateError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Renamed[/green] workflow to {saved['name']} ({saved['id']})"
+    )
+
+
+@app.command("duplicate")
+def duplicate(
+    workflow: str = typer.Argument(..., help="Workflow ID"),
+    name: str | None = typer.Option(None, "--name", help="Name for duplicate"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Duplicate a workflow TOML file with a new ID/name."""
+    try:
+        saved = duplicate_workflow_payload(workflow, name, data_dir)
+    except (WorkflowAlreadyExistsError, WorkflowCreateError, WorkflowUpdateError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    console.print(
+        f"[green]Duplicated[/green] workflow to {saved['name']} ({saved['id']})"
+    )
 
 
 @app.command("build")

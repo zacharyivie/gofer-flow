@@ -11,6 +11,8 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     DeleteFileOperation,
+    FileOperation,
+    FolderOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     MoveFileOperation,
@@ -102,6 +104,8 @@ def test_file_io_operations_roundtrip() -> None:
             destination_path=Path("new.txt"),
         ),
         DeleteFileOperation(type=OperationType.DELETE_FILE, path=Path("old.txt")),
+        FileOperation(type=OperationType.FILE, path=Path("input.txt")),
+        FolderOperation(type=OperationType.FOLDER, path=Path("docs")),
         OpenResourceOperation(type=OperationType.OPEN_RESOURCE, target="https://example.com"),
         AgentOperation(
             type=OperationType.AGENT,

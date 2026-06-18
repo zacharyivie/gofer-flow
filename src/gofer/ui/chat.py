@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+import os
 import shutil
+import sys
+import threading
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
@@ -35,7 +38,14 @@ async def run_workflow_chat(
     resolved_data_dir = data_dir or get_data_dir()
     resolved_working_dir = working_dir or resolved_data_dir
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_chat_prompt(provider=provider, model=model, messages=messages, workflow=workflow)
+    gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
+    prompt = build_chat_prompt(
+        provider=provider,
+        model=model,
+        messages=messages,
+        workflow=workflow,
+        gofer_cli_path=gofer_cli_path,
+    )
     prompt = _prepare_prompt_for_cli(
         provider=provider,
         binary_path=binary_path,
@@ -79,6 +89,7 @@ async def stream_workflow_chat(
     model: str,
     messages: list[dict[str, str]],
     workflow: dict[str, Any] | None,
+    cancel_event: threading.Event | None = None,
     working_dir: Path | None = None,
     data_dir: Path | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
@@ -93,7 +104,14 @@ async def stream_workflow_chat(
     resolved_data_dir = data_dir or get_data_dir()
     resolved_working_dir = working_dir or resolved_data_dir
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
-    prompt = build_chat_prompt(provider=provider, model=model, messages=messages, workflow=workflow)
+    gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
+    prompt = build_chat_prompt(
+        provider=provider,
+        model=model,
+        messages=messages,
+        workflow=workflow,
+        gofer_cli_path=gofer_cli_path,
+    )
     prompt = _prepare_prompt_for_cli(
         provider=provider,
         binary_path=binary_path,
@@ -116,6 +134,7 @@ async def stream_workflow_chat(
     try:
         async for event in stream_subprocess(
             command,
+            cancel_event=cancel_event,
             cwd=resolved_working_dir,
             timeout=300,
         ):
@@ -180,6 +199,80 @@ def provider_payload() -> dict[str, Any]:
     }
 
 
+def ensure_local_gofer_cli(data_dir: Path) -> Path | None:
+    """Copy the gof CLI into the active data directory for assistant sandbox access."""
+    source = _gofer_cli_source_path()
+    destination = local_gofer_cli_path(data_dir, source)
+    if source is None or not source.exists():
+        return destination if destination.exists() else None
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if source.samefile(destination):
+            _make_executable(destination)
+            return destination
+    except OSError:
+        pass
+
+    if destination.exists() and _same_file_signature(source, destination):
+        _make_executable(destination)
+        return destination
+
+    temp_destination = destination.with_name(f".{destination.name}.tmp")
+    try:
+        shutil.copy2(source, temp_destination)
+        _make_executable(temp_destination)
+        os.replace(temp_destination, destination)
+    except OSError:
+        temp_destination.unlink(missing_ok=True)
+        return destination if destination.exists() else None
+
+    return destination
+
+
+def local_gofer_cli_path(data_dir: Path, source_path: Path | None = None) -> Path:
+    if sys.platform == "win32":
+        source_suffix = source_path.suffix.lower() if source_path else ".exe"
+        executable_name = f"gof{source_suffix}" if source_suffix in {".bat", ".cmd"} else "gof.exe"
+    else:
+        executable_name = "gof"
+    return data_dir / "bin" / executable_name
+
+
+def _gofer_cli_source_path() -> Path | None:
+    configured_path = os.environ.get("GOFER_CLI_SOURCE_PATH")
+    if configured_path:
+        return Path(configured_path)
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable)
+
+    resolved = shutil.which("gof")
+    return Path(resolved) if resolved else None
+
+
+def _same_file_signature(left: Path, right: Path) -> bool:
+    try:
+        left_stat = left.stat()
+        right_stat = right.stat()
+    except OSError:
+        return False
+    return (
+        left_stat.st_size == right_stat.st_size
+        and int(left_stat.st_mtime) == int(right_stat.st_mtime)
+    )
+
+
+def _make_executable(path: Path) -> None:
+    if sys.platform == "win32":
+        return
+    try:
+        path.chmod(path.stat().st_mode | 0o755)
+    except OSError:
+        return
+
+
 def _build_chat_command(
     provider: str,
     model: str,
@@ -209,7 +302,15 @@ def _build_chat_command(
         command.append(prompt)
         return command
 
-    command = [binary_path or "claude", "--print", "-p", prompt]
+    data_dir = data_dir or get_data_dir()
+    command = [
+        binary_path or "claude",
+        "--print",
+        "--add-dir",
+        str(data_dir),
+        "-p",
+        prompt,
+    ]
     if model != "cli-default":
         command += ["--model", model]
     return command
@@ -282,9 +383,11 @@ def build_chat_prompt(
     model: str,
     messages: list[dict[str, str]],
     workflow: dict[str, Any] | None,
+    gofer_cli_path: Path | None = None,
 ) -> str:
     skill_text = _load_skill_text()
     workflow_context = _compact_workflow_context(workflow)
+    cli_context = _gofer_cli_prompt_context(gofer_cli_path)
     transcript = "\n".join(
         f"{message.get('role', 'user').upper()}: {message.get('body', '')}"
         for message in messages[-12:]
@@ -293,6 +396,8 @@ def build_chat_prompt(
 
 Selected provider: {provider}
 Requested model: {model}
+
+{cli_context}
 
 You have access to the Gofer Flow workflow-builder skill below regardless of local CLI
 skill setup. Follow it when answering workflow design, editing, validation, CLI, TOML,
@@ -307,7 +412,7 @@ skill's validation commands and report the exact workflow path and verification 
 {skill_text}
 </gofer_flow_skill>
 
-Current workflow context:
+Workflow context:
 {workflow_context}
 
 Conversation:
@@ -315,6 +420,19 @@ Conversation:
 
 Answer the latest user message. Be concrete and concise. If you recommend workflow
 changes, reference exact nodes, edges, agents, or TOML fields."""
+
+
+def _gofer_cli_prompt_context(gofer_cli_path: Path | None) -> str:
+    if gofer_cli_path is None:
+        return (
+            "Gofer Flow CLI: no local gof executable copy was available. If a bare `gof` "
+            "command is unavailable, explain that the CLI could not be located."
+        )
+
+    return (
+        "Gofer Flow CLI: use this exact executable path for all Gofer Flow CLI commands "
+        f"instead of relying on PATH: {gofer_cli_path}"
+    )
 
 
 def _load_skill_text() -> str:
@@ -331,7 +449,10 @@ def _load_skill_text() -> str:
 
 def _compact_workflow_context(workflow: dict[str, Any] | None) -> str:
     if not workflow:
-        return "No workflow selected."
+        return "No workflows are currently available."
+
+    if isinstance(workflow.get("workflows"), list):
+        return _compact_all_workflows_context(workflow)
 
     nodes = workflow.get("nodes") or []
     edges = workflow.get("edges") or []
@@ -362,3 +483,64 @@ def _compact_workflow_context(workflow: dict[str, Any] | None) -> str:
             *(agent_lines or ["- none"]),
         ]
     )
+
+
+def _compact_all_workflows_context(context: dict[str, Any]) -> str:
+    workflows = [
+        workflow
+        for workflow in context.get("workflows", [])
+        if isinstance(workflow, dict)
+    ]
+    selected_workflow_id = context.get("selectedWorkflowId")
+    if not workflows:
+        return "\n".join([
+            "Selected workflow: none",
+            "Existing workflows: none",
+            "The user can still ask you to create new Gofer Flow workflows.",
+        ])
+
+    lines = [
+        f"Selected workflow: {selected_workflow_id or 'none'}",
+        f"Existing workflows: {len(workflows)}",
+    ]
+
+    for workflow in workflows:
+        workflow_id = workflow.get("id")
+        selected_marker = " [selected]" if workflow_id == selected_workflow_id else ""
+        lines.extend([
+            "",
+            f"Workflow: {workflow_id} / {workflow.get('name')}{selected_marker}",
+            f"Source path: {workflow.get('sourcePath')}",
+            f"Status: {workflow.get('status')}",
+            f"Description: {workflow.get('description')}",
+        ])
+        if workflow.get("invalid"):
+            lines.append(f"Validation error: {workflow.get('validationError')}")
+            continue
+
+        nodes = workflow.get("nodes") or []
+        edges = workflow.get("edges") or []
+        agents = workflow.get("agents") or {}
+        lines.append("Nodes:")
+        lines.extend(
+            f"- {node.get('id')} ({node.get('type')}): {node.get('meta', '')}"
+            for node in nodes
+        )
+        if not nodes:
+            lines.append("- none")
+        lines.append("Edges:")
+        lines.extend(
+            f"- {edge.get('from')} -> {edge.get('to')} [{edge.get('condition', 'always')}]"
+            for edge in edges
+        )
+        if not edges:
+            lines.append("- none")
+        lines.append("Agents:")
+        agent_lines = [
+            f"- {agent_id}: {config.get('subscription', 'unknown')}"
+            for agent_id, config in agents.items()
+            if isinstance(config, dict)
+        ]
+        lines.extend(agent_lines or ["- none"])
+
+    return "\n".join(lines)
