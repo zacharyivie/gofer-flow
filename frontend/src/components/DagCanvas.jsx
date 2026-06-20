@@ -3931,6 +3931,7 @@ function TextFileDialog({ mode, path, onClose }) {
 
 export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
   const [contextMenu, setContextMenu] = useState(null);
+  const [copiedEntry, setCopiedEntry] = useState(null);
   const [nameRequest, setNameRequest] = useState(null);
   const [directory, setDirectory] = useState("");
   const [entries, setEntries] = useState([]);
@@ -4053,15 +4054,22 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
   async function copyEntry(entry) {
     setContextMenu(null);
     if (!entry) return;
-    const nextName = window.prompt("Copy as", defaultCopyName(entry.name));
-    if (!nextName) return;
+    setCopiedEntry(entry);
+  }
 
+  async function pasteEntry() {
+    setContextMenu(null);
+    if (!copiedEntry) return;
+
+    const existingNames = new Set(entries.map((entry) => entry.name));
+    const nextName = nextCopyName(copiedEntry.name, existingNames);
     try {
       await window.goferDesktop?.copyPath?.({
-        sourcePath: entry.path,
+        sourcePath: copiedEntry.path,
         destinationPath: joinPath(directory, nextName),
       });
       await loadDirectory(directory);
+      setSelectedPath(joinPath(directory, nextName));
     } catch (copyError) {
       setError(copyError instanceof Error ? copyError.message : "Unable to copy path");
     }
@@ -4212,6 +4220,8 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
         </div>
         {contextMenu ? (
           <PathContextMenu
+            canPaste={Boolean(copiedEntry)}
+            copiedName={copiedEntry?.name}
             entry={contextMenu.entry}
             x={contextMenu.x}
             y={contextMenu.y}
@@ -4219,6 +4229,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
             onCreateFile={() => requestCreateChild("file")}
             onCreateFolder={() => requestCreateChild("folder")}
             onDelete={() => deleteEntry(contextMenu.entry)}
+            onPaste={pasteEntry}
             onRename={() => requestRenameEntry(contextMenu.entry)}
           />
         ) : null}
@@ -4329,11 +4340,14 @@ function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSu
 }
 
 function PathContextMenu({
+  canPaste,
+  copiedName,
   entry,
   onCopy,
   onCreateFile,
   onCreateFolder,
   onDelete,
+  onPaste,
   onRename,
   x,
   y,
@@ -4371,6 +4385,16 @@ function PathContextMenu({
           <div className="my-1 border-t border-line" />
         </>
       ) : null}
+      <button
+        className="block w-full px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:text-slate-400 disabled:hover:bg-transparent"
+        disabled={!canPaste}
+        title={canPaste ? `Paste ${copiedName}` : "Copy a file or folder first"}
+        type="button"
+        onClick={onPaste}
+      >
+        Paste
+      </button>
+      <div className="my-1 border-t border-line" />
       <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
         Create new
       </div>
@@ -4392,13 +4416,24 @@ function PathContextMenu({
   );
 }
 
-function defaultCopyName(name = "") {
+function nextCopyName(name = "", existingNames = new Set()) {
+  let candidate = defaultCopyName(name);
+  let index = 2;
+  while (existingNames.has(candidate)) {
+    candidate = defaultCopyName(name, index);
+    index += 1;
+  }
+  return candidate;
+}
+
+function defaultCopyName(name = "", index = null) {
   const value = String(name || "copy");
   const dotIndex = value.lastIndexOf(".");
+  const suffix = index ? ` copy ${index}` : " copy";
   if (dotIndex > 0) {
-    return `${value.slice(0, dotIndex)} copy${value.slice(dotIndex)}`;
+    return `${value.slice(0, dotIndex)}${suffix}${value.slice(dotIndex)}`;
   }
-  return `${value} copy`;
+  return `${value}${suffix}`;
 }
 
 function InlineTextField({ onChange, placeholder, value }) {
