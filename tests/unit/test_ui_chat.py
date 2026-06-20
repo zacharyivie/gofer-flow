@@ -324,6 +324,47 @@ async def test_stream_workflow_chat_yields_thoughts_and_final(monkeypatch, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_stream_workflow_chat_compacts_long_context(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+    monkeypatch.setattr(chat, "CHAT_COMPACT_CHAR_LIMIT", 20)
+
+    async def fake_run_subprocess(*_args, **_kwargs):
+        return 0, "short workflow assistant summary", ""
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {"type": "chunk", "stream": "stdout", "text": "final\n", "returncode": None}
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(chat, "run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream_subprocess)
+
+    events = [
+        event
+        async for event in stream_workflow_chat(
+            provider="codex",
+            model="cli-default",
+            messages=[
+                {"role": "user", "body": "older " * 20},
+                {"role": "assistant", "body": "older answer " * 20},
+                {"role": "user", "body": "latest"},
+            ],
+            workflow=None,
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["compaction", "thought", "final"]
+    assert events[0]["message"] == "Compacting workflow assistant context"
+    compacted_messages = events[0]["messages"]
+    assert compacted_messages[0]["kind"] == "system"
+    assert compacted_messages[0]["body"] == "Compacting workflow assistant context"
+    assert compacted_messages[1]["kind"] == "memory"
+    assert "short workflow assistant summary" in compacted_messages[1]["body"]
+    assert compacted_messages[-1]["body"] == "latest"
+
+
+@pytest.mark.asyncio
 async def test_stream_workflow_chat_passes_cancel_event(monkeypatch, tmp_path) -> None:
     captured_cancel_event = None
     monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")

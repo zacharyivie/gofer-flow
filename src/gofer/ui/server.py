@@ -5,6 +5,7 @@ import json
 import signal
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
 
 log = get_logger(__name__)
+CONTINUOUS_RUN_POLL_SECONDS = 1.0
 
 
 def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> None:
@@ -55,7 +57,7 @@ def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> Non
             workflow = AgenticWorkflow.from_file(path)
         except Exception:
             continue
-        if workflow.config.schedule is None:
+        if workflow.config.run_continuously or workflow.config.schedule is None:
             continue
         try:
             scheduler.add_workflow(workflow, path)
@@ -78,7 +80,7 @@ def sync_workflow_watchers(data_dir: Path, watcher: WorkflowWatcher) -> None:
             workflow = AgenticWorkflow.from_file(path)
         except Exception:
             continue
-        if workflow.config.watch is None:
+        if workflow.config.run_continuously or workflow.config.watch is None:
             continue
         try:
             watcher.add_workflow(workflow, path)
@@ -100,10 +102,83 @@ class GoferUiServer(ThreadingHTTPServer):
         self.gofer_cli_path = ensure_local_gofer_cli(data_dir)
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
         self.watcher = WorkflowWatcher()
+        self._continuous_runs: dict[str, threading.Thread] = {}
+        self._continuous_lock = threading.Lock()
+        self._continuous_stop = threading.Event()
+        self._continuous_thread: threading.Thread | None = None
 
     def sync_schedules(self) -> None:
         sync_workflow_schedules(self.data_dir, self.scheduler)
         sync_workflow_watchers(self.data_dir, self.watcher)
+
+    def start_continuous_monitor(self) -> None:
+        if self._continuous_thread and self._continuous_thread.is_alive():
+            return
+        self._continuous_stop.clear()
+        self._continuous_thread = threading.Thread(
+            target=self._continuous_monitor_loop,
+            name="gofer-continuous-workflow-monitor",
+            daemon=True,
+        )
+        self._continuous_thread.start()
+
+    def stop_continuous_monitor(self) -> None:
+        self._continuous_stop.set()
+        if self._continuous_thread:
+            self._continuous_thread.join(timeout=3)
+
+    def _continuous_monitor_loop(self) -> None:
+        while not self._continuous_stop.is_set():
+            try:
+                self.ensure_continuous_runs()
+            except Exception:  # noqa: BLE001
+                log.exception("Continuous workflow monitor failed")
+            self._continuous_stop.wait(CONTINUOUS_RUN_POLL_SECONDS)
+
+    def ensure_continuous_runs(self) -> None:
+        active_ids: set[str] = set()
+        for path in sorted(self.data_dir.glob("*.toml")):
+            try:
+                workflow = AgenticWorkflow.from_file(path)
+            except Exception:
+                continue
+            if not workflow.config.run_continuously:
+                continue
+            active_ids.add(workflow.config.id)
+            self._start_continuous_run_if_needed(workflow.config.id)
+
+        with self._continuous_lock:
+            for workflow_id in list(self._continuous_runs):
+                thread = self._continuous_runs[workflow_id]
+                if workflow_id not in active_ids or not thread.is_alive():
+                    self._continuous_runs.pop(workflow_id, None)
+
+    def _start_continuous_run_if_needed(self, workflow_id: str) -> None:
+        with self._continuous_lock:
+            existing = self._continuous_runs.get(workflow_id)
+            if existing and existing.is_alive():
+                return
+
+            thread = threading.Thread(
+                target=self._run_continuous_workflow_once,
+                args=(workflow_id,),
+                name=f"gofer-continuous-{workflow_id}",
+                daemon=True,
+            )
+            self._continuous_runs[workflow_id] = thread
+            thread.start()
+
+    def _run_continuous_workflow_once(self, workflow_id: str) -> None:
+        try:
+            asyncio.run(run_workflow_payload(workflow_id, self.data_dir, dry_run=False))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Continuous workflow '%s' run failed: %s", workflow_id, exc)
+            time.sleep(CONTINUOUS_RUN_POLL_SECONDS)
+        finally:
+            with self._continuous_lock:
+                current = self._continuous_runs.get(workflow_id)
+                if current is threading.current_thread():
+                    self._continuous_runs.pop(workflow_id, None)
 
 
 class GoferUiRequestHandler(BaseHTTPRequestHandler):
@@ -265,21 +340,20 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             remainder = parsed.path.removeprefix("/api/workflows/")
             workflow_id, run_id = remainder.removesuffix("/stop").split("/runs/", 1)
             query = parse_qs(parsed.query)
-            self._send_json(
-                stop_workflow_run_payload(
-                    workflow_id,
-                    self._request_data_dir(query),
-                    run_id=run_id,
-                )
+            payload = stop_workflow_run_payload(
+                workflow_id,
+                self._request_data_dir(query),
+                run_id=run_id,
             )
+            self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/stop"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/stop")
             query = parse_qs(parsed.query)
-            self._send_json(
-                stop_workflow_run_payload(workflow_id, self._request_data_dir(query))
-            )
+            payload = stop_workflow_run_payload(workflow_id, self._request_data_dir(query))
+            self._sync_schedules()
+            self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/rename"):
@@ -300,6 +374,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._sync_schedules()
+            self._sync_continuous_runs()
             self._send_json({"workflow": workflow})
             return
 
@@ -430,6 +505,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         if isinstance(server, GoferUiServer):
             server.sync_schedules()
 
+    def _sync_continuous_runs(self) -> None:
+        server = self.server
+        if isinstance(server, GoferUiServer):
+            server.ensure_continuous_runs()
+
     async def _stream_chat_response(self, body: dict[str, Any], data_dir: Path) -> None:
         cancel_event = threading.Event()
         try:
@@ -533,6 +613,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765, data_dir: Path | None = Non
     server.sync_schedules()
     server.scheduler.resume()
     server.watcher.start()
+    server.start_continuous_monitor()
     _install_shutdown_handlers(server)
     print(f"GOFER_UI_READY {json.dumps(ready_payload(server), sort_keys=True)}", flush=True)
     try:
@@ -540,6 +621,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765, data_dir: Path | None = Non
     except KeyboardInterrupt:
         pass
     finally:
+        server.stop_continuous_monitor()
         server.watcher.shutdown(wait=False)
         server.scheduler.shutdown(wait=False)
         server.server_close()

@@ -18,7 +18,7 @@ from typing import Any
 
 import anyio
 
-from gofer.core.agent import Agent, AgentResult
+from gofer.core.agent import Agent, AgentConfig, AgentResult
 from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
 from gofer.core.operations import (
     AgentOperation,
@@ -53,6 +53,8 @@ from gofer.utils.process import run_subprocess
 from gofer.utils.run_state import clear_workflow_stop, workflow_run_stop_path
 
 log = get_logger(__name__)
+AGENT_MEMORY_COMPACT_CHAR_LIMIT = 32_000
+AGENT_MEMORY_RECENT_TURNS = 8
 
 
 def command_shell_args(command: str) -> list[str]:
@@ -117,6 +119,62 @@ def _trash_path(path: Path) -> Path:
     destination = trash_root / f"{timestamp}-{path.name}"
     shutil.move(str(path), str(destination))
     return destination
+
+
+def _safe_path_part(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
+    return safe or "item"
+
+
+def _turns_size(turns: list[dict[str, str]]) -> int:
+    return sum(len(str(turn.get("body", ""))) for turn in turns)
+
+
+def _turns_transcript(turns: list[dict[str, str]]) -> str:
+    return "\n\n".join(
+        f"{turn.get('role', 'message').upper()}:\n{turn.get('body', '')}"
+        for turn in turns
+        if turn.get("body")
+    )
+
+
+async def _summarize_agent_turns(
+    turns: list[dict[str, str]],
+    agent_config: AgentConfig,
+    subscription: Subscription,
+    cancel_event: threading.Event | None,
+) -> str:
+    transcript = _turns_transcript(turns)
+    prompt = (
+        "Compact this Gofer Flow agent-node conversation memory for future node runs.\n"
+        "Preserve durable goals, decisions, file paths, commands, inputs, outputs, "
+        "errors, unresolved tasks, and details required to continue the workflow. "
+        "Omit chatter and redundant text.\n\n"
+        f"{transcript}"
+    )
+    try:
+        result = await subscription.execute(
+            prompt=prompt,
+            working_dir=agent_config.working_dir,
+            tools=agent_config.tools,
+            mcp_servers=agent_config.mcp_servers,
+            env=agent_config.env,
+            timeout=180,
+            cancel_event=cancel_event,
+        )
+    except Exception:  # noqa: BLE001
+        return _fallback_turn_summary(turns)
+    if not result.success:
+        return _fallback_turn_summary(turns)
+    summary = (result.message or result.output).strip()
+    return summary or _fallback_turn_summary(turns)
+
+
+def _fallback_turn_summary(turns: list[dict[str, str]]) -> str:
+    transcript = _turns_transcript(turns)
+    if len(transcript) <= 12_000:
+        return transcript
+    return f"{transcript[:6_000]}\n\n[...middle omitted during compaction...]\n\n{transcript[-6_000:]}"
 
 
 def _load_tabular(path: Path) -> list[dict[str, object]]:
@@ -342,6 +400,17 @@ class WorkflowRunLog:
             for line in value.rstrip("\n").splitlines():
                 fh.write(f"{line}\n")
 
+    def node_agent_event(self, node_id: str, label: str, value: str) -> None:
+        if not value:
+            return
+        lines = value.rstrip("\n").splitlines()
+        if not lines:
+            return
+        self._write("NODE", f"{node_id} - {label}: {lines[0]}")
+        with self.path.open("a", encoding="utf-8") as fh:
+            for line in lines[1:]:
+                fh.write(f"{line}\n")
+
     def complete(self, success: bool, reason: str | None = None) -> None:
         if success:
             self.info(f"{self.workflow_id} completed successfully")
@@ -379,6 +448,7 @@ class WorkflowExecutor:
         self._stop_monitor_done = threading.Event()
         self._trigger_context: dict[str, Any] = {}
         self._run_log: WorkflowRunLog | None = None
+        self._agent_run_memory: dict[str, list[dict[str, str]]] = {}
 
     def with_trigger_context(self, trigger_context: dict[str, Any]) -> WorkflowExecutor:
         self._trigger_context = trigger_context
@@ -388,6 +458,131 @@ class WorkflowExecutor:
         if self._run_log is None:
             raise RuntimeError("Workflow run log has not been initialized")
         return self._run_log
+
+    def _log_agent_result(
+        self,
+        node_id: str,
+        result: AgentResult,
+        prefix: str = "",
+    ) -> None:
+        for thought in result.thoughts:
+            value = f"{prefix}{thought}" if prefix else thought
+            self._log().node_agent_event(
+                node_id,
+                "AGENT_THOUGHT",
+                value,
+            )
+        message = result.message if result.message is not None else result.output
+        if prefix:
+            message = f"{prefix}{message}"
+        self._log().node_agent_event(
+            node_id,
+            "AGENT_MESSAGE",
+            message,
+        )
+
+    def _agent_memory(self, node_id: str, mode: str) -> list[dict[str, str]]:
+        if mode == "run":
+            return list(self._agent_run_memory.get(node_id, []))
+        if mode == "all":
+            return self._load_agent_memory(node_id)
+        return []
+
+    def _remember_agent_result(self, node_id: str, mode: str, result: AgentResult) -> None:
+        if mode not in {"run", "all"}:
+            return
+        message = result.message if result.message is not None else result.output
+        if not result.prompt and not message:
+            return
+        turns = self._agent_memory(node_id, mode)
+        if result.prompt:
+            turns.append({"role": "user", "body": result.prompt})
+        if message:
+            turns.append({"role": "assistant", "body": message})
+        turns = turns[-40:]
+        if mode == "run":
+            self._agent_run_memory[node_id] = turns
+        else:
+            self._save_agent_memory(node_id, turns)
+
+    def _agent_memory_path(self, node_id: str) -> Path:
+        base = self._log_base_dir.parent if self._log_base_dir is not None else get_data_dir()
+        workflow_id = _safe_path_part(self._workflow.config.id)
+        safe_node_id = _safe_path_part(node_id)
+        return base / "agent-memory" / workflow_id / f"{safe_node_id}.json"
+
+    def _load_agent_memory(self, node_id: str) -> list[dict[str, str]]:
+        path = self._agent_memory_path(node_id)
+        if not path.exists():
+            return []
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(loaded, list):
+            return []
+        turns = []
+        for item in loaded:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip()
+            body = str(item.get("body", "")).strip()
+            if role and body:
+                turns.append({"role": role, "body": body})
+        return turns
+
+    def _save_agent_memory(self, node_id: str, turns: list[dict[str, str]]) -> None:
+        path = self._agent_memory_path(node_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(turns, indent=2), encoding="utf-8")
+
+    async def _compact_agent_memory_if_needed(
+        self,
+        node_id: str,
+        mode: str,
+        turns: list[dict[str, str]],
+        agent_config: AgentConfig,
+        subscription: Subscription,
+    ) -> list[dict[str, str]]:
+        if mode not in {"run", "all"}:
+            return turns
+        if _turns_size(turns) <= AGENT_MEMORY_COMPACT_CHAR_LIMIT:
+            return turns
+
+        self._log().info(f"Compacting agent context for agent node {node_id}")
+        recent = turns[-AGENT_MEMORY_RECENT_TURNS:]
+        older = turns[:-AGENT_MEMORY_RECENT_TURNS]
+        summary = await _summarize_agent_turns(
+            older,
+            agent_config,
+            subscription,
+            self._cancel_event if self._pass_cancel_event else None,
+        )
+        compacted_turns = [
+            {
+                "role": "system",
+                "body": f"Compacted prior agent node context:\n{summary}",
+            },
+            *recent,
+        ]
+        if mode == "run":
+            self._agent_run_memory[node_id] = compacted_turns
+        else:
+            self._save_agent_memory(node_id, compacted_turns)
+        return compacted_turns
+
+    def _agent_config_for_operation(
+        self,
+        agent_config: AgentConfig,
+        prompt_path: Path | None,
+        working_dir: Path | None,
+    ) -> AgentConfig:
+        updates: dict[str, Path] = {}
+        if prompt_path is not None:
+            updates["prompt_path"] = prompt_path
+        if working_dir is not None:
+            updates["working_dir"] = working_dir
+        return agent_config.model_copy(update=updates) if updates else agent_config
 
     async def run(self) -> ExecutionResult:
         if self._stop_file is not None:
@@ -469,7 +664,9 @@ class WorkflowExecutor:
 
             total = time.monotonic() - start
             success = not halted and all(
-                o.success for o in ctx.node_outputs.values() if not o.skipped
+                o.success or graph._nodes[o.node_id].allow_failure
+                for o in ctx.node_outputs.values()
+                if not o.skipped
             )
             reason = None if success else halt_reason or self._failure_reason(ctx.node_outputs)
             run_log.complete(success, reason)
@@ -585,7 +782,11 @@ class WorkflowExecutor:
             await anyio.sleep(node.retry_delay_seconds)
 
         if output is not None and not output.success:
-            if node.on_failure == "halt" and not self._has_failure_route(node, output, graph):
+            if (
+                not node.allow_failure
+                and node.on_failure == "halt"
+                and not self._has_failure_route(node, output, graph)
+            ):
                 halt_flag[0] = True
 
         if self._stop_requested():
@@ -864,6 +1065,11 @@ class WorkflowExecutor:
             sub = self._subscriptions.get(agent_config.subscription)
             if sub is None:
                 raise ValueError(f"No subscription for '{agent_config.subscription}'")
+            agent_config = self._agent_config_for_operation(
+                agent_config,
+                None,
+                op.working_dir,
+            )
             input_ctx = {key: ctx.resolve_path(value) for key, value in op.input_mapping.items()}
             piped_text = "\n".join(
                 ctx.node_outputs[pred_id].output
@@ -879,8 +1085,16 @@ class WorkflowExecutor:
                 input_ctx,
                 cancel_event=self._cancel_event if self._pass_cancel_event else None,
                 prompt_override=prompt,
+                memory=await self._compact_agent_memory_if_needed(
+                    node.node_id,
+                    op.memory,
+                    self._agent_memory(node.node_id, op.memory),
+                    agent_config,
+                    sub,
+                ),
             )
-            self._log().node_output(node.node_id, "agent output", result.output)
+            self._log_agent_result(node.node_id, result)
+            self._remember_agent_result(node.node_id, op.memory, result)
             return NodeOutput(
                 node_id=node.node_id,
                 success=result.success,
@@ -970,6 +1184,11 @@ class WorkflowExecutor:
             sub = self._subscriptions.get(agent_config.subscription)
             if sub is None:
                 raise ValueError(f"No subscription for '{agent_config.subscription}'")
+            agent_config = self._agent_config_for_operation(
+                agent_config,
+                op.prompt_path,
+                op.working_dir,
+            )
 
             input_ctx: dict[str, object] = {
                 k: ctx.resolve_path(v)
@@ -1005,8 +1224,16 @@ class WorkflowExecutor:
                     {**input_ctx, **fan_items[0]},
                     cancel_event=self._cancel_event if self._pass_cancel_event else None,
                     prompt_override=prompt_override,
+                    memory=await self._compact_agent_memory_if_needed(
+                        node.node_id,
+                        op.memory,
+                        self._agent_memory(node.node_id, op.memory),
+                        agent_config,
+                        sub,
+                    ),
                 )
-                self._log().node_output(node.node_id, "agent output", result.output)
+                self._log_agent_result(node.node_id, result)
+                self._remember_agent_result(node.node_id, op.memory, result)
                 outputs.append(result)
             else:
                 limiter = anyio.CapacityLimiter(max_concurrency)
@@ -1022,13 +1249,25 @@ class WorkflowExecutor:
                                     self._cancel_event if self._pass_cancel_event else None
                                 ),
                                 prompt_override=prompt_override,
+                                memory=await self._compact_agent_memory_if_needed(
+                                    node.node_id,
+                                    op.memory,
+                                    self._agent_memory(node.node_id, op.memory),
+                                    agent_config,
+                                    sub,
+                                ),
                             )
                             result = results_list[idx]
                             if result is not None:
-                                self._log().node_output(
+                                self._log_agent_result(
                                     node.node_id,
-                                    f"fan-out item {idx + 1} output",
-                                    result.output,
+                                    result,
+                                    prefix=f"fan-out item {idx + 1} ",
+                                )
+                                self._remember_agent_result(
+                                    node.node_id,
+                                    op.memory,
+                                    result,
                                 )
                         except Exception as exc:  # noqa: BLE001
                             errors.append((idx, exc))

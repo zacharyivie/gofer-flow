@@ -9,10 +9,18 @@ from gofer.subscriptions.base import Subscription
 
 
 class FakeSubscription(Subscription):
-    def __init__(self, output: str = "ok", exit_code: int = 0) -> None:
+    def __init__(
+        self,
+        output: str = "ok",
+        exit_code: int = 0,
+        thoughts: list[str] | None = None,
+        message: str | None = None,
+    ) -> None:
         self.calls: list[dict[str, object]] = []
         self._output = output
         self._exit_code = exit_code
+        self._thoughts = thoughts or []
+        self._message = message
 
     def _build_command(
         self, prompt: str, tools: list[str], mcp_servers: list[str]
@@ -30,6 +38,7 @@ class FakeSubscription(Subscription):
         mcp_servers: list[str],
         env: dict[str, str],
         timeout: float | None = None,
+        cancel_event=None,
     ) -> AgentResult:
         self.calls.append({"prompt": prompt, "working_dir": working_dir})
         return AgentResult(
@@ -38,6 +47,8 @@ class FakeSubscription(Subscription):
             output=self._output,
             exit_code=self._exit_code,
             duration_seconds=0.0,
+            thoughts=self._thoughts,
+            message=self._message,
         )
 
 

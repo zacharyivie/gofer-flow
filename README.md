@@ -63,7 +63,8 @@ npm run dev
 
 ## Desktop App
 
-Linux desktop packages are built from the Electron app in `frontend/release`.
+Linux and macOS desktop packages are built from the Electron app in
+`frontend/release`.
 Arch users will be able to install Gofer Flow from AUR after publication:
 
 ```bash
@@ -76,12 +77,17 @@ On Windows, the normal installer includes the bundled `gof.exe` backend. During
 setup, the "Add gof CLI to my user PATH" option is checked by default so users
 can run `gof` from new PowerShell or Command Prompt sessions after installation.
 
+On macOS, release builds publish a `.dmg`. Until the app is signed and notarized
+with an Apple Developer account, users may need to approve the app in System
+Settings after first launch.
+
 ## CLI-Only Installs
 
 Release builds also publish standalone CLI binaries:
 
 - Linux: `gof-linux-x64`
 - Windows: `gof-windows-x64.exe`
+- macOS: `gof-macos-<arch>`
 - Debian/Ubuntu: `gofer-flow-cli_<version>_amd64.deb`
 - Red Hat/Fedora: `gofer-flow-cli-<version>-1.<dist>.x86_64.rpm`
 - Arch/AUR: `gofer-flow-cli`
@@ -103,10 +109,11 @@ yay -S gofer-flow-cli
 
 ## Release Builds
 
-Release artifacts for Linux and Windows are built by the GitHub Actions workflow
-in `.github/workflows/release.yml`. It runs on `workflow_dispatch` and `v*` tags,
-builds the Python backend binary, builds the React frontend, packages Electron,
-and uploads desktop installer plus CLI-only artifacts with SHA-256 checksum files.
+Release artifacts for Linux, Windows, and macOS are built by the GitHub Actions
+workflow in `.github/workflows/release.yml`. It runs on `workflow_dispatch` and
+`v*` tags, builds the Python backend binary, builds the React frontend, packages
+Electron, and uploads desktop installer plus CLI-only artifacts with SHA-256
+checksum files.
 
 Use the version bump script before tagging a release:
 

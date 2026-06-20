@@ -159,6 +159,7 @@ class CommonLlmTaskOperation(BaseModel):
     target: str = ""
     instructions: str = ""
     working_dir: Path
+    memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
 
 
@@ -187,6 +188,7 @@ class AgentOperation(BaseModel):
     working_dir: Path
     skill_name: str | None = None
     dynamic_count: int | str = 1
+    memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
     fan_source: FanSource | None = None
 

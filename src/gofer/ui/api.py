@@ -62,7 +62,12 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
     errors: list[dict[str, str]] = []
 
     if not base.exists():
-        return {"dataDir": str(base), "workflows": workflows, "errors": errors}
+        return {
+            "dataDir": str(base),
+            "workflows": workflows,
+            "errors": errors,
+            "promptAgentIds": [],
+        }
 
     for path in sorted(base.glob("*.toml")):
         try:
@@ -75,7 +80,31 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
 
         workflows.append(workflow_to_payload(workflow, path))
 
-    return {"dataDir": str(base), "workflows": workflows, "errors": errors}
+    return {
+        "dataDir": str(base),
+        "workflows": workflows,
+        "errors": errors,
+        "promptAgentIds": prompt_agent_ids(base),
+    }
+
+
+def prompt_agent_ids(data_dir: Path) -> list[str]:
+    prompts_dir = data_dir / "prompts"
+    if not prompts_dir.exists():
+        return []
+    return sorted(
+        {
+            path.stem
+            for path in prompts_dir.glob("*.md")
+            if re.fullmatch(r"agent-\d+", path.stem)
+        },
+        key=_agent_id_sort_key,
+    )
+
+
+def _agent_id_sort_key(agent_id: str) -> tuple[int, str]:
+    match = re.fullmatch(r"agent-(\d+)", agent_id)
+    return (int(match.group(1)) if match else 0, agent_id)
 
 
 def invalid_workflow_payload(path: Path, message: str) -> dict[str, Any]:
@@ -89,6 +118,7 @@ def invalid_workflow_payload(path: Path, message: str) -> dict[str, Any]:
         "sourcePath": str(path),
         "schedule": None,
         "watch": None,
+        "runContinuously": False,
         "maxTotalNodeRuns": 1000,
         "tags": ["error", "invalid"],
         "agents": {},
@@ -152,6 +182,7 @@ def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> d
         raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
     path.unlink()
     shutil.rmtree(base / "logs" / workflow_id, ignore_errors=True)
+    shutil.rmtree(base / "agent-memory" / workflow_id, ignore_errors=True)
     delete_workflow_chat_prompt(base, workflow_id)
     return {"workflowId": workflow_id, "deleted": True}
 
@@ -282,14 +313,22 @@ async def run_workflow_payload(
     if not path.exists():
         raise WorkflowRunError(f"Workflow '{workflow_id}' not found")
 
-    run_key = _run_key(base, workflow_id)
-    cancel_event = threading.Event()
-    with _active_run_lock:
-        _active_run_stop_events.setdefault(run_key, set()).add(cancel_event)
-
     try:
         workflow = AgenticWorkflow.from_file(path)
         workflow.validate()
+    except Exception as exc:
+        raise WorkflowRunError(str(exc)) from exc
+
+    run_key = _run_key(base, workflow_id)
+    cancel_event = threading.Event()
+    with _active_run_lock:
+        if workflow.config.run_continuously and _active_run_stop_events.get(run_key):
+            raise WorkflowRunError(
+                f"Workflow '{workflow_id}' is configured to run continuously and is already running"
+            )
+        _active_run_stop_events.setdefault(run_key, set()).add(cancel_event)
+
+    try:
         result = await WorkflowExecutor(
             workflow,
             _subscriptions,
@@ -337,6 +376,8 @@ def stop_workflow_run_payload(
     run_id: str | None = None,
 ) -> dict[str, Any]:
     base = data_dir or get_data_dir()
+    if run_id is None:
+        _disable_run_continuously(workflow_id, base)
     if run_id:
         log_path = base / "logs" / workflow_id / run_id
         if not log_path.exists() or _log_status(log_path) != "running":
@@ -372,6 +413,20 @@ def stop_workflow_run_payload(
         cancel_event.set()
     request_workflow_stop(workflow_id, base)
     return {"workflowId": workflow_id, "stopped": True}
+
+
+def _disable_run_continuously(workflow_id: str, data_dir: Path) -> None:
+    path = data_dir / f"{workflow_id}.toml"
+    if not path.exists():
+        return
+    try:
+        workflow = AgenticWorkflow.from_file(path)
+    except Exception:
+        return
+    if not workflow.config.run_continuously:
+        return
+    workflow.config.run_continuously = False
+    workflow.to_file(path)
 
 
 def _run_key(data_dir: Path, workflow_id: str) -> tuple[str, str]:
@@ -460,6 +515,7 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
             name=str(payload.get("name") or payload["id"]),
             schedule=payload.get("schedule"),
             watch=payload.get("watch"),
+            run_continuously=bool(payload.get("runContinuously", False)),
             max_total_node_runs=int(payload.get("maxTotalNodeRuns") or 1000),
         )
     )
@@ -467,6 +523,9 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
     for agent_id, agent_data in (payload.get("agents") or {}).items():
         if not isinstance(agent_data, dict):
             continue
+        agent_data = dict(agent_data)
+        if not agent_data.get("prompt_path"):
+            agent_data.pop("prompt_path", None)
         workflow.register_agent(
             AgentConfig(agent_id=str(agent_id), **_without(agent_data, "agent_id"))
         )
@@ -485,6 +544,7 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
                 node_id=node_id,
                 operation=_operation_adapter.validate_python(operation_data),
                 pipe_output=bool(settings.get("pipeOutput", False)),
+                allow_failure=bool(settings.get("allowFailure", False)),
                 retry_count=int(settings.get("retryCount") or 0),
                 retry_delay_seconds=float(settings.get("retryDelaySeconds") or 1.0),
                 timeout_seconds=_optional_float(settings.get("timeoutSeconds")),
@@ -535,6 +595,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
                     "operation": operation,
                     "settings": {
                         "pipeOutput": node.pipe_output,
+                        "allowFailure": node.allow_failure,
                         "retryCount": node.retry_count,
                         "retryDelaySeconds": node.retry_delay_seconds,
                         "timeoutSeconds": node.timeout_seconds,
@@ -575,6 +636,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         "sourcePath": str(path) if path else None,
         "schedule": schedule,
         "watch": watch,
+        "runContinuously": workflow.config.run_continuously,
         "maxTotalNodeRuns": workflow.config.max_total_node_runs,
         "tags": tags,
         "agents": {
@@ -701,9 +763,21 @@ def _workflow_description(
     node_count = len(list(workflow.graph._graph.nodes()))
     edge_count = len(list(workflow.graph._graph.edges()))
     agent_count = len(workflow.agents)
-    schedule_text = f" Scheduled with {schedule['cron_expression']}." if schedule else ""
-    watch_text = f" Watching {watch['path']}." if watch else ""
-    return f"{node_count} nodes, {edge_count} edges, {agent_count} agents.{schedule_text}{watch_text}"
+    continuous_text = " Runs continuously." if workflow.config.run_continuously else ""
+    schedule_text = (
+        f" Scheduled with {schedule['cron_expression']}."
+        if schedule and not workflow.config.run_continuously
+        else ""
+    )
+    watch_text = (
+        f" Watching {watch['path']}."
+        if watch and not workflow.config.run_continuously
+        else ""
+    )
+    return (
+        f"{node_count} nodes, {edge_count} edges, {agent_count} agents."
+        f"{continuous_text}{schedule_text}{watch_text}"
+    )
 
 
 def _workflow_status(schedule: dict[str, Any] | None) -> str:
@@ -748,11 +822,12 @@ def _log_status(path: Path) -> str:
         return "unknown"
     if not lines:
         return "unknown"
-    last_line = lines[-1].lower()
-    if "completed successfully" in last_line:
-        return "success"
-    if "failed due to" in last_line:
-        return "error"
+    for line in reversed(lines):
+        normalized = line.lower()
+        if "completed successfully" in normalized:
+            return "success"
+        if "failed due to" in normalized:
+            return "error"
     return "running"
 
 

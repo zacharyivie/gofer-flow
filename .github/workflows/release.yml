@@ -23,8 +23,10 @@ jobs:
             artifact-name: gofer-flow-linux
             artifact-glob: |
               frontend/release/*.AppImage
+              frontend/release/*.AppImage.blockmap
               frontend/release/*.deb
               frontend/release/*.rpm
+              frontend/release/latest-linux.yml
               frontend/release/gof-linux-x64
               frontend/release/checksums-linux.txt
           - name: windows
@@ -33,7 +35,21 @@ jobs:
             artifact-name: gofer-flow-windows
             artifact-glob: |
               frontend/release/*.exe
+              frontend/release/*.exe.blockmap
+              frontend/release/latest.yml
               frontend/release/checksums-windows.txt
+          - name: macos
+            os: macos-latest
+            package-script: dist:mac
+            artifact-name: gofer-flow-macos
+            artifact-glob: |
+              frontend/release/*.dmg
+              frontend/release/*.dmg.blockmap
+              frontend/release/*.zip
+              frontend/release/*.zip.blockmap
+              frontend/release/latest-mac.yml
+              frontend/release/gof-macos-*
+              frontend/release/checksums-macos.txt
 
     steps:
       - name: Check out repository
@@ -72,6 +88,8 @@ jobs:
 
       - name: Build Electron packages
         working-directory: frontend
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run ${{ matrix.package-script }}
 
       - name: Copy Linux CLI artifact
@@ -91,12 +109,25 @@ jobs:
         shell: pwsh
         run: Copy-Item dist/gof.exe frontend/release/gof-windows-x64.exe
 
+      - name: Copy macOS CLI artifact
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          arch="$(uname -m)"
+          case "$arch" in
+            arm64) artifact_arch="arm64" ;;
+            x86_64) artifact_arch="x64" ;;
+            *) artifact_arch="$arch" ;;
+          esac
+          cp dist/gof "frontend/release/gof-macos-${artifact_arch}"
+          chmod +x "frontend/release/gof-macos-${artifact_arch}"
+
       - name: Generate Linux checksums
         if: runner.os == 'Linux'
         working-directory: frontend/release
         shell: bash
         run: |
-          sha256sum *.AppImage *.deb *.rpm gof-linux-x64 > checksums-linux.txt
+          sha256sum *.AppImage *.AppImage.blockmap *.deb *.rpm latest-linux.yml gof-linux-x64 > checksums-linux.txt
           cat checksums-linux.txt
 
       - name: Generate Windows checksums
@@ -104,13 +135,22 @@ jobs:
         working-directory: frontend/release
         shell: pwsh
         run: |
-          Get-ChildItem -File -Filter "*.exe" |
+          Get-ChildItem -File |
+            Where-Object { $_.Name -like "*.exe" -or $_.Name -like "*.exe.blockmap" -or $_.Name -eq "latest.yml" } |
             Sort-Object Name |
             ForEach-Object {
               $hash = Get-FileHash -Algorithm SHA256 $_.FullName
               "$($hash.Hash.ToLower())  $($_.Name)"
             } | Set-Content checksums-windows.txt
           Get-Content checksums-windows.txt
+
+      - name: Generate macOS checksums
+        if: runner.os == 'macOS'
+        working-directory: frontend/release
+        shell: bash
+        run: |
+          shasum -a 256 *.dmg *.dmg.blockmap *.zip *.zip.blockmap latest-mac.yml gof-macos-* > checksums-macos.txt
+          cat checksums-macos.txt
 
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4

@@ -12,6 +12,7 @@ import {
   Database,
   Download,
   ExternalLink,
+  Eye,
   FilePenLine,
   Files,
   FileText,
@@ -22,6 +23,7 @@ import {
   MoveRight,
   Play,
   Plus,
+  RefreshCw,
   Route,
   Search,
   Sparkles,
@@ -132,6 +134,7 @@ const nodeStyles = {
 };
 
 const defaultSettings = {
+  allowFailure: false,
   pipeOutput: false,
   retryCount: 0,
   retryDelaySeconds: 1,
@@ -274,63 +277,85 @@ function defaultOperation(type, nodeNumber = 1) {
       return {
         type: "agent",
         agent_id: `agent-${nodeNumber}`,
-        prompt_path: `prompts/agent-${nodeNumber}.md`,
+        prompt_path: "",
         working_dir: ".",
         skill_name: "",
         dynamic_count: 1,
+        memory: "none",
         input_mapping: {},
         fan_source: null,
       };
   }
 }
 
-function defaultAgentConfig(agentId) {
+function defaultAgentConfig(agentId, overrides = {}) {
   return {
     agent_id: agentId,
     subscription: "codex",
     working_dir: ".",
-    prompt_path: `prompts/${agentId}.md`,
+    prompt_path: "",
     tools: [],
     mcp_servers: [],
     env: {},
+    ...overrides,
   };
 }
 
-function nodeMetaFromOperation(operation = {}) {
+function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
   switch (operation.type) {
     case "bash_command":
       return operation.command || commandNodeLabel.toLowerCase();
     case "python_script":
     case "shell_script":
-      return operation.script_path || "script";
+      return operation.script_path
+        ? resolveDisplayPath(operation.script_path, pathBasePath)
+        : "script";
     case "read_file":
-      return `read ${operation.path || "file"}`;
+      return `read ${operation.path ? resolveDisplayPath(operation.path, pathBasePath) : "file"}`;
     case "write_file":
-      return `write ${operation.path || "file"}`;
+      return `write ${operation.path ? resolveDisplayPath(operation.path, pathBasePath) : "file"}`;
     case "copy_file":
-      return `copy ${operation.source_path || "source"} to ${operation.destination_path || "destination"}`;
+      return `copy ${
+        operation.source_path ? resolveDisplayPath(operation.source_path, pathBasePath) : "source"
+      } to ${
+        operation.destination_path
+          ? resolveDisplayPath(operation.destination_path, pathBasePath)
+          : "destination"
+      }`;
     case "move_file":
-      return `move ${operation.source_path || "source"} to ${operation.destination_path || "destination"}`;
+      return `move ${
+        operation.source_path ? resolveDisplayPath(operation.source_path, pathBasePath) : "source"
+      } to ${
+        operation.destination_path
+          ? resolveDisplayPath(operation.destination_path, pathBasePath)
+          : "destination"
+      }`;
     case "delete_file":
-      return `delete ${operation.path || "file"}`;
+      return `delete ${operation.path ? resolveDisplayPath(operation.path, pathBasePath) : "file"}`;
     case "file":
-      return operation.path || "file";
+      return operation.path ? resolveDisplayPath(operation.path, pathBasePath) : "file";
     case "folder":
-      return operation.path || "folder";
+      return operation.path ? resolveDisplayPath(operation.path, pathBasePath) : "folder";
     case "open_resource":
-      return `open ${operation.target || "target"}`;
+      return `open ${operation.target ? resolveDisplayPath(operation.target, pathBasePath) : "target"}`;
     case "prompt_file":
-      return `prompt ${operation.output_path || "file"}`;
+      return `prompt ${
+        operation.output_path ? resolveDisplayPath(operation.output_path, pathBasePath) : "file"
+      }`;
     case "common_llm_task":
       return `${operation.task || "summarize"} with ${operation.agent_id || "agent"}`;
     case "local_vectorize":
-      return `index ${operation.source_path || "files"}`;
+      return `index ${
+        operation.source_path ? resolveDisplayPath(operation.source_path, pathBasePath) : "files"
+      }`;
     case "local_search":
-      return `search ${operation.index_path || "index"}`;
+      return `search ${
+        operation.index_path ? resolveDisplayPath(operation.index_path, pathBasePath) : "index"
+      }`;
     case "agent":
       if (operation.skill_name) return `${operation.agent_id || "agent"} · /${operation.skill_name}`;
       return operation.prompt_path
-        ? `${operation.agent_id || "agent"} · ${operation.prompt_path}`
+        ? `${operation.agent_id || "agent"} · ${resolveDisplayPath(operation.prompt_path, pathBasePath)}`
         : operation.agent_id || "agent";
     default:
       return "operation";
@@ -347,6 +372,42 @@ function fileExtension(pathValue = "") {
   const index = name.lastIndexOf(".");
   if (index <= 0 || index === name.length - 1) return "";
   return name.slice(index + 1).toUpperCase();
+}
+
+function isUrlPath(pathValue = "") {
+  return /^[a-z][a-z0-9+.-]*:/i.test(String(pathValue));
+}
+
+function isAbsolutePath(pathValue = "") {
+  const value = String(pathValue);
+  return (
+    value.startsWith("/") ||
+    value.startsWith("\\\\") ||
+    /^[A-Za-z]:[\\/]/.test(value)
+  );
+}
+
+function joinPath(basePath = "", pathValue = "") {
+  const base = String(basePath);
+  const value = String(pathValue);
+  const separator = base.includes("\\") && !base.includes("/") ? "\\" : "/";
+  if (!base) return value;
+  if (value === ".") return base;
+  return `${base.replace(/[\\/]+$/, "")}${separator}${value.replace(/^[\\/]+/, "")}`;
+}
+
+function normalizeDisplayPath(pathValue = "") {
+  const value = String(pathValue);
+  if (!value) return "";
+  return value.replace(/\/\.(?=\/|$)/g, "").replace(/\\/g, "\\");
+}
+
+function resolveDisplayPath(pathValue = "", basePath = "") {
+  const value = String(pathValue ?? "").trim();
+  if (!value || isUrlPath(value) || isAbsolutePath(value)) {
+    return value;
+  }
+  return normalizeDisplayPath(joinPath(basePath, value));
 }
 
 function clamp(value, min, max) {
@@ -367,8 +428,12 @@ function nextAvailableNodeNumber(nodes) {
   return nextNumber;
 }
 
-function nextAvailableAgentNumber(nodes, agents) {
+function nextAvailableAgentNumber(nodes, agents, usedAgentIds = []) {
   const usedNumbers = new Set([
+    ...usedAgentIds
+      .map((agentId) => String(agentId).match(/^agent-(\d+)$/)?.[1])
+      .filter(Boolean)
+      .map(Number),
     ...Object.keys(agents ?? {})
       .map((agentId) => String(agentId).match(/^agent-(\d+)$/)?.[1])
       .filter(Boolean)
@@ -386,6 +451,7 @@ function nextAvailableAgentNumber(nodes, agents) {
 }
 
 export default function DagCanvas({
+  dataDir = "",
   logState,
   notice,
   runState,
@@ -398,6 +464,7 @@ export default function DagCanvas({
   onStopWorkflow,
   onValidateWorkflow,
   onWorkflowChange,
+  usedAgentIds = [],
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
@@ -510,17 +577,42 @@ export default function DagCanvas({
       type: operation.type,
       meta: nodeMetaFromOperation(operation),
     };
-
     if (
-      (operation.type === "agent" || operation.type === "common_llm_task") &&
-      patch.agent_id &&
-      !workflow.agents?.[patch.agent_id]
+      (operation.type === "file" || operation.type === "folder") &&
+      Object.hasOwn(patch, "path") &&
+      operation.path
     ) {
+      nextNodePatch.label = pathBasename(operation.path);
+    }
+    const syncAgentPatch = {};
+    if (operation.type === "agent" || operation.type === "common_llm_task") {
+      if (Object.hasOwn(patch, "prompt_path")) {
+        syncAgentPatch.prompt_path = operation.prompt_path;
+      }
+      if (Object.hasOwn(patch, "working_dir")) {
+        syncAgentPatch.working_dir = operation.working_dir;
+      }
+    }
+    const shouldSyncAgent =
+      (operation.type === "agent" || operation.type === "common_llm_task") &&
+      operation.agent_id &&
+      (patch.agent_id || Object.keys(syncAgentPatch).length);
+
+    if (shouldSyncAgent) {
+      const currentAgent =
+        workflow.agents?.[operation.agent_id] ??
+        defaultAgentConfig(operation.agent_id, {
+          prompt_path: operation.prompt_path,
+          working_dir: operation.working_dir,
+        });
       onWorkflowChange({
         ...workflow,
         agents: {
           ...(workflow.agents ?? {}),
-          [patch.agent_id]: defaultAgentConfig(patch.agent_id),
+          [operation.agent_id]: {
+            ...currentAgent,
+            ...syncAgentPatch,
+          },
         },
         nodes: workflowNodes.map((currentNode) =>
           currentNode.id === nodeId ? { ...currentNode, ...nextNodePatch } : currentNode,
@@ -544,7 +636,13 @@ export default function DagCanvas({
   }
 
   function updateNodeType(nodeId, type) {
-    const nextOperation = defaultOperation(type, workflowNodes.length + 1);
+    const nextAgentNumber = nextAvailableAgentNumber(workflowNodes, workflow.agents, usedAgentIds);
+    const nextOperation = defaultOperation(
+      type,
+      type === "agent" || type === "common_llm_task"
+        ? nextAgentNumber
+        : workflowNodes.length + 1,
+    );
     const nextNode = {
       type,
       operation: nextOperation,
@@ -562,7 +660,10 @@ export default function DagCanvas({
         ...workflow,
         agents: {
           ...(workflow.agents ?? {}),
-          [nextOperation.agent_id]: defaultAgentConfig(nextOperation.agent_id),
+          [nextOperation.agent_id]: defaultAgentConfig(nextOperation.agent_id, {
+            prompt_path: nextOperation.prompt_path,
+            working_dir: nextOperation.working_dir,
+          }),
         },
         nodes: workflowNodes.map((node) => (node.id === nodeId ? { ...node, ...nextNode } : node)),
       });
@@ -587,7 +688,11 @@ export default function DagCanvas({
 
   function addNode() {
     const nextNumber = nextAvailableNodeNumber(workflowNodes);
-    const nextAgentNumber = nextAvailableAgentNumber(workflowNodes, workflow.agents);
+    const nextAgentNumber = nextAvailableAgentNumber(
+      workflowNodes,
+      workflow.agents,
+      usedAgentIds,
+    );
     const nextOperation = defaultOperation("agent", nextAgentNumber);
     const newNode = {
       id: `node-${nextNumber}`,
@@ -603,7 +708,10 @@ export default function DagCanvas({
       ...workflow,
       agents: {
         ...(workflow.agents ?? {}),
-        [newNode.operation.agent_id]: defaultAgentConfig(newNode.operation.agent_id),
+        [newNode.operation.agent_id]: defaultAgentConfig(newNode.operation.agent_id, {
+          prompt_path: newNode.operation.prompt_path,
+          working_dir: newNode.operation.working_dir,
+        }),
       },
       nodes: [...workflowNodes, newNode],
     });
@@ -1133,7 +1241,12 @@ export default function DagCanvas({
           onDrop={handleCanvasDrop}
           onWheel={handleCanvasWheel}
         >
-          <WorkflowTriggerStrip schedule={workflow.schedule} watch={workflow.watch} />
+          <WorkflowTriggerStrip
+            dataDir={dataDir}
+            runContinuously={workflow.runContinuously}
+            schedule={workflow.schedule}
+            watch={workflow.watch}
+          />
           {invalidWorkflow ? (
             <InvalidWorkflowCanvas workflow={workflow} />
           ) : (
@@ -1241,7 +1354,10 @@ export default function DagCanvas({
               {workflowNodes.map((node) => (
                 <WorkflowNode
                   key={node.id}
-                  node={node}
+                  node={{
+                    ...node,
+                    meta: nodeMetaFromOperation(node.operation ?? defaultOperation(node.type), dataDir),
+                  }}
                   selected={selectedNodeId === node.id}
                   status={nodeStatuses[node.id]}
                   expanded={Boolean(expandedFolderNodes[node.id])}
@@ -1269,6 +1385,7 @@ export default function DagCanvas({
             node={selectedNode}
             nodes={workflowNodes}
             workflow={workflow}
+            dataDir={dataDir}
             width={inspectorWidth}
             onAddEdge={addEdge}
             onDeleteEdge={deleteEdge}
@@ -1332,6 +1449,15 @@ function InvalidWorkflowCanvas({ workflow }) {
     }
   }
 
+  async function openSourcePath() {
+    if (!sourcePath) return;
+    try {
+      await window.goferDesktop?.revealPath?.(sourcePath);
+    } catch (error) {
+      console.error("Failed to reveal workflow source path", error);
+    }
+  }
+
   return (
     <div className="absolute inset-0 z-10 grid place-items-center p-6">
       <section className="flex max-h-[72%] w-full max-w-2xl flex-col overflow-hidden rounded-lg border border-red-200 bg-red-50/95 shadow-panel backdrop-blur dark:border-red-950 dark:bg-[#241b1b]/95">
@@ -1340,9 +1466,14 @@ function InvalidWorkflowCanvas({ workflow }) {
             <h3 className="text-sm font-semibold text-red-800 dark:text-red-200">
               Invalid workflow TOML
             </h3>
-            <p className="mt-1 truncate text-xs text-red-700/80 dark:text-red-200/70">
+            <button
+              className="mt-1 block max-w-full truncate text-left text-xs text-red-700/80 underline-offset-2 transition hover:text-red-800 hover:underline dark:text-red-200/70 dark:hover:text-red-100"
+              title={sourcePath}
+              type="button"
+              onClick={openSourcePath}
+            >
               {sourcePath}
-            </p>
+            </button>
           </div>
           <button
             className="inline-flex shrink-0 items-center gap-2 rounded-md border border-red-200 bg-white px-2.5 py-1.5 text-xs font-medium text-red-700 transition hover:bg-red-100 dark:border-red-900 dark:bg-[#2b2222] dark:text-red-200 dark:hover:bg-[#362828]"
@@ -1363,12 +1494,19 @@ function InvalidWorkflowCanvas({ workflow }) {
   );
 }
 
-function WorkflowTriggerStrip({ schedule, watch }) {
-  if (!schedule && !watch) return null;
+function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, watch }) {
+  if (!runContinuously && !schedule && !watch) return null;
+  const watchPath = watch?.path ? resolveDisplayPath(watch.path, dataDir) : "";
 
   return (
     <div className="pointer-events-none absolute left-5 top-5 z-20 flex max-w-[calc(100%-40px)] flex-wrap gap-2">
-      {schedule ? (
+      {runContinuously ? (
+        <div className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95">
+          <RefreshCw size={14} className="text-teal-600" />
+          <span className="truncate">Runs continuously</span>
+        </div>
+      ) : null}
+      {!runContinuously && schedule ? (
         <div className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95">
           <CalendarDays size={14} className="text-teal-600" />
           <span className="truncate">
@@ -1376,11 +1514,11 @@ function WorkflowTriggerStrip({ schedule, watch }) {
           </span>
         </div>
       ) : null}
-      {watch ? (
+      {!runContinuously && watch ? (
         <div className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95">
           <FolderOpen size={14} className="text-teal-600" />
           <span className="truncate">
-            Starts when files change: {watch.path}{watch.glob ? `/${watch.glob}` : ""}
+            Starts when files change: {watchPath}{watch.glob ? `/${watch.glob}` : ""}
             {watch.mode ? ` (${watch.mode})` : ""}
           </span>
         </div>
@@ -1621,6 +1759,8 @@ function LogOverlay({
   title,
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [expandedRowIds, setExpandedRowIds] = useState({});
+  const [filters, setFilters] = useState({ datetime: "", node: "", message: "" });
   const historyRef = useRef(null);
   const displayText = error
     ? error
@@ -1629,6 +1769,23 @@ function LogOverlay({
       : text?.trim()
         ? text.trim()
         : "No run log available.";
+  const logRows = useMemo(() => parseLogRows(displayText), [displayText]);
+  const filteredRows = useMemo(() => {
+    return logRows.filter((row) => {
+      const datetime = filters.datetime.trim().toLowerCase();
+      const node = filters.node.trim().toLowerCase();
+      const message = filters.message.trim().toLowerCase();
+      return (
+        (!datetime || row.datetime.toLowerCase().includes(datetime)) &&
+        (!node || row.node.toLowerCase().includes(node)) &&
+        (!message || row.message.toLowerCase().includes(message))
+      );
+    });
+  }, [filters, logRows]);
+
+  useEffect(() => {
+    setExpandedRowIds({});
+  }, [displayText]);
 
   useEffect(() => {
     if (!historyOpen) return undefined;
@@ -1764,14 +1921,180 @@ function LogOverlay({
           </span>
         </div>
       </div>
-      <pre
-        className="workflow-scrollbar overflow-auto whitespace-pre-wrap bg-white px-4 py-3 font-mono text-xs leading-5 text-slate-700"
+      <div
+        className="workflow-scrollbar overflow-auto bg-white dark:bg-[#1e1e1e]"
         style={{ height: Math.max(0, height - 44) }}
       >
-        {displayText}
-      </pre>
+        <table className="w-full table-fixed border-collapse text-left text-xs">
+          <thead className="sticky top-0 z-10 border-b border-line bg-[#f9fbfd] dark:bg-[#252526]">
+            <tr className="text-[11px] uppercase tracking-wide text-muted">
+              <th className="w-[190px] px-3 pb-1 pt-2 font-semibold">Datetime</th>
+              <th className="w-[170px] px-3 pb-1 pt-2 font-semibold">Node</th>
+              <th className="px-3 pb-1 pt-2 font-semibold">Message</th>
+            </tr>
+            <tr className="border-t border-line/70">
+              <th className="px-3 pb-2 pt-1">
+                <LogFilterInput
+                  label="Filter datetime"
+                  value={filters.datetime}
+                  onChange={(value) =>
+                    setFilters((current) => ({ ...current, datetime: value }))
+                  }
+                />
+              </th>
+              <th className="px-3 pb-2 pt-1">
+                <LogFilterInput
+                  label="Filter node"
+                  value={filters.node}
+                  onChange={(value) =>
+                    setFilters((current) => ({ ...current, node: value }))
+                  }
+                />
+              </th>
+              <th className="px-3 pb-2 pt-1">
+                <LogFilterInput
+                  label="Filter message"
+                  value={filters.message}
+                  onChange={(value) =>
+                    setFilters((current) => ({ ...current, message: value }))
+                  }
+                />
+              </th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-line/70">
+            {filteredRows.map((row) => {
+              const expanded = Boolean(expandedRowIds[row.id]);
+              return (
+                <tr
+                  key={row.id}
+                  className="h-10 cursor-pointer align-top text-slate-700 transition hover:bg-slate-50 dark:text-[#cccccc] dark:hover:bg-[#2a2d2e]"
+                  title={expanded ? "Collapse log row" : "Expand log row"}
+                  onClick={() =>
+                    setExpandedRowIds((current) => ({
+                      ...current,
+                      [row.id]: !current[row.id],
+                    }))
+                  }
+                >
+                  <td className="px-3 py-2 font-mono text-[11px] text-muted">
+                    <div className={expanded ? "whitespace-pre-wrap" : "truncate"}>
+                      {row.datetime || "-"}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-[11px] text-muted">
+                    <div className={expanded ? "whitespace-pre-wrap" : "truncate"}>
+                      {row.node || "-"}
+                    </div>
+                  </td>
+                  <td className="px-3 py-2 font-mono text-[11px] leading-5">
+                    <div
+                      className={
+                        expanded
+                          ? "whitespace-pre-wrap break-words"
+                          : "truncate whitespace-nowrap"
+                      }
+                    >
+                      {row.message || "-"}
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
+            {!filteredRows.length ? (
+              <tr>
+                <td className="px-4 py-6 text-center text-xs text-muted" colSpan={3}>
+                  {logRows.length ? "No log rows match the current filters." : displayText}
+                </td>
+              </tr>
+            ) : null}
+          </tbody>
+        </table>
+      </div>
     </section>
   );
+}
+
+function LogFilterInput({ label, onChange, value }) {
+  return (
+    <input
+      aria-label={label}
+      className="h-7 w-full rounded-md border border-line bg-white px-2 text-[11px] font-normal text-ink outline-none transition placeholder:text-muted/70 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10 dark:bg-[#1e1e1e]"
+      placeholder={label}
+      type="text"
+      value={value}
+      onChange={(event) => onChange(event.target.value)}
+      onClick={(event) => event.stopPropagation()}
+    />
+  );
+}
+
+function parseLogRows(logText) {
+  if (!logText?.trim()) return [];
+  const rows = [];
+  const timestampPattern =
+    /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:?\d{2})?)\s+-\s+(.*)$/;
+
+  function pushRow(row) {
+    if (!row) return;
+    rows.push({
+      ...row,
+      message: row.message.trimEnd(),
+    });
+  }
+
+  let current = null;
+  logText.split("\n").forEach((line, index) => {
+    const match = line.match(timestampPattern);
+    if (match) {
+      pushRow(current);
+      const parsed = parseLogPayload(match[2]);
+      current = {
+        id: `log-row-${index}`,
+        datetime: match[1],
+        node: parsed.node,
+        message: parsed.message,
+      };
+      return;
+    }
+
+    if (current) {
+      current.message = current.message ? `${current.message}\n${line}` : line;
+    } else if (line.trim()) {
+      current = {
+        id: `log-row-${index}`,
+        datetime: "",
+        node: "",
+        message: line,
+      };
+    }
+  });
+
+  pushRow(current);
+  return rows;
+}
+
+function parseLogPayload(payload) {
+  const nodeMatch = payload.match(/^NODE\s+-\s+(.+?)\s+-\s+(.*)$/);
+  if (nodeMatch) {
+    return {
+      node: nodeMatch[1],
+      message: nodeMatch[2],
+    };
+  }
+
+  const levelMatch = payload.match(/^(INFO|ERROR|WARN|WARNING|DEBUG)\s+-\s+(.*)$/);
+  if (levelMatch) {
+    return {
+      node: levelMatch[1],
+      message: levelMatch[2],
+    };
+  }
+
+  return {
+    node: "workflow",
+    message: payload,
+  };
 }
 
 function RunStatusDot({ status }) {
@@ -1957,6 +2280,7 @@ const compactEdgeConditionOptions = [
 function Inspector({
   agents,
   collapsed,
+  dataDir,
   edge,
   edges,
   node,
@@ -2007,7 +2331,7 @@ function Inspector({
 
   function updateWorkflowWatch(patch) {
     const currentWatch = watch ?? {
-      path: ".",
+      path: dataDir || "",
       glob: "*",
       recursive: false,
       debounce_seconds: 1,
@@ -2063,7 +2387,7 @@ function Inspector({
                 onChange={(value) => onWorkflowChange({ name: value })}
               />
               {workflow.sourcePath ? (
-                <TextField label="Source path" value={workflow.sourcePath} readOnly />
+                <TextField label="Source path" value={workflow.sourcePath} readOnly pathLink />
               ) : null}
               <NumberField
                 label="Max total node runs"
@@ -2071,11 +2395,26 @@ function Inspector({
                 value={workflow.maxTotalNodeRuns ?? 1000}
                 onChange={(value) => onWorkflowChange({ maxTotalNodeRuns: value || 1000 })}
               />
+              <ToggleField
+                checked={Boolean(workflow.runContinuously)}
+                label="Run continuously"
+                onChange={(checked) => onWorkflowChange({ runContinuously: checked })}
+              />
+              {workflow.runContinuously ? (
+                <p className="text-sm leading-6 text-muted">
+                  Continuous mode keeps one run active and overrides schedule and file watcher starts.
+                  Stop all runs to turn it off.
+                </p>
+              ) : null}
             </InspectorSection>
 
-            <InspectorSection title="Schedule">
+            <InspectorSection
+              title="Schedule"
+              className={workflow.runContinuously ? "opacity-50" : ""}
+            >
               <ToggleField
                 checked={Boolean(schedule)}
+                disabled={Boolean(workflow.runContinuously)}
                 label="Scheduled"
                 onChange={(checked) =>
                   onWorkflowChange({
@@ -2109,15 +2448,19 @@ function Inspector({
               )}
             </InspectorSection>
 
-            <InspectorSection title="File watcher">
+            <InspectorSection
+              title="File watcher"
+              className={workflow.runContinuously ? "opacity-50" : ""}
+            >
               <ToggleField
                 checked={Boolean(watch)}
+                disabled={Boolean(workflow.runContinuously)}
                 label="Watch files"
                 onChange={(checked) =>
                   onWorkflowChange({
                     watch: checked
                       ? watch ?? {
-                          path: ".",
+                          path: dataDir || "",
                           glob: "*",
                           recursive: false,
                           debounce_seconds: 1,
@@ -2135,7 +2478,8 @@ function Inspector({
                     value={watch.path ?? ""}
                     onChange={(value) => updateWorkflowWatch({ path: value })}
                     pathPicker
-                    placeholder="."
+                    pathBasePath={dataDir}
+                    placeholder="Absolute folder path"
                   />
                   <TextField
                     label="Glob"
@@ -2281,6 +2625,16 @@ function Inspector({
               label="Pipe output"
               onChange={(checked) => onSettingsChange({ pipeOutput: checked })}
             />
+            <ToggleField
+              checked={Boolean(settings.allowFailure)}
+              label="Allow failure"
+              onChange={(checked) => onSettingsChange({ allowFailure: checked })}
+            />
+            {settings.allowFailure ? (
+              <p className="text-sm leading-6 text-muted">
+                Failed output can still trigger on-failure edges, but it will not fail the whole workflow.
+              </p>
+            ) : null}
             <NumberField
               label="Retry count"
               min="0"
@@ -2316,7 +2670,8 @@ function Inspector({
                 value={operation.working_dir ?? ""}
                 onChange={(value) => onOperationChange({ working_dir: value })}
                 pathPicker
-                placeholder="."
+                pathBasePath={dataDir}
+                placeholder="Absolute working directory"
               />
               <KeyValueField
                 label="Environment"
@@ -2335,6 +2690,7 @@ function Inspector({
                 value={operation.script_path ?? ""}
                 onChange={(value) => onOperationChange({ script_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <ListField
                 label="Arguments"
@@ -2357,6 +2713,7 @@ function Inspector({
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextField
                 label="Encoding"
@@ -2383,6 +2740,7 @@ function Inspector({
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextareaField
                 label="Content"
@@ -2421,12 +2779,14 @@ function Inspector({
                 value={operation.source_path ?? ""}
                 onChange={(value) => onOperationChange({ source_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextField
                 label="Destination path"
                 value={operation.destination_path ?? ""}
                 onChange={(value) => onOperationChange({ destination_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <ToggleField
                 checked={operation.create_dirs !== false}
@@ -2448,6 +2808,7 @@ function Inspector({
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <ToggleField
                 checked={operation.use_trash !== false}
@@ -2474,6 +2835,7 @@ function Inspector({
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
                 pathPicker
+                pathBasePath={dataDir}
                 placeholder="/absolute/path/to/file"
               />
             </InspectorSection>
@@ -2486,6 +2848,7 @@ function Inspector({
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
                 pathPicker
+                pathBasePath={dataDir}
                 placeholder="/absolute/path/to/folder"
               />
             </InspectorSection>
@@ -2498,6 +2861,7 @@ function Inspector({
                 value={operation.target ?? ""}
                 onChange={(value) => onOperationChange({ target: value })}
                 pathPicker
+                pathBasePath={dataDir}
                 placeholder="File, folder, URL, or app path"
               />
               <SelectField
@@ -2528,12 +2892,14 @@ function Inspector({
                 value={operation.output_path ?? ""}
                 onChange={(value) => onOperationChange({ output_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextField
                 label="Template path"
                 value={operation.template_path ?? ""}
                 onChange={(value) => onOperationChange({ template_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
                 placeholder="Optional"
               />
               <TextareaField
@@ -2605,6 +2971,7 @@ function Inspector({
                   value={operation.working_dir ?? ""}
                   onChange={(value) => onOperationChange({ working_dir: value })}
                   pathPicker
+                  pathBasePath={dataDir}
                 />
                 <KeyValueField
                   label="Input mapping"
@@ -2615,6 +2982,7 @@ function Inspector({
               <AgentConfigSection
                 agentConfig={agentConfig}
                 agentId={operation.agent_id}
+                pathBasePath={dataDir}
                 onAgentChange={onAgentChange}
               />
             </>
@@ -2627,12 +2995,14 @@ function Inspector({
                 value={operation.source_path ?? ""}
                 onChange={(value) => onOperationChange({ source_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextField
                 label="Index path"
                 value={operation.index_path ?? ""}
                 onChange={(value) => onOperationChange({ index_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextField
                 label="Glob"
@@ -2666,6 +3036,7 @@ function Inspector({
                 value={operation.index_path ?? ""}
                 onChange={(value) => onOperationChange({ index_path: value })}
                 pathPicker
+                pathBasePath={dataDir}
               />
               <TextareaField
                 label="Query"
@@ -2695,6 +3066,7 @@ function Inspector({
                   value={operation.prompt_path ?? ""}
                   onChange={(value) => onOperationChange({ prompt_path: value })}
                   pathPicker
+                  pathBasePath={dataDir}
                   placeholder="Optional when using a skill"
                 />
                 <TextField
@@ -2708,11 +3080,22 @@ function Inspector({
                   value={operation.working_dir ?? ""}
                   onChange={(value) => onOperationChange({ working_dir: value })}
                   pathPicker
+                  pathBasePath={dataDir}
                 />
                 <TextField
                   label="Dynamic count"
                   value={String(operation.dynamic_count ?? 1)}
                   onChange={(value) => onOperationChange({ dynamic_count: value })}
+                />
+                <SelectField
+                  label="Memory"
+                  value={operation.memory ?? "none"}
+                  options={[
+                    ["none", "None"],
+                    ["run", "This run only"],
+                    ["all", "All runs"],
+                  ]}
+                  onChange={(value) => onOperationChange({ memory: value })}
                 />
                 <KeyValueField
                   label="Input mapping"
@@ -2754,11 +3137,12 @@ function Inspector({
                     label="Path"
                     value={operation.fan_source.path ?? ""}
                     onChange={(value) =>
-                      onOperationChange({
+                    onOperationChange({
                         fan_source: { ...operation.fan_source, path: value },
                       })
                     }
                     pathPicker
+                    pathBasePath={dataDir}
                   />
                 ) : null}
                 {operation.fan_source?.type === "directory" ? (
@@ -2772,6 +3156,7 @@ function Inspector({
                         })
                       }
                       pathPicker
+                      pathBasePath={dataDir}
                     />
                     <TextField
                       label="Glob"
@@ -2832,9 +3217,10 @@ function Inspector({
               <InspectorSection title="Agent config">
                 <AgentConfigFields
                   agentConfig={agentConfig}
-                  agentId={operation.agent_id}
-                  onAgentChange={onAgentChange}
-                />
+                agentId={operation.agent_id}
+                pathBasePath={dataDir}
+                onAgentChange={onAgentChange}
+              />
               </InspectorSection>
             </>
           ) : null}
@@ -3072,7 +3458,7 @@ function nodesForFrom(nodes) {
   return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
-function AgentConfigSection({ agentConfig, agentId, onAgentChange }) {
+function AgentConfigSection({ agentConfig, agentId, onAgentChange, pathBasePath }) {
   if (!agentConfig) return null;
   return (
     <InspectorSection title="Agent config">
@@ -3080,12 +3466,13 @@ function AgentConfigSection({ agentConfig, agentId, onAgentChange }) {
         agentConfig={agentConfig}
         agentId={agentId}
         onAgentChange={onAgentChange}
+        pathBasePath={pathBasePath}
       />
     </InspectorSection>
   );
 }
 
-function AgentConfigFields({ agentConfig, agentId, onAgentChange }) {
+function AgentConfigFields({ agentConfig, agentId, onAgentChange, pathBasePath }) {
   return (
     <>
       <SelectField
@@ -3102,12 +3489,14 @@ function AgentConfigFields({ agentConfig, agentId, onAgentChange }) {
         value={agentConfig.prompt_path ?? ""}
         onChange={(value) => onAgentChange(agentId, { prompt_path: value })}
         pathPicker
+        pathBasePath={pathBasePath}
       />
       <TextField
         label="Working directory"
         value={agentConfig.working_dir ?? ""}
         onChange={(value) => onAgentChange(agentId, { working_dir: value })}
         pathPicker
+        pathBasePath={pathBasePath}
       />
       <ListField
         label="Tools"
@@ -3249,18 +3638,59 @@ function InspectorPanel({ children, open, subtitle, title, onToggle }) {
   );
 }
 
-function InspectorSection({ children, title }) {
+function InspectorSection({ children, className = "", title }) {
   return (
-    <section className="space-y-3 rounded-lg border border-line p-3">
+    <section className={`space-y-3 rounded-lg border border-line p-3 ${className}`}>
       <h3 className="text-xs font-semibold uppercase tracking-[0.14em] text-muted">{title}</h3>
       {children}
     </section>
   );
 }
 
-function TextField({ label, onChange, pathPicker = false, placeholder, readOnly = false, value }) {
+function TextField({
+  label,
+  onChange,
+  pathBasePath = "",
+  pathLink = false,
+  pathPicker = false,
+  placeholder,
+  readOnly = false,
+  value,
+}) {
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [pathInfo, setPathInfo] = useState(null);
+  const [textFileDialog, setTextFileDialog] = useState(null);
+  const isPathField = pathPicker || pathLink;
   const canPickPath = pathPicker && !readOnly && typeof onChange === "function";
+  const displayValue = isPathField ? resolveDisplayPath(value ?? "", pathBasePath) : value ?? "";
+  const canOpenPath = isPathField && displayValue && !isUrlPath(displayValue);
+  const canEditTextPath = canOpenPath && pathInfo?.isFile;
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadPathInfo() {
+      if (!canOpenPath) {
+        setPathInfo(null);
+        return;
+      }
+      try {
+        const info = await window.goferDesktop?.getPathInfo?.(displayValue);
+        if (!cancelled) {
+          setPathInfo(info ?? null);
+        }
+      } catch {
+        if (!cancelled) {
+          setPathInfo(null);
+        }
+      }
+    }
+
+    loadPathInfo();
+    return () => {
+      cancelled = true;
+    };
+  }, [canOpenPath, displayValue]);
 
   async function handlePathPick(event) {
     event.preventDefault();
@@ -3273,13 +3703,30 @@ function TextField({ label, onChange, pathPicker = false, placeholder, readOnly 
 
     try {
       const selectedPath = await window.goferDesktop?.selectPath?.({
-        currentPath: value ?? "",
+        currentPath: displayValue,
       });
       if (selectedPath) {
         onChange(selectedPath);
       }
     } catch (error) {
       console.error("Failed to select path", error);
+    }
+  }
+
+  async function handlePathOpen(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!displayValue) return;
+
+    try {
+      const info = await window.goferDesktop?.getPathInfo?.(displayValue);
+      if (info?.isDirectory) {
+        await window.goferDesktop?.openPath?.(displayValue);
+      } else {
+        await window.goferDesktop?.revealPath?.(displayValue);
+      }
+    } catch (error) {
+      console.error("Failed to reveal path", error);
     }
   }
 
@@ -3290,18 +3737,32 @@ function TextField({ label, onChange, pathPicker = false, placeholder, readOnly 
         <span className="relative mt-1 block">
           <input
             className={`h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500 read-only:bg-slate-50 ${
-              canPickPath ? "pr-10" : ""
+              canPickPath && canOpenPath ? "pr-[4.5rem]" : canPickPath || canOpenPath ? "pr-10" : ""
             }`}
             placeholder={placeholder}
             readOnly={readOnly}
-            value={value ?? ""}
+            title={displayValue}
+            value={displayValue}
             onChange={(event) => onChange?.(event.target.value)}
           />
+          {canOpenPath ? (
+            <button
+              aria-label={`Open ${label?.toLowerCase?.() ?? "path"}`}
+              className={`absolute top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-strong dark:hover:bg-[#2a2a2a] ${
+                canPickPath ? "right-9" : "right-2"
+              }`}
+              title={`Open ${label?.toLowerCase?.() ?? "path"} in file browser`}
+              type="button"
+              onClick={handlePathOpen}
+            >
+              <ExternalLink size={16} strokeWidth={1.9} />
+            </button>
+          ) : null}
           {canPickPath ? (
             <button
-              aria-label={`Choose ${label.toLowerCase()}`}
+              aria-label={`Choose ${label?.toLowerCase?.() ?? "path"}`}
               className="absolute right-2 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-strong dark:hover:bg-[#2a2a2a]"
-              title={`Choose ${label.toLowerCase()}`}
+              title={`Choose ${label?.toLowerCase?.() ?? "path"}`}
               type="button"
               onClick={handlePathPick}
             >
@@ -3310,9 +3771,29 @@ function TextField({ label, onChange, pathPicker = false, placeholder, readOnly 
           ) : null}
         </span>
       </label>
+      {canEditTextPath ? (
+        <div className="mt-1 flex justify-end gap-2">
+          <button
+            className="inline-flex items-center gap-1 text-[11px] font-medium text-muted underline-offset-2 transition hover:text-ink hover:underline"
+            type="button"
+            onClick={() => setTextFileDialog({ mode: "edit", path: displayValue })}
+          >
+            <FilePenLine size={12} />
+            edit
+          </button>
+          <button
+            className="inline-flex items-center gap-1 text-[11px] font-medium text-muted underline-offset-2 transition hover:text-ink hover:underline"
+            type="button"
+            onClick={() => setTextFileDialog({ mode: "preview", path: displayValue })}
+          >
+            <Eye size={12} />
+            preview
+          </button>
+        </div>
+      ) : null}
       {pickerOpen ? (
         <PathPickerDialog
-          currentPath={value ?? ""}
+          currentPath={displayValue}
           label={label}
           onClose={() => setPickerOpen(false)}
           onSelect={(selectedPath) => {
@@ -3321,11 +3802,136 @@ function TextField({ label, onChange, pathPicker = false, placeholder, readOnly 
           }}
         />
       ) : null}
+      {textFileDialog ? (
+        <TextFileDialog
+          mode={textFileDialog.mode}
+          path={textFileDialog.path}
+          onClose={() => setTextFileDialog(null)}
+        />
+      ) : null}
     </>
   );
 }
 
+function TextFileDialog({ mode, path, onClose }) {
+  const [content, setContent] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const readOnly = mode === "preview";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadFile() {
+      setLoading(true);
+      setError("");
+      try {
+        const payload = await window.goferDesktop?.readTextFile?.(path);
+        if (!cancelled) {
+          setContent(payload?.content ?? "");
+        }
+      } catch (loadError) {
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : String(loadError));
+        }
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    loadFile();
+    return () => {
+      cancelled = true;
+    };
+  }, [path]);
+
+  async function saveFile() {
+    setSaving(true);
+    setError("");
+    try {
+      await window.goferDesktop?.writeTextFile?.({ targetPath: path, content });
+      onClose();
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Unable to save file");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[80] grid place-items-center bg-slate-950/35 px-4">
+      <div className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-line bg-white shadow-panel">
+        <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
+          <div className="min-w-0">
+            <h2 className="text-sm font-semibold text-strong">
+              {readOnly ? "Preview file" : "Edit file"}
+            </h2>
+            <p className="mt-1 truncate text-xs text-muted" title={path}>
+              {path}
+            </p>
+          </div>
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
+            title="Close"
+            type="button"
+            onClick={onClose}
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div className="min-h-[340px] flex-1 p-4">
+          {loading ? (
+            <div className="flex h-48 items-center justify-center text-sm text-muted">
+              <Loader2 size={16} className="mr-2 animate-spin" />
+              Loading file
+            </div>
+          ) : error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+              {error}
+            </div>
+          ) : (
+            <textarea
+              className="h-[52vh] min-h-[320px] w-full resize-none rounded-lg border border-line bg-slate-50 p-3 font-mono text-xs leading-5 text-ink outline-none transition focus:border-teal-500 read-only:bg-slate-50"
+              readOnly={readOnly}
+              spellCheck={false}
+              value={content}
+              onChange={(event) => setContent(event.target.value)}
+            />
+          )}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-line px-4 py-3">
+          <button
+            className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+            type="button"
+            onClick={onClose}
+          >
+            Close
+          </button>
+          {!readOnly ? (
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={loading || saving || Boolean(error)}
+              type="button"
+              onClick={saveFile}
+            >
+              {saving ? <Loader2 size={15} className="animate-spin" /> : <FilePenLine size={15} />}
+              Save
+            </button>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
+  const [contextMenu, setContextMenu] = useState(null);
+  const [nameRequest, setNameRequest] = useState(null);
   const [directory, setDirectory] = useState("");
   const [entries, setEntries] = useState([]);
   const [error, setError] = useState("");
@@ -3339,6 +3945,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
   }, [currentPath]);
 
   async function loadDirectory(nextPath) {
+    setContextMenu(null);
     setLoading(true);
     setError("");
     try {
@@ -3375,6 +3982,104 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
       await window.goferDesktop?.openPath?.(directory);
     } catch (openError) {
       setError(openError instanceof Error ? openError.message : "Unable to open path");
+    }
+  }
+
+  function showContextMenu(event, entry = null) {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!directory) return;
+    setContextMenu({
+      entry,
+      x: event.clientX,
+      y: event.clientY,
+    });
+  }
+
+  function requestCreateChild(kind) {
+    setContextMenu(null);
+    setNameRequest({ kind, mode: "create" });
+  }
+
+  function requestRenameEntry(entry) {
+    setContextMenu(null);
+    if (!entry) return;
+    setNameRequest({
+      entry,
+      initialName: entry.name,
+      kind: entry.isDirectory ? "folder" : "file",
+      mode: "rename",
+    });
+  }
+
+  async function createChild(kind, name) {
+    if (!name) return;
+
+    try {
+      let result;
+      if (kind === "file") {
+        result = await window.goferDesktop?.createFile?.({ directory, name });
+      } else {
+        result = await window.goferDesktop?.createFolder?.({ directory, name });
+      }
+      await loadDirectory(directory);
+      if (result?.path) {
+        setSelectedPath(result.path);
+      }
+      setNameRequest(null);
+    } catch (createError) {
+      setError(createError instanceof Error ? createError.message : `Unable to create ${kind}`);
+    }
+  }
+
+  async function renameEntry(entry, name) {
+    if (!entry || !name) return;
+
+    try {
+      const result = await window.goferDesktop?.renamePath?.({
+        sourcePath: entry.path,
+        name,
+      });
+      await loadDirectory(directory);
+      if (result?.path) {
+        setSelectedPath(result.path);
+      }
+      setNameRequest(null);
+    } catch (renameError) {
+      setError(renameError instanceof Error ? renameError.message : "Unable to rename path");
+    }
+  }
+
+  async function copyEntry(entry) {
+    setContextMenu(null);
+    if (!entry) return;
+    const nextName = window.prompt("Copy as", defaultCopyName(entry.name));
+    if (!nextName) return;
+
+    try {
+      await window.goferDesktop?.copyPath?.({
+        sourcePath: entry.path,
+        destinationPath: joinPath(directory, nextName),
+      });
+      await loadDirectory(directory);
+    } catch (copyError) {
+      setError(copyError instanceof Error ? copyError.message : "Unable to copy path");
+    }
+  }
+
+  async function deleteEntry(entry) {
+    setContextMenu(null);
+    if (!entry) return;
+    if (!window.confirm(`Delete ${entry.name}?`)) return;
+
+    try {
+      await window.goferDesktop?.deletePath?.(entry.path);
+      if (selectedPath === entry.path) {
+        setSelectedPath(directory);
+      }
+      await loadDirectory(directory);
+    } catch (deleteError) {
+      setError(deleteError instanceof Error ? deleteError.message : "Unable to delete path");
     }
   }
 
@@ -3437,6 +4142,22 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
           </button>
           <button
             className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!directory || loading}
+            type="button"
+            onClick={() => requestCreateChild("file")}
+          >
+            New file
+          </button>
+          <button
+            className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={!directory || loading}
+            type="button"
+            onClick={() => requestCreateChild("folder")}
+          >
+            New folder
+          </button>
+          <button
+            className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-50"
             disabled={!directory}
             type="button"
             onClick={() => onSelect(directory)}
@@ -3445,7 +4166,10 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
           </button>
         </div>
 
-        <div className="min-h-[260px] flex-1 overflow-y-auto p-2">
+        <div
+          className="min-h-[260px] flex-1 overflow-y-auto p-2"
+          onContextMenu={(event) => showContextMenu(event)}
+        >
           {loading ? (
             <div className="flex h-40 items-center justify-center text-sm text-muted">
               <Loader2 size={16} className="mr-2 animate-spin" />
@@ -3470,20 +4194,48 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
                     selectedPath === entry.path ? "bg-slate-100 text-strong" : "text-slate-700"
                   }`}
                   type="button"
+                  onContextMenu={(event) => showContextMenu(event, entry)}
                   onClick={() =>
                     entry.isDirectory ? loadDirectory(entry.path) : setSelectedPath(entry.path)
                   }
                 >
-                  <FolderOpen
-                    className={entry.isDirectory ? "text-teal-600" : "text-muted"}
-                    size={16}
-                  />
+                  {entry.isDirectory ? (
+                    <FolderOpen className="text-teal-600" size={16} />
+                  ) : (
+                    <FileText className="text-muted" size={16} />
+                  )}
                   <span className="min-w-0 flex-1 truncate">{entry.name}</span>
                   {entry.hidden ? <span className="text-[11px] text-muted">hidden</span> : null}
                 </button>
               ))
             : null}
         </div>
+        {contextMenu ? (
+          <PathContextMenu
+            entry={contextMenu.entry}
+            x={contextMenu.x}
+            y={contextMenu.y}
+            onCopy={() => copyEntry(contextMenu.entry)}
+            onCreateFile={() => requestCreateChild("file")}
+            onCreateFolder={() => requestCreateChild("folder")}
+            onDelete={() => deleteEntry(contextMenu.entry)}
+            onRename={() => requestRenameEntry(contextMenu.entry)}
+          />
+        ) : null}
+        {nameRequest ? (
+          <PathNameDialog
+            directory={directory}
+            initialName={nameRequest.initialName}
+            kind={nameRequest.kind}
+            mode={nameRequest.mode}
+            onClose={() => setNameRequest(null)}
+            onSubmit={(name) =>
+              nameRequest.mode === "rename"
+                ? renameEntry(nameRequest.entry, name)
+                : createChild(nameRequest.kind, name)
+            }
+          />
+        ) : null}
 
         <div className="flex items-center justify-between gap-3 border-t border-line px-4 py-3">
           <p className="min-w-0 truncate text-xs text-muted">{selectedPath || directory}</p>
@@ -3509,6 +4261,144 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
       </div>
     </div>
   );
+}
+
+function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSubmit }) {
+  const [name, setName] = useState(initialName);
+  const [submitting, setSubmitting] = useState(false);
+  const title =
+    mode === "rename"
+      ? `Rename ${kind}`
+      : kind === "file"
+        ? "Create file"
+        : "Create folder";
+  const action = mode === "rename" ? "Rename" : "Create";
+
+  async function submit(event) {
+    event.preventDefault();
+    const trimmedName = name.trim();
+    if (!trimmedName) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(trimmedName);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4">
+      <form
+        className="w-full max-w-sm rounded-lg border border-line bg-white p-4 shadow-panel"
+        onSubmit={submit}
+      >
+        <div className="mb-3">
+          <h3 className="text-sm font-semibold text-strong">{title}</h3>
+          <p className="mt-1 truncate text-xs text-muted" title={directory}>
+            {directory}
+          </p>
+        </div>
+        <input
+          autoFocus
+          className="h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500"
+          placeholder={kind === "file" ? "new-file.txt" : "new-folder"}
+          value={name}
+          onChange={(event) => setName(event.target.value)}
+        />
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:bg-slate-50"
+            disabled={submitting}
+            type="button"
+            onClick={onClose}
+          >
+            Cancel
+          </button>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={submitting || !name.trim()}
+            type="submit"
+          >
+            {submitting ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
+            {action}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function PathContextMenu({
+  entry,
+  onCopy,
+  onCreateFile,
+  onCreateFolder,
+  onDelete,
+  onRename,
+  x,
+  y,
+}) {
+  return (
+    <div
+      className="fixed z-[90] min-w-44 overflow-hidden rounded-lg border border-line bg-white py-1 text-sm shadow-panel"
+      style={{ left: x, top: y }}
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {entry ? (
+        <>
+          <button
+            className="block w-full px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50"
+            type="button"
+            onClick={onRename}
+          >
+            Rename
+          </button>
+          <button
+            className="block w-full px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50"
+            type="button"
+            onClick={onCopy}
+          >
+            Copy
+          </button>
+          <button
+            className="block w-full px-3 py-2 text-left text-red-600 transition hover:bg-red-50"
+            type="button"
+            onClick={onDelete}
+          >
+            Delete
+          </button>
+          <div className="my-1 border-t border-line" />
+        </>
+      ) : null}
+      <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-muted">
+        Create new
+      </div>
+      <button
+        className="block w-full px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50"
+        type="button"
+        onClick={onCreateFile}
+      >
+        File
+      </button>
+      <button
+        className="block w-full px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50"
+        type="button"
+        onClick={onCreateFolder}
+      >
+        Folder
+      </button>
+    </div>
+  );
+}
+
+function defaultCopyName(name = "") {
+  const value = String(name || "copy");
+  const dotIndex = value.lastIndexOf(".");
+  if (dotIndex > 0) {
+    return `${value.slice(0, dotIndex)} copy${value.slice(dotIndex)}`;
+  }
+  return `${value} copy`;
 }
 
 function InlineTextField({ onChange, placeholder, value }) {
@@ -3721,13 +4611,18 @@ function TextareaField({ label, onChange, placeholder, rows = 3, value }) {
   );
 }
 
-function ToggleField({ checked, label, onChange }) {
+function ToggleField({ checked, disabled = false, label, onChange }) {
   return (
-    <label className="flex items-center justify-between gap-3 rounded-lg border border-line px-3 py-2">
+    <label
+      className={`flex items-center justify-between gap-3 rounded-lg border border-line px-3 py-2 ${
+        disabled ? "cursor-not-allowed bg-slate-50 text-muted dark:bg-[#252526]" : ""
+      }`}
+    >
       <span className="text-sm font-medium text-slate-700">{label}</span>
       <input
         checked={checked}
         className="h-4 w-4 accent-teal-700"
+        disabled={disabled}
         type="checkbox"
         onChange={(event) => onChange(event.target.checked)}
       />

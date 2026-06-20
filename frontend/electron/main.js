@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const { autoUpdater } = require("electron-updater");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const distIndexPath = path.join(__dirname, "..", "dist", "index.html");
@@ -25,6 +26,8 @@ const BACKEND_READY_PREFIX = "GOFER_UI_READY ";
 const BACKEND_START_TIMEOUT_MS = 15000;
 const ELECTRON_READY_MESSAGE = "GOFER_ELECTRON_READY";
 const BACKEND_EXECUTABLE_NAME = process.platform === "win32" ? "gof.exe" : "gof";
+const LATEST_RELEASE_URL =
+  "https://api.github.com/repos/zacharyivie/gofer-flow/releases/latest";
 const isProduction =
   app.isPackaged || process.env.GOFER_ELECTRON_MODE === "production";
 const isSmokeTest = process.env.GOFER_ELECTRON_SMOKE_TEST === "1";
@@ -36,6 +39,16 @@ let activeApiBaseUrl;
 let selectedDataDir;
 let mainWindow;
 let backendErrorWindow;
+let updateState = {
+  available: false,
+  checking: false,
+  downloading: false,
+  downloaded: false,
+  error: "",
+  info: null,
+  progress: null,
+};
+let installUpdateAfterDownload = false;
 
 const singleInstanceLock = isSmokeTest || app.requestSingleInstanceLock();
 if (!singleInstanceLock) {
@@ -450,6 +463,7 @@ function escapeHtml(value) {
 app.whenReady().then(async () => {
   setupApplicationMenu();
   setupIpcHandlers();
+  setupAutoUpdater();
   try {
     const apiBaseUrl = await startBackend();
     activeApiBaseUrl = apiBaseUrl;
@@ -548,8 +562,266 @@ function setupIpcHandlers() {
   ipcMain.handle("gofer:open-path", openPath);
   ipcMain.handle("gofer:reveal-path", revealPath);
   ipcMain.handle("gofer:path-info", pathInfo);
+  ipcMain.handle("gofer:copy-path", copyPath);
+  ipcMain.handle("gofer:delete-path", deletePath);
+  ipcMain.handle("gofer:rename-path", renamePath);
+  ipcMain.handle("gofer:create-file", createFile);
+  ipcMain.handle("gofer:create-folder", createFolder);
+  ipcMain.handle("gofer:read-text-file", readTextFile);
+  ipcMain.handle("gofer:write-text-file", writeTextFile);
   ipcMain.handle("gofer:set-data-dir", setDataDir);
   ipcMain.handle("gofer:select-path", selectPath);
+  ipcMain.handle("gofer:check-for-updates", checkForUpdates);
+  ipcMain.handle("gofer:download-and-install-update", downloadAndInstallUpdate);
+  ipcMain.handle("gofer:install-downloaded-update", installDownloadedUpdate);
+  ipcMain.handle("gofer:open-update-release", openUpdateRelease);
+  ipcMain.handle("gofer:get-update-state", getUpdateState);
+}
+
+function setupAutoUpdater() {
+  autoUpdater.autoDownload = false;
+  autoUpdater.autoInstallOnAppQuit = true;
+  autoUpdater.allowDowngrade = false;
+  autoUpdater.allowPrerelease = false;
+
+  autoUpdater.on("checking-for-update", () => {
+    setUpdateState({ checking: true, error: "" });
+  });
+  autoUpdater.on("update-available", (info) => {
+    setUpdateState({
+      available: true,
+      checking: false,
+      downloaded: false,
+      downloading: false,
+      error: "",
+      info: updateInfoPayload(info),
+      progress: null,
+    });
+  });
+  autoUpdater.on("update-not-available", (info) => {
+    setUpdateState({
+      available: false,
+      checking: false,
+      downloaded: false,
+      downloading: false,
+      error: "",
+      info: updateInfoPayload(info),
+      progress: null,
+    });
+  });
+  autoUpdater.on("download-progress", (progress) => {
+    setUpdateState({
+      downloading: true,
+      progress: {
+        percent: Number(progress.percent || 0),
+        transferred: Number(progress.transferred || 0),
+        total: Number(progress.total || 0),
+        bytesPerSecond: Number(progress.bytesPerSecond || 0),
+      },
+    });
+  });
+  autoUpdater.on("update-downloaded", (info) => {
+    setUpdateState({
+      available: true,
+      checking: false,
+      downloaded: true,
+      downloading: false,
+      error: "",
+      info: updateInfoPayload(info),
+      progress: { percent: 100 },
+    });
+    if (installUpdateAfterDownload) {
+      installUpdateAfterDownload = false;
+      setImmediate(() => {
+        isQuitting = true;
+        stopBackend();
+        autoUpdater.quitAndInstall(false, true);
+      });
+    }
+  });
+  autoUpdater.on("error", (error) => {
+    installUpdateAfterDownload = false;
+    if (isNoPublishedVersionsError(error)) {
+      setNoReleasesUpdateState();
+      return;
+    }
+    setUpdateState({
+      checking: false,
+      downloading: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  });
+}
+
+async function checkForUpdates() {
+  if (!app.isPackaged || isSmokeTest) {
+    setUpdateState(await checkLatestReleaseFallback());
+    return getUpdateState();
+  }
+
+  try {
+    await autoUpdater.checkForUpdates();
+  } catch (error) {
+    if (isNoPublishedVersionsError(error)) {
+      setNoReleasesUpdateState();
+      return getUpdateState();
+    }
+    throw error;
+  }
+  return getUpdateState();
+}
+
+async function downloadAndInstallUpdate() {
+  if (!app.isPackaged || isSmokeTest) {
+    await openUpdateRelease();
+    return getUpdateState();
+  }
+
+  installUpdateAfterDownload = true;
+  setUpdateState({ downloading: true, error: "" });
+  await autoUpdater.downloadUpdate();
+  return getUpdateState();
+}
+
+function installDownloadedUpdate() {
+  if (!app.isPackaged || isSmokeTest) {
+    return getUpdateState();
+  }
+  isQuitting = true;
+  stopBackend();
+  autoUpdater.quitAndInstall(false, true);
+  return getUpdateState();
+}
+
+async function openUpdateRelease() {
+  await shell.openExternal("https://github.com/zacharyivie/gofer-flow/releases/latest");
+  return { opened: true };
+}
+
+function getUpdateState() {
+  return {
+    ...updateState,
+    currentVersion: app.getVersion(),
+    platform: process.platform,
+    arch: process.arch,
+    supported: app.isPackaged && !isSmokeTest,
+  };
+}
+
+function setUpdateState(patch) {
+  updateState = { ...updateState, ...patch };
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("gofer:update-state", getUpdateState());
+  }
+}
+
+function setNoReleasesUpdateState() {
+  setUpdateState({
+    available: false,
+    checking: false,
+    downloaded: false,
+    downloading: false,
+    error: "",
+    info: {
+      noReleases: true,
+      releaseName: "No published releases yet",
+      version: app.getVersion(),
+    },
+    progress: null,
+  });
+}
+
+function updateInfoPayload(info) {
+  if (!info) return null;
+  return {
+    version: info.version || "",
+    releaseName: info.releaseName || "",
+    releaseDate: info.releaseDate || "",
+  };
+}
+
+async function checkLatestReleaseFallback() {
+  const currentVersion = app.getVersion();
+  if (isSmokeTest) {
+    return {
+      available: false,
+      checking: false,
+      downloading: false,
+      downloaded: false,
+      error: "",
+      info: { version: currentVersion },
+      progress: null,
+    };
+  }
+
+  const response = await fetch(LATEST_RELEASE_URL, {
+    headers: {
+      Accept: "application/vnd.github+json",
+      "User-Agent": `Gofer-Flow/${app.getVersion()}`,
+    },
+  });
+  if (response.status === 404) {
+    return {
+      available: false,
+      checking: false,
+      downloading: false,
+      downloaded: false,
+      error: "",
+      info: {
+        noReleases: true,
+        releaseName: "No published releases yet",
+        version: currentVersion,
+      },
+      progress: null,
+    };
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub releases API returned ${response.status}`);
+  }
+  const release = await response.json();
+  return {
+    available: compareVersions(normalizeVersion(release.tag_name), normalizeVersion(currentVersion)) > 0,
+    checking: false,
+    downloading: false,
+    downloaded: false,
+    error: "",
+    info: {
+      version: normalizeVersion(release.tag_name || release.name || ""),
+      releaseName: release.name || release.tag_name || "",
+      releaseDate: release.published_at || "",
+    },
+    progress: null,
+  };
+}
+
+function isNoPublishedVersionsError(error) {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return (
+    message.includes("No published versions on GitHub") ||
+    message.includes("ERR_XML_MISSED_ELEMENT")
+  );
+}
+
+function normalizeVersion(value) {
+  const match = String(value || "").trim().match(/v?(\d+(?:\.\d+){0,2}(?:[-+][0-9A-Za-z.-]+)?)/);
+  return match ? match[1] : "0.0.0";
+}
+
+function compareVersions(left, right) {
+  const leftParts = versionParts(left);
+  const rightParts = versionParts(right);
+  for (let index = 0; index < 3; index += 1) {
+    if (leftParts[index] > rightParts[index]) return 1;
+    if (leftParts[index] < rightParts[index]) return -1;
+  }
+  return 0;
+}
+
+function versionParts(version) {
+  return normalizeVersion(version)
+    .split(/[.-]/)
+    .slice(0, 3)
+    .map((part) => Number.parseInt(part, 10) || 0);
 }
 
 async function openPath(_event, options = {}) {
@@ -597,6 +869,108 @@ async function pathInfo(_event, options = {}) {
   return pathInfoFromStat(targetPath, stat);
 }
 
+async function copyPath(_event, options = {}) {
+  if (!options.sourcePath || typeof options.sourcePath !== "string") {
+    throw new Error("A source path is required.");
+  }
+  if (!options.destinationPath || typeof options.destinationPath !== "string") {
+    throw new Error("A destination path is required.");
+  }
+
+  const sourcePath = resolveExactPath(options.sourcePath);
+  const destinationPath = resolveExactPath(options.destinationPath);
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Path does not exist: ${sourcePath}`);
+  }
+  if (fs.existsSync(destinationPath)) {
+    throw new Error(`Destination already exists: ${destinationPath}`);
+  }
+  await fs.promises.cp(sourcePath, destinationPath, {
+    errorOnExist: true,
+    force: false,
+    recursive: true,
+  });
+  return { path: destinationPath };
+}
+
+async function deletePath(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+
+  const targetPath = resolveExactPath(options.targetPath);
+  if (!fs.existsSync(targetPath)) {
+    throw new Error(`Path does not exist: ${targetPath}`);
+  }
+  await fs.promises.rm(targetPath, { force: true, recursive: true });
+  return { deleted: true };
+}
+
+async function renamePath(_event, options = {}) {
+  if (!options.sourcePath || typeof options.sourcePath !== "string") {
+    throw new Error("A source path is required.");
+  }
+  if (!options.name || typeof options.name !== "string") {
+    throw new Error("A new name is required.");
+  }
+
+  const sourcePath = resolveExactPath(options.sourcePath);
+  if (!fs.existsSync(sourcePath)) {
+    throw new Error(`Path does not exist: ${sourcePath}`);
+  }
+  const destinationPath = resolveNewChildPath(path.dirname(sourcePath), options.name);
+  if (fs.existsSync(destinationPath)) {
+    throw new Error(`Destination already exists: ${destinationPath}`);
+  }
+  await fs.promises.rename(sourcePath, destinationPath);
+  return { path: destinationPath };
+}
+
+async function createFile(_event, options = {}) {
+  const filePath = resolveNewChildPath(options.directory, options.name);
+  await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.promises.writeFile(filePath, "", { encoding: "utf-8", flag: "wx" });
+  return { path: filePath };
+}
+
+async function createFolder(_event, options = {}) {
+  const folderPath = resolveNewChildPath(options.directory, options.name);
+  await fs.promises.mkdir(folderPath, { recursive: false });
+  return { path: folderPath };
+}
+
+async function readTextFile(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+
+  const targetPath = resolveExactPath(options.targetPath);
+  const stat = await fs.promises.stat(targetPath);
+  if (!stat.isFile()) {
+    throw new Error(`Path is not a file: ${targetPath}`);
+  }
+  if (stat.size > 2 * 1024 * 1024) {
+    throw new Error("File is too large to edit in Gofer Flow.");
+  }
+  return {
+    content: await fs.promises.readFile(targetPath, "utf-8"),
+    path: targetPath,
+  };
+}
+
+async function writeTextFile(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+  if (typeof options.content !== "string") {
+    throw new Error("File content is required.");
+  }
+
+  const targetPath = resolveExactPath(options.targetPath);
+  await fs.promises.writeFile(targetPath, options.content, "utf-8");
+  return { path: targetPath };
+}
+
 function pathInfoFromStat(targetPath, stat) {
   return {
     basename: path.basename(targetPath),
@@ -605,6 +979,20 @@ function pathInfoFromStat(targetPath, stat) {
     isFile: stat.isFile(),
     path: targetPath,
   };
+}
+
+function resolveNewChildPath(directory, name) {
+  if (!directory || typeof directory !== "string") {
+    throw new Error("A directory is required.");
+  }
+  if (!name || typeof name !== "string") {
+    throw new Error("A name is required.");
+  }
+  const cleanName = name.trim();
+  if (!cleanName || cleanName.includes("/") || cleanName.includes("\\") || cleanName === "." || cleanName === "..") {
+    throw new Error("Use a plain file or folder name.");
+  }
+  return path.join(resolveExactPath(directory), cleanName);
 }
 
 async function setDataDir(_event, options = {}) {

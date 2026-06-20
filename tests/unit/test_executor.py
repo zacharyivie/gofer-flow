@@ -200,6 +200,50 @@ async def test_failed_bash_command_routes_to_on_failure_edge(tmp_path: Path) -> 
     assert "recovered" in result.node_outputs["recover"].output
 
 
+async def test_allowed_failure_routes_to_on_failure_edge_without_failing_workflow(
+    tmp_path: Path,
+) -> None:
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="fail",
+        operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="1/0"),
+        allow_failure=True,
+    ))
+    wf.add_operation(_bash_node("recover", "echo recovered"))
+    wf.then(
+        "fail",
+        "recover",
+        EdgeConfig(
+            from_node="fail",
+            to_node="recover",
+            condition=EdgeConditionType.ON_FAILURE,
+        ),
+    )
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert not result.node_outputs["fail"].success
+    assert result.node_outputs["recover"].success
+    assert "recovered" in result.node_outputs["recover"].output
+
+
+async def test_allowed_failure_without_failure_route_does_not_fail_workflow(
+    tmp_path: Path,
+) -> None:
+    wf = _make_workflow()
+    wf.add_operation(GraphNode(
+        node_id="fail",
+        operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="exit 7"),
+        allow_failure=True,
+    ))
+
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
+
+    assert result.success
+    assert not result.node_outputs["fail"].success
+
+
 async def test_uncaught_python_exception_routes_to_on_failure_edge(tmp_path: Path) -> None:
     script = tmp_path / "explode.py"
     script.write_text("1 / 0\n")
@@ -425,6 +469,249 @@ async def test_agent_node_can_call_skill_without_prompt_path(tmp_path: Path) -> 
 
     assert result.success
     assert sub.calls[0]["prompt"] == "/gofer-flow-workflow-builder"
+
+
+async def test_agent_node_logs_thoughts_and_message_separately(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Say hello.")
+    sub = FakeSubscription(
+        output="hello from agent",
+        thoughts=["checking context\nchoosing answer"],
+        message="hello from agent",
+    )
+
+    wf = _make_workflow("agent-log")
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+        ),
+    ))
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    assert result.success
+    assert result.node_outputs["agent-step"].output == "hello from agent"
+    log_text = result.log_path.read_text()
+    assert "agent-step - AGENT_THOUGHT: checking context" in log_text
+    assert "choosing answer" in log_text
+    assert "agent-step - AGENT_MESSAGE: hello from agent" in log_text
+    assert "node output:\nAGENT_MESSAGE" not in log_text
+
+
+async def test_agent_node_uses_node_prompt_path_over_agent_default(tmp_path: Path) -> None:
+    default_prompt = tmp_path / "default.md"
+    default_prompt.write_text("Default {{value}}")
+    selected_prompt = tmp_path / "selected.md"
+    selected_prompt.write_text("Selected {{value}}")
+    node_working_dir = tmp_path / "node-workdir"
+    node_working_dir.mkdir()
+    sub = FakeSubscription(output="done")
+
+    wf = _make_workflow("agent-prompt-override")
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=default_prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=selected_prompt,
+            working_dir=node_working_dir,
+            input_mapping={"value": "trigger.value"},
+        ),
+    ))
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).with_trigger_context({"value": "input"}).run()
+
+    assert result.success
+    assert sub.calls[0]["prompt"] == "Selected input"
+    assert sub.calls[0]["working_dir"] == node_working_dir
+
+
+async def test_agent_node_memory_run_keeps_conversation_within_workflow_run(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Review iteration.")
+    sub = FakeSubscription(output="agent reply", message="agent reply")
+
+    wf = _make_workflow("agent-run-memory")
+    wf.config = wf.config.model_copy(update={"max_total_node_runs": 2})
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+            memory="run",
+        ),
+    ))
+    wf.graph.add_edge(
+        "agent-step",
+        "agent-step",
+        EdgeConfig(
+            from_node="agent-step",
+            to_node="agent-step",
+            condition=EdgeConditionType.ON_SUCCESS,
+        ),
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    assert not result.success
+    assert len(sub.calls) == 2
+    assert "Previous conversation:" not in str(sub.calls[0]["prompt"])
+    assert "Previous conversation:" in str(sub.calls[1]["prompt"])
+    assert "agent reply" in str(sub.calls[1]["prompt"])
+
+
+async def test_agent_node_memory_all_persists_between_workflow_runs(tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Review once.")
+    sub = FakeSubscription(output="stored reply", message="stored reply")
+
+    wf = _make_workflow("agent-all-memory")
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+            memory="all",
+        ),
+    ))
+
+    await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+    await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    assert len(sub.calls) == 2
+    assert "Previous conversation:" not in str(sub.calls[0]["prompt"])
+    assert "Previous conversation:" in str(sub.calls[1]["prompt"])
+    assert "stored reply" in str(sub.calls[1]["prompt"])
+    memory_path = tmp_path / "agent-memory" / "agent-all-memory" / "agent-step.json"
+    assert memory_path.exists()
+
+
+async def test_agent_node_memory_compaction_logs_info(monkeypatch, tmp_path: Path) -> None:
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Review once.")
+
+    class CompactingSubscription(FakeSubscription):
+        async def execute(self, *args, **kwargs):
+            prompt_text = str(kwargs.get("prompt", ""))
+            self.calls.append({
+                "prompt": prompt_text,
+                "working_dir": kwargs.get("working_dir"),
+            })
+            if prompt_text.startswith("Compact this Gofer Flow agent-node"):
+                from gofer.core.agent import AgentResult
+
+                return AgentResult(
+                    agent_id="",
+                    success=True,
+                    output="short memory",
+                    exit_code=0,
+                    duration_seconds=0.0,
+                    message="short memory",
+                )
+            from gofer.core.agent import AgentResult
+
+            return AgentResult(
+                agent_id="",
+                success=True,
+                output="fresh reply",
+                exit_code=0,
+                duration_seconds=0.0,
+                message="fresh reply",
+            )
+
+    monkeypatch.setattr(executor_module, "AGENT_MEMORY_COMPACT_CHAR_LIMIT", 20)
+    sub = CompactingSubscription()
+
+    wf = _make_workflow("agent-compact-memory")
+    wf.register_agent(AgentConfig(
+        agent_id="bot",
+        subscription="claude_code",
+        working_dir=tmp_path,
+        prompt_path=prompt,
+    ))
+    wf.add_operation(GraphNode(
+        node_id="agent-step",
+        operation=AgentOperation(
+            type=OperationType.AGENT,
+            agent_id="bot",
+            prompt_path=prompt,
+            working_dir=tmp_path,
+            memory="all",
+        ),
+    ))
+
+    memory_path = tmp_path / "agent-memory" / "agent-compact-memory" / "agent-step.json"
+    memory_path.parent.mkdir(parents=True)
+    memory_path.write_text(
+        '[{"role":"user","body":"very long previous prompt"},'
+        '{"role":"assistant","body":"very long previous response"}]',
+        encoding="utf-8",
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    assert result.success
+    assert len(sub.calls) == 2
+    log_text = result.log_path.read_text(encoding="utf-8")
+    assert "INFO - Compacting agent context for agent node agent-step" in log_text
+    assert "Compacted prior agent node context" in str(sub.calls[1]["prompt"])
+    assert "short memory" in str(sub.calls[1]["prompt"])
 
 
 async def test_local_vectorize_and_search_nodes(tmp_path: Path) -> None:

@@ -8,6 +8,7 @@ import pytest
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
+    WorkflowRunError,
     create_workflow_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
@@ -117,6 +118,18 @@ working_dir = "."
     assert workflow["edges"] == []
 
 
+def test_list_workflow_payloads_reports_prompt_agent_ids(tmp_path: Path) -> None:
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "agent-3.md").write_text("old prompt\n")
+    (prompts_dir / "agent-1.md").write_text("old prompt\n")
+    (prompts_dir / "reviewer.md").write_text("not an auto-generated agent id\n")
+
+    payload = list_workflow_payloads(tmp_path)
+
+    assert payload["promptAgentIds"] == ["agent-1", "agent-3"]
+
+
 def test_create_workflow_payload_writes_real_workflow(tmp_path: Path) -> None:
     workflow = create_workflow_payload("My New Workflow!", tmp_path)
 
@@ -206,6 +219,9 @@ def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     log_dir = tmp_path / "logs" / "delete-me"
     log_dir.mkdir(parents=True)
     (log_dir / "2026-06-13T10-00-00-0400.log").write_text("old run\n")
+    memory_dir = tmp_path / "agent-memory" / "delete-me"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "agent-step.json").write_text("[]\n")
     chat_prompt_path = workflow_chat_prompt_path(tmp_path, "delete-me")
     chat_prompt_path.parent.mkdir(parents=True)
     chat_prompt_path.write_text("old chat prompt\n")
@@ -215,6 +231,7 @@ def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     assert result == {"workflowId": "delete-me", "deleted": True}
     assert not (tmp_path / "delete-me.toml").exists()
     assert not log_dir.exists()
+    assert not memory_dir.exists()
     assert not chat_prompt_path.exists()
 
 
@@ -294,6 +311,45 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
     assert reloaded["edges"][0]["condition"] == "on_success"
 
 
+def test_update_workflow_payload_allows_empty_agent_prompt_path(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Empty Agent Prompt", tmp_path)
+    workflow["agents"] = {
+        "agent-1": {
+            "agent_id": "agent-1",
+            "subscription": "codex",
+            "working_dir": ".",
+            "prompt_path": "",
+            "tools": [],
+            "mcp_servers": [],
+            "env": {},
+        }
+    }
+    workflow["nodes"] = [
+        {
+            "id": "agent-node",
+            "type": "agent",
+            "operation": {
+                "type": "agent",
+                "agent_id": "agent-1",
+                "prompt_path": "",
+                "working_dir": ".",
+                "dynamic_count": 1,
+                "input_mapping": {},
+                "fan_source": None,
+            },
+            "settings": {},
+        },
+    ]
+
+    update_workflow_payload("empty-agent-prompt", workflow, tmp_path)
+    text = (tmp_path / "empty-agent-prompt.toml").read_text()
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert "prompt_path" not in text
+    assert reloaded["agents"]["agent-1"].get("prompt_path") is None
+    assert reloaded["nodes"][0]["operation"].get("prompt_path") is None
+
+
 def test_update_workflow_payload_persists_file_watcher(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Watched", tmp_path)
     workflow["watch"] = {
@@ -311,6 +367,44 @@ def test_update_workflow_payload_persists_file_watcher(tmp_path: Path) -> None:
     assert saved["watch"] == workflow["watch"]
     assert reloaded["watch"] == workflow["watch"]
     assert "Watching inputs" in reloaded["description"]
+
+
+def test_update_workflow_payload_persists_allow_failure(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Allowed Failure", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "may-fail",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "exit 1",
+            },
+            "settings": {
+                "allowFailure": True,
+            },
+        }
+    ]
+
+    saved = update_workflow_payload("allowed-failure", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+    text = (tmp_path / "allowed-failure.toml").read_text(encoding="utf-8")
+
+    assert saved["nodes"][0]["settings"]["allowFailure"] is True
+    assert reloaded["nodes"][0]["settings"]["allowFailure"] is True
+    assert "allow_failure = true" in text
+
+
+def test_update_workflow_payload_persists_run_continuously(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Continuous", tmp_path)
+    workflow["runContinuously"] = True
+
+    saved = update_workflow_payload("continuous", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+    text = (tmp_path / "continuous.toml").read_text(encoding="utf-8")
+
+    assert saved["runContinuously"] is True
+    assert reloaded["runContinuously"] is True
+    assert "run_continuously = true" in text
 
 
 def test_run_workflow_payload_supports_dry_run(tmp_path: Path) -> None:
@@ -369,6 +463,21 @@ def test_stop_workflow_run_payload_reports_no_active_run(tmp_path: Path) -> None
         "stopped": False,
         "message": "No active run",
     }
+
+
+def test_stop_workflow_run_payload_disables_run_continuously(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Continuous Stop", tmp_path)
+    workflow["runContinuously"] = True
+    update_workflow_payload("continuous-stop", workflow, tmp_path)
+
+    result = stop_workflow_run_payload("continuous-stop", tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert result["stopped"] is True
+    assert reloaded["runContinuously"] is False
+    assert "run_continuously" not in (tmp_path / "continuous-stop.toml").read_text(
+        encoding="utf-8"
+    )
 
 
 def test_stop_workflow_run_payload_stops_specific_running_log(tmp_path: Path) -> None:
@@ -464,6 +573,50 @@ async def test_run_workflow_payload_allows_concurrent_runs(tmp_path: Path) -> No
     assert len(list_workflow_run_logs_payload("concurrent", tmp_path)["runs"]) == 2
 
 
+async def test_run_workflow_payload_rejects_concurrent_continuous_runs(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Continuous Concurrent", tmp_path)
+    workflow["runContinuously"] = True
+    workflow["nodes"] = [
+        {
+            "id": "sleep",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "sleep 5",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("continuous-concurrent", workflow, tmp_path)
+    first_run = None
+    second_error = None
+
+    async def run_first() -> None:
+        nonlocal first_run
+        first_run = await run_workflow_payload("continuous-concurrent", tmp_path, False)
+
+    with anyio.fail_after(4):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run_first)
+            for _ in range(40):
+                await anyio.sleep(0.05)
+                logs = list_workflow_run_logs_payload("continuous-concurrent", tmp_path)["runs"]
+                if any(run["status"] == "running" for run in logs):
+                    break
+            else:  # pragma: no cover
+                raise AssertionError("Continuous run did not become active")
+            try:
+                await run_workflow_payload("continuous-concurrent", tmp_path, False)
+            except WorkflowRunError as exc:
+                second_error = str(exc)
+            stop_workflow_run_payload("continuous-concurrent", tmp_path)
+
+    assert first_run is not None
+    assert first_run["success"] is False
+    assert second_error is not None
+    assert "already running" in second_error
+
+
 def test_latest_workflow_log_payload_reads_last_run(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Latest Log", tmp_path)
     workflow["nodes"] = [
@@ -506,6 +659,24 @@ def test_list_workflow_run_logs_payload_returns_runs_newest_first(tmp_path: Path
     assert [run["id"] for run in payload["runs"]] == [second.name, first.name]
     assert payload["runs"][0]["status"] == "error"
     assert payload["runs"][1]["status"] == "success"
+
+
+def test_list_workflow_run_logs_payload_detects_multiline_failure(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "gofer-demo"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-18T09-52-26-0400.log"
+    run.write_text(
+        "2026-06-18T09:52:26-04:00 - gofer-demo started successfully\n"
+        "2026-06-18T09:52:26-04:00 - NODE - summarize-demo - attempt 1 finished success=False exit_code=1 duration=0.08s\n"
+        "2026-06-18T09:52:26-04:00 - ERROR - gofer-demo failed due to node summarize-demo failed: WARNING: proceeding\n"
+        "Reading additional input from stdin...\n"
+        "Error: failed to initialize in-process app-server client: Read-only file system (os error 30)\n",
+        encoding="utf-8",
+    )
+
+    payload = list_workflow_run_logs_payload("gofer-demo", tmp_path)
+
+    assert payload["runs"][0]["status"] == "error"
 
 
 def test_workflow_run_log_payload_reads_specific_run(tmp_path: Path) -> None:

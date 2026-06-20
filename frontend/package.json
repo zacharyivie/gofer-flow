@@ -34,6 +34,13 @@
       "buildResources": "build-resources",
       "output": "release"
     },
+    "publish": [
+      {
+        "provider": "github",
+        "owner": "zacharyivie",
+        "repo": "gofer-flow"
+      }
+    ],
     "files": [
       "dist/**/*",
       "electron/**/*",
@@ -112,7 +119,8 @@
     },
     "mac": {
       "target": [
-        "dmg"
+        "dmg",
+        "zip"
       ],
       "category": "public.app-category.developer-tools",
       "icon": "build-resources/icon.icns",
@@ -129,6 +137,7 @@
     }
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "lucide-react": "^0.468.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",

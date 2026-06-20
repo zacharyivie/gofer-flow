@@ -77,6 +77,67 @@ def test_workflow_add_file_and_folder_nodes(tmp_path: Path) -> None:
     assert wf.graph._nodes["source-folder"].operation.type == "folder"
 
 
+def test_workflow_add_node_allows_failure(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Allowed Failure", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "add-node", "allowed-failure",
+            "--id", "may-fail",
+            "--type", "bash_command",
+            "--command", "exit 1",
+            "--allow-failure",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "allowed-failure.toml")
+    assert wf.graph._nodes["may-fail"].allow_failure is True
+
+
+def test_workflow_add_agent_node_supports_memory_option(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Memory Flow", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "add-agent", "memory-flow",
+            "--id", "agent-1",
+            "--subscription", "codex",
+            "--working-dir", ".",
+            "--prompt-path", "prompts/agent-1.md",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "add-node", "memory-flow",
+            "--id", "remember",
+            "--type", "agent",
+            "--agent-id", "agent-1",
+            "--prompt-path", "prompts/agent-1.md",
+            "--working-dir", ".",
+            "--memory", "all",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "memory-flow.toml")
+    assert wf.graph._nodes["remember"].operation.memory == "all"
+
+
 def test_workflow_rename_and_duplicate_commands(tmp_path: Path) -> None:
     result = runner.invoke(
         app, ["workflow", "create", "--name", "Original", "--output", str(tmp_path)]
@@ -106,6 +167,62 @@ def test_workflow_rename_and_duplicate_commands(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert (tmp_path / "renamed-2.toml").exists()
+
+
+def test_workflow_set_info_configures_run_continuously(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Continuous", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "set-info", "continuous",
+            "--run-continuously",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    wf = AgenticWorkflow.from_file(tmp_path / "continuous.toml")
+    assert wf.config.run_continuously is True
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow", "set-info", "continuous",
+            "--no-run-continuously",
+            "--data-dir", str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    wf = AgenticWorkflow.from_file(tmp_path / "continuous.toml")
+    assert wf.config.run_continuously is False
+
+
+def test_workflow_run_rejects_active_continuous_workflow(tmp_path: Path) -> None:
+    toml = tmp_path / "continuous.toml"
+    toml.write_text(
+        _SIMPLE_TOML.replace('id = "simple"', 'id = "continuous"').replace(
+            'name = "Simple"',
+            'name = "Continuous"\nrun_continuously = true',
+        ),
+        encoding="utf-8",
+    )
+    log_dir = tmp_path / "logs" / "continuous"
+    log_dir.mkdir(parents=True)
+    (log_dir / "2026-06-18T10-00-00-0400.log").write_text(
+        "2026-06-18T10:00:00-04:00 - continuous started successfully\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app, ["workflow", "run", "continuous", "--data-dir", str(tmp_path)]
+    )
+
+    assert result.exit_code == 1
+    assert "already has an" in result.output
+    assert "active run" in result.output
 
 
 def test_workflow_run_dry_run(tmp_path: Path) -> None:
@@ -149,6 +266,9 @@ def test_workflow_rm_cleans_state(tmp_path: Path) -> None:
     log_dir = tmp_path / "logs" / "clean-me"
     log_dir.mkdir(parents=True)
     (log_dir / "2026-06-13T10-00-00-0400.log").write_text("old run\n")
+    memory_dir = tmp_path / "agent-memory" / "clean-me"
+    memory_dir.mkdir(parents=True)
+    (memory_dir / "agent-step.json").write_text("[]\n")
     chat_path = workflow_chat_prompt_path(tmp_path, "clean-me")
     chat_path.parent.mkdir(parents=True)
     chat_path.write_text("old chat\n")
@@ -163,6 +283,7 @@ def test_workflow_rm_cleans_state(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
     assert not (tmp_path / "clean-me.toml").exists()
     assert not log_dir.exists()
+    assert not memory_dir.exists()
     assert not chat_path.exists()
     assert not stop_path.exists()
 

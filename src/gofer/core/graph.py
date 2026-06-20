@@ -46,6 +46,7 @@ class GraphNode(BaseModel):
     retry_delay_seconds: float = 1.0
     timeout_seconds: float | None = None
     pipe_output: bool = False
+    allow_failure: bool = False
     on_failure: str = "halt"
 
 

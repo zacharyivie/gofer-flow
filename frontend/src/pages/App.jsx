@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Download,
   FolderOpen,
   GitBranch,
   ListFilter,
@@ -31,6 +32,7 @@ import { apiUrl } from "../lib/api.js";
 
 export default function App() {
   const [workflows, setWorkflows] = useState([]);
+  const [promptAgentIds, setPromptAgentIds] = useState([]);
   const [activeWorkflowId, setActiveWorkflowId] = useState();
   const [query, setQuery] = useState("");
   const [dataDir, setDataDir] = useState("");
@@ -41,6 +43,12 @@ export default function App() {
   const [dirtyWorkflow, setDirtyWorkflow] = useState();
   const [saveState, setSaveState] = useState({ saving: false, error: "" });
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
+  const [updateState, setUpdateState] = useState({
+    available: false,
+    checking: false,
+    error: "",
+    info: null,
+  });
   const [runState, setRunState] = useState({ running: false, error: "", result: null });
   const [logState, setLogState] = useState({
     loading: false,
@@ -69,14 +77,16 @@ export default function App() {
         throw new Error(`Workflow API returned ${response.status}`);
       }
       const payload = await response.json();
+      const payloadDataDir = payload.dataDir ?? "";
+      setPromptAgentIds(payload.promptAgentIds ?? []);
       const nextWorkflows = (payload.workflows ?? [])
         .filter((workflow) => !deletedWorkflowIdsRef.current.has(workflow.id))
-        .map(summarizeWorkflow);
+        .map((workflow) => summarizeWorkflow(workflow, payloadDataDir));
       setWorkflows((current) => {
         const refreshedWorkflows = nextWorkflows.map((workflow) => {
           const localWorkflow = current.find((candidate) => candidate.id === workflow.id);
           return localWorkflow
-            ? summarizeWorkflow(mergeSavedWorkflow(localWorkflow, workflow))
+            ? summarizeWorkflow(mergeSavedWorkflow(localWorkflow, workflow), payloadDataDir)
             : workflow;
         });
         const dirtyWorkflowId = dirtyWorkflowRef.current?.id;
@@ -85,7 +95,7 @@ export default function App() {
           : null;
         const mergedWorkflows =
           silent && localDirtyWorkflow
-            ? preserveLocalWorkflow(refreshedWorkflows, localDirtyWorkflow)
+            ? preserveLocalWorkflow(refreshedWorkflows, localDirtyWorkflow, payloadDataDir)
             : refreshedWorkflows;
 
         return silent && JSON.stringify(current) === JSON.stringify(mergedWorkflows)
@@ -125,6 +135,76 @@ export default function App() {
   useEffect(() => {
     window.localStorage.setItem("gofer-ui-theme", theme);
   }, [theme]);
+
+  const checkForUpdates = useCallback(async ({ silent = false } = {}) => {
+    if (!window.goferUpdates?.check) return;
+    setUpdateState((current) => ({
+      ...current,
+      checking: true,
+      error: silent ? current.error : "",
+    }));
+    try {
+      const info = await window.goferUpdates.check();
+      setUpdateState({
+        available: Boolean(info?.available),
+        checking: false,
+        error: "",
+        info,
+      });
+      if (!silent) {
+        setTopBarNotice({
+          type: info?.available ? "success" : "success",
+          message: info?.available
+            ? `Gofer Flow ${info.info?.version ?? "update"} is available`
+            : info?.info?.noReleases
+              ? "No published Gofer Flow releases yet"
+            : "Gofer Flow is up to date",
+        });
+      }
+    } catch (error) {
+      setUpdateState((current) => ({
+        ...current,
+        checking: false,
+        error: error instanceof Error ? error.message : "Unable to check for updates",
+      }));
+      if (!silent) {
+        setTopBarNotice({
+          type: "error",
+          message: error instanceof Error ? error.message : "Unable to check for updates",
+        });
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!window.goferUpdates?.onState) return undefined;
+    const unsubscribe = window.goferUpdates.onState((nextState) => {
+      setUpdateState((current) => ({ ...current, ...nextState }));
+    });
+    window.goferUpdates.getState?.().then((nextState) => {
+      setUpdateState((current) => ({ ...current, ...nextState }));
+    }).catch(() => {});
+    return unsubscribe;
+  }, []);
+
+  useEffect(() => {
+    checkForUpdates({ silent: true });
+  }, [checkForUpdates]);
+
+  async function applyUpdate(update) {
+    if (!window.goferUpdates) return;
+    try {
+      const nextState = update.downloaded
+        ? await window.goferUpdates.installDownloaded()
+        : await window.goferUpdates.downloadAndInstall();
+      setUpdateState((current) => ({ ...current, ...nextState }));
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to apply update",
+      });
+    }
+  }
 
   useEffect(() => {
     if (!topBarNotice.message) return undefined;
@@ -300,9 +380,24 @@ export default function App() {
       return text.toLowerCase().includes(query.toLowerCase());
     });
   }, [query, workflows]);
+  const usedAgentIds = useMemo(() => {
+    return [
+      ...new Set(
+        [
+          ...promptAgentIds,
+          ...workflows.flatMap((workflow) => [
+            ...Object.keys(workflow.agents ?? {}),
+            ...(workflow.nodes ?? [])
+              .map((node) => node.operation?.agent_id)
+              .filter(Boolean),
+          ]),
+        ],
+      ),
+    ];
+  }, [promptAgentIds, workflows]);
 
   function updateActiveWorkflow(nextWorkflow) {
-    const summarizedWorkflow = summarizeWorkflow(nextWorkflow);
+    const summarizedWorkflow = summarizeWorkflow(nextWorkflow, dataDir);
     setWorkflows((current) =>
       current.map((workflow) =>
         workflow.id === summarizedWorkflow.id ? summarizedWorkflow : workflow,
@@ -323,7 +418,7 @@ export default function App() {
         setWorkflows((current) =>
           current.map((candidate) =>
             candidate.id === savedWorkflow.id
-              ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow))
+              ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow), dataDir)
               : candidate,
           ),
         );
@@ -362,7 +457,7 @@ export default function App() {
   }
 
   async function runWorkflowNow(workflow) {
-    const workflowToRun = summarizeWorkflow(workflow);
+    const workflowToRun = summarizeWorkflow(workflow, dataDir);
     saveRevisionRef.current += 1;
     dirtyWorkflowRef.current = undefined;
     setDirtyWorkflow(undefined);
@@ -380,7 +475,7 @@ export default function App() {
       setWorkflows((current) =>
         current.map((candidate) =>
           candidate.id === savedWorkflow.id
-            ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow))
+            ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow), dataDir)
             : candidate,
         ),
       );
@@ -454,6 +549,7 @@ export default function App() {
         ...current,
         stopping: false,
       }));
+      loadWorkflows({ silent: true });
       loadRunLogs(workflow.id, { silent: true });
     } catch (error) {
       setRunState((current) => ({ ...current, stopping: false }));
@@ -506,7 +602,7 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
 
-      const nextWorkflow = summarizeWorkflow(payload.workflow);
+      const nextWorkflow = summarizeWorkflow(payload.workflow, dataDir);
       deletedWorkflowIdsRef.current.delete(nextWorkflow.id);
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
@@ -523,7 +619,7 @@ export default function App() {
 
   async function validateWorkflow(workflow) {
     try {
-      await persistWorkflow(summarizeWorkflow(workflow));
+      await persistWorkflow(summarizeWorkflow(workflow, dataDir));
       setTopBarNotice({ type: "success", message: "Workflow is valid" });
     } catch (error) {
       setTopBarNotice({
@@ -549,7 +645,7 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
 
-      const nextWorkflow = summarizeWorkflow(payload.workflow);
+      const nextWorkflow = summarizeWorkflow(payload.workflow, dataDir);
       deletedWorkflowIdsRef.current.delete(nextWorkflow.id);
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
@@ -624,7 +720,7 @@ export default function App() {
 
     try {
       if (dirtyWorkflowRef.current?.id === workflow.id) {
-        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current));
+        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current, dataDir));
         dirtyWorkflowRef.current = undefined;
         setDirtyWorkflow(undefined);
       }
@@ -644,7 +740,7 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
 
-      const renamed = summarizeWorkflow(payload.workflow);
+      const renamed = summarizeWorkflow(payload.workflow, dataDir);
       deletedWorkflowIdsRef.current.delete(renamed.id);
       setWorkflows((current) =>
         current.map((candidate) =>
@@ -668,7 +764,7 @@ export default function App() {
 
     try {
       if (dirtyWorkflowRef.current?.id === workflow.id) {
-        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current));
+        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current, dataDir));
         dirtyWorkflowRef.current = undefined;
         setDirtyWorkflow(undefined);
       }
@@ -688,7 +784,7 @@ export default function App() {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
 
-      const duplicated = summarizeWorkflow(payload.workflow);
+      const duplicated = summarizeWorkflow(payload.workflow, dataDir);
       deletedWorkflowIdsRef.current.delete(duplicated.id);
       setWorkflows((current) => [...current, duplicated]);
       setActiveWorkflowId(duplicated.id);
@@ -757,16 +853,21 @@ export default function App() {
           <>
             <TopBar
               theme={theme}
+              updateState={updateState}
               workflow={activeWorkflow}
+              onCheckForUpdates={() => checkForUpdates()}
+              onApplyUpdate={() => applyUpdate(updateState)}
               onToggleTheme={() =>
                 setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
               }
             />
             <DagCanvas
+              dataDir={dataDir}
               logState={logState}
               notice={topBarNotice}
               runState={runState}
               workflow={activeWorkflow}
+              usedAgentIds={usedAgentIds}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
               onStopRunLog={(runId) => stopWorkflowRunLog(activeWorkflow.id, runId)}
@@ -863,7 +964,7 @@ function getInitialTheme() {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function summarizeWorkflow(workflow) {
+function summarizeWorkflow(workflow, dataDir = "") {
   if (workflow.invalid) {
     return {
       ...workflow,
@@ -878,11 +979,14 @@ function summarizeWorkflow(workflow) {
   const agentCount = agentIdsForWorkflow(workflow).length;
   const operationTypes = [...new Set((workflow.nodes ?? []).map((node) => node.type))].sort();
   const status = workflow.status ?? "Ready";
+  const watchPath = workflow.watch?.path
+    ? resolveDisplayPath(workflow.watch.path, dataDir)
+    : "";
   return {
     ...workflow,
     description: `${workflow.nodes.length} nodes, ${workflow.edges.length} edges, ${agentCount} agents.${
       workflow.schedule ? ` Scheduled with ${workflow.schedule.cron_expression}.` : ""
-    }${workflow.watch ? ` Watching ${workflow.watch.path}.` : ""
+    }${workflow.watch ? ` Watching ${watchPath}.` : ""
     }`,
     status,
     tags: [status.toLowerCase(), ...operationTypes.slice(0, 2)],
@@ -916,7 +1020,7 @@ function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
   };
 }
 
-function preserveLocalWorkflow(remoteWorkflows, localWorkflow) {
+function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
   const foundWorkflow = remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id);
   if (!foundWorkflow) {
     return [...remoteWorkflows, localWorkflow];
@@ -928,9 +1032,33 @@ function preserveLocalWorkflow(remoteWorkflows, localWorkflow) {
           sourcePath: workflow.sourcePath ?? localWorkflow.sourcePath,
           status: workflow.status ?? localWorkflow.status,
           updatedAt: workflow.updatedAt ?? localWorkflow.updatedAt,
-        })
+        }, dataDir)
       : workflow,
   );
+}
+
+function isUrlPath(pathValue = "") {
+  return /^[a-z][a-z0-9+.-]*:/i.test(String(pathValue));
+}
+
+function isAbsolutePath(pathValue = "") {
+  const value = String(pathValue);
+  return (
+    value.startsWith("/") ||
+    value.startsWith("\\\\") ||
+    /^[A-Za-z]:[\\/]/.test(value)
+  );
+}
+
+function resolveDisplayPath(pathValue = "", basePath = "") {
+  const value = String(pathValue ?? "").trim();
+  if (!value || isUrlPath(value) || isAbsolutePath(value)) {
+    return value;
+  }
+  if (!basePath) return value;
+  if (value === ".") return basePath;
+  const separator = String(basePath).includes("\\") && !String(basePath).includes("/") ? "\\" : "/";
+  return `${String(basePath).replace(/[\\/]+$/, "")}${separator}${value.replace(/^[\\/]+/, "")}`;
 }
 
 function WorkflowSidebar({
@@ -1269,11 +1397,15 @@ function WorkflowListItem({
 
 function TopBar({
   theme,
+  updateState,
   workflow,
+  onApplyUpdate,
+  onCheckForUpdates,
   onToggleTheme,
 }) {
   const nodeCount = workflow.nodes?.length ?? 0;
   const edgeCount = workflow.edges?.length ?? 0;
+  const hasUpdateBridge = Boolean(window.goferUpdates?.check);
   return (
     <header className="flex h-[62px] shrink-0 items-center justify-between bg-white px-6 pt-1">
       <div className="min-w-0 pt-1">
@@ -1294,6 +1426,40 @@ function TopBar({
         </div>
       </div>
       <div className="flex items-center gap-2">
+        {hasUpdateBridge ? (
+          updateState?.available ? (
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-lg border border-teal-700/30 bg-teal-50 px-3 text-xs font-semibold text-teal-800 transition hover:border-teal-700/50 hover:bg-teal-100 disabled:cursor-wait disabled:opacity-70 dark:border-teal-500/30 dark:bg-teal-950/40 dark:text-teal-200 dark:hover:bg-teal-900/50"
+              disabled={Boolean(updateState.downloading)}
+              title={updateButtonTitle(updateState)}
+              type="button"
+              onClick={onApplyUpdate}
+            >
+              {updateState.downloading ? (
+                <Loader2 size={15} className="animate-spin" />
+              ) : (
+                <Download size={15} />
+              )}
+              {updateButtonLabel(updateState)}
+            </button>
+          ) : (
+            <button
+              className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              title={
+                updateState?.error
+                  ? `Update check failed: ${updateState.error}`
+                  : "Check for updates"
+              }
+              type="button"
+              onClick={onCheckForUpdates}
+            >
+              <RefreshCw
+                size={16}
+                className={updateState?.checking ? "animate-spin" : ""}
+              />
+            </button>
+          )
+        ) : null}
         <button
           className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
           title={theme === "dark" ? "Light mode" : "Dark mode"}
@@ -1305,6 +1471,21 @@ function TopBar({
       </div>
     </header>
   );
+}
+
+function updateButtonLabel(updateState) {
+  if (updateState?.downloaded) return "Restart to update";
+  if (updateState?.downloading) {
+    const percent = Math.max(0, Math.min(100, updateState.progress?.percent ?? 0));
+    return `Downloading ${Math.round(percent)}%`;
+  }
+  return `Update ${updateState?.info?.version ?? "available"}`;
+}
+
+function updateButtonTitle(updateState) {
+  if (updateState?.downloaded) return "Restart Gofer Flow and apply the downloaded update";
+  if (updateState?.downloading) return "Downloading update";
+  return "Download, install, and restart Gofer Flow";
 }
 
 function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows }) {
@@ -1527,6 +1708,20 @@ function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows 
               const thought = String(event.text ?? "").trim();
               if (!thought) continue;
               appendAssistantMessage(thought, "thought", { groupId: thoughtGroupId });
+              restartTypingDelay();
+            } else if (event.type === "compaction") {
+              const compactedMessages = Array.isArray(event.messages)
+                ? event.messages
+                : null;
+              if (compactedMessages) {
+                updateThreadMessages(targetThreadId, compactedMessages);
+              } else {
+                appendAssistantMessage(
+                  event.message || "Compacting workflow assistant context",
+                  "system",
+                  { role: "system" },
+                );
+              }
               restartTypingDelay();
             } else if (event.type === "final") {
               finalReceived = true;
@@ -1989,14 +2184,19 @@ function TypingIndicator() {
 }
 
 function ChatMessageBubble({ message }) {
+  const isSystem = message.role === "system" || message.kind === "system";
   return (
     <div
       data-message-id={message.id}
-      className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+      className={`flex ${
+        isSystem ? "justify-center" : message.role === "user" ? "justify-end" : "justify-start"
+      }`}
     >
       <div
         className={`max-w-[86%] rounded-lg px-3 py-2 text-sm leading-6 ${
-          message.role === "user"
+          isSystem
+            ? "border border-line bg-slate-50 text-xs font-medium text-muted"
+            : message.role === "user"
             ? "bg-brand text-white"
             : "border border-line bg-white text-slate-700 shadow-sm"
         }`}
@@ -2081,11 +2281,12 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
 
 function extractThoughtTokenSummary(thoughts) {
   const tokenPattern =
-    /(?:tokens?\s*(?:used|spent|total)?\s*[:=]?\s*([\d,.]+k?)|([\d,.]+k?)\s*tokens?\s*(?:used|spent)?)/i;
-  for (const thought of thoughts) {
-    const match = String(thought?.body ?? "").match(tokenPattern);
+    /(?:tokens?\s*(?:used|spent|total)?\s*[:=]?\s*([\d,.]+k?)|([\d,.]+k?)\s*tokens?\s*(?:used|spent)?)/gi;
+  for (const thought of [...thoughts].reverse()) {
+    const matches = [...String(thought?.body ?? "").matchAll(tokenPattern)];
+    const match = matches.at(-1);
     const value = match?.[1] || match?.[2];
-    if (value) return `${value} tokens`;
+    if (value) return `${value} tokens used`;
   }
   return "";
 }
@@ -2156,6 +2357,10 @@ function buildChatItems(messages) {
 
   while (index < messages.length) {
     const message = messages[index];
+    if (message.kind === "memory") {
+      index += 1;
+      continue;
+    }
     if (message.kind !== "thought") {
       items.push({ type: "message", message });
       index += 1;

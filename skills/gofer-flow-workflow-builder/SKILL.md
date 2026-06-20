@@ -21,10 +21,12 @@ If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path,
    - Use `--data-dir <path>` only when the user or tests require an isolated data directory.
 4. Configure the workflow with non-interactive CLI commands whenever possible:
    - `gof workflow set-info <workflow> --name "<Label>" --max-total-node-runs 100`
+   - `gof workflow set-info <workflow> --run-continuously` to keep exactly one run active; this overrides schedule/watch starts until `--no-run-continuously` or the UI stop button turns it off.
    - `gof workflow set-schedule <workflow> --cron "0 9 * * 1-5" --timezone UTC`
    - `gof workflow set-watch <workflow> --path <path> --glob "*" --mode fanout`
    - `gof workflow add-agent <workflow> --id <agent-id> --subscription codex --working-dir . --prompt-path prompts/agent.md`
    - `gof workflow add-node <workflow> --id <node-id> --type <node-type> ...`
+   - Use `gof workflow add-node ... --allow-failure` when a node is expected to fail and should route through `on_failure` edges without failing the overall workflow.
    - `gof workflow add-edge <workflow> --from <from-node> --to <to-node> --condition on_success`
    - `gof workflow import <path/to/workflow.toml>` when the user provides a TOML file.
 5. Edit TOML directly only for unsupported fields, then validate immediately.
@@ -46,6 +48,7 @@ If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path,
 - Use `common_llm_task` nodes for standard review/summarize/explain/extract/rewrite/classify work instead of creating a bespoke prompt file.
 - Use `local_vectorize` followed by `local_search` when a workflow needs offline local search over files before an agent step.
 - Use `skill_name` on an `agent` node when the user wants to invoke a Codex/Claude Code skill directly. The agent prompt becomes `/skill_name`, so `prompt_path` can be omitted on that node.
+- Use `--memory run` when an agent node should keep a continuous conversation only within one workflow run. Use `--memory all` when it should remember prior executions across future workflow runs. Leave the default `--memory none` for independent calls.
 - Never require real LLM provider CLIs in tests; validate with `--dry-run`.
 
 ## Preferred CLI Recipes
@@ -115,6 +118,7 @@ type = "agent"
 agent_id = "reviewer"
 prompt_path = "prompts/reviewer.md"
 working_dir = "."
+memory = "none" # none, run, or all
 
 [[edges]]
 from = "collect"
@@ -141,6 +145,17 @@ debounce_seconds = 1.0
 mode = "batch" # batch, queue, or fanout
 max_concurrency = 1
 ```
+
+Continuous run:
+
+```toml
+[workflow]
+run_continuously = true
+```
+
+Continuous workflows ignore schedule and watcher starts while enabled. They keep
+one active run alive, do not allow concurrent runs, and stop only when the user
+requests stop, which also disables `run_continuously`.
 
 Watcher mode guidance:
 
@@ -384,6 +399,7 @@ agent_id = "reviewer"
 prompt_path = "prompts/reviewer.md"
 working_dir = "."
 dynamic_count = 1
+memory = "run" # none, run, or all
 input_mapping = { diff = "collect.output" }
 ```
 
@@ -396,6 +412,7 @@ type = "agent"
 agent_id = "builder"
 working_dir = "."
 skill_name = "gofer-flow-workflow-builder"
+memory = "none"
 ```
 
 This sends `/gofer-flow-workflow-builder` to the configured Codex or Claude Code agent. Omit `prompt_path` on the node when using `skill_name`.

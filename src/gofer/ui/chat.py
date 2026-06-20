@@ -13,6 +13,8 @@ from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess, stream_subprocess
 
 ProviderName = Literal["codex", "claude_code"]
+CHAT_COMPACT_CHAR_LIMIT = 32_000
+CHAT_COMPACT_RECENT_MESSAGES = 8
 
 
 class ChatProviderError(ValueError):
@@ -39,6 +41,14 @@ async def run_workflow_chat(
     resolved_working_dir = working_dir or resolved_data_dir
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
     gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
+    messages, _ = await _compact_chat_messages_if_needed(
+        provider=provider,
+        model=model,
+        messages=messages,
+        binary_path=binary_path,
+        data_dir=resolved_data_dir,
+        working_dir=resolved_working_dir,
+    )
     prompt = build_chat_prompt(
         provider=provider,
         model=model,
@@ -105,6 +115,20 @@ async def stream_workflow_chat(
     resolved_working_dir = working_dir or resolved_data_dir
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
     gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
+    messages, compacted = await _compact_chat_messages_if_needed(
+        provider=provider,
+        model=model,
+        messages=messages,
+        binary_path=binary_path,
+        data_dir=resolved_data_dir,
+        working_dir=resolved_working_dir,
+    )
+    if compacted:
+        yield {
+            "type": "compaction",
+            "message": "Compacting workflow assistant context",
+            "messages": messages,
+        }
     prompt = build_chat_prompt(
         provider=provider,
         model=model,
@@ -376,6 +400,103 @@ def _latest_user_message(messages: list[dict[str, str]]) -> str:
 
 def _single_line(value: str) -> str:
     return " ".join(value.split())
+
+
+async def _compact_chat_messages_if_needed(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, str]],
+    binary_path: str,
+    data_dir: Path,
+    working_dir: Path,
+) -> tuple[list[dict[str, str]], bool]:
+    if _messages_size(messages) <= CHAT_COMPACT_CHAR_LIMIT:
+        return messages, False
+
+    recent = messages[-CHAT_COMPACT_RECENT_MESSAGES:]
+    older = messages[:-CHAT_COMPACT_RECENT_MESSAGES]
+    summary = await _summarize_chat_messages(
+        provider=provider,
+        model=model,
+        messages=older,
+        binary_path=binary_path,
+        data_dir=data_dir,
+        working_dir=working_dir,
+    )
+    compacted_messages = [
+        {
+            "id": "compaction-notice",
+            "role": "system",
+            "kind": "system",
+            "body": "Compacting workflow assistant context",
+        },
+        {
+            "id": "compacted-context",
+            "role": "system",
+            "kind": "memory",
+            "body": f"Compacted prior workflow assistant context:\n{summary}",
+        },
+        *recent,
+    ]
+    return compacted_messages, True
+
+
+async def _summarize_chat_messages(
+    *,
+    provider: str,
+    model: str,
+    messages: list[dict[str, str]],
+    binary_path: str,
+    data_dir: Path,
+    working_dir: Path,
+) -> str:
+    transcript = _messages_transcript(messages)
+    prompt = (
+        "Compact this Gofer Flow workflow assistant conversation for future turns.\n"
+        "Preserve user goals, workflow IDs, file paths, commands run, decisions, "
+        "errors, unresolved tasks, and important assistant outputs. Omit chatter.\n\n"
+        f"{transcript}"
+    )
+    command = _build_chat_command(
+        provider=provider,
+        model=model,
+        prompt=prompt,
+        binary_path=binary_path,
+        data_dir=data_dir,
+        working_dir=working_dir,
+    )
+    try:
+        returncode, stdout, stderr = await run_subprocess(
+            command,
+            cwd=working_dir,
+            timeout=180,
+        )
+    except OSError:
+        return _fallback_chat_summary(messages)
+    if returncode != 0:
+        return _fallback_chat_summary(messages)
+    summary = (stdout or stderr).strip()
+    return summary or _fallback_chat_summary(messages)
+
+
+def _messages_size(messages: list[dict[str, str]]) -> int:
+    return sum(len(str(message.get("body", ""))) for message in messages)
+
+
+def _messages_transcript(messages: list[dict[str, str]]) -> str:
+    return "\n\n".join(
+        f"{message.get('role', 'user').upper()}:\n{message.get('body', '')}"
+        for message in messages
+        if message.get("body")
+    )
+
+
+def _fallback_chat_summary(messages: list[dict[str, str]]) -> str:
+    transcript = _messages_transcript(messages)
+    if len(transcript) <= 12_000:
+        return transcript
+    return f"{transcript[:6_000]}\n\n[...middle omitted during compaction...]\n\n{transcript[-6_000:]}"
 
 
 def build_chat_prompt(

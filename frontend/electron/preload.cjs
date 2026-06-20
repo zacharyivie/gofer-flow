@@ -44,6 +44,43 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     ipcRenderer.invoke("gofer:path-info", {
       targetPath: typeof targetPath === "string" ? targetPath : "",
     }),
+  copyPath: (options = {}) =>
+    ipcRenderer.invoke("gofer:copy-path", {
+      sourcePath:
+        typeof options.sourcePath === "string" ? options.sourcePath : "",
+      destinationPath:
+        typeof options.destinationPath === "string" ? options.destinationPath : "",
+    }),
+  deletePath: (targetPath) =>
+    ipcRenderer.invoke("gofer:delete-path", {
+      targetPath: typeof targetPath === "string" ? targetPath : "",
+    }),
+  renamePath: (options = {}) =>
+    ipcRenderer.invoke("gofer:rename-path", {
+      sourcePath:
+        typeof options.sourcePath === "string" ? options.sourcePath : "",
+      name: typeof options.name === "string" ? options.name : "",
+    }),
+  createFile: (options = {}) =>
+    ipcRenderer.invoke("gofer:create-file", {
+      directory: typeof options.directory === "string" ? options.directory : "",
+      name: typeof options.name === "string" ? options.name : "",
+    }),
+  createFolder: (options = {}) =>
+    ipcRenderer.invoke("gofer:create-folder", {
+      directory: typeof options.directory === "string" ? options.directory : "",
+      name: typeof options.name === "string" ? options.name : "",
+    }),
+  readTextFile: (targetPath) =>
+    ipcRenderer.invoke("gofer:read-text-file", {
+      targetPath: typeof targetPath === "string" ? targetPath : "",
+    }),
+  writeTextFile: (options = {}) =>
+    ipcRenderer.invoke("gofer:write-text-file", {
+      targetPath:
+        typeof options.targetPath === "string" ? options.targetPath : "",
+      content: typeof options.content === "string" ? options.content : "",
+    }),
   getDroppedFilePath: (file) => webUtils.getPathForFile(file) || "",
   setDataDir: (dataDir) =>
     ipcRenderer.invoke("gofer:set-data-dir", {
@@ -54,4 +91,18 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       currentPath:
         typeof options.currentPath === "string" ? options.currentPath : "",
     }),
+});
+
+contextBridge.exposeInMainWorld("goferUpdates", {
+  check: () => ipcRenderer.invoke("gofer:check-for-updates"),
+  downloadAndInstall: () => ipcRenderer.invoke("gofer:download-and-install-update"),
+  installDownloaded: () => ipcRenderer.invoke("gofer:install-downloaded-update"),
+  openRelease: () => ipcRenderer.invoke("gofer:open-update-release"),
+  getState: () => ipcRenderer.invoke("gofer:get-update-state"),
+  onState: (callback) => {
+    if (typeof callback !== "function") return () => {};
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("gofer:update-state", listener);
+    return () => ipcRenderer.removeListener("gofer:update-state", listener);
+  },
 });

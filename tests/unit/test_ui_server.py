@@ -82,6 +82,31 @@ command = "echo hello"
     assert scheduler.list_workflows() == []
 
 
+def test_ui_server_sync_skips_schedule_when_run_continuously(tmp_path) -> None:
+    (tmp_path / "continuous.toml").write_text(
+        """
+[workflow]
+id = "continuous"
+name = "Continuous"
+run_continuously = true
+
+[workflow.schedule]
+cron_expression = "43 * * * *"
+timezone = "America/New_York"
+
+[[nodes]]
+id = "hello"
+type = "bash_command"
+command = "echo hello"
+""".strip()
+    )
+    scheduler = WorkflowScheduler(db_path=tmp_path / "schedules.db")
+
+    sync_workflow_schedules(tmp_path, scheduler)
+
+    assert scheduler.list_workflows() == []
+
+
 def test_ui_server_syncs_workflow_watchers(tmp_path) -> None:
     workflow_path = tmp_path / "watched.toml"
     workflow_path.write_text(
@@ -105,6 +130,31 @@ command = "echo hello"
     sync_workflow_watchers(tmp_path, watcher)
 
     assert [item["id"] for item in watcher.list_workflows()] == ["watched"]
+
+
+def test_ui_server_sync_skips_watcher_when_run_continuously(tmp_path) -> None:
+    (tmp_path / "continuous.toml").write_text(
+        """
+[workflow]
+id = "continuous"
+name = "Continuous"
+run_continuously = true
+
+[workflow.watch]
+path = "inputs"
+glob = "*.txt"
+
+[[nodes]]
+id = "hello"
+type = "bash_command"
+command = "echo hello"
+""".strip()
+    )
+    watcher = WorkflowWatcher()
+
+    sync_workflow_watchers(tmp_path, watcher)
+
+    assert watcher.list_workflows() == []
 
 
 def test_ui_server_dynamic_port_reports_bound_port(tmp_path) -> None:

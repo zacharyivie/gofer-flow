@@ -44,6 +44,26 @@ async def test_agent_interpolates_prompt(agent_config: AgentConfig) -> None:
     assert "awesome-project" in str(sub.calls[0]["prompt"])
 
 
+async def test_agent_includes_memory_in_prompt(agent_config: AgentConfig) -> None:
+    sub = FakeSubscription()
+    agent = Agent(agent_config, sub)
+    result = await agent.run(
+        {"repo": "awesome-project"},
+        memory=[
+            {"role": "user", "body": "Previous question"},
+            {"role": "assistant", "body": "Previous answer"},
+        ],
+    )
+
+    prompt = str(sub.calls[0]["prompt"])
+    assert "Previous conversation:" in prompt
+    assert "Previous question" in prompt
+    assert "Previous answer" in prompt
+    assert "Current request:" in prompt
+    assert "awesome-project" in prompt
+    assert result.prompt == "Summarize awesome-project."
+
+
 async def test_agent_failure_propagates(agent_config: AgentConfig) -> None:
     sub = FakeSubscription(output="error", exit_code=1)
     agent = Agent(agent_config, sub)

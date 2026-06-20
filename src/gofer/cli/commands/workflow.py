@@ -226,6 +226,7 @@ def _operation_from_options(
     instructions: str,
     index_path: Path | None,
     dynamic_count: str,
+    memory: str,
     input_mapping: dict[str, str],
     env: dict[str, str],
     args: list[str],
@@ -358,6 +359,8 @@ def _operation_from_options(
                 raise typer.BadParameter(
                     "--agent-id and --working-dir are required for common_llm_task nodes"
                 )
+            if memory not in {"none", "run", "all"}:
+                raise typer.BadParameter("--memory must be one of none, run, all")
             return CommonLlmTaskOperation(
                 type=OperationType.COMMON_LLM_TASK,
                 agent_id=agent_id,
@@ -365,6 +368,7 @@ def _operation_from_options(
                 target=target_text,
                 instructions=instructions,
                 working_dir=working_dir,
+                memory=memory,  # type: ignore[arg-type]
                 input_mapping=input_mapping,
             )
         case OperationType.LOCAL_VECTORIZE:
@@ -396,6 +400,8 @@ def _operation_from_options(
                 raise typer.BadParameter(
                     "agent nodes require --prompt-path unless --skill-name is provided"
                 )
+            if memory not in {"none", "run", "all"}:
+                raise typer.BadParameter("--memory must be one of none, run, all")
             count: int | str = int(dynamic_count) if dynamic_count.isdigit() else dynamic_count
             return AgentOperation(
                 type=OperationType.AGENT,
@@ -404,6 +410,7 @@ def _operation_from_options(
                 working_dir=working_dir,
                 skill_name=skill_name,
                 dynamic_count=count,
+                memory=memory,  # type: ignore[arg-type]
                 input_mapping=input_mapping,
                 fan_source=fan_source,
             )
@@ -431,6 +438,15 @@ def run(
 
     wf.validate()
     base = data_dir or workflow_path.parent
+    if wf.config.run_continuously:
+        runs = list_workflow_run_logs_payload(wf.config.id, base).get("runs") or []
+        if any(run_log.get("status") == "running" for run_log in runs):
+            console.print(
+                f"[yellow]Workflow '{wf.config.id}' is configured to run continuously "
+                "and already has an active run.[/yellow]"
+            )
+            raise typer.Exit(1)
+
     result = asyncio.run(
         WorkflowExecutor(
             wf,
@@ -624,6 +640,11 @@ def set_info(
         min=1,
         help="Maximum node executions allowed in one workflow run",
     ),
+    run_continuously: bool | None = typer.Option(
+        None,
+        "--run-continuously/--no-run-continuously",
+        help="Keep one workflow run active and ignore schedule/watch starts",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Update top-level workflow settings without opening an editor."""
@@ -638,6 +659,11 @@ def set_info(
         name=name if name is not None else wf.config.name,
         schedule=wf.config.schedule,
         watch=wf.config.watch,
+        run_continuously=(
+            run_continuously
+            if run_continuously is not None
+            else wf.config.run_continuously
+        ),
         max_total_node_runs=(
             max_total_node_runs
             if max_total_node_runs is not None
@@ -820,6 +846,11 @@ def add_node(
     instructions: str = typer.Option("", "--instructions", help="Task instructions"),
     index_path: Path | None = typer.Option(None, "--index-path", help="Local vector index path"),
     dynamic_count: str = typer.Option("1", "--dynamic-count", help="Agent dynamic count"),
+    memory: str = typer.Option(
+        "none",
+        "--memory",
+        help="Agent memory mode: none, run, or all",
+    ),
     input_map: list[str] | None = typer.Option(
         None, "--input-map", help="Agent input mapping KEY=CTX_PATH"
     ),
@@ -844,6 +875,11 @@ def add_node(
     encoding: str = typer.Option("utf-8", "--encoding"),
     errors: str = typer.Option("strict", "--errors"),
     pipe_output: bool = typer.Option(False, "--pipe-output"),
+    allow_failure: bool = typer.Option(
+        False,
+        "--allow-failure",
+        help="Allow this node to fail without failing the overall workflow",
+    ),
     retry_count: int = typer.Option(0, "--retry-count", min=0),
     retry_delay_seconds: float = typer.Option(1.0, "--retry-delay-seconds", min=0.0),
     timeout_seconds: float | None = typer.Option(None, "--timeout-seconds", min=0.0),
@@ -891,6 +927,7 @@ def add_node(
             instructions=instructions,
             index_path=index_path,
             dynamic_count=dynamic_count,
+            memory=memory,
             input_mapping=mapping,
             env=_parse_key_values(env, "--env"),
             args=arg or [],
@@ -917,6 +954,7 @@ def add_node(
                 node_id=node_id,
                 operation=operation,
                 pipe_output=pipe_output,
+                allow_failure=allow_failure,
                 retry_count=retry_count,
                 retry_delay_seconds=retry_delay_seconds,
                 timeout_seconds=timeout_seconds,
@@ -1097,6 +1135,7 @@ def rm(
 
     path.unlink()
     shutil.rmtree(cleanup_base / "logs" / wf.config.id, ignore_errors=True)
+    shutil.rmtree(cleanup_base / "agent-memory" / wf.config.id, ignore_errors=True)
     workflow_stop_path(wf.config.id, cleanup_base).unlink(missing_ok=True)
     delete_workflow_chat_prompt(cleanup_base, wf.config.id)
     console.print(f"[green]Deleted[/green] {path}")

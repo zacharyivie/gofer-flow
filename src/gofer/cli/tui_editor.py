@@ -658,6 +658,13 @@ def _operation_fields(
             str(op.dynamic_count),
         ),
         FieldDescriptor(
+            f"{prefix}.memory",
+            "Memory",
+            FieldKind.CHOICE,
+            op.memory,
+            choices=["none", "run", "all"],
+        ),
+        FieldDescriptor(
             f"{prefix}.input_mapping",
             "Input Mapping",
             FieldKind.DICT_STR_STR,
@@ -786,6 +793,7 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     prompt_path=_as_path(fm.get(f"{p}.prompt_path"), op.prompt_path),
                     working_dir=_as_path(fm.get(f"{p}.working_dir"), op.working_dir),
                     dynamic_count=dc,
+                    memory=fm.get(f"{p}.memory") or op.memory,
                     input_mapping=fm.get(f"{p}.input_mapping") or {},
                     fan_source=op.fan_source,
                 )

@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 
 from gofer.core.agent import AgentResult
-from gofer.utils.process import run_subprocess
+from gofer.utils.process import stream_subprocess
 
 
 class Subscription(ABC):
@@ -22,20 +22,41 @@ class Subscription(ABC):
     ) -> AgentResult:
         cmd = self._build_command(prompt, tools, mcp_servers)
         start = time.monotonic()
-        returncode, stdout, stderr = await run_subprocess(
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        thought_chunks: list[str] = []
+        returncode = 1
+        async for event in stream_subprocess(
             cmd,
             cancel_event=cancel_event,
             cwd=working_dir,
             env=env,
             timeout=timeout,
-        )
+        ):
+            if event["type"] == "chunk":
+                text = event["text"]
+                if not text:
+                    continue
+                thought_chunks.append(text)
+                if event["stream"] == "stdout":
+                    stdout_chunks.append(text)
+                else:
+                    stderr_chunks.append(text)
+                continue
+            if event["stream"] is None:
+                returncode = event["returncode"] if event["returncode"] is not None else 1
         duration = time.monotonic() - start
+        stdout = "".join(stdout_chunks)
+        stderr = "".join(stderr_chunks)
+        message = stdout or stderr
         return AgentResult(
             agent_id="",
             success=returncode == 0,
-            output=stdout or stderr,
+            output=message,
             exit_code=returncode,
             duration_seconds=duration,
+            thoughts=thought_chunks,
+            message=message,
         )
 
     @abstractmethod

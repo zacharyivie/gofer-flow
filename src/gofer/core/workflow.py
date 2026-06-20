@@ -32,12 +32,19 @@ class WorkflowConfig(BaseModel):
     name: str
     schedule: ScheduleConfig | None = None
     watch: WatchConfig | None = None
+    run_continuously: bool = False
     max_total_node_runs: int = 1000
 
 
 _op_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 
-_GRAPH_NODE_FIELDS = {"pipe_output", "retry_count", "retry_delay_seconds", "timeout_seconds"}
+_GRAPH_NODE_FIELDS = {
+    "allow_failure",
+    "pipe_output",
+    "retry_count",
+    "retry_delay_seconds",
+    "timeout_seconds",
+}
 
 
 class AgenticWorkflow:
@@ -82,6 +89,7 @@ class AgenticWorkflow:
             name=wf_data["name"],
             schedule=schedule,
             watch=watch,
+            run_continuously=bool(wf_data.get("run_continuously", False)),
             max_total_node_runs=wf_data.get("max_total_node_runs", 1000),
         )
         workflow = cls(config)
@@ -166,12 +174,14 @@ class AgenticWorkflow:
             data["workflow"]["schedule"] = self.config.schedule.model_dump()
         if self.config.watch:
             data["workflow"]["watch"] = _paths_to_str(self.config.watch.model_dump())
+        if self.config.run_continuously:
+            data["workflow"]["run_continuously"] = True
         if self.config.max_total_node_runs != 1000:
             data["workflow"]["max_total_node_runs"] = self.config.max_total_node_runs
 
         if self.agents:
             data["agents"] = {
-                aid: _paths_to_str(ac.model_dump(exclude={"agent_id"}))
+                aid: _paths_to_str(ac.model_dump(exclude={"agent_id"}, exclude_none=True))
                 for aid, ac in self.agents.items()
             }
 
@@ -183,6 +193,8 @@ class AgenticWorkflow:
             # Serialize GraphNode-level fields (only non-defaults to keep TOML clean)
             if node.pipe_output:
                 node_dict["pipe_output"] = True
+            if node.allow_failure:
+                node_dict["allow_failure"] = True
             if node.retry_count:
                 node_dict["retry_count"] = node.retry_count
             if node.retry_delay_seconds != 1.0:
