@@ -127,7 +127,17 @@ jobs:
         working-directory: frontend/release
         shell: bash
         run: |
-          sha256sum *.AppImage *.AppImage.blockmap *.deb *.rpm latest-linux.yml gof-linux-x64 > checksums-linux.txt
+          files=()
+          for pattern in *.AppImage *.AppImage.blockmap *.deb *.rpm latest-linux.yml gof-linux-x64; do
+            for file in $pattern; do
+              [ -e "$file" ] && files+=("$file")
+            done
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No Linux release files found for checksums" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > checksums-linux.txt
           cat checksums-linux.txt
 
       - name: Generate Windows checksums
@@ -149,7 +159,17 @@ jobs:
         working-directory: frontend/release
         shell: bash
         run: |
-          shasum -a 256 *.dmg *.dmg.blockmap *.zip *.zip.blockmap latest-mac.yml gof-macos-* > checksums-macos.txt
+          files=()
+          for pattern in *.dmg *.dmg.blockmap *.zip *.zip.blockmap latest-mac.yml gof-macos-*; do
+            for file in $pattern; do
+              [ -e "$file" ] && files+=("$file")
+            done
+          done
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No macOS release files found for checksums" >&2
+            exit 1
+          fi
+          shasum -a 256 "${files[@]}" > checksums-macos.txt
           cat checksums-macos.txt
 
       - name: Upload workflow artifacts
