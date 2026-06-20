@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 import os
 import threading
+import time
 from typing import Literal, TypedDict
 
 import anyio
@@ -78,6 +79,7 @@ async def stream_subprocess(
 
     async def _stream() -> AsyncIterator[ProcessStreamEvent]:
         process = await anyio.open_process(cmd, cwd=cwd, env=merged_env)
+        deadline = time.monotonic() + timeout if timeout is not None else None
 
         if process.stdin is not None:
             if stdin:
@@ -124,9 +126,18 @@ async def stream_subprocess(
         async def wait_for_process() -> None:
             nonlocal returncode
             stopped = False
+            timed_out = False
             while process.returncode is None:
                 if cancel_event is not None and cancel_event.is_set():
                     stopped = True
+                    process.terminate()
+                    with anyio.move_on_after(1):
+                        await process.wait()
+                    if process.returncode is None:
+                        process.kill()
+                    break
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
                     process.terminate()
                     with anyio.move_on_after(1):
                         await process.wait()
@@ -137,11 +148,20 @@ async def stream_subprocess(
                     await process.wait()
             await process.wait()
             returncode = process.returncode if process.returncode is not None else 130
+            if timed_out:
+                returncode = 124
             if stopped:
                 await send.send({
                     "type": "chunk",
                     "stream": "stderr",
                     "text": "Process stopped by user\n",
+                    "returncode": None,
+                })
+            if timed_out:
+                await send.send({
+                    "type": "chunk",
+                    "stream": "stderr",
+                    "text": f"Process timed out after {timeout:g} seconds\n",
                     "returncode": None,
                 })
             await send.send({
@@ -175,14 +195,8 @@ async def stream_subprocess(
             "returncode": returncode if returncode is not None else 130,
         }
 
-    if timeout is None:
-        async for event in _stream():
-            yield event
-        return
-
-    with anyio.fail_after(timeout):
-        async for event in _stream():
-            yield event
+    async for event in _stream():
+        yield event
 
 
 async def _run_cancellable_process(
