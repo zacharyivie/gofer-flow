@@ -27,7 +27,7 @@ import {
   Waypoints,
   X,
 } from "lucide-react";
-import DagCanvas, { PathPickerDialog } from "../components/DagCanvas.jsx";
+import DagCanvas from "../components/DagCanvas.jsx";
 import { apiUrl } from "../lib/api.js";
 
 export default function App() {
@@ -37,12 +37,18 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
+  const [doctorState, setDoctorState] = useState({
+    loading: true,
+    error: "",
+    errors: [],
+    warnings: [],
+  });
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createState, setCreateState] = useState({ saving: false, error: "" });
-  const [dataDirPickerOpen, setDataDirPickerOpen] = useState(false);
   const [dirtyWorkflow, setDirtyWorkflow] = useState();
-  const [saveState, setSaveState] = useState({ saving: false, error: "" });
+  const [, setSaveState] = useState({ saving: false, error: "" });
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
+  const [runPreview, setRunPreview] = useState(null);
   const [updateState, setUpdateState] = useState({
     available: false,
     checking: false,
@@ -55,8 +61,19 @@ export default function App() {
     error: "",
     text: "",
     path: null,
+    nodeOutputs: null,
+    nodeOutputsTruncated: false,
+    nodeOutputsMaxBytes: null,
+    usageSummary: null,
+    runEvents: [],
+    runNodes: {},
     runs: [],
     selectedRunId: null,
+  });
+  const [approvalState, setApprovalState] = useState({
+    approvals: [],
+    error: "",
+    loading: false,
   });
   const [theme, setTheme] = useState(getInitialTheme);
   const [workflowPaneWidth, setWorkflowPaneWidth] = useState(292);
@@ -120,17 +137,50 @@ export default function App() {
     }
   }, []);
 
+  const loadDoctor = useCallback(async ({ silent = false } = {}) => {
+    if (!silent) {
+      setDoctorState((current) => ({ ...current, loading: true, error: "" }));
+    }
+    try {
+      const response = await fetch(apiUrl("/doctor"));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Doctor API returned ${response.status}`);
+      }
+      setDoctorState({
+        loading: false,
+        error: "",
+        errors: payload.errors ?? [],
+        warnings: payload.warnings ?? [],
+      });
+    } catch (error) {
+      if (!silent) {
+        setDoctorState({
+          loading: false,
+          error: error instanceof Error ? error.message : "Unable to load health checks",
+          errors: [],
+          warnings: [],
+        });
+      }
+    }
+  }, []);
+
   useEffect(() => {
     loadWorkflows();
   }, [loadWorkflows]);
 
   useEffect(() => {
+    loadDoctor();
+  }, [loadDoctor]);
+
+  useEffect(() => {
     const intervalId = window.setInterval(() => {
       loadWorkflows({ silent: true });
+      loadDoctor({ silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [loadWorkflows]);
+  }, [loadDoctor, loadWorkflows]);
 
   useEffect(() => {
     window.localStorage.setItem("gofer-ui-theme", theme);
@@ -207,14 +257,14 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!topBarNotice.message) return undefined;
+    if (!topBarNotice?.message) return undefined;
 
     const timeoutId = window.setTimeout(() => {
       setTopBarNotice({ type: "", message: "" });
     }, 3500);
 
     return () => window.clearTimeout(timeoutId);
-  }, [topBarNotice.message]);
+  }, [topBarNotice?.message]);
 
   const loadLatestLog = useCallback(async (workflowId, { silent = false } = {}) => {
     const requestId = logRequestRef.current + 1;
@@ -233,10 +283,18 @@ export default function App() {
       if (requestId !== logRequestRef.current) return;
       const nextText = payload.log?.logText ?? "";
       const nextPath = payload.log?.logPath ?? null;
+      const nextNodeOutputs = payload.log?.nodeOutputs ?? null;
+      const nextUsageSummary = payload.log?.usageSummary ?? null;
+      const nextRunEvents = payload.log?.runEvents ?? [];
+      const nextRunNodes = payload.log?.runNodes ?? {};
       setLogState((current) => {
         if (
           current.text === nextText &&
           current.path === nextPath &&
+          JSON.stringify(current.nodeOutputs ?? null) === JSON.stringify(nextNodeOutputs) &&
+          JSON.stringify(current.usageSummary ?? null) === JSON.stringify(nextUsageSummary) &&
+          JSON.stringify(current.runEvents ?? []) === JSON.stringify(nextRunEvents) &&
+          JSON.stringify(current.runNodes ?? {}) === JSON.stringify(nextRunNodes) &&
           current.error === "" &&
           current.loading === false
         ) {
@@ -247,6 +305,12 @@ export default function App() {
           error: "",
           text: nextText,
           path: nextPath,
+          nodeOutputs: nextNodeOutputs,
+          nodeOutputsTruncated: Boolean(payload.log?.nodeOutputsTruncated),
+          nodeOutputsMaxBytes: payload.log?.nodeOutputsMaxBytes ?? null,
+          usageSummary: nextUsageSummary,
+          runEvents: nextRunEvents,
+          runNodes: nextRunNodes,
           runs: current.runs,
           selectedRunId: null,
         };
@@ -313,6 +377,12 @@ export default function App() {
         error: "",
         text: payload.log?.logText ?? "",
         path: payload.log?.logPath ?? null,
+        nodeOutputs: payload.log?.nodeOutputs ?? null,
+        nodeOutputsTruncated: Boolean(payload.log?.nodeOutputsTruncated),
+        nodeOutputsMaxBytes: payload.log?.nodeOutputsMaxBytes ?? null,
+        usageSummary: payload.log?.usageSummary ?? null,
+        runEvents: payload.log?.runEvents ?? [],
+        runNodes: payload.log?.runNodes ?? {},
         selectedRunId: runId,
       }));
     } catch (error) {
@@ -327,6 +397,34 @@ export default function App() {
     }
   }, []);
 
+  const loadApprovals = useCallback(async (workflowId, { silent = false } = {}) => {
+    if (!silent) {
+      setApprovalState((current) => ({ ...current, loading: true, error: "" }));
+    }
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/approvals`),
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setApprovalState({
+        approvals: payload.approvals ?? [],
+        error: "",
+        loading: false,
+      });
+    } catch (error) {
+      if (!silent) {
+        setApprovalState((current) => ({
+          ...current,
+          error: error instanceof Error ? error.message : "Unable to load approvals",
+          loading: false,
+        }));
+      }
+    }
+  }, []);
+
   useEffect(() => {
     if (!activeWorkflow?.id) {
       setLogState({
@@ -334,15 +432,23 @@ export default function App() {
         error: "",
         text: "",
         path: null,
+        nodeOutputs: null,
+        nodeOutputsTruncated: false,
+        nodeOutputsMaxBytes: null,
+        usageSummary: null,
+        runEvents: [],
+        runNodes: {},
         runs: [],
         selectedRunId: null,
       });
+      setApprovalState({ approvals: [], error: "", loading: false });
       return;
     }
 
     loadLatestLog(activeWorkflow.id);
     loadRunLogs(activeWorkflow.id);
-  }, [activeWorkflow?.id, loadLatestLog, loadRunLogs]);
+    loadApprovals(activeWorkflow.id);
+  }, [activeWorkflow?.id, loadApprovals, loadLatestLog, loadRunLogs]);
 
   useEffect(() => {
     if (!activeWorkflow?.id) {
@@ -356,10 +462,18 @@ export default function App() {
         loadLatestLog(activeWorkflow.id, { silent: true });
       }
       loadRunLogs(activeWorkflow.id, { silent: true });
+      loadApprovals(activeWorkflow.id, { silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [activeWorkflow?.id, loadLatestLog, loadRunLog, loadRunLogs, logState.selectedRunId]);
+  }, [
+    activeWorkflow?.id,
+    loadApprovals,
+    loadLatestLog,
+    loadRunLog,
+    loadRunLogs,
+    logState.selectedRunId,
+  ]);
 
   useEffect(() => {
     if (!dirtyWorkflow) return undefined;
@@ -446,7 +560,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(workflow),
+        body: JSON.stringify(workflowPayloadForSave(workflow)),
       },
     );
     const payload = await response.json();
@@ -480,32 +594,83 @@ export default function App() {
         ),
       );
       setSaveState({ saving: false, error: "" });
+      const externalAccessWarnings = agentExternalAccessWarnings(savedWorkflow);
+      if (externalAccessWarnings.length > 0) {
+        const confirmed = window.confirm(
+          [
+            "Agent filesystem access outside working_dir:",
+            "",
+            ...externalAccessWarnings.map((warning) => `- ${warning}`),
+            "",
+            "Run this workflow?",
+          ].join("\n"),
+        );
+        if (!confirmed) {
+          setRunState({
+            running: false,
+            workflowId: savedWorkflow.id,
+            error: "",
+            result: null,
+          });
+          setLogState((current) => ({ ...current, loading: false }));
+          return;
+        }
+      }
 
-      const response = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(savedWorkflow.id)}/run`),
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ dryRun: false }),
-        },
-      );
+      const triggerContext = buildRunPreviewTriggerContext(savedWorkflow);
+      const previewRequest = workflowPlanRequest(savedWorkflow.id, triggerContext);
+      const previewResponse = await fetch(previewRequest.url, previewRequest.options);
+      const previewPayload = await previewResponse.json();
+      if (!previewResponse.ok) {
+        throw new Error(previewPayload.error || `Workflow API returned ${previewResponse.status}`);
+      }
+      setRunState({ running: false, workflowId: savedWorkflow.id, error: "", result: null });
+      setLogState((current) => ({ ...current, loading: false }));
+      setRunPreview({ workflow: savedWorkflow, plan: previewPayload.plan, triggerContext });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to run workflow";
+      setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
+      setSaveState((current) => ({ ...current, saving: false }));
+      loadLatestLog(workflowToRun.id, { silent: true });
+      loadRunLogs(workflowToRun.id, { silent: true });
+    }
+  }
+
+  async function executeWorkflowRun(workflow, triggerContext = {}) {
+    setRunPreview(null);
+    setRunState({ running: true, workflowId: workflow.id, error: "", result: null });
+    setLogState((current) => ({
+      ...current,
+      loading: true,
+      error: "",
+      selectedRunId: null,
+    }));
+    try {
+      const runRequest = workflowRunRequest(workflow.id, {
+        dryRun: false,
+        triggerContext,
+      });
+      const response = await fetch(runRequest.url, runRequest.options);
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
-      setRunState({ running: false, workflowId: savedWorkflow.id, error: "", result: payload.run });
+      setRunState({ running: false, workflowId: workflow.id, error: "", result: payload.run });
+      const nextRunStatus =
+        payload.run?.status === "stopped"
+          ? "Stopped"
+          : payload.run?.success
+            ? "Success"
+            : "Error";
+      const nextRunTag =
+        payload.run?.status === "stopped" ? "stopped" : payload.run?.success ? "success" : "error";
       setWorkflows((current) =>
         current.map((candidate) =>
-          candidate.id === savedWorkflow.id
+          candidate.id === workflow.id
             ? {
                 ...candidate,
-                status: payload.run?.success ? "Success" : "Error",
-                tags: [
-                  payload.run?.success ? "success" : "error",
-                  ...(candidate.tags ?? []).slice(1),
-                ],
+                status: nextRunStatus,
+                tags: [nextRunTag, ...(candidate.tags ?? []).slice(1)],
               }
             : candidate,
         ),
@@ -515,16 +680,54 @@ export default function App() {
         error: "",
         text: payload.run?.logText ?? "",
         path: payload.run?.logPath ?? null,
+        nodeOutputs: payload.run?.nodeOutputs ?? null,
+        nodeOutputsTruncated: Boolean(payload.run?.nodeOutputsTruncated),
+        nodeOutputsMaxBytes: payload.run?.nodeOutputsMaxBytes ?? null,
+        usageSummary: payload.run?.usageSummary ?? null,
+        runEvents: payload.run?.runEvents ?? [],
+        runNodes: payload.run?.runNodes ?? {},
         runs: logState.runs,
         selectedRunId: null,
       });
-      loadRunLogs(savedWorkflow.id);
+      loadRunLogs(workflow.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
-      setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
-      setSaveState((current) => ({ ...current, saving: false }));
-      loadLatestLog(workflowToRun.id, { silent: true });
-      loadRunLogs(workflowToRun.id, { silent: true });
+      setRunState({ running: false, workflowId: workflow.id, error: message, result: null });
+      loadLatestLog(workflow.id, { silent: true });
+      loadRunLogs(workflow.id, { silent: true });
+    }
+  }
+
+  async function decideApproval(workflow, approval, decision, notes = "", by = "ui") {
+    try {
+      const response = await fetch(
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflow.id)}/approvals/${encodeURIComponent(
+            approval.runId,
+          )}/${encodeURIComponent(approval.nodeId)}/${decision === "approved" ? "approve" : "reject"}`,
+        ),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ by, notes }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setTopBarNotice({
+        type: "success",
+        message: decision === "approved" ? "Approval recorded" : "Rejection recorded",
+      });
+      loadApprovals(workflow.id, { silent: true });
+      loadLatestLog(workflow.id, { silent: true });
+      loadRunLogs(workflow.id, { silent: true });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to record approval",
+      });
     }
   }
 
@@ -682,6 +885,12 @@ export default function App() {
               error: "",
               text: "",
               path: null,
+              nodeOutputs: null,
+              nodeOutputsTruncated: false,
+              nodeOutputsMaxBytes: null,
+              usageSummary: null,
+              runEvents: [],
+              runNodes: {},
               runs: [],
               selectedRunId: null,
             }
@@ -797,8 +1006,8 @@ export default function App() {
     }
   }
 
-  async function changeDataDir(nextDataDir) {
-    if (!window.goferDesktop?.setDataDir) {
+  async function changeDataDir() {
+    if (!window.goferDesktop?.dataDirectory?.choose) {
       setTopBarNotice({
         type: "error",
         message: "Changing the app data folder is only available in the desktop app",
@@ -807,9 +1016,14 @@ export default function App() {
     }
 
     try {
-      setDataDirPickerOpen(false);
       setTopBarNotice({ type: "success", message: "Switching app data folder..." });
-      await window.goferDesktop.setDataDir(nextDataDir);
+      const result = await window.goferDesktop.dataDirectory.choose({ currentPath: dataDir });
+      if (!result?.dataDir) {
+        setTopBarNotice({ type: "", message: "" });
+        return;
+      }
+      setDataDir(result.dataDir);
+      await loadWorkflows();
     } catch (error) {
       setTopBarNotice({
         type: "error",
@@ -830,7 +1044,7 @@ export default function App() {
         width={workflowPaneWidth}
         onQueryChange={setQuery}
         onCreate={() => setCreateDialogOpen(true)}
-        onDataDirPick={() => setDataDirPickerOpen(true)}
+        onDataDirPick={changeDataDir}
         onDeleteWorkflow={deleteWorkflow}
         onDuplicateWorkflow={duplicateWorkflow}
         onRefresh={loadWorkflows}
@@ -861,9 +1075,11 @@ export default function App() {
                 setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
               }
             />
+            <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
             <DagCanvas
               dataDir={dataDir}
               logState={logState}
+              approvalState={approvalState}
               notice={topBarNotice}
               runState={runState}
               workflow={activeWorkflow}
@@ -875,6 +1091,9 @@ export default function App() {
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
               onStopWorkflow={stopWorkflowRun}
+              onDecideApproval={(approval, decision, notes, by) =>
+                decideApproval(activeWorkflow, approval, decision, notes, by)
+              }
               onWorkflowChange={updateActiveWorkflow}
             />
           </>
@@ -898,6 +1117,14 @@ export default function App() {
           })
         }
       />
+      {runPreview ? (
+        <RunPreviewDialog
+          plan={runPreview.plan}
+          workflow={runPreview.workflow}
+          onCancel={() => setRunPreview(null)}
+          onRun={() => executeWorkflowRun(runPreview.workflow, runPreview.triggerContext)}
+        />
+      ) : null}
       <CreateWorkflowDialog
         error={createState.error}
         open={createDialogOpen}
@@ -910,14 +1137,6 @@ export default function App() {
         }}
         onCreate={createWorkflow}
       />
-      {dataDirPickerOpen ? (
-        <PathPickerDialog
-          currentPath={dataDir}
-          label="app data folder"
-          onClose={() => setDataDirPickerOpen(false)}
-          onSelect={changeDataDir}
-        />
-      ) : null}
     </main>
   );
 }
@@ -964,7 +1183,7 @@ function getInitialTheme() {
   return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
-function summarizeWorkflow(workflow, dataDir = "") {
+export function summarizeWorkflow(workflow, dataDir = "") {
   if (workflow.invalid) {
     return {
       ...workflow,
@@ -1004,7 +1223,7 @@ function agentIdsForWorkflow(workflow) {
   ];
 }
 
-function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
+export function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
   const localNodesById = Object.fromEntries(
     (localWorkflow.nodes ?? []).map((node) => [node.id, node]),
   );
@@ -1020,7 +1239,7 @@ function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
   };
 }
 
-function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
+export function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
   const foundWorkflow = remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id);
   if (!foundWorkflow) {
     return [...remoteWorkflows, localWorkflow];
@@ -1035,6 +1254,79 @@ function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
         }, dataDir)
       : workflow,
   );
+}
+
+export function workflowPayloadForSave(workflow) {
+  return {
+    ...workflow,
+    nodes: (workflow.nodes ?? []).map((node) => ({
+      ...node,
+      x: node.x ?? 0,
+      y: node.y ?? 0,
+    })),
+    edges: workflow.edges ?? [],
+    agents: workflow.agents ?? {},
+  };
+}
+
+export function workflowPlanRequest(workflowId, triggerContext = {}) {
+  return {
+    url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/plan`),
+    options: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ triggerContext }),
+    },
+  };
+}
+
+export function workflowRunRequest(
+  workflowId,
+  { dryRun = false, triggerContext = {} } = {},
+) {
+  return {
+    url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/run`),
+    options: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ dryRun, triggerContext }),
+    },
+  };
+}
+
+export function workflowLogUrls(workflowId, runId = null) {
+  const encodedWorkflowId = encodeURIComponent(workflowId);
+  return {
+    latest: apiUrl(`/workflows/${encodedWorkflowId}/logs/latest`),
+    runs: apiUrl(`/workflows/${encodedWorkflowId}/logs`),
+    selected: runId
+      ? apiUrl(`/workflows/${encodedWorkflowId}/logs/${encodeURIComponent(runId)}`)
+      : null,
+  };
+}
+
+export function chatStreamRequestBody({ provider, model, messages, workflow }) {
+  return {
+    provider,
+    model,
+    messages,
+    workflow,
+  };
+}
+
+export function workflowIdsAfterDelete(workflows, deletedWorkflowId) {
+  return workflows
+    .filter((workflow) => workflow.id !== deletedWorkflowId)
+    .map((workflow) => workflow.id);
+}
+
+export function nextActiveWorkflowIdAfterDelete(workflows, activeWorkflowId, deletedWorkflowId) {
+  if (activeWorkflowId !== deletedWorkflowId) return activeWorkflowId;
+  return workflows.find((workflow) => workflow.id !== deletedWorkflowId)?.id;
 }
 
 function isUrlPath(pathValue = "") {
@@ -1096,7 +1388,7 @@ function WorkflowSidebar({
 
   async function openDataDir() {
     if (!dataDir) return;
-    await window.goferDesktop?.openPath?.(dataDir);
+    await window.goferDesktop?.workspace?.openPath?.(dataDir);
   }
 
   return (
@@ -1670,7 +1962,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows 
           "Content-Type": "application/json",
         },
         signal: abortController.signal,
-        body: JSON.stringify({
+        body: JSON.stringify(chatStreamRequestBody({
           provider: providerId,
           model,
           messages: nextMessages.map(({ role, body }) => ({ role, body })),
@@ -1679,7 +1971,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows 
             id: `workflow-assistant:${targetThreadId}`,
             chatThreadId: targetThreadId,
           },
-        }),
+        })),
       });
       if (!response.ok) {
         const payload = await response.json();
@@ -2293,7 +2585,7 @@ function extractThoughtTokenSummary(thoughts) {
 
 const chatThreadsStorageKey = "gofer-flow-chat-threads";
 
-function loadChatThreads() {
+export function loadChatThreads() {
   try {
     const storedThreads = JSON.parse(window.localStorage.getItem(chatThreadsStorageKey) || "[]");
     if (
@@ -2308,11 +2600,11 @@ function loadChatThreads() {
   return [];
 }
 
-function persistChatThreads(threads) {
+export function persistChatThreads(threads) {
   window.localStorage.setItem(chatThreadsStorageKey, JSON.stringify(threads));
 }
 
-function threadTitleFromMessage(message) {
+export function threadTitleFromMessage(message) {
   const words = message.trim().split(/\s+/).slice(0, 8);
   const title = words.join(" ");
   return title.length < message.trim().length ? `${title}...` : title || "New thread";
@@ -2332,7 +2624,7 @@ function defaultChatMessages() {
   return [];
 }
 
-function chatStorageKeyFor(threadId) {
+export function chatStorageKeyFor(threadId) {
   return `gofer-flow-chat-thread:${threadId}`;
 }
 
@@ -2351,7 +2643,7 @@ function loadChatMessages(storageKey) {
   return defaultChatMessages();
 }
 
-function buildChatItems(messages) {
+export function buildChatItems(messages) {
   const items = [];
   let index = 0;
 
@@ -2390,7 +2682,7 @@ function buildChatItems(messages) {
   return items;
 }
 
-function parseChatStreamEvent(line) {
+export function parseChatStreamEvent(line) {
   const trimmed = line.trim();
   if (!trimmed) return null;
   try {
@@ -2405,6 +2697,239 @@ function uniqueClientId() {
     return window.crypto.randomUUID();
   }
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function formatPreviewValue(value) {
+  if (value && typeof value === "object") {
+    if (typeof value.path === "string") return value.path;
+    if (typeof value.name === "string") return value.name;
+    return JSON.stringify(value);
+  }
+  return String(value);
+}
+
+function formatFanOutCount(fanOut) {
+  if (!fanOut || fanOut.count == null) return "unknown";
+  if (fanOut.countExact === false) {
+    return `at least ${fanOut.countLowerBound ?? fanOut.count}`;
+  }
+  return String(fanOut.count);
+}
+
+function formatTriggerContextItems(triggerContext) {
+  if (!triggerContext || typeof triggerContext !== "object") return [];
+  const items = [];
+  if (triggerContext.schedule) {
+    const schedule = triggerContext.schedule;
+    items.push(
+      `Schedule: ${schedule.cron_expression ?? schedule.cron ?? "configured"} timezone=${schedule.timezone ?? "local"}`,
+    );
+  }
+  if (triggerContext.watch) {
+    const watch = triggerContext.watch;
+    items.push(
+      `Watch: ${watch.path ?? ""} glob=${watch.glob ?? "*"} mode=${watch.mode ?? "batch"}`,
+    );
+  }
+  if (triggerContext.runContinuously) {
+    items.push("Run continuously: enabled");
+  }
+  if (triggerContext.provided) {
+    items.push(`Provided trigger context: ${JSON.stringify(triggerContext.provided)}`);
+  }
+  return items;
+}
+
+function buildRunPreviewTriggerContext(workflow) {
+  const triggerContext = {};
+  if (workflow.schedule) {
+    triggerContext.schedule = workflow.schedule;
+  }
+  if (workflow.watch) {
+    triggerContext.watch = workflow.watch;
+  }
+  if (workflow.runContinuously) {
+    triggerContext.runContinuously = true;
+  }
+  return triggerContext;
+}
+
+export function RunPreviewDialog({ plan, workflow, onCancel, onRun }) {
+  const warnings = plan?.warnings ?? [];
+  const destructiveActions = plan?.destructiveActions ?? [];
+  const providers = plan?.providerRequirements ?? [];
+  const requiredSecrets = plan?.requiredSecrets ?? [];
+  const unresolvedValues = plan?.unresolvedDynamicValues ?? [];
+  const triggerItems = formatTriggerContextItems(plan?.triggerContext);
+  const generations = plan?.generations ?? [];
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
+      <div className="flex max-h-[86vh] w-full max-w-[760px] flex-col rounded-lg border border-line bg-white shadow-panel">
+        <div className="flex items-center justify-between border-b border-line px-5 py-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-semibold">Run preview: {workflow.name}</h2>
+            <p className="text-xs text-muted">{workflow.id}</p>
+          </div>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            title="Close"
+            type="button"
+            onClick={onCancel}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="min-h-0 flex-1 space-y-4 overflow-auto px-5 py-4">
+          {destructiveActions.length > 0 ? (
+            <PreviewSection title="Destructive actions" tone="danger" items={destructiveActions} />
+          ) : null}
+          {warnings.length > 0 ? (
+            <PreviewSection title="Warnings" tone="warning" items={warnings} />
+          ) : null}
+          {requiredSecrets.length > 0 ? (
+            <PreviewSection title="Required secrets" items={requiredSecrets} />
+          ) : null}
+          {triggerItems.length > 0 ? (
+            <PreviewSection title="Trigger context" items={triggerItems} />
+          ) : null}
+          {providers.length > 0 ? (
+            <PreviewSection
+              title="Provider CLI requirements"
+              items={providers.map((provider) => {
+                const extraPaths = provider.extraPaths?.length
+                  ? ` extra_paths=${provider.extraPaths.join(", ")}`
+                  : "";
+                const binary = provider.binary ?? "unknown";
+                const availability = provider.available ? "available" : "missing";
+                return `${provider.agentId}: ${provider.subscription} binary=${binary} (${availability}) cwd=${provider.workingDir}${extraPaths}`;
+              })}
+            />
+          ) : null}
+          {unresolvedValues.length > 0 ? (
+            <PreviewSection
+              title="Unresolved dynamic values"
+              tone="warning"
+              items={unresolvedValues}
+            />
+          ) : null}
+
+          <section>
+            <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
+              Execution order
+            </h3>
+            <div className="space-y-2">
+              {generations.map((generation) => (
+                <details
+                  key={generation.index}
+                  className="rounded-lg border border-line bg-slate-50 px-3 py-2"
+                  open={generation.index === 0}
+                >
+                  <summary className="cursor-pointer text-sm font-semibold">
+                    Generation {generation.index} · {(generation.nodes ?? []).length} node
+                    {(generation.nodes ?? []).length === 1 ? "" : "s"}
+                  </summary>
+                  <div className="mt-2 space-y-2">
+                    {(generation.nodes ?? []).map((node) => (
+                      <div
+                        key={node.id}
+                        className="rounded-md border border-line bg-white px-3 py-2 text-sm"
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <p className="font-semibold">{node.id}</p>
+                            <p className="break-words text-xs text-muted">{node.detail}</p>
+                          </div>
+                          <span className="shrink-0 rounded-md bg-slate-100 px-2 py-1 text-xs text-muted">
+                            {node.type}
+                          </span>
+                        </div>
+                        {(node.sideEffects ?? []).length > 0 ? (
+                          <p className="mt-2 text-xs text-slate-600">
+                            {(node.sideEffects ?? []).join("; ")}
+                          </p>
+                        ) : null}
+                        {node.workingDir ? (
+                          <p className="mt-2 break-words text-xs text-slate-600">
+                            Working directory: {node.workingDir}
+                          </p>
+                        ) : null}
+                        {node.fanOut ? (
+                          <div className="mt-2 text-xs text-slate-600">
+                            <p>
+                              Fan-out {node.fanOut.sourceType}:{" "}
+                              {formatFanOutCount(node.fanOut)} item
+                              {node.fanOut.count === 1 && node.fanOut.countExact !== false
+                                ? ""
+                                : "s"}
+                            </p>
+                            {(node.fanOut.sampleItems ?? []).length > 0 ? (
+                              <ul className="mt-1 space-y-0.5">
+                                {(node.fanOut.sampleItems ?? []).map((sample, index) => (
+                                  <li key={`${node.id}-sample-${index}`}>
+                                    Sample: {formatPreviewValue(sample)}
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {(node.unresolvedDynamicValues ?? []).length > 0 ? (
+                          <div className="mt-2 text-xs text-amber-700">
+                            <p className="font-medium">Unresolved values</p>
+                            <ul className="mt-1 space-y-0.5">
+                              {(node.unresolvedDynamicValues ?? []).map((value) => (
+                                <li key={value}>{value}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-line px-5 py-4">
+          <button className="btn-ghost" type="button" onClick={onCancel}>
+            Cancel
+          </button>
+          <button
+            className="btn-primary inline-flex items-center justify-center gap-2 whitespace-nowrap"
+            type="button"
+            onClick={onRun}
+          >
+            <Play size={15} />
+            Run workflow
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function PreviewSection({ title, items, tone = "default" }) {
+  const toneClass =
+    tone === "danger"
+      ? "border-red-200 bg-red-50 text-red-800"
+      : tone === "warning"
+        ? "border-amber-200 bg-amber-50 text-amber-800"
+        : "border-line bg-slate-50 text-slate-700";
+
+  return (
+    <section className={`rounded-lg border px-3 py-2 ${toneClass}`}>
+      <h3 className="text-xs font-semibold uppercase">{title}</h3>
+      <ul className="mt-2 space-y-1 text-sm">
+        {items.map((item) => (
+          <li key={item}>- {item}</li>
+        ))}
+      </ul>
+    </section>
+  );
 }
 
 function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
@@ -2513,18 +3038,107 @@ function EmptyWorkspace({ error, loading, onRefresh }) {
   );
 }
 
+function WorkflowHealthPanel({ doctorState, workflow }) {
+  const globalErrors = doctorState?.errors ?? [];
+  const globalWarnings = doctorState?.warnings ?? [];
+  const workflowErrors = workflow?.healthErrors ?? [];
+  const workflowWarnings = workflow?.healthWarnings ?? [];
+  const errors = [...globalErrors, ...workflowErrors];
+  const warnings = [...globalWarnings, ...workflowWarnings];
+  const diagnostics = [...errors, ...warnings].filter((diagnostic) =>
+    diagnostic?.severity === "error" || diagnostic?.severity === "warning",
+  );
+  if (doctorState?.loading && !diagnostics.length) {
+    return (
+      <section className="border-b border-line bg-white px-5 py-2">
+        <div className="flex items-center gap-2 text-sm text-muted">
+          <Loader2 size={15} className="animate-spin" />
+          <span>Checking environment health...</span>
+        </div>
+      </section>
+    );
+  }
+  if (doctorState?.error && !diagnostics.length) {
+    return (
+      <section className="border-b border-amber-200 bg-amber-50 px-5 py-2">
+        <div className="flex items-center gap-2 text-sm text-amber-800">
+          <AlertCircle size={15} />
+          <span>{doctorState.error}</span>
+        </div>
+      </section>
+    );
+  }
+  if (!diagnostics.length) {
+    return (
+      <section className="border-b border-line bg-white px-5 py-2">
+        <div className="flex items-center gap-2 text-sm text-emerald-700">
+          <Check size={15} />
+          <span>Environment health checks passed.</span>
+        </div>
+      </section>
+    );
+  }
+
+  const errorCount = errors.length;
+  return (
+    <section
+      className={`border-b px-5 py-3 ${
+        errorCount ? "border-red-200 bg-red-50" : "border-amber-200 bg-amber-50"
+      }`}
+    >
+      <div className="flex items-start gap-3">
+        <AlertCircle
+          className={`mt-0.5 shrink-0 ${errorCount ? "text-red-600" : "text-amber-700"}`}
+          size={17}
+        />
+        <div className="min-w-0 flex-1">
+          <h2 className={`text-sm font-semibold ${errorCount ? "text-red-800" : "text-amber-900"}`}>
+            {errorCount ? "Environment setup needs attention" : "Environment setup warnings"}
+          </h2>
+          <ul className={`mt-1 space-y-1 text-sm leading-5 ${errorCount ? "text-red-700" : "text-amber-800"}`}>
+            {diagnostics.slice(0, 3).map((diagnostic, index) => (
+              <li key={`${diagnostic.id}-${diagnostic.subject ?? "workflow"}-${index}`}>
+                {diagnostic.message}
+              </li>
+            ))}
+          </ul>
+          {diagnostics.length > 3 ? (
+            <p className={`mt-1 text-xs ${errorCount ? "text-red-700" : "text-amber-800"}`}>
+              {diagnostics.length - 3} more issue{diagnostics.length === 4 ? "" : "s"} shown in workflow settings.
+            </p>
+          ) : null}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function agentExternalAccessWarnings(workflow) {
+  return (workflow?.resourceWarnings ?? []).filter((warning) =>
+    String(warning).includes("grants provider filesystem access outside working_dir"),
+  );
+}
+
 function StatusDot({ status }) {
   const normalizedStatus = status || "Ready";
   const color = {
     Ready: "bg-emerald-500",
     Success: "bg-emerald-500",
     Error: "bg-red-500",
+    Stopped: "bg-amber-500",
   }[normalizedStatus] ?? "bg-emerald-500";
+  const running = normalizedStatus === "Running";
 
   return (
-    <span className="flex shrink-0 items-center gap-1.5 rounded-md border border-line bg-white px-2 py-1 text-[11px] font-medium text-slate-600">
-      {normalizedStatus === "Running" ? (
-        <Loader2 size={11} className="animate-spin text-muted" />
+    <span
+      className={`flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1 text-[11px] font-medium ${
+        running
+          ? "border-blue-200 bg-blue-50 text-blue-700 dark:border-sky-700/70 dark:bg-sky-950/70 dark:text-sky-200"
+          : "border-line bg-white text-slate-600"
+      }`}
+    >
+      {running ? (
+        <Loader2 size={11} className="animate-spin text-blue-600 dark:text-sky-300" />
       ) : (
         <span className={`h-1.5 w-1.5 rounded-full ${color}`} />
       )}

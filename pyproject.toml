@@ -55,6 +55,22 @@ python_version = "3.11"
 module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*", "openpyxl", "openpyxl.*"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+# Keep application code strict while allowing pytest monkeypatches, fixtures, and
+# dynamic assertions to remain concise. The tests are still included in
+# `mypy src tests` so import/type regressions outside these test-only patterns
+# are checked.
+disable_error_code = [
+    "arg-type",
+    "attr-defined",
+    "call-overload",
+    "no-untyped-def",
+    "str-bytes-safe",
+    "union-attr",
+    "unused-ignore",
+]
+
 [tool.ruff]
 line-length = 100
 

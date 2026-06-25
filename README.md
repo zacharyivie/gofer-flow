@@ -1,13 +1,13 @@
 # Gofer Flow
 
-Gofer Flow is a Python CLI tool for defining and running graph-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, and LLM agent calls into directed graphs that may include recursive loops.
+Gofer Flow is a Python CLI tool for defining and running graph-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, structured HTTP requests, and LLM agent calls into directed graphs that may include recursive loops.
 
 The installed command is `gof`.
 
 ## What It Can Do
 
 - Run workflow nodes from start nodes through conditional edges, including recursive loops for improve/review or retry-until-output workflows.
-- Execute `bash_command`, `shell_script`, `python_script`, and `agent` nodes.
+- Execute `bash_command`, `shell_script`, `python_script`, `http_request`, and `agent` nodes.
 - Use Claude Code or Codex as agent backends through their local CLIs.
 - Validate workflow structure while allowing cycles and self-loops.
 - Show workflow structure in the terminal.
@@ -80,6 +80,23 @@ can run `gof` from new PowerShell or Command Prompt sessions after installation.
 On macOS, release builds publish a `.dmg`. Until the app is signed and notarized
 with an Apple Developer account, users may need to approve the app in System
 Settings after first launch.
+
+### Desktop Trust Model
+
+The Electron renderer runs with `contextIsolation: true`, `nodeIntegration:
+false`, and Electron sandboxing enabled. The preload bridge exposes only IPC
+methods backed by main-process validation. Main-process IPC handlers reject
+messages that do not come from the current main window main frame. Development
+mode allows the configured local Vite origin for that frame, while packaged
+builds allow only the bundled `frontend/dist` app entry and the bundled backend
+error page.
+
+Desktop file operations are confined to the active Gofer data directory unless
+the user explicitly selects another file or folder through the native picker.
+Selected paths are represented by short-lived session grants tracked by the
+preload bridge and checked by the main process. Deletes use the operating system
+trash instead of recursive removal, and external URL opening is restricted to
+`https:` links.
 
 ## CLI-Only Installs
 
@@ -293,6 +310,7 @@ working_dir = "."
 prompt_path = "prompts/reviewer.md"
 tools = []
 mcp_servers = []
+extra_paths = []
 env = {}
 
 [[nodes]]
@@ -314,6 +332,198 @@ to = "review"
 ```
 
 Prompt files support `{{var}}` interpolation from the context passed to an agent. When a predecessor node has `pipe_output = true`, its output is prepended to downstream agent prompts and sent to downstream script or command nodes as stdin.
+
+### HTTP request nodes
+
+Use `http_request` when a workflow needs a structured API call without shelling out to `curl`. URL, headers, query params, JSON body fields, raw body, and output mappings support `{{node.data.path}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation. Secret references use `{{secret.NAME}}` or `secret:NAME`; at runtime Gofer reads `GOFER_SECRET_NAME` or `NAME` from the environment and masks configured secret fields in logs.
+
+API polling:
+
+```toml
+[[nodes]]
+id = "poll-status"
+type = "http_request"
+method = "GET"
+url = "https://api.example.com/jobs/{{trigger.job_id}}"
+expected_statuses = [200]
+response_mode = "json"
+
+[nodes.headers]
+Authorization = "{{secret.API_TOKEN}}"
+
+[nodes.output_mapping]
+state = "json.state"
+```
+
+Issue creation:
+
+```toml
+[[nodes]]
+id = "create-issue"
+type = "http_request"
+method = "POST"
+url = "https://api.example.com/issues"
+expected_statuses = [201]
+response_mode = "json"
+secret_fields = ["Authorization"]
+
+[nodes.headers]
+Authorization = "{{secret.API_TOKEN}}"
+
+[nodes.json]
+title = "{{previous.data.title}}"
+body = "{{previous.output}}"
+
+[nodes.output_mapping]
+issue_id = "json.id"
+issue_url = "json.url"
+```
+
+Slack-style message posting:
+
+```toml
+[[nodes]]
+id = "notify"
+type = "http_request"
+method = "POST"
+url = "https://hooks.slack.com/services/{{secret.SLACK_WEBHOOK_PATH}}"
+expected_statuses = [200]
+body = '{"text":"Workflow {{trigger.workflow_id}} finished"}'
+secret_fields = ["url"]
+```
+
+Webhook callback with retry:
+
+```toml
+[[nodes]]
+id = "callback"
+type = "http_request"
+method = "POST"
+url = "{{trigger.callback_url}}"
+expected_statuses = [200, 202]
+
+[nodes.json]
+status = "{{previous.terminal_status}}"
+message = "{{previous.output}}"
+
+[nodes.retry]
+attempts = 3
+backoff_seconds = 1.5
+retry_on_statuses = [429, 500, 502, 503, 504]
+```
+
+### Approval gates and notifications
+
+Use `approval_gate` when a workflow should pause before continuing. The node writes a pending approval request under the Gofer data directory, records the run ID and node ID in the run log, and resumes when a user approves or rejects it from the CLI. Approval messages support the same `{{node.output}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation used by other nodes.
+
+```toml
+[[nodes]]
+id = "review-deploy"
+type = "approval_gate"
+message = "Deploy {{previous.output}} to production?"
+timeout_seconds = 3600
+approvers = ["ops"]
+notify = true
+notification_title = "Deployment approval needed"
+
+[[nodes]]
+id = "deploy"
+type = "bash_command"
+command = "./deploy.sh"
+
+[[nodes]]
+id = "record-rejection"
+type = "notification"
+title = "Deployment rejected"
+body = "Run {{review-deploy.data.runId}} was rejected: {{review-deploy.data.notes}}"
+
+[[edges]]
+from = "review-deploy"
+to = "deploy"
+condition = "on_success"
+
+[[edges]]
+from = "review-deploy"
+to = "record-rejection"
+condition = "on_failure"
+```
+
+CLI approval workflow:
+
+```bash
+# List pending approvals
+gof workflow approvals
+
+# Approve or reject a pending gate by run ID and node ID
+gof workflow approve 2026-06-24T10-15-300000-0400.log review-deploy \
+  --workflow deploy-flow \
+  --by alice \
+  --notes "Change reviewed"
+gof workflow reject 2026-06-24T10-15-300000-0400.log review-deploy \
+  --workflow deploy-flow \
+  --by bob \
+  --notes "Rollback plan missing"
+```
+
+Approval nodes return success only for explicit approval. Rejection and timeout return failure, so `on_failure` routes can handle both. Use `output_matches` against `approved`, `rejected`, or `timeout` when those outcomes need separate paths.
+
+Notifications currently support the `desktop` channel and use an adapter boundary so future email, Slack, Teams, or webhook providers can share the same TOML shape:
+
+```toml
+[[nodes]]
+id = "notify-ops"
+type = "notification"
+title = "Workflow needs attention"
+body = "Workflow {{trigger.workflow_id}} run {{trigger.run_id}} needs review."
+channel = "desktop"
+urgency = "normal"
+```
+
+### Resource limits
+
+Workflows use conservative default resource ceilings for local execution: fan-out item counts, files scanned, bytes read per file and per run, vector index size, subprocess output capture, node/run log bytes, UI request and log response bytes, chat prompt size, watcher queue depth, and watcher/continuous-run concurrency are bounded. A workflow that exceeds a limit fails closed with an error that includes the configured limit.
+
+Default limits:
+
+```toml
+[workflow.resource_limits]
+max_fanout_items = 1000
+max_files_scanned = 5000
+max_file_read_bytes = 1048576
+max_aggregate_read_bytes = 32000000
+max_vector_index_bytes = 50000000
+max_log_bytes_per_node = 1048576
+max_log_bytes_per_run = 20000000
+max_api_request_body_bytes = 1048576
+max_api_log_response_bytes = 1048576
+max_chat_prompt_bytes = 128000
+max_subprocess_output_bytes = 2000000
+max_watcher_queue_depth = 1000
+max_watcher_concurrency = 4
+max_fanout_concurrency = 16
+```
+
+Advanced local batch workflows can opt in to larger limits in TOML:
+
+```toml
+[workflow.resource_limits]
+max_fanout_items = 2000
+max_files_scanned = 10000
+max_file_read_bytes = 2097152
+max_aggregate_read_bytes = 67108864
+max_vector_index_bytes = 104857600
+max_log_bytes_per_node = 2097152
+max_log_bytes_per_run = 41943040
+max_api_request_body_bytes = 2097152
+max_api_log_response_bytes = 2097152
+max_chat_prompt_bytes = 262144
+max_subprocess_output_bytes = 4000000
+max_watcher_queue_depth = 2000
+max_watcher_concurrency = 4
+max_fanout_concurrency = 16
+```
+
+File watcher queues are bounded by `max_watcher_queue_depth`. When a hot watcher produces more events than fit, Gofer Flow keeps the newest queued batches/events and drops the oldest overflow before starting more runs. `max_watcher_concurrency` is also capped by the trusted server-wide limit, so a workflow override cannot raise host-wide watcher or continuous-run concurrency.
 
 ## Node Types
 
@@ -367,6 +577,19 @@ agent_id = "summarizer"
 prompt_path = "prompts/summarize.md"
 working_dir = "."
 input_mapping = { diff = "collect" }
+```
+
+Agent prompt context may contain file paths from triggers, fan-out items, or upstream
+outputs. Those path strings are treated as data and do not expand the provider
+sandbox. To intentionally grant access outside `working_dir`, add exact paths to the
+agent config:
+
+```toml
+[agents.summarizer]
+subscription = "codex"
+working_dir = "."
+prompt_path = "prompts/summarize.md"
+extra_paths = ["/path/to/shared/context"]
 ```
 
 ## Node Controls
@@ -489,6 +712,7 @@ Run checks after code changes:
 ruff check src tests --fix
 mypy src tests
 python -m pytest
+cd frontend && npm test && npm run check:build
 ```
 
 Run focused tests while developing:

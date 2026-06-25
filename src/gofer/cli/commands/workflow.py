@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -12,32 +14,46 @@ from rich.console import Console
 from rich.table import Table
 
 from gofer.core.agent import AgentConfig
+from gofer.core.approvals import ApprovalRequest, ApprovalStore
 from gofer.core.executor import WorkflowExecutor
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
+    FailOperation,
     FileOperation,
     FolderOperation,
+    HttpRequestOperation,
+    HttpRetryPolicy,
+    InfiniteFanSource,
     LocalSearchOperation,
     LocalVectorizeOperation,
+    LoopOperation,
     MoveFileOperation,
+    NotificationOperation,
     OpenResourceOperation,
     Operation,
     OperationType,
+    PassOperation,
     PromptFileOperation,
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
+    StartOperation,
     TabularFanSource,
     TriggerEventsFanSource,
     WriteFileOperation,
 )
+from gofer.core.planner import build_execution_plan, plan_to_json
+from gofer.core.run_outputs import write_run_node_outputs_payload
+from gofer.core.usage import summarize_node_outputs
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig, WorkflowConfig
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
@@ -45,10 +61,11 @@ from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
     WorkflowLogError,
+    WorkflowUpdateError,
+    duplicate_workflow_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_run_logs_payload,
-    duplicate_workflow_payload,
     rename_workflow_payload,
     workflow_run_log_payload,
 )
@@ -78,9 +95,7 @@ def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
     return find_workflow(name, data_dir)
 
 
-def _resolve_workflow_with_path(
-    name: str, data_dir: Path | None
-) -> tuple[AgenticWorkflow, Path]:
+def _resolve_workflow_with_path(name: str, data_dir: Path | None) -> tuple[AgenticWorkflow, Path]:
     """Resolve a workflow and the TOML path that should be updated."""
     path = Path(name)
     if path.suffix == ".toml":
@@ -106,6 +121,220 @@ def _resolve_workflow_with_path(
 
 def _log_base_dir(data_dir: Path | None) -> Path:
     return (data_dir or get_data_dir()) / "logs"
+
+
+def _agent_access_warnings(
+    wf: AgenticWorkflow,
+    path_base: Path | None = None,
+) -> list[str]:
+    return [
+        warning
+        for warning in wf.resource_warnings(path_base)
+        if "grants provider filesystem access outside working_dir" in warning
+    ]
+
+
+def _print_agent_access_summary(
+    wf: AgenticWorkflow,
+    path_base: Path | None = None,
+) -> None:
+    warnings = _agent_access_warnings(wf, path_base)
+    if not warnings:
+        return
+    console.print("[yellow]Agent filesystem access outside working_dir:[/yellow]")
+    for warning in warnings:
+        console.print(f"[yellow]- {warning}[/yellow]")
+
+
+def _print_local_vector_index_stats(data: dict[str, Any]) -> None:
+    if "indexed_file_count" not in data or "chunk_count" not in data:
+        return
+    strategy = data.get("strategy")
+    search_strategy = data.get("search_strategy")
+    console.print(
+        "[dim]Index stats: "
+        f"{data.get('indexed_file_count')} files, "
+        f"{data.get('chunk_count')} chunks, "
+        f"{data.get('index_size_bytes')} bytes, "
+        f"last update {data.get('last_update_time')}, "
+        f"strategy {strategy}, search {search_strategy}, "
+        f"{data.get('stale_files')} stale, {data.get('deleted_files')} deleted"
+        "[/dim]"
+    )
+
+
+def _parse_trigger_context(trigger_json: str | None) -> dict[str, Any] | None:
+    if not trigger_json:
+        return None
+    try:
+        data = json.loads(trigger_json)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"--trigger-json must be valid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise typer.BadParameter("--trigger-json must decode to an object")
+    return data
+
+
+def _print_execution_plan(plan: dict[str, Any]) -> None:
+    console.print(
+        f"[bold]Execution plan[/bold] for [cyan]{plan['workflowId']}[/cyan] "
+        f"({plan['workflowName']})"
+    )
+    trigger = plan.get("triggerContext") or {}
+    if trigger:
+        trigger_parts = []
+        if trigger.get("schedule"):
+            schedule = trigger["schedule"]
+            trigger_parts.append(
+                f"schedule={schedule.get('cron_expression')} {schedule.get('timezone')}"
+            )
+        if trigger.get("watch"):
+            watch = trigger["watch"]
+            trigger_parts.append(
+                f"watch={watch.get('path')} glob={watch.get('glob')} mode={watch.get('mode')}"
+            )
+        if trigger.get("runContinuously"):
+            trigger_parts.append("run_continuously=true")
+        if trigger.get("provided"):
+            trigger_parts.append("trigger_context=provided")
+        console.print("[bold]Trigger:[/bold] " + "; ".join(trigger_parts))
+
+    destructive = plan.get("destructiveActions") or []
+    if destructive:
+        console.print("[red]Destructive or high-impact actions:[/red]")
+        for action in destructive:
+            console.print(f"  • {action}")
+
+    warnings = plan.get("warnings") or []
+    if warnings:
+        console.print("[yellow]Warnings:[/yellow]")
+        for warning in warnings:
+            console.print(f"  • {warning}")
+
+    required_secrets = plan.get("requiredSecrets") or []
+    if required_secrets:
+        console.print("[yellow]Required secrets:[/yellow] " + ", ".join(required_secrets))
+
+    projected_usage = plan.get("projectedLlmUsage") or {}
+    if isinstance(projected_usage, dict) and projected_usage.get("agent_calls"):
+        console.print(
+            "[bold]Projected LLM usage:[/bold] "
+            f"calls={projected_usage.get('agent_calls')} "
+            f"tokens~{projected_usage.get('total_tokens')} "
+            f"cost~${float(projected_usage.get('estimated_cost') or 0.0):.6f}"
+        )
+
+    providers = plan.get("providerRequirements") or []
+    if providers:
+        console.print("[bold]Provider CLI requirements:[/bold]")
+        for provider in providers:
+            availability = "available" if provider.get("available") else "missing"
+            line = (
+                f"  • {provider['agentId']}: {provider['subscription']} "
+                f"binary={provider.get('binary') or 'unknown'} ({availability}) "
+                f"cwd={provider['workingDir']}"
+            )
+            extra_paths = provider.get("extraPaths") or []
+            if extra_paths:
+                line += f" extra_paths={', '.join(str(path) for path in extra_paths)}"
+            console.print(line)
+
+    unresolved = plan.get("unresolvedDynamicValues") or []
+    if unresolved:
+        console.print("[yellow]Unresolved dynamic values:[/yellow]")
+        for value in unresolved:
+            console.print(f"  • {value}")
+
+    for generation in plan.get("generations") or []:
+        table = Table(title=f"Generation {generation['index']}", show_lines=False)
+        table.add_column("Node")
+        table.add_column("Type")
+        table.add_column("Working dir")
+        table.add_column("Impact")
+        table.add_column("Fan-out")
+        for node in generation.get("nodes") or []:
+            fan_out = node.get("fanOut")
+            fan_text = ""
+            if fan_out:
+                fan_text = f"{fan_out.get('sourceType')} count={_format_fan_out_count(fan_out)}"
+                if fan_out.get("sampleItems"):
+                    samples = [_format_plan_sample(item) for item in fan_out["sampleItems"]]
+                    fan_text += f" samples={'; '.join(samples)}"
+            impact = "; ".join(node.get("sideEffects") or []) or node.get("detail", "")
+            if node.get("unresolvedDynamicValues"):
+                impact = "; ".join(
+                    [
+                        impact,
+                        "unresolved: "
+                        + ", ".join(str(value) for value in node["unresolvedDynamicValues"]),
+                    ]
+                ).strip("; ")
+            table.add_row(
+                node["id"],
+                node["type"],
+                str(node.get("workingDir") or ""),
+                impact,
+                fan_text,
+            )
+        console.print(table)
+        for node in generation.get("nodes") or []:
+            working_dir = node.get("workingDir")
+            if working_dir:
+                console.print(f"  Working dir for {node['id']}: {working_dir}")
+            fan_out = node.get("fanOut") or {}
+            if fan_out:
+                console.print(
+                    "  Fan-out for "
+                    f"{node['id']}: {fan_out.get('sourceType')} "
+                    f"count={_format_fan_out_count(fan_out)}"
+                )
+            samples = fan_out.get("sampleItems") or []
+            if samples:
+                sample_text = "; ".join(_format_plan_sample(item) for item in samples)
+                console.print(f"  Samples for {node['id']}: {sample_text}")
+
+
+def _print_validate_http_diagnostics(plan: dict[str, Any]) -> None:
+    http_requests: list[str] = []
+    for generation in plan.get("generations") or []:
+        for node in generation.get("nodes") or []:
+            for detail in node.get("sideEffectDetails") or []:
+                if detail.get("kind") == "network" and detail.get("action") == "http_request":
+                    http_requests.append(
+                        f"{node.get('id')}: {detail.get('method')} {detail.get('host')}"
+                    )
+    if http_requests:
+        console.print("[bold]HTTP requests:[/bold]")
+        for request in http_requests:
+            console.print(f"  • {request}")
+    required_secrets = plan.get("requiredSecrets") or []
+    if required_secrets:
+        console.print("[yellow]Required secrets:[/yellow] " + ", ".join(required_secrets))
+    unresolved = plan.get("unresolvedDynamicValues") or []
+    if unresolved:
+        console.print("[yellow]Unresolved dynamic values:[/yellow]")
+        for value in unresolved:
+            console.print(f"  • {value}")
+
+
+def _format_plan_sample(item: Any) -> str:
+    if isinstance(item, dict):
+        if "path" in item:
+            return str(item["path"])
+        if "name" in item:
+            return str(item["name"])
+        return json.dumps(item, sort_keys=True, default=str)
+    return str(item)
+
+
+def _format_fan_out_count(fan_out: dict[str, Any]) -> str:
+    count = fan_out.get("count")
+    if count is None:
+        return "unknown"
+    if fan_out.get("countExact", True):
+        return str(count)
+    lower_bound = fan_out.get("countLowerBound", count)
+    return f"at least {lower_bound}"
 
 
 def _workflow_log_context(workflow: str, data_dir: Path | None) -> tuple[str, Path]:
@@ -142,8 +371,22 @@ def _parse_json_object(value: str | None, option_name: str) -> dict[str, str]:
     return {str(k): str(v) for k, v in parsed.items()}
 
 
+def _parse_json_value(value: str | None, option_name: str) -> object | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed: object = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise typer.BadParameter(f"{option_name} must be valid JSON") from exc
+    return parsed
+
+
 def _save_workflow(wf: AgenticWorkflow, path: Path) -> None:
-    wf.validate()
+    try:
+        wf.validate(path)
+    except Exception as exc:
+        console.print(f"[red]Invalid workflow: {exc}[/red]")
+        raise typer.Exit(1)
     path.parent.mkdir(parents=True, exist_ok=True)
     wf.to_file(path)
     console.print(f"[green]Saved[/green] {path}")
@@ -157,7 +400,7 @@ def _fan_source_from_options(
     fan_include_content: bool,
     fan_max_concurrency: int,
     fan_fail_fast: bool,
-):
+) -> Any | None:
     if fan_source is None:
         return None
     normalized = fan_source.replace("_", "-")
@@ -197,8 +440,10 @@ def _fan_source_from_options(
             max_concurrency=fan_max_concurrency,
             fail_fast=fan_fail_fast,
         )
+    if normalized == "infinite":
+        return InfiniteFanSource(type="infinite")
     raise typer.BadParameter(
-        "--fan-source must be one of count, tabular, directory, trigger-events"
+        "--fan-source must be one of count, tabular, directory, trigger-events, infinite"
     )
 
 
@@ -213,6 +458,7 @@ def _operation_from_options(
     target: str | None,
     resource_type: str,
     content: str,
+    message: str,
     template: str,
     template_path: Path | None,
     output_path: Path | None,
@@ -225,6 +471,11 @@ def _operation_from_options(
     target_text: str,
     instructions: str,
     index_path: Path | None,
+    vector_mode: str,
+    search_top_k: int,
+    search_score_threshold: float,
+    search_include_snippets: bool,
+    search_include_file_metadata: bool,
     dynamic_count: str,
     memory: str,
     input_mapping: dict[str, str],
@@ -238,10 +489,45 @@ def _operation_from_options(
     missing_ok: bool,
     encoding: str,
     errors: str,
+    fan_glob: str,
     fan_source: Any,
+    http_method: str,
+    http_url: str | None,
+    http_headers: dict[str, str],
+    http_params: dict[str, str],
+    http_json: object | None,
+    http_body: str | None,
+    http_timeout_seconds: float,
+    http_retry_attempts: int,
+    http_retry_backoff_seconds: float,
+    http_retry_statuses: list[int],
+    http_expected_statuses: list[int],
+    http_response_mode: str,
+    http_output_mapping: dict[str, str],
+    http_secret_fields: list[str],
+    approval_timeout_seconds: float | None,
+    approval_timeout_decision: str,
+    approval_approvers: list[str],
+    approval_notify: bool,
+    notification_title: str,
+    notification_body: str,
+    notification_channel: str,
+    notification_urgency: str,
 ) -> Operation:
     normalized = node_type.replace("-", "_")
     match normalized:
+        case OperationType.START:
+            return StartOperation(type=OperationType.START)
+        case OperationType.PASS:
+            return PassOperation(type=OperationType.PASS, message=message)
+        case OperationType.FAIL:
+            return FailOperation(type=OperationType.FAIL, message=message)
+        case OperationType.BREAK:
+            return BreakOperation(type=OperationType.BREAK, message=message)
+        case OperationType.LOOP:
+            if fan_source is None:
+                raise typer.BadParameter("--fan-source is required for loop nodes")
+            return LoopOperation(type=OperationType.LOOP, source=fan_source)
         case OperationType.BASH_COMMAND:
             if command is None:
                 raise typer.BadParameter("--command is required for bash_command nodes")
@@ -376,12 +662,17 @@ def _operation_from_options(
                 raise typer.BadParameter(
                     "--source-path and --index-path are required for local_vectorize nodes"
                 )
+            if vector_mode not in {"incremental", "full", "validate", "compact"}:
+                raise typer.BadParameter(
+                    "--vector-mode must be one of incremental, full, validate, compact"
+                )
             return LocalVectorizeOperation(
                 type=OperationType.LOCAL_VECTORIZE,
                 source_path=source_path,
                 index_path=index_path,
                 glob=fan_glob,
                 recursive=recursive,
+                mode=vector_mode,  # type: ignore[arg-type]
             )
         case OperationType.LOCAL_SEARCH:
             if index_path is None:
@@ -390,6 +681,60 @@ def _operation_from_options(
                 type=OperationType.LOCAL_SEARCH,
                 index_path=index_path,
                 query=target_text or command or "",
+                top_k=search_top_k,
+                score_threshold=search_score_threshold,
+                include_snippets=search_include_snippets,
+                include_file_metadata=search_include_file_metadata,
+            )
+        case OperationType.HTTP_REQUEST:
+            if http_url is None:
+                raise typer.BadParameter("--url is required for http_request nodes")
+            if http_response_mode not in {"auto", "json", "text", "none"}:
+                raise typer.BadParameter("--response-mode must be one of auto, json, text, none")
+            return HttpRequestOperation(
+                type=OperationType.HTTP_REQUEST,
+                method=http_method.upper(),
+                url=http_url,
+                headers=http_headers,
+                params=http_params,
+                json=http_json,
+                body=http_body,
+                timeout_seconds=http_timeout_seconds,
+                retry=HttpRetryPolicy(
+                    attempts=http_retry_attempts,
+                    backoff_seconds=http_retry_backoff_seconds,
+                    retry_on_statuses=http_retry_statuses,
+                ),
+                expected_statuses=http_expected_statuses,
+                response_mode=http_response_mode,  # type: ignore[arg-type]
+                output_mapping=http_output_mapping,
+                secret_fields=http_secret_fields,
+            )
+        case OperationType.APPROVAL_GATE:
+            if not message:
+                raise typer.BadParameter("--message is required for approval_gate nodes")
+            if approval_timeout_decision not in {"reject", "timeout"}:
+                raise typer.BadParameter("--timeout-decision must be reject or timeout")
+            return ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message=message,
+                timeout_seconds=approval_timeout_seconds,
+                timeout_decision=approval_timeout_decision,  # type: ignore[arg-type]
+                approvers=approval_approvers,
+                notify=approval_notify,
+                notification_title=notification_title,
+            )
+        case OperationType.NOTIFICATION:
+            if notification_channel != "desktop":
+                raise typer.BadParameter("--channel must be desktop")
+            if notification_urgency not in {"low", "normal", "critical"}:
+                raise typer.BadParameter("--urgency must be low, normal, or critical")
+            return NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                title=notification_title,
+                body=notification_body or message,
+                channel=notification_channel,  # type: ignore[arg-type]
+                urgency=notification_urgency,  # type: ignore[arg-type]
             )
         case OperationType.AGENT:
             if agent_id is None or working_dir is None:
@@ -402,23 +747,22 @@ def _operation_from_options(
                 )
             if memory not in {"none", "run", "all"}:
                 raise typer.BadParameter("--memory must be one of none, run, all")
-            count: int | str = int(dynamic_count) if dynamic_count.isdigit() else dynamic_count
             return AgentOperation(
                 type=OperationType.AGENT,
                 agent_id=agent_id,
                 prompt_path=prompt_path,
                 working_dir=working_dir,
                 skill_name=skill_name,
-                dynamic_count=count,
                 memory=memory,  # type: ignore[arg-type]
                 input_mapping=input_mapping,
-                fan_source=fan_source,
             )
     raise typer.BadParameter(
         "node type must be one of "
-        "bash_command, python_script, shell_script, agent, read_file, write_file, "
+        "start, pass, fail, break, loop, bash_command, python_script, shell_script, "
+        "agent, read_file, write_file, "
         "copy_file, move_file, delete_file, file, folder, open_resource, prompt_file, "
-        "common_llm_task, local_vectorize, local_search"
+        "common_llm_task, local_vectorize, local_search, http_request, "
+        "approval_gate, notification"
     )
 
 
@@ -427,6 +771,11 @@ def run(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simulate without executing"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show each node's output"),
+    trigger_json: str | None = typer.Option(
+        None,
+        "--trigger-json",
+        help="Trigger context JSON object used for dry-run planning",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Execute a workflow by name or file path."""
@@ -436,8 +785,19 @@ def run(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
-    wf.validate()
+    wf.validate(workflow_path)
+    _print_agent_access_summary(wf, workflow_path.parent)
+    trigger_context = _parse_trigger_context(trigger_json)
     base = data_dir or workflow_path.parent
+    if dry_run:
+        _print_execution_plan(
+            build_execution_plan(
+                wf,
+                workflow_path=workflow_path,
+                trigger_context=trigger_context,
+            )
+        )
+        return
     if wf.config.run_continuously:
         runs = list_workflow_run_logs_payload(wf.config.id, base).get("runs") or []
         if any(run_log.get("status") == "running" for run_log in runs):
@@ -453,9 +813,14 @@ def run(
             _SUBSCRIPTIONS,
             dry_run=dry_run,
             log_base_dir=base / "logs",
+            workflow_path=workflow_path,
             stop_file=workflow_stop_path(wf.config.id, base),
-        ).run()
+        )
+        .with_trigger_context(trigger_context or {})
+        .run()
     )
+    if result.log_path:
+        write_run_node_outputs_payload(result, wf.config.resource_limits)
 
     if verbose:
         for node_id, node_out in result.node_outputs.items():
@@ -467,15 +832,161 @@ def run(
                         console.print(output)
             else:
                 console.print(f"\n{status} [bold]{node_id}[/bold]")
-                if node_out.output:
-                    console.print(node_out.output)
+                output_text = node_out.output
+                if node_out.type == str(OperationType.HTTP_REQUEST):
+                    preview = node_out.data.get("responsePreview")
+                    if isinstance(preview, dict) and isinstance(preview.get("body"), str):
+                        output_text = str(preview["body"])
+                    elif isinstance(node_out.data.get("error"), str):
+                        output_text = str(node_out.data["error"])
+                if output_text:
+                    console.print(output_text)
+                if node_out.type == str(OperationType.LOCAL_VECTORIZE):
+                    _print_local_vector_index_stats(node_out.data)
 
+    _print_usage_summary(result.usage_summary)
     if result.success:
-        console.print(f"[green]✓[/green] Workflow '{result.workflow_id}' completed successfully "
-                      f"in {result.duration_seconds:.2f}s")
+        console.print(
+            f"[green]✓[/green] Workflow '{result.workflow_id}' completed successfully "
+            f"in {result.duration_seconds:.2f}s"
+        )
     else:
         console.print(f"[red]✗[/red] Workflow '{result.workflow_id}' failed")
         raise typer.Exit(1)
+
+
+def _print_usage_summary(summary: dict[str, object]) -> None:
+    totals = summary.get("totals") if isinstance(summary, dict) else None
+    if not isinstance(totals, dict) or not totals.get("agent_calls"):
+        return
+    console.print(
+        "[bold]LLM usage:[/bold] "
+        f"calls={totals.get('agent_calls')} "
+        f"tokens={totals.get('total_tokens')} "
+        f"cost~${float(totals.get('estimated_cost') or 0.0):.6f} "
+        f"agent_time={float(totals.get('agent_time_seconds') or 0.0):.2f}s"
+    )
+
+
+@app.command("plan")
+def plan(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    json_output: bool = typer.Option(False, "--json", help="Print the plan as JSON"),
+    trigger_json: str | None = typer.Option(
+        None,
+        "--trigger-json",
+        help="Trigger context JSON object for trigger-event fan-out estimates",
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Preview execution order, fan-out, provider calls, and side effects."""
+    try:
+        wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
+        wf.validate(workflow_path)
+        trigger_context = _parse_trigger_context(trigger_json)
+        plan_payload = build_execution_plan(
+            wf,
+            workflow_path=workflow_path,
+            trigger_context=trigger_context,
+        )
+    except Exception as exc:
+        console.print(f"[red]Plan failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    if json_output:
+        sys.stdout.write(plan_to_json(plan_payload))
+        sys.stdout.write("\n")
+        return
+    _print_execution_plan(plan_payload)
+
+
+@app.command("usage")
+def usage(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    json_output: bool = typer.Option(False, "--json", help="Print usage as JSON"),
+    limit: int = typer.Option(10, "--limit", min=1, help="Number of recent runs to inspect"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Show LLM usage summaries for recent workflow runs."""
+    try:
+        workflow_id, base = _workflow_log_context(workflow, data_dir)
+        runs_payload = list_workflow_run_logs_payload(workflow_id, base)
+    except (KeyError, WorkflowLogError) as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1)
+
+    run_summaries = []
+    for run_log in (runs_payload.get("runs") or [])[:limit]:
+        run_id = str(run_log["id"])
+        try:
+            payload = workflow_run_log_payload(workflow_id, run_id, base)
+        except WorkflowLogError:
+            continue
+        summary = payload.get("usageSummary")
+        if not isinstance(summary, dict):
+            summary = summarize_node_outputs(payload.get("nodeOutputs") or {})
+        run_summaries.append(
+            {
+                "runId": run_id,
+                "startedAt": payload.get("startedAt"),
+                "status": payload.get("status"),
+                "summary": summary,
+            }
+        )
+
+    totals = {
+        "agent_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost": 0.0,
+        "agent_time_seconds": 0.0,
+    }
+    for run_summary in run_summaries:
+        summary = run_summary["summary"]
+        run_totals = summary.get("totals") if isinstance(summary, dict) else {}
+        if not isinstance(run_totals, dict):
+            continue
+        for key in ("agent_calls", "input_tokens", "output_tokens", "total_tokens"):
+            totals[key] += int(run_totals.get(key) or 0)
+        totals["estimated_cost"] += float(run_totals.get("estimated_cost") or 0.0)
+        totals["agent_time_seconds"] += float(run_totals.get("agent_time_seconds") or 0.0)
+
+    payload = {
+        "workflowId": workflow_id,
+        "runs": run_summaries,
+        "totals": totals,
+    }
+    if json_output:
+        sys.stdout.write(json.dumps(payload, default=str))
+        sys.stdout.write("\n")
+        return
+
+    if not run_summaries:
+        console.print(f"No usage records found for [bold]{workflow_id}[/bold].")
+        return
+    _print_usage_summary({"totals": totals})
+    table = Table(title=f"Recent LLM usage for {workflow_id}")
+    table.add_column("Run")
+    table.add_column("Status")
+    table.add_column("Calls", justify="right")
+    table.add_column("Tokens", justify="right")
+    table.add_column("Cost", justify="right")
+    table.add_column("Agent time", justify="right")
+    for run_summary in run_summaries:
+        summary = run_summary["summary"]
+        run_totals = summary.get("totals") if isinstance(summary, dict) else {}
+        if not isinstance(run_totals, dict):
+            run_totals = {}
+        table.add_row(
+            str(run_summary["runId"]),
+            str(run_summary.get("status") or "unknown"),
+            str(run_totals.get("agent_calls") or 0),
+            str(run_totals.get("total_tokens") or 0),
+            f"${float(run_totals.get('estimated_cost') or 0.0):.6f}",
+            f"{float(run_totals.get('agent_time_seconds') or 0.0):.2f}s",
+        )
+    console.print(table)
 
 
 @app.command("stop")
@@ -495,6 +1006,219 @@ def stop(
     console.print(f"[green]Stop requested[/green] for '{wf.config.id}' via {stop_path}")
 
 
+def _find_approval_request(
+    store: ApprovalStore,
+    run_id: str,
+    node_id: str,
+    workflow_id: str | None,
+) -> ApprovalRequest | None:
+    if workflow_id:
+        request = store.get(workflow_id, run_id, node_id)
+        return request if request is not None and request.decision is None else None
+    matches = [
+        request
+        for request in store.list_pending()
+        if request.run_id == run_id and request.node_id == node_id
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _approval_waiter_is_live(request: ApprovalRequest) -> bool:
+    if request.waiter_pid is None:
+        return False
+    try:
+        os.kill(request.waiter_pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _resume_decided_approval(
+    store: ApprovalStore,
+    request: ApprovalRequest,
+    data_dir: Path | None,
+) -> None:
+    if request.decision is None or _approval_waiter_is_live(request):
+        return
+    workflow_path = Path(request.workflow_path) if request.workflow_path else None
+    if workflow_path is None or not workflow_path.exists():
+        base = data_dir or get_data_dir()
+        workflow_path = base / f"{request.workflow_id}.toml"
+    if not workflow_path.exists():
+        return
+    try:
+        workflow = AgenticWorkflow.from_file(workflow_path)
+        result = asyncio.run(
+            WorkflowExecutor(
+                workflow,
+                _SUBSCRIPTIONS,
+                log_base_dir=(data_dir or workflow_path.parent) / "logs",
+                workflow_path=workflow_path,
+                approval_store=store,
+            ).resume_from_approval(request)
+        )
+    except Exception as exc:  # noqa: BLE001
+        console.print(f"[yellow]Approval recorded, but resume failed: {exc}[/yellow]")
+        return
+    if result is not None:
+        if result.log_path:
+            write_run_node_outputs_payload(result, workflow.config.resource_limits)
+        console.print(f"[green]Resumed[/green] {request.workflow_id} {request.run_id}")
+
+
+def _is_timeout_decision(request: ApprovalRequest) -> bool:
+    return (
+        request.decision is not None
+        and request.decision.decided_by == "gofer"
+        and request.decision.notes.startswith("Timed out after ")
+    )
+
+
+def _resume_expired_approvals(
+    store: ApprovalStore,
+    requests: list[ApprovalRequest],
+    data_dir: Path | None,
+) -> None:
+    for request in requests:
+        if _is_timeout_decision(request):
+            _resume_decided_approval(store, request, data_dir)
+
+
+@app.command("approvals")
+def approvals(
+    workflow: str | None = typer.Option(
+        None,
+        "--workflow",
+        "-w",
+        help="Only show pending approvals for this workflow ID",
+    ),
+    all_requests: bool = typer.Option(
+        False,
+        "--all",
+        help="Show pending and completed approval decisions",
+    ),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """List approval gates."""
+    store = ApprovalStore(data_dir)
+    all_loaded_requests = store.list_requests(workflow)
+    _resume_expired_approvals(store, all_loaded_requests, data_dir)
+    requests = (
+        all_loaded_requests
+        if all_requests
+        else [request for request in all_loaded_requests if request.decision is None]
+    )
+    if not requests:
+        console.print("No approvals" if all_requests else "No pending approvals")
+        return
+    if all_requests:
+        table = Table()
+        table.add_column("Workflow")
+        table.add_column("Run ID")
+        table.add_column("Node")
+        table.add_column("Status")
+        table.add_column("Decision")
+        table.add_column("Message")
+    else:
+        table = Table("Workflow", "Run ID", "Node", "Requested", "Message")
+    for request in requests:
+        decision = request.decision
+        if all_requests:
+            table.add_row(
+                request.workflow_id,
+                request.run_id,
+                request.node_id,
+                "decided" if decision is not None else "pending",
+                (f"{decision.decision} by {decision.decided_by}" if decision is not None else ""),
+                request.message,
+            )
+        else:
+            table.add_row(
+                request.workflow_id,
+                request.run_id,
+                request.node_id,
+                request.requested_at,
+                request.message,
+            )
+    console.print(table)
+
+
+@app.command("approve")
+def approve(
+    run_id: str = typer.Argument(..., help="Run ID from the pending approval"),
+    node_id: str = typer.Argument(..., help="Approval node ID"),
+    workflow: str | None = typer.Option(
+        None,
+        "--workflow",
+        "-w",
+        help="Workflow ID when run/node IDs are not unique",
+    ),
+    by: str = typer.Option("cli", "--by", help="Approver identity/source"),
+    notes: str = typer.Option("", "--notes", help="Decision notes"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Approve a pending approval gate."""
+    store = ApprovalStore(data_dir)
+    request = _find_approval_request(store, run_id, node_id, workflow)
+    if request is None:
+        console.print("[red]Pending approval not found or not unique; pass --workflow.[/red]")
+        raise typer.Exit(1)
+    try:
+        decided = store.decide(
+            request.workflow_id,
+            run_id,
+            node_id,
+            "approved",
+            decided_by=by,
+            notes=notes,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Approved[/green] {request.workflow_id} {run_id} {node_id}")
+    _resume_decided_approval(store, decided, data_dir)
+
+
+@app.command("reject")
+def reject(
+    run_id: str = typer.Argument(..., help="Run ID from the pending approval"),
+    node_id: str = typer.Argument(..., help="Approval node ID"),
+    workflow: str | None = typer.Option(
+        None,
+        "--workflow",
+        "-w",
+        help="Workflow ID when run/node IDs are not unique",
+    ),
+    by: str = typer.Option("cli", "--by", help="Approver identity/source"),
+    notes: str = typer.Option("", "--notes", help="Decision notes"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Reject a pending approval gate."""
+    store = ApprovalStore(data_dir)
+    request = _find_approval_request(store, run_id, node_id, workflow)
+    if request is None:
+        console.print("[red]Pending approval not found or not unique; pass --workflow.[/red]")
+        raise typer.Exit(1)
+    try:
+        decided = store.decide(
+            request.workflow_id,
+            run_id,
+            node_id,
+            "rejected",
+            decided_by=by,
+            notes=notes,
+        )
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    console.print(f"[green]Rejected[/green] {request.workflow_id} {run_id} {node_id}")
+    _resume_decided_approval(store, decided, data_dir)
+
+
 @app.command("validate")
 def validate(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
@@ -502,8 +1226,14 @@ def validate(
 ) -> None:
     """Validate a workflow by name or file path."""
     try:
-        wf = _resolve_workflow(workflow, data_dir)
-        wf.validate()
+        wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
+        wf.validate(workflow_path)
+        _print_validate_http_diagnostics(
+            build_execution_plan(
+                wf,
+                workflow_path=workflow_path,
+            )
+        )
         console.print(f"[green]✓[/green] '{wf.config.id}' is valid")
     except Exception as exc:
         console.print(f"[red]✗[/red] Validation failed: {exc}")
@@ -525,7 +1255,7 @@ def import_workflow(
     try:
         if replace:
             workflow = AgenticWorkflow.from_file(source)
-            workflow.validate()
+            workflow.validate(source)
             base.mkdir(parents=True, exist_ok=True)
             destination = base / f"{workflow.config.id}.toml"
             workflow.to_file(destination)
@@ -588,12 +1318,14 @@ def logs_list(
 
     for run_log in runs:
         console.print(
-            "\t".join((
-                str(run_log["id"]),
-                str(run_log.get("startedAt") or "unknown"),
-                str(run_log.get("status") or "unknown"),
-                str(base / "logs" / workflow_id / str(run_log["id"])),
-            ))
+            "\t".join(
+                (
+                    str(run_log["id"]),
+                    str(run_log.get("startedAt") or "unknown"),
+                    str(run_log.get("status") or "unknown"),
+                    str(base / "logs" / workflow_id / str(run_log["id"])),
+                )
+            )
         )
 
 
@@ -660,9 +1392,7 @@ def set_info(
         schedule=wf.config.schedule,
         watch=wf.config.watch,
         run_continuously=(
-            run_continuously
-            if run_continuously is not None
-            else wf.config.run_continuously
+            run_continuously if run_continuously is not None else wf.config.run_continuously
         ),
         max_total_node_runs=(
             max_total_node_runs
@@ -768,8 +1498,11 @@ def add_agent(
     working_dir: Path = typer.Option(..., "--working-dir", help="Agent working directory"),
     prompt_path: Path = typer.Option(..., "--prompt-path", help="Prompt markdown path"),
     tool: list[str] | None = typer.Option(None, "--tool", help="Allowed tool name"),
-    mcp_server: list[str] | None = typer.Option(
-        None, "--mcp-server", help="MCP server name"
+    mcp_server: list[str] | None = typer.Option(None, "--mcp-server", help="MCP server name"),
+    extra_path: list[Path] | None = typer.Option(
+        None,
+        "--extra-path",
+        help="Additional path to grant the provider sandbox (repeatable)",
     ),
     env: list[str] | None = typer.Option(None, "--env", help="Environment KEY=VALUE"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
@@ -791,6 +1524,7 @@ def add_agent(
                 tools=tool or [],
                 mcp_servers=mcp_server or [],
                 env=_parse_key_values(env, "--env"),
+                extra_paths=[path.expanduser().resolve() for path in extra_path or []],
             )
         )
     except Exception as exc:
@@ -822,6 +1556,7 @@ def add_node(
         "auto", "--resource-type", help="auto, file, folder, url, or app"
     ),
     content: str = typer.Option("", "--content", help="Content for write_file nodes"),
+    message: str = typer.Option("", "--message", help="Message for pass/fail nodes"),
     template: str = typer.Option("", "--template", help="Inline prompt template"),
     template_path: Path | None = typer.Option(
         None, "--template-path", help="Prompt template file path"
@@ -845,6 +1580,27 @@ def add_node(
     ),
     instructions: str = typer.Option("", "--instructions", help="Task instructions"),
     index_path: Path | None = typer.Option(None, "--index-path", help="Local vector index path"),
+    vector_mode: str = typer.Option(
+        "incremental",
+        "--vector-mode",
+        help="local_vectorize mode: incremental, full, validate, or compact",
+    ),
+    search_top_k: int = typer.Option(5, "--top-k", min=1, help="local_search result count"),
+    search_score_threshold: float = typer.Option(
+        0.0,
+        "--score-threshold",
+        help="Minimum local_search score to include",
+    ),
+    search_include_snippets: bool = typer.Option(
+        True,
+        "--include-snippets/--no-include-snippets",
+        help="Include snippets in local_search results",
+    ),
+    search_include_file_metadata: bool = typer.Option(
+        True,
+        "--include-file-metadata/--no-include-file-metadata",
+        help="Include file metadata in local_search results",
+    ),
     dynamic_count: str = typer.Option("1", "--dynamic-count", help="Agent dynamic count"),
     memory: str = typer.Option(
         "none",
@@ -853,6 +1609,13 @@ def add_node(
     ),
     input_map: list[str] | None = typer.Option(
         None, "--input-map", help="Agent input mapping KEY=CTX_PATH"
+    ),
+    node_input: list[str] | None = typer.Option(
+        None,
+        "--input",
+        help=(
+            "Common node input KEY=CTX_PATH. Use stdin=SOURCE or env.NAME=SOURCE for command nodes."
+        ),
     ),
     input_mapping_json: str | None = typer.Option(
         None, "--input-mapping-json", help="Agent input mapping JSON object"
@@ -880,11 +1643,18 @@ def add_node(
         "--allow-failure",
         help="Allow this node to fail without failing the overall workflow",
     ),
+    await_all_inputs: bool = typer.Option(
+        True,
+        "--await-all-inputs/--no-await-all-inputs",
+        help="Wait for all upstream nodes before this node runs",
+    ),
     retry_count: int = typer.Option(0, "--retry-count", min=0),
     retry_delay_seconds: float = typer.Option(1.0, "--retry-delay-seconds", min=0.0),
     timeout_seconds: float | None = typer.Option(None, "--timeout-seconds", min=0.0),
     fan_source: str | None = typer.Option(
-        None, "--fan-source", help="count, tabular, directory, or trigger-events"
+        None,
+        "--fan-source",
+        help="loop source: count, tabular, directory, trigger-events, or infinite",
     ),
     fan_count: str = typer.Option("1", "--fan-count"),
     fan_path: Path | None = typer.Option(None, "--fan-path"),
@@ -892,6 +1662,50 @@ def add_node(
     fan_include_content: bool = typer.Option(False, "--fan-include-content"),
     fan_max_concurrency: int = typer.Option(16, "--fan-max-concurrency", min=1),
     fan_fail_fast: bool = typer.Option(False, "--fan-fail-fast"),
+    http_method: str = typer.Option("GET", "--method", help="HTTP method for http_request"),
+    http_url: str | None = typer.Option(None, "--url", help="URL for http_request"),
+    http_header: list[str] | None = typer.Option(None, "--header", help="HTTP header KEY=VALUE"),
+    http_param: list[str] | None = typer.Option(
+        None, "--param", help="HTTP query parameter KEY=VALUE"
+    ),
+    http_json: str | None = typer.Option(None, "--json-body", help="HTTP JSON request body"),
+    http_body: str | None = typer.Option(None, "--body", help="HTTP raw request body"),
+    http_timeout: float = typer.Option(30.0, "--http-timeout", min=0.1),
+    http_retry_attempts: int = typer.Option(1, "--http-retry-attempts", min=1),
+    http_retry_backoff: float = typer.Option(0.0, "--http-retry-backoff", min=0.0),
+    http_retry_status: list[int] | None = typer.Option(
+        None, "--http-retry-status", help="HTTP status that should be retried"
+    ),
+    http_expected_status: list[int] | None = typer.Option(
+        None, "--expected-status", help="Expected successful HTTP status"
+    ),
+    http_response_mode: str = typer.Option(
+        "auto", "--response-mode", help="auto, json, text, or none"
+    ),
+    http_output_map: list[str] | None = typer.Option(
+        None, "--output-map", help="HTTP output mapping KEY=response.path"
+    ),
+    http_secret_field: list[str] | None = typer.Option(
+        None, "--secret-field", help="HTTP field/path to mask in logs and UI"
+    ),
+    approval_timeout: float | None = typer.Option(
+        None, "--approval-timeout", help="Seconds before an approval gate times out"
+    ),
+    approval_timeout_decision: str = typer.Option(
+        "timeout", "--timeout-decision", help="Approval timeout output: timeout or reject"
+    ),
+    approver: list[str] | None = typer.Option(
+        None, "--approver", help="Allowed approver identity for approval_gate"
+    ),
+    approval_notify: bool = typer.Option(
+        False, "--notify", help="Send a desktop notification for approval_gate"
+    ),
+    notification_title: str = typer.Option(
+        "Gofer Flow notification", "--title", help="Notification or approval title"
+    ),
+    notification_body: str = typer.Option("", "--notification-body", help="Notification body"),
+    notification_channel: str = typer.Option("desktop", "--channel", help="Notification channel"),
+    notification_urgency: str = typer.Option("normal", "--urgency", help="Notification urgency"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Add or replace a workflow node."""
@@ -914,6 +1728,7 @@ def add_node(
             target=target,
             resource_type=resource_type,
             content=content,
+            message=message,
             template=template,
             template_path=template_path,
             output_path=output_path,
@@ -926,6 +1741,11 @@ def add_node(
             target_text=target_text,
             instructions=instructions,
             index_path=index_path,
+            vector_mode=vector_mode,
+            search_top_k=search_top_k,
+            search_score_threshold=search_score_threshold,
+            search_include_snippets=search_include_snippets,
+            search_include_file_metadata=search_include_file_metadata,
             dynamic_count=dynamic_count,
             memory=memory,
             input_mapping=mapping,
@@ -939,6 +1759,7 @@ def add_node(
             missing_ok=missing_ok,
             encoding=encoding,
             errors=errors,
+            fan_glob=fan_glob,
             fan_source=_fan_source_from_options(
                 fan_source,
                 fan_count,
@@ -948,13 +1769,37 @@ def add_node(
                 fan_max_concurrency,
                 fan_fail_fast,
             ),
+            http_method=http_method,
+            http_url=http_url,
+            http_headers=_parse_key_values(http_header, "--header"),
+            http_params=_parse_key_values(http_param, "--param"),
+            http_json=_parse_json_value(http_json, "--json-body"),
+            http_body=http_body,
+            http_timeout_seconds=http_timeout,
+            http_retry_attempts=http_retry_attempts,
+            http_retry_backoff_seconds=http_retry_backoff,
+            http_retry_statuses=http_retry_status or [],
+            http_expected_statuses=http_expected_status or [200],
+            http_response_mode=http_response_mode,
+            http_output_mapping=_parse_key_values(http_output_map, "--output-map"),
+            http_secret_fields=http_secret_field or [],
+            approval_timeout_seconds=approval_timeout,
+            approval_timeout_decision=approval_timeout_decision,
+            approval_approvers=approver or [],
+            approval_notify=approval_notify,
+            notification_title=notification_title,
+            notification_body=notification_body,
+            notification_channel=notification_channel,
+            notification_urgency=notification_urgency,
         )
         wf.add_operation(
             GraphNode(
                 node_id=node_id,
                 operation=operation,
+                inputs=_parse_key_values(node_input, "--input"),
                 pipe_output=pipe_output,
                 allow_failure=allow_failure,
+                await_all_inputs=await_all_inputs,
                 retry_count=retry_count,
                 retry_delay_seconds=retry_delay_seconds,
                 timeout_seconds=timeout_seconds,
@@ -983,9 +1828,7 @@ def rm_node(
         raise typer.Exit(1)
     wf.graph._graph.remove_node(node_id)
     wf.graph._nodes.pop(node_id, None)
-    wf.graph._edges = {
-        edge: cfg for edge, cfg in wf.graph._edges.items() if node_id not in edge
-    }
+    wf.graph._edges = {edge: cfg for edge, cfg in wf.graph._edges.items() if node_id not in edge}
     _save_workflow(wf, path)
 
 
@@ -1033,8 +1876,10 @@ def rm_edge(
     except KeyError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
-    if wf.graph._graph.has_edge(from_node, to_node):
-        wf.graph._graph.remove_edge(from_node, to_node)
+    if not wf.graph._graph.has_edge(from_node, to_node):
+        console.print(f"[red]Edge '{from_node}' -> '{to_node}' not found[/red]")
+        raise typer.Exit(1)
+    wf.graph._graph.remove_edge(from_node, to_node)
     wf.graph._edges.pop((from_node, to_node), None)
     _save_workflow(wf, path)
 
@@ -1059,13 +1904,15 @@ def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidd
         except Exception:
             continue
         schedule = wf.config.schedule.cron_expression if wf.config.schedule else "—"
-        rows.append((
-            wf.config.id,
-            wf.config.name,
-            schedule,
-            str(len(wf.agents)),
-            str(len(list(wf.graph._graph.nodes()))),
-        ))
+        rows.append(
+            (
+                wf.config.id,
+                wf.config.name,
+                schedule,
+                str(len(wf.agents)),
+                str(len(list(wf.graph._graph.nodes()))),
+            )
+        )
 
     if not rows:
         console.print(f"No workflows found in [bold]{base}[/bold].")
@@ -1102,7 +1949,7 @@ def edit(
     if FieldEditorApp(sections, title=f"Edit Workflow: {wf.config.id}").run():
         sections_to_workflow(sections, wf)
         try:
-            wf.validate()
+            wf.validate(path)
         except Exception as exc:
             console.print(f"[red]Validation failed: {exc}[/red]")
             raise typer.Exit(1)
@@ -1127,7 +1974,11 @@ def rm(
 
     base = data_dir or get_data_dir()
     resolved_path = Path(workflow)
-    path = resolved_path if resolved_path.suffix == ".toml" and resolved_path.exists() else base / f"{wf.config.id}.toml"
+    path = (
+        resolved_path
+        if resolved_path.suffix == ".toml" and resolved_path.exists()
+        else base / f"{wf.config.id}.toml"
+    )
     cleanup_base = data_dir or path.parent
 
     if not yes:
@@ -1154,9 +2005,7 @@ def rename(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
-    console.print(
-        f"[green]Renamed[/green] workflow to {saved['name']} ({saved['id']})"
-    )
+    console.print(f"[green]Renamed[/green] workflow to {saved['name']} ({saved['id']})")
 
 
 @app.command("duplicate")
@@ -1172,9 +2021,7 @@ def duplicate(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
-    console.print(
-        f"[green]Duplicated[/green] workflow to {saved['name']} ({saved['id']})"
-    )
+    console.print(f"[green]Duplicated[/green] workflow to {saved['name']} ({saved['id']})")
 
 
 @app.command("build")
@@ -1221,12 +2068,17 @@ name = "{name}"
 # recursive = false
 # debounce_seconds = 1.0
 # mode = "batch" # batch, queue, or fanout
-# max_concurrency = 1
+# max_concurrency = 16
 
 # [[nodes]]
 # id = "my-step"
 # type = "bash_command"
 # command = "echo hello"
+
+# Control node examples:
+# type = "start"
+# type = "pass" message = "workflow completed"
+# type = "fail" message = "required condition was not met"
 
 # First-class file I/O node examples:
 # type = "read_file"   path = "data/input.txt"
@@ -1321,13 +2173,10 @@ Return a concise summary with:
     )
     wf.add_operation(
         GraphNode(
-            node_id="summarize-added-files",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="summarizer",
-                prompt_path=prompt_file,
-                working_dir=working_dir,
-                fan_source=TriggerEventsFanSource(
+            node_id="changed-files",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TriggerEventsFanSource(
                     type="trigger_events",
                     include_content=True,
                     max_concurrency=max_concurrency,
@@ -1336,5 +2185,17 @@ Return a concise summary with:
             ),
         )
     )
+    wf.add_operation(
+        GraphNode(
+            node_id="summarize-added-files",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="summarizer",
+                prompt_path=prompt_file,
+                working_dir=working_dir,
+            ),
+        )
+    )
+    wf.then("changed-files", "summarize-added-files")
     _save_workflow(wf, workflow_path)
     console.print("[green]Created folder watcher summarizer workflow[/green]")

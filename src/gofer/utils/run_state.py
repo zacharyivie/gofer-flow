@@ -41,4 +41,7 @@ def request_workflow_run_stop(
 
 
 def clear_workflow_stop(workflow_id: str, data_dir: Path | None = None) -> None:
-    workflow_stop_path(workflow_id, data_dir).unlink(missing_ok=True)
+    try:
+        workflow_stop_path(workflow_id, data_dir).unlink(missing_ok=True)
+    except OSError:
+        return

@@ -7,7 +7,12 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from gofer.core.agent import Agent, AgentConfig
+from gofer.core.agent import (
+    Agent,
+    AgentConfig,
+    agent_external_access_warnings,
+    configured_extra_paths,
+)
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
@@ -38,6 +43,11 @@ def create(
     tools: str | None = typer.Option(None, "--tools", help="Comma-separated tool names"),
     mcp_servers: str | None = typer.Option(
         None, "--mcp-servers", help="Comma-separated MCP server names"
+    ),
+    extra_path: list[Path] | None = typer.Option(
+        None,
+        "--extra-path",
+        help="Additional path to grant the provider sandbox (repeatable)",
     ),
     env: list[str] | None = typer.Option(
         None, "--env", help="Environment variables as KEY=VALUE (repeatable)"
@@ -103,6 +113,7 @@ def create(
         tools=tools_list,
         mcp_servers=mcp_list,
         env=env_dict,
+        extra_paths=_resolve_extra_paths(extra_path),
     )
     wf = AgenticWorkflow(WorkflowConfig(id=agent_id, name=name))
     wf.register_agent(config)
@@ -125,6 +136,11 @@ def edit(
     mcp_servers: str | None = typer.Option(
         None, "--mcp-servers", help="Comma-separated MCP server names"
     ),
+    extra_path: list[Path] | None = typer.Option(
+        None,
+        "--extra-path",
+        help="Replace additional provider sandbox paths (repeatable)",
+    ),
     env: list[str] | None = typer.Option(
         None, "--env", help="Environment variables as KEY=VALUE (repeatable)"
     ),
@@ -140,7 +156,8 @@ def edit(
 
     # No flags → interactive TUI editor
     _any_flag = any(
-        v is not None for v in [subscription, working_dir, prompt, tools, mcp_servers, env]
+        v is not None
+        for v in [subscription, working_dir, prompt, tools, mcp_servers, extra_path, env]
     )
     if not _any_flag:
         from gofer.cli.tui_editor import (
@@ -181,6 +198,9 @@ def edit(
     if mcp_servers is not None:
         cfg = cfg.model_copy(update={"mcp_servers": [s.strip() for s in mcp_servers.split(",")]})
 
+    if extra_path is not None:
+        cfg = cfg.model_copy(update={"extra_paths": _resolve_extra_paths(extra_path)})
+
     if env is not None:
         env_dict: dict[str, str] = {}
         for pair in env:
@@ -195,6 +215,30 @@ def edit(
     dest_path = base / f"{wf.config.id}.toml"
     wf.to_file(dest_path)
     console.print(f"[green]Updated agent[/green] [bold]{agent_id}[/bold] → {dest_path}")
+
+
+def _resolve_extra_paths(paths: list[Path] | None) -> list[Path]:
+    resolved_paths: list[Path] = []
+    for path in paths or []:
+        resolved_paths.append(path.expanduser().resolve())
+    return resolved_paths
+
+
+def _print_agent_access_summary(config: AgentConfig) -> None:
+    warnings = agent_external_access_warnings(config)
+    if not warnings:
+        return
+    console.print("[yellow]Agent filesystem access outside working_dir:[/yellow]")
+    for warning in warnings:
+        console.print(f"[yellow]- {warning}[/yellow]")
+
+
+def _validate_agent_extra_paths(config: AgentConfig) -> None:
+    try:
+        configured_extra_paths(config)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
 
 
 @app.command("rm")
@@ -230,7 +274,11 @@ def rm(
 
     managed_prompts_dir = base / "prompts"
     try:
-        if prompt_path.is_relative_to(managed_prompts_dir) and prompt_path.exists():
+        if (
+            prompt_path is not None
+            and prompt_path.is_relative_to(managed_prompts_dir)
+            and prompt_path.exists()
+        ):
             prompt_path.unlink()
     except ValueError:
         pass
@@ -252,6 +300,9 @@ def run(
     if sub is None:
         console.print(f"[red]Unknown subscription '{config.subscription}'[/red]")
         raise typer.Exit(1)
+
+    _validate_agent_extra_paths(config)
+    _print_agent_access_summary(config)
 
     result = asyncio.run(Agent(config, sub).run())
     if result.success:

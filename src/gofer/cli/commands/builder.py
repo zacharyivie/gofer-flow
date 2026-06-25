@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Literal, cast
+
+import networkx as nx
 
 try:
     import questionary
@@ -24,8 +27,11 @@ from gofer.core.operations import (
     DeleteFileOperation,
     DirectoryFanSource,
     FanSource,
+    InfiniteFanSource,
+    LoopOperation,
     MoveFileOperation,
     OpenResourceOperation,
+    Operation,
     OperationType,
     PythonScriptOperation,
     ReadFileOperation,
@@ -84,11 +90,15 @@ class WorkflowBuilder:
             if path_str:
                 glob = questionary.text("File pattern:", default="*").ask() or "*"
                 recursive = questionary.confirm("Watch folders recursively?", default=False).ask()
-                mode = questionary.select(
-                    "Watcher mode:",
-                    choices=["batch", "queue", "fanout"],
-                    default="batch",
-                ).ask() or "batch"
+                mode = cast(
+                    Literal["batch", "queue", "fanout"],
+                    questionary.select(
+                        "Watcher mode:",
+                        choices=["batch", "queue", "fanout"],
+                        default="batch",
+                    ).ask()
+                    or "batch",
+                )
                 max_concurrency_str = questionary.text(
                     "Max watcher run concurrency:", default="1"
                 ).ask()
@@ -139,11 +149,13 @@ class WorkflowBuilder:
                 "move_file",
                 "delete_file",
                 "open_resource",
+                "loop",
                 "agent",
             ],
         ).ask()
 
         node: GraphNode | None = None
+        op: Operation
 
         if node_type == "bash_command":
             command = questionary.text("Command:").ask()
@@ -281,13 +293,11 @@ class WorkflowBuilder:
                     chosen_idx = choices.index(chosen)
                     _, agent_config = all_agents[chosen_idx]
                     self._workflow.register_agent(agent_config)
-                    fan_source = self._ask_fan_source()
                     op = AgentOperation(
                         type=OperationType.AGENT,
                         agent_id=agent_config.agent_id,
                         prompt_path=agent_config.prompt_path,
                         working_dir=agent_config.working_dir,
-                        fan_source=fan_source,
                     )
                     pipe_output = questionary.confirm(
                         "Pipe output to next node?", default=False
@@ -337,24 +347,31 @@ class WorkflowBuilder:
                 )
                 self._workflow.register_agent(agent_config)
 
-                fan_source = self._ask_fan_source()
                 op = AgentOperation(
                     type=OperationType.AGENT,
                     agent_id=agent_id,
                     prompt_path=prompt_path,
                     working_dir=working_dir,
-                    fan_source=fan_source,
                 )
                 pipe_output = questionary.confirm("Pipe output to next node?", default=False).ask()
                 node = GraphNode(node_id=node_id, operation=op, pipe_output=pipe_output)
+
+        elif node_type == "loop":
+            source = self._ask_fan_source(required=True)
+            if source is None:
+                return
+            node = GraphNode(
+                node_id=node_id,
+                operation=LoopOperation(type=OperationType.LOOP, source=source),
+            )
 
         if node is not None:
             self._workflow.add_operation(node)
             console.print(f"  [green]✓[/green] Added node '{node_id}'")
 
-    def _ask_fan_source(self) -> FanSource | None:
-        if not questionary.confirm(
-            "Run in parallel for each item in a collection?", default=False
+    def _ask_fan_source(self, required: bool = False) -> FanSource | None:
+        if not required and not questionary.confirm(
+            "Loop once for each item in a collection?", default=False
         ).ask():
             return None
 
@@ -362,44 +379,33 @@ class WorkflowBuilder:
             "Run once for each…",
             choices=[
                 "Fixed number of times",
-                "Row in a CSV/TSV file",
+                "Row in a JSONL/CSV file",
                 "File in a directory",
                 "File watcher trigger event",
+                "Indefinitely until BREAK",
             ],
         ).ask()
         if source_type is None:
             return None
 
-        max_concurrency_str = questionary.text(
-            "Max parallel instances:", default="16"
-        ).ask()
-        max_concurrency = int(max_concurrency_str) if max_concurrency_str else 16
-        fail_fast = questionary.confirm(
-            "Stop all instances immediately if one fails?", default=False
-        ).ask()
-
         if source_type == "Fixed number of times":
             count_str = questionary.text(
-                "Number of parallel runs (integer or {{node.output}} reference):", default="1"
+                "Number of iterations (integer or {{node.output}} reference):", default="1"
             ).ask()
             count: int | str
             try:
                 count = int(count_str)
             except (ValueError, TypeError):
                 count = count_str or 1
-            return CountFanSource(
-                type="count", count=count, max_concurrency=max_concurrency, fail_fast=fail_fast
-            )
+            return CountFanSource(type="count", count=count)
 
-        if source_type == "Row in a CSV/TSV file":
-            path_str = questionary.text("Path to CSV/TSV file:").ask()
+        if source_type == "Row in a JSONL/CSV file":
+            path_str = questionary.text("Path to JSONL/CSV file:").ask()
             if not path_str:
                 return None
             return TabularFanSource(
                 type="tabular",
                 path=Path(path_str),
-                max_concurrency=max_concurrency,
-                fail_fast=fail_fast,
             )
 
         if source_type == "File in a directory":
@@ -415,8 +421,6 @@ class WorkflowBuilder:
                 path=Path(path_str),
                 glob=glob,
                 include_content=include_content,
-                max_concurrency=max_concurrency,
-                fail_fast=fail_fast,
             )
 
         if source_type == "File watcher trigger event":
@@ -426,9 +430,10 @@ class WorkflowBuilder:
             return TriggerEventsFanSource(
                 type="trigger_events",
                 include_content=include_content,
-                max_concurrency=max_concurrency,
-                fail_fast=fail_fast,
             )
+
+        if source_type == "Indefinitely until BREAK":
+            return InfiniteFanSource(type="infinite")
 
         return None
 
@@ -444,10 +449,24 @@ class WorkflowBuilder:
             from_id = questionary.select("From node:", choices=node_ids).ask()
             to_choices = [n for n in node_ids if n != from_id]
             to_id = questionary.select("To node:", choices=to_choices).ask()
+            if from_id == to_id:
+                console.print(f"  [red]✗[/red] Edge would create a self-loop: {from_id}")
+                continue
+            if nx.has_path(self._workflow.graph._graph, to_id, from_id):
+                console.print(
+                    f"  [red]✗[/red] Edge would create a cycle: {from_id} → {to_id}"
+                )
+                continue
 
             condition_str = questionary.select(
                 "Edge condition:",
-                choices=["always", "on_success", "on_failure", "output_matches"],
+                choices=[
+                    "always",
+                    "on_success",
+                    "on_failure",
+                    "output_matches",
+                    "after_loop",
+                ],
             ).ask()
 
             output_pattern = None

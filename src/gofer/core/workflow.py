@@ -1,16 +1,27 @@
 from __future__ import annotations
 
+import re
 import tomllib
 import warnings
 from pathlib import Path
 from typing import Any, Literal
 
 import tomli_w as _tomli_w
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter, field_validator
 
-from gofer.core.agent import AgentConfig
+from gofer.core.agent import AgentConfig, agent_external_access_warnings, configured_extra_paths
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
-from gofer.core.operations import Operation
+from gofer.core.operations import (
+    AgentOperation,
+    CommonLlmTaskOperation,
+    DirectoryFanSource,
+    LocalVectorizeOperation,
+    LoopOperation,
+    Operation,
+    TriggerEventsFanSource,
+)
+from gofer.core.resources import ResourceLimits
+from gofer.core.usage import LlmUsageBudget
 
 
 class ScheduleConfig(BaseModel):
@@ -32,19 +43,57 @@ class WorkflowConfig(BaseModel):
     name: str
     schedule: ScheduleConfig | None = None
     watch: WatchConfig | None = None
+    resource_limits: ResourceLimits = Field(default_factory=ResourceLimits)
+    llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
     run_continuously: bool = False
     max_total_node_runs: int = 1000
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        return validate_workflow_id(value)
+
+
+WORKFLOW_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
+
+
+def validate_workflow_id(value: str) -> str:
+    if not WORKFLOW_ID_PATTERN.fullmatch(value):
+        raise ValueError(
+            "Workflow id must match [a-z0-9][a-z0-9-]{0,127}"
+        )
+    return value
 
 
 _op_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 
 _GRAPH_NODE_FIELDS = {
     "allow_failure",
+    "await_all_inputs",
+    "inputs",
+    "label",
     "pipe_output",
     "retry_count",
     "retry_delay_seconds",
     "timeout_seconds",
 }
+
+
+def _count_paths_until(paths: Any, limit: int) -> int:
+    count = 0
+    for path in paths:
+        if Path(path).is_file():
+            count += 1
+            if count >= limit:
+                break
+    return count
+
+
+def _resolve_config_path(path: Path, path_base: Path | None) -> Path:
+    expanded = path.expanduser()
+    if expanded.is_absolute() or path_base is None:
+        return expanded
+    return path_base / expanded
 
 
 class AgenticWorkflow:
@@ -67,8 +116,95 @@ class AgenticWorkflow:
         self.agents[config.agent_id] = config
         return self
 
-    def validate(self) -> None:
+    def validate(self, workflow_path: Path | None = None) -> None:
+        path_base = workflow_path.parent if workflow_path is not None else None
         self.graph.validate()
+        for agent in self.agents.values():
+            configured_extra_paths(agent, path_base)
+        for warning in self.resource_warnings(path_base):
+            warnings.warn(warning, UserWarning, stacklevel=2)
+
+    def resource_warnings(self, path_base: Path | None = None) -> list[str]:
+        warnings_: list[str] = []
+        limits = self.config.resource_limits
+        warned_agents: set[str] = set()
+        for graph_node in self.graph.nodes_in_order():
+            op = graph_node.operation
+            if not isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
+                continue
+            agent = self.agents.get(op.agent_id)
+            if agent is None:
+                continue
+            warned_agents.add(op.agent_id)
+            effective_agent = agent.model_copy(update={"working_dir": op.working_dir})
+            warnings_.extend(agent_external_access_warnings(effective_agent, path_base))
+        for agent_id, agent in sorted(self.agents.items()):
+            if agent_id not in warned_agents:
+                warnings_.extend(agent_external_access_warnings(agent, path_base))
+        for graph_node in self.graph.nodes_in_order():
+            op = graph_node.operation
+            if isinstance(op, LoopOperation):
+                source = op.source
+                if isinstance(source, DirectoryFanSource):
+                    source_path = _resolve_config_path(source.path, path_base)
+                    if source.include_content:
+                        warnings_.append(
+                            f"Node '{graph_node.node_id}' directory fan-out includes file "
+                            f"content; limits apply: max_fanout_items={limits.max_fanout_items}, "
+                            f"max_file_read_bytes={limits.max_file_read_bytes}, "
+                            f"max_aggregate_read_bytes={limits.max_aggregate_read_bytes}"
+                        )
+                    if source_path.exists() and source_path.is_dir():
+                        scanned = _count_paths_until(
+                            source_path.glob(source.glob),
+                            limits.max_fanout_items + 1,
+                        )
+                        if scanned > limits.max_fanout_items:
+                            warnings_.append(
+                                f"Node '{graph_node.node_id}' directory fan-out may exceed "
+                                f"max_fanout_items={limits.max_fanout_items}"
+                            )
+                elif isinstance(source, TriggerEventsFanSource) and source.include_content:
+                    warnings_.append(
+                        f"Node '{graph_node.node_id}' trigger-event fan-out includes changed "
+                        f"file content; limits apply: max_fanout_items={limits.max_fanout_items}, "
+                        f"max_file_read_bytes={limits.max_file_read_bytes}, "
+                        f"max_aggregate_read_bytes={limits.max_aggregate_read_bytes}"
+                    )
+            elif isinstance(op, LocalVectorizeOperation):
+                source_path = _resolve_config_path(op.source_path, path_base)
+                warnings_.append(
+                    f"Node '{graph_node.node_id}' local_vectorize scans local files; "
+                    f"limits apply: max_files_scanned={limits.max_files_scanned}, "
+                    f"max_file_read_bytes={limits.max_file_read_bytes}, "
+                    f"max_aggregate_read_bytes={limits.max_aggregate_read_bytes}, "
+                    f"max_vector_index_bytes={limits.max_vector_index_bytes}"
+                )
+                if source_path.exists() and source_path.is_dir():
+                    iterator = (
+                        source_path.rglob(op.glob)
+                        if op.recursive
+                        else source_path.glob(op.glob)
+                    )
+                    scanned = _count_paths_until(iterator, limits.max_files_scanned + 1)
+                    if scanned > limits.max_files_scanned:
+                        warnings_.append(
+                            f"Node '{graph_node.node_id}' local_vectorize may exceed "
+                            f"max_files_scanned={limits.max_files_scanned}"
+                        )
+        if self.config.watch is not None:
+            warnings_.append(
+                f"Workflow watch queue is bounded: "
+                f"max_watcher_queue_depth={limits.max_watcher_queue_depth}; "
+                "oldest queued event batches are dropped on overflow"
+            )
+            if self.config.watch.max_concurrency > limits.max_watcher_concurrency:
+                warnings_.append(
+                    f"Workflow watch max_concurrency={self.config.watch.max_concurrency} "
+                    f"will be capped by global max_watcher_concurrency="
+                    f"{limits.max_watcher_concurrency}"
+                )
+        return warnings_
 
     # ── TOML serde ──────────────────────────────────────────────────────────
 
@@ -76,7 +212,10 @@ class AgenticWorkflow:
     def from_file(cls, path: Path) -> AgenticWorkflow:
         with open(path, "rb") as fh:
             data: dict[str, Any] = tomllib.load(fh)
+        return cls.from_dict(data)
 
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> AgenticWorkflow:
         wf_data = data["workflow"]
         schedule = None
         if "schedule" in wf_data:
@@ -89,6 +228,8 @@ class AgenticWorkflow:
             name=wf_data["name"],
             schedule=schedule,
             watch=watch,
+            resource_limits=ResourceLimits(**wf_data.get("resource_limits", {})),
+            llm_budget=LlmUsageBudget(**wf_data.get("llm_budget", {})),
             run_continuously=bool(wf_data.get("run_continuously", False)),
             max_total_node_runs=wf_data.get("max_total_node_runs", 1000),
         )
@@ -174,6 +315,12 @@ class AgenticWorkflow:
             data["workflow"]["schedule"] = self.config.schedule.model_dump()
         if self.config.watch:
             data["workflow"]["watch"] = _paths_to_str(self.config.watch.model_dump())
+        if self.config.resource_limits != ResourceLimits():
+            data["workflow"]["resource_limits"] = self.config.resource_limits.model_dump()
+        if self.config.llm_budget.enabled():
+            data["workflow"]["llm_budget"] = self.config.llm_budget.model_dump(
+                exclude_none=True
+            )
         if self.config.run_continuously:
             data["workflow"]["run_continuously"] = True
         if self.config.max_total_node_runs != 1000:
@@ -181,20 +328,38 @@ class AgenticWorkflow:
 
         if self.agents:
             data["agents"] = {
-                aid: _paths_to_str(ac.model_dump(exclude={"agent_id"}, exclude_none=True))
+                aid: _paths_to_str(
+                    ac.model_dump(
+                        exclude={"agent_id"},
+                        exclude_defaults=True,
+                        exclude_none=True,
+                    )
+                )
                 for aid, ac in self.agents.items()
             }
 
         nodes = []
         edges = []
         for node in self.graph.nodes_in_order():
-            node_dict = _paths_to_str(node.operation.model_dump(exclude_none=True))
+            node_dict = _paths_to_str(
+                node.operation.model_dump(
+                    exclude_defaults=True,
+                    exclude_none=True,
+                    by_alias=True,
+                )
+            )
             node_dict["id"] = node.node_id
             # Serialize GraphNode-level fields (only non-defaults to keep TOML clean)
+            if node.label:
+                node_dict["label"] = node.label
+            if node.inputs:
+                node_dict["inputs"] = node.inputs
             if node.pipe_output:
                 node_dict["pipe_output"] = True
             if node.allow_failure:
                 node_dict["allow_failure"] = True
+            if not node.await_all_inputs:
+                node_dict["await_all_inputs"] = False
             if node.retry_count:
                 node_dict["retry_count"] = node.retry_count
             if node.retry_delay_seconds != 1.0:

@@ -40,9 +40,10 @@ If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path,
 
 - Build a graph with clear node IDs in lowercase kebab-case or snake_case. Cycles and self-edges are supported for bounded recursive workflows.
 - Keep node boundaries meaningful: one command/script/agent responsibility per node.
-- Use `pipe_output = true` when downstream nodes should receive predecessor output on stdin or agent prompt context.
+- Prefer explicit node inputs over raw piping. Use `gof workflow add-node ... --input stdin=previous.text`, `--input env.FILE_PATH=loop.current.file_path`, or prompt variables like `--input file_path=source.data.file_path` so child nodes can access parent outputs without parsing JSON.
+- Use `pipe_output = true` only for simple legacy stdin flows where the whole predecessor text output is the desired input.
 - Prefer explicit edges. Use conditions only when the user asks for branching or failure handling.
-- For recursive workflows, set a sensible `[workflow].max_total_node_runs` value and ensure loop exit edges are based on `output_matches`, `on_success`, or `on_failure`.
+- For recursive workflows, prefer a `loop` node plus a `break` node. Set a sensible `[workflow].max_total_node_runs` value and ensure loop exit edges are based on `output_matches`, `on_success`, or `on_failure`.
 - Use existing scripts/prompts when present. Create prompt files only when needed.
 - Use `prompt_file` nodes when a workflow should generate or refresh reusable prompt files from templates and variables.
 - Use `common_llm_task` nodes for standard review/summarize/explain/extract/rewrite/classify work instead of creating a bespoke prompt file.
@@ -53,7 +54,7 @@ If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path,
 
 ## Preferred CLI Recipes
 
-For "watch this folder and summarize files that are added or changed" requests, use the built-in recipe first. Do not scan the whole watched directory. The watcher provides the changed file events, and the agent node fans out over only those events.
+For "watch this folder and summarize files that are added or changed" requests, use the built-in recipe first. Do not scan the whole watched directory. The watcher provides the changed file events, and a loop node iterates over only those events before calling the agent.
 
 ```bash
 gof workflow recipe watch-folder-summarize \
@@ -69,7 +70,8 @@ This creates:
 
 - `[workflow.watch]` with `mode = "fanout"`.
 - A `summarizer` agent using the selected provider.
-- An agent node with `fan_source = { type = "trigger_events", include_content = true }`.
+- A `loop` node with `source = { type = "trigger_events", include_content = true }`.
+- An agent node connected after the loop.
 - A prompt that receives `{{kind}}`, `{{path}}`, `{{name}}`, and `{{file_content}}`.
 
 For custom watched workflows, compose the same behavior with lower-level commands:
@@ -79,14 +81,18 @@ gof workflow create --name "Custom Watcher"
 gof workflow set-watch custom-watcher --path /path/to/folder --glob "*.md" --mode fanout
 gof workflow add-agent custom-watcher --id summarizer --subscription codex --working-dir . --prompt-path prompts/summarizer.md
 gof workflow add-node custom-watcher \
+  --id changed-files \
+  --type loop \
+  --fan-source trigger-events \
+  --fan-include-content \
+  --fan-max-concurrency 4
+gof workflow add-node custom-watcher \
   --id summarize-added-files \
   --type agent \
   --agent-id summarizer \
   --prompt-path prompts/summarizer.md \
-  --working-dir . \
-  --fan-source trigger-events \
-  --fan-include-content \
-  --fan-max-concurrency 4
+  --working-dir .
+gof workflow add-edge custom-watcher --from changed-files --to summarize-added-files
 ```
 
 ## TOML Shape
@@ -161,7 +167,7 @@ Watcher mode guidance:
 
 - `batch`: one workflow run receives all changed files in `trigger.events`.
 - `queue`: one workflow run per changed file; each run gets one event in `trigger.event` and `trigger.events[0]`.
-- `fanout`: one workflow run receives all changed files and should usually use `fan_source = { type = "trigger_events" }` on an agent node.
+- `fanout`: one workflow run receives all changed files and should usually use a `loop` node with `source = { type = "trigger_events" }` before the agent node.
 
 Recursive safety:
 
@@ -398,7 +404,6 @@ type = "agent"
 agent_id = "reviewer"
 prompt_path = "prompts/reviewer.md"
 working_dir = "."
-dynamic_count = 1
 memory = "run" # none, run, or all
 input_mapping = { diff = "collect.output" }
 ```
@@ -442,41 +447,80 @@ condition = "output_matches"
 output_pattern = "CRITICAL|HIGH"
 ```
 
-Supported conditions: `always`, `on_success`, `on_failure`, `output_matches`.
+Supported conditions: `always`, `on_success`, `on_failure`, `output_matches`, `after_loop`.
 
-## Fan-Out
+## Loop Nodes
 
-Use fan-out on agent nodes when the user asks to run work for N items, rows, or files.
+Use loop nodes when the user asks to run work for N items, rows, files, watcher events, or indefinitely until a `break` node is reached. Agent nodes do not own fan-out; connect `loop -> child node(s)` and use loop variables in downstream prompts or input mappings. A loop runs the full child chain for one item before starting the next item. For example, `LOOP -> A -> B` runs `A0, B0, A1, B1` until the loop runs out of inputs or a `break` node fires. If a node should run once after the loop finishes, connect it from the loop node with `condition = "after_loop"`.
 
 Fixed count:
 
 ```toml
+[[nodes]]
+id = "research-loop"
+type = "loop"
+source = { type = "count", count = 5 }
+
 [[nodes]]
 id = "research"
 type = "agent"
 agent_id = "researcher"
 prompt_path = "prompts/researcher.md"
 working_dir = "."
-fan_source = { type = "count", count = 5, max_concurrency = 3, fail_fast = false }
+
+[[edges]]
+from = "research-loop"
+to = "research"
+
+[[edges]]
+from = "research-loop"
+to = "summarize-results"
+condition = "after_loop"
 ```
 
 Tabular rows:
 
 ```toml
-fan_source = { type = "tabular", path = "data/topics.csv", max_concurrency = 8, fail_fast = false }
+source = { type = "tabular", path = "data/topics.csv" }
 ```
 
 Directory files:
 
 ```toml
-fan_source = { type = "directory", path = "docs", glob = "*.md", include_content = true, max_concurrency = 8, fail_fast = false }
+source = { type = "directory", path = "docs", glob = "*.md", include_content = true }
 ```
 
 File watcher trigger events:
 
 ```toml
-fan_source = { type = "trigger_events", include_content = true, max_concurrency = 4, fail_fast = false }
+source = { type = "trigger_events", include_content = true }
 ```
+
+Indefinite loop until `break`:
+
+```toml
+source = { type = "infinite" }
+```
+
+Loop variables are available to downstream agent prompts and input mappings as `loop.*`. Prefer `loop.current.*` in explicit node inputs, such as `--input env.FILE_PATH=loop.current.file_path` for shell nodes or `--input file_path=loop.current.file_path` for agent/prompt variables. Loop fields are also merged into agent template context directly, so a directory loop can use `{{file_path}}`, `{{file_name}}`, and `{{file_content}}`. If the loop node has `pipe_output = true`, direct loop child nodes receive the current loop item as JSON on stdin or `_piped_input`, not the full loop item list.
+
+Common node output contract:
+
+- `node-id.text`: the obvious primary text output.
+- `node-id.success`: whether the node succeeded.
+- `node-id.data.*`: structured fields such as:
+  - command/script: `stdout`, `stderr`, `command`, `script_path`
+  - file-like nodes: `file_path`, `file_name`, `file_stem`, `file_extension`, `parent_path`, `directory`, `content`
+  - folder nodes: `folder_path`, `folder_name`, `parent_path`, `directory`
+  - copy/move/delete: `source_path`, `destination_path`, `destination_directory`, `trash_path`, `deleted`
+  - loop nodes: `source_type`, `source_path`, `glob`, `count`, `max_concurrency`
+  - agent/common LLM task: `message`, `agent_id`, `thoughts`
+  - local search/vectorize: `results`, `index_path`, `query`, `file_count`, `chunk_count`
+- `node-id.items`: list outputs from loop/search style nodes.
+- `previous.text`: primary text output from the direct upstream node.
+- `loop.current.*`: current loop item fields such as `index`, `file_path`, `file_name`, `file_stem`, `file_extension`, `directory`, `parent_path`, `file_content`, `_row`, `event_json`, `kind`, `size`, and `mtime_ns`.
+- For agent nodes, prefer explicit `--input` mappings when a prompt template controls context. If any explicit node input is configured, Gofer Flow does not automatically prepend the full loop item JSON or merge every loop field into the prompt context.
+- Bash/script children of loop nodes also receive scalar loop fields as uppercase environment variables, such as `$FILE_PATH`, `$FILE_NAME`, `$FILE_STEM`, `$FILE_EXTENSION`, `$DIRECTORY`, and `$INDEX`.
 
 Trigger context variables:
 

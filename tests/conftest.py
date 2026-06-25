@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
 
 from gofer.core.agent import AgentResult
 from gofer.subscriptions.base import Subscription
+from gofer.utils.paths import get_data_dir
+
+
+@pytest.fixture(autouse=True)
+def isolated_gofer_data_dir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Keep tests from touching the developer's real Gofer data directory."""
+    env_root = tmp_path / "gofer-env"
+    home = env_root / "home"
+    xdg_data = env_root / "xdg-data"
+    appdata = env_root / "appdata"
+    local_appdata = env_root / "local-appdata"
+    for path in (home, xdg_data, appdata, local_appdata):
+        path.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("XDG_DATA_HOME", str(xdg_data))
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+
+    return get_data_dir()
 
 
 class FakeSubscription(Subscription):
@@ -23,7 +48,11 @@ class FakeSubscription(Subscription):
         self._message = message
 
     def _build_command(
-        self, prompt: str, tools: list[str], mcp_servers: list[str]
+        self,
+        prompt: str,
+        tools: list[str],
+        mcp_servers: list[str],
+        extra_paths: list[Path] | None = None,
     ) -> list[str]:
         return ["fake"]
 
@@ -38,9 +67,16 @@ class FakeSubscription(Subscription):
         mcp_servers: list[str],
         env: dict[str, str],
         timeout: float | None = None,
-        cancel_event=None,
+        cancel_event: threading.Event | None = None,
+        extra_paths: list[Path] | None = None,
+        max_output_bytes: int | None = None,
     ) -> AgentResult:
-        self.calls.append({"prompt": prompt, "working_dir": working_dir})
+        self.calls.append({
+            "prompt": prompt,
+            "working_dir": working_dir,
+            "extra_paths": extra_paths or [],
+            "max_output_bytes": max_output_bytes,
+        })
         return AgentResult(
             agent_id="",
             success=self._exit_code == 0,

@@ -4,15 +4,18 @@ from pathlib import Path
 
 import pytest
 
+from gofer.core.resources import ResourceLimits
 from gofer.ui import chat
 from gofer.ui.chat import (
     ChatProviderError,
     _build_chat_command,
     build_chat_prompt,
     ensure_local_gofer_cli,
+    local_gofer_cli_path,
     provider_payload,
     run_workflow_chat,
     stream_workflow_chat,
+    trusted_gofer_cli_dir,
 )
 
 
@@ -112,12 +115,15 @@ def test_ensure_local_gofer_cli_copies_source_binary(monkeypatch, tmp_path) -> N
     source = tmp_path / "source-gof"
     source.write_text("#!/bin/sh\necho gof\n", encoding="utf-8")
     monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+    data_dir = tmp_path / "gofer-data"
 
-    copied = ensure_local_gofer_cli(tmp_path / "gofer-data")
+    copied = ensure_local_gofer_cli(data_dir)
 
-    assert copied == tmp_path / "gofer-data" / "bin" / "gof"
+    assert copied is not None
+    assert copied == tmp_path / ".gofer-trusted-bin" / "gof"
     assert copied.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
     assert copied.stat().st_mode & 0o111
+    assert not copied.is_relative_to(data_dir)
 
 
 def test_ensure_local_gofer_cli_preserves_windows_command_shim(
@@ -131,8 +137,242 @@ def test_ensure_local_gofer_cli_preserves_windows_command_shim(
 
     copied = ensure_local_gofer_cli(tmp_path / "gofer-data")
 
-    assert copied == tmp_path / "gofer-data" / "bin" / "gof.cmd"
+    assert copied is not None
+    assert copied == tmp_path / ".gofer-trusted-bin" / "gof.cmd"
     assert copied.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_ensure_local_gofer_cli_does_not_reuse_existing_helper_without_source(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "gofer-data"
+    old_data_dir_helper = data_dir / "bin" / "gof"
+    old_data_dir_helper.parent.mkdir(parents=True)
+    old_data_dir_helper.write_text("#!/bin/sh\necho planted\n", encoding="utf-8")
+    planted_trusted_helper = local_gofer_cli_path(data_dir)
+    planted_trusted_helper.parent.mkdir(parents=True)
+    planted_trusted_helper.write_text("#!/bin/sh\necho trusted-planted\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: tmp_path / "missing-gof")
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is None
+    assert old_data_dir_helper.read_text(encoding="utf-8") == "#!/bin/sh\necho planted\n"
+    assert (
+        planted_trusted_helper.read_text(encoding="utf-8")
+        == "#!/bin/sh\necho trusted-planted\n"
+    )
+
+
+def test_ensure_local_gofer_cli_does_not_reuse_helper_when_source_is_unknown(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "gofer-data"
+    planted = local_gofer_cli_path(data_dir)
+    planted.parent.mkdir(parents=True)
+    planted.write_text("#!/bin/sh\necho planted\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: None)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is None
+    assert planted.read_text(encoding="utf-8") == "#!/bin/sh\necho planted\n"
+
+
+def test_ensure_local_gofer_cli_rejects_source_inside_data_dir(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "gofer-data"
+    planted_source = data_dir / "bin" / "gof"
+    planted_source.parent.mkdir(parents=True)
+    planted_source.write_text("#!/bin/sh\necho planted\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: planted_source)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is None
+    assert not local_gofer_cli_path(data_dir, planted_source).exists()
+
+
+def test_ensure_local_gofer_cli_replaces_tampered_helper_by_hash(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    tampered = local_gofer_cli_path(data_dir, source)
+    tampered.parent.mkdir(parents=True)
+    tampered.write_text("#!/bin/sh\necho planted\n", encoding="utf-8")
+    source_stat = source.stat()
+    tampered.chmod(source_stat.st_mode)
+    chat.os.utime(tampered, (source_stat.st_atime, source_stat.st_mtime))
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is not None
+    assert copied == tampered
+    assert copied.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
+
+
+def test_ensure_local_gofer_cli_keeps_matching_helper_by_hash(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    existing = local_gofer_cli_path(data_dir, source)
+    existing.parent.mkdir(parents=True)
+    existing.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    old_mtime = 1_700_000_000
+    chat.os.utime(existing, (old_mtime, old_mtime))
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is not None
+    assert copied == existing
+    assert int(copied.stat().st_mtime) == old_mtime
+
+
+def test_ensure_local_gofer_cli_sets_owner_only_permissions(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+
+    copied = ensure_local_gofer_cli(tmp_path / "gofer-data")
+
+    assert copied is not None
+    if chat.sys.platform != "win32":
+        assert copied.parent.stat().st_mode & 0o777 == 0o700
+        assert copied.stat().st_mode & 0o777 == 0o700
+
+
+def test_ensure_local_gofer_cli_fails_closed_when_permissions_cannot_be_hardened(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+    monkeypatch.setattr(chat, "_ensure_owner_only_dir", lambda _path: False)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is None
+    assert not local_gofer_cli_path(data_dir, source).exists()
+
+
+def test_ensure_local_gofer_cli_fails_closed_when_directory_chmod_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    helper_dir = trusted_gofer_cli_dir(data_dir)
+    original_chmod = chat.Path.chmod
+
+    def chmod(path: Path, mode: int) -> None:
+        if path == helper_dir:
+            raise OSError("chmod denied")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+    monkeypatch.setattr(chat.Path, "chmod", chmod)
+
+    copied = ensure_local_gofer_cli(data_dir)
+    prompt = build_chat_prompt(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "Validate the workflow"}],
+        workflow=None,
+        gofer_cli_path=copied,
+    )
+
+    assert copied is None
+    assert not local_gofer_cli_path(data_dir, source).exists()
+    assert "CLI automation is unavailable" in prompt
+
+
+def test_ensure_local_gofer_cli_fails_closed_when_file_permissions_cannot_be_hardened(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+    monkeypatch.setattr(chat, "_make_owner_executable", lambda _path: False)
+
+    copied = ensure_local_gofer_cli(data_dir)
+
+    assert copied is None
+    assert not local_gofer_cli_path(data_dir, source).exists()
+
+
+def test_ensure_local_gofer_cli_fails_closed_when_file_chmod_fails(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    source = tmp_path / "source-gof"
+    source.write_text("#!/bin/sh\necho trusted\n", encoding="utf-8")
+    data_dir = tmp_path / "gofer-data"
+    helper = local_gofer_cli_path(data_dir, source)
+    original_chmod = chat.Path.chmod
+
+    def chmod(path: Path, mode: int) -> None:
+        if path == helper or path.name == f".{helper.name}.tmp":
+            raise OSError("chmod denied")
+        original_chmod(path, mode)
+
+    monkeypatch.setattr(chat, "_gofer_cli_source_path", lambda: source)
+    monkeypatch.setattr(chat.Path, "chmod", chmod)
+
+    copied = ensure_local_gofer_cli(data_dir)
+    prompt = build_chat_prompt(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "Validate the workflow"}],
+        workflow=None,
+        gofer_cli_path=copied,
+    )
+
+    assert copied is None
+    assert not helper.exists()
+    assert "CLI automation is unavailable" in prompt
+
+
+def test_gofer_cli_source_path_uses_packaged_executable(monkeypatch, tmp_path) -> None:
+    packaged = tmp_path / "Gofer"
+    packaged.write_text("binary", encoding="utf-8")
+    monkeypatch.delenv("GOFER_CLI_SOURCE_PATH", raising=False)
+    monkeypatch.setattr(chat.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(chat.sys, "executable", str(packaged))
+
+    assert chat._gofer_cli_source_path() == packaged
+
+
+def test_build_chat_prompt_reports_cli_unavailable_when_helper_is_unverified() -> None:
+    prompt = build_chat_prompt(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "Validate the workflow"}],
+        workflow=None,
+        gofer_cli_path=None,
+    )
+
+    assert "CLI automation is unavailable" in prompt
+    assert "Do not run a stale helper" in prompt
 
 
 def test_build_chat_command_passes_model_flags() -> None:
@@ -156,6 +396,7 @@ def test_build_chat_command_passes_model_flags() -> None:
     assert option_value(codex, "--sandbox") == "workspace-write"
     assert option_value(codex, "--cd") == "/tmp/project"
     assert option_value(codex, "--add-dir") == "/tmp/gofer-data"
+    assert str(trusted_gofer_cli_dir(Path("/tmp/gofer-data"))) not in codex
     assert ["--model", "gpt-5"] == codex[-3:-1]
     assert codex[-1] == "hello"
     assert claude == [
@@ -243,6 +484,64 @@ async def test_run_workflow_chat_defaults_working_dir_to_data_dir(monkeypatch, t
 
 
 @pytest.mark.asyncio
+async def test_run_workflow_chat_uses_workflow_resource_limits(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_max_output_bytes = None
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def capture_subprocess(_command, **kwargs):
+        nonlocal captured_max_output_bytes
+        captured_max_output_bytes = kwargs.get("max_output_bytes")
+        return 0, "done", ""
+
+    monkeypatch.setattr(chat, "run_subprocess", capture_subprocess)
+
+    await run_workflow_chat(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "hello"}],
+        workflow={
+            "id": "limited",
+            "resourceLimits": {
+                "max_subprocess_output_bytes": 7,
+                "max_chat_prompt_bytes": 1_000_000,
+            },
+        },
+        working_dir=tmp_path,
+        data_dir=tmp_path,
+        resource_limits=ResourceLimits(max_subprocess_output_bytes=99),
+    )
+
+    assert captured_max_output_bytes == 7
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_chat_rejects_oversized_prompt_before_provider(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("provider subprocess should not be invoked")
+
+    monkeypatch.setattr(chat, "run_subprocess", fail_if_called)
+
+    with pytest.raises(ChatProviderError, match="Chat prompt exceeds limit 8 bytes"):
+        await run_workflow_chat(
+            provider="codex",
+            model="cli-default",
+            messages=[{"role": "user", "body": "hello"}],
+            workflow={"id": "limited", "resourceLimits": {"max_chat_prompt_bytes": 8}},
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+            resource_limits=ResourceLimits(max_chat_prompt_bytes=1_000_000),
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_workflow_chat_uses_prompt_file_for_windows_codex_shim(
     monkeypatch,
     tmp_path,
@@ -321,6 +620,32 @@ async def test_stream_workflow_chat_yields_thoughts_and_final(monkeypatch, tmp_p
     assert events[0]["text"] == "working\n"
     assert events[1]["stream"] == "stderr"
     assert events[2]["message"]["body"] == "working\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_chat_rejects_oversized_prompt_before_provider(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("provider subprocess should not be invoked")
+        yield {}
+
+    monkeypatch.setattr(chat, "stream_subprocess", fail_if_called)
+
+    with pytest.raises(ChatProviderError, match="Chat prompt exceeds limit 8 bytes"):
+        async for _event in stream_workflow_chat(
+            provider="codex",
+            model="cli-default",
+            messages=[{"role": "user", "body": "hello"}],
+            workflow={"id": "limited", "resourceLimits": {"max_chat_prompt_bytes": 8}},
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+            resource_limits=ResourceLimits(max_chat_prompt_bytes=1_000_000),
+        ):
+            pass
 
 
 @pytest.mark.asyncio

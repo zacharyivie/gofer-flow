@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import Any
 
 import pytest
 from rich.console import Console
@@ -11,21 +12,47 @@ from typer.testing import CliRunner
 from gofer.cli.dag_renderer import (
     _build_arrow_column,
     _condition_label,
+    _loop_cell,
     _node_box,
     _op_detail,
     _op_icon_color,
     render_workflow,
 )
 from gofer.cli.main import app
+from gofer.core.agent import AgentConfig
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
+    CommonLlmTaskOperation,
+    CopyFileOperation,
+    CountFanSource,
+    DeleteFileOperation,
+    DirectoryFanSource,
+    FailOperation,
+    FileOperation,
+    FolderOperation,
+    InfiniteFanSource,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
+    LoopOperation,
+    MoveFileOperation,
+    NotificationOperation,
+    OpenResourceOperation,
     OperationType,
+    PassOperation,
+    PromptFileOperation,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
+    StartOperation,
+    TabularFanSource,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
-from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 
 runner = CliRunner()
 
@@ -89,6 +116,130 @@ def test_op_icon_color_agent() -> None:
     assert color == "magenta"
 
 
+@pytest.mark.parametrize(
+    ("op", "expected_icon", "expected_color"),
+    [
+        (StartOperation(type=OperationType.START), "?", "white"),
+        (PassOperation(type=OperationType.PASS, message="ok"), "?", "white"),
+        (FailOperation(type=OperationType.FAIL, message="bad"), "?", "white"),
+        (BreakOperation(type=OperationType.BREAK, message="stop"), "brk", "yellow"),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=3),
+            ),
+            "loop",
+            "blue",
+        ),
+        (BashCommandOperation(type=OperationType.BASH_COMMAND, command="x"), "$", "cyan"),
+        (
+            PythonScriptOperation(type=OperationType.PYTHON_SCRIPT, script_path=Path("x.py")),
+            "py",
+            "green",
+        ),
+        (
+            ShellScriptOperation(type=OperationType.SHELL_SCRIPT, script_path=Path("x.sh")),
+            "sh",
+            "yellow",
+        ),
+        (ReadFileOperation(type=OperationType.READ_FILE, path=Path("input.txt")), "r", "blue"),
+        (
+            WriteFileOperation(type=OperationType.WRITE_FILE, path=Path("out.txt")),
+            "w",
+            "green",
+        ),
+        (
+            CopyFileOperation(
+                type=OperationType.COPY_FILE,
+                source_path=Path("a.txt"),
+                destination_path=Path("b.txt"),
+            ),
+            "cp",
+            "blue",
+        ),
+        (
+            MoveFileOperation(
+                type=OperationType.MOVE_FILE,
+                source_path=Path("a.txt"),
+                destination_path=Path("b.txt"),
+            ),
+            "mv",
+            "yellow",
+        ),
+        (DeleteFileOperation(type=OperationType.DELETE_FILE, path=Path("old.txt")), "rm", "red"),
+        (FileOperation(type=OperationType.FILE, path=Path("data.csv")), "file", "blue"),
+        (FolderOperation(type=OperationType.FOLDER, path=Path("data")), "dir", "yellow"),
+        (
+            OpenResourceOperation(type=OperationType.OPEN_RESOURCE, target="https://example.test"),
+            "↗",
+            "blue",
+        ),
+        (
+            PromptFileOperation(type=OperationType.PROMPT_FILE, output_path=Path("prompt.md")),
+            "pr",
+            "magenta",
+        ),
+        (
+            CommonLlmTaskOperation(
+                type=OperationType.COMMON_LLM_TASK,
+                agent_id="writer",
+                task="summarize",
+                working_dir=Path("/tmp"),
+            ),
+            "llm",
+            "magenta",
+        ),
+        (
+            LocalVectorizeOperation(
+                type=OperationType.LOCAL_VECTORIZE,
+                source_path=Path("docs"),
+                index_path=Path("index"),
+            ),
+            "idx",
+            "green",
+        ),
+        (
+            LocalSearchOperation(
+                type=OperationType.LOCAL_SEARCH,
+                index_path=Path("index"),
+                query="find it",
+            ),
+            "srch",
+            "blue",
+        ),
+        (
+            ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message="Approve?",
+            ),
+            "ok?",
+            "yellow",
+        ),
+        (
+            NotificationOperation(type=OperationType.NOTIFICATION, title="Heads up"),
+            "bell",
+            "cyan",
+        ),
+        (
+            AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="codex",
+                prompt_path=Path("p.md"),
+                working_dir=Path("/tmp"),
+            ),
+            "@",
+            "magenta",
+        ),
+    ],
+)
+def test_op_icon_color_all_operation_types(
+    op: Any,
+    expected_icon: str,
+    expected_color: str,
+) -> None:
+    assert _op_icon_color(op) == (expected_icon, expected_color)
+
+
 # ── _op_detail ────────────────────────────────────────────────────────────────
 
 
@@ -119,9 +270,191 @@ def test_op_detail_agent() -> None:
         type=OperationType.AGENT,
         agent_id="summarizer",
         prompt_path=Path("p.md"),
-        working_dir=Path("/")
+        working_dir=Path("/"),
     )
     assert _op_detail(op) == "summarizer"
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (StartOperation(type=OperationType.START), ""),
+        (PassOperation(type=OperationType.PASS, message="ok"), ""),
+        (FailOperation(type=OperationType.FAIL, message="bad"), ""),
+        (BreakOperation(type=OperationType.BREAK, message="stop now"), "stop now"),
+        (BreakOperation(type=OperationType.BREAK), "break loop"),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=Path("items.csv")),
+            ),
+            "rows in items.csv",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=Path("docs")),
+            ),
+            "files in docs/",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=5),
+            ),
+            "×5",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=TriggerEventsFanSource(type="trigger_events"),
+            ),
+            "trigger events",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=InfiniteFanSource(type="infinite"),
+            ),
+            "until BREAK",
+        ),
+        (ReadFileOperation(type=OperationType.READ_FILE, path=Path("input.txt")), "read input.txt"),
+        (
+            WriteFileOperation(type=OperationType.WRITE_FILE, path=Path("out.txt")),
+            "write out.txt",
+        ),
+        (
+            CopyFileOperation(
+                type=OperationType.COPY_FILE,
+                source_path=Path("a.txt"),
+                destination_path=Path("b.txt"),
+            ),
+            "a.txt → b.txt",
+        ),
+        (
+            MoveFileOperation(
+                type=OperationType.MOVE_FILE,
+                source_path=Path("a.txt"),
+                destination_path=Path("b.txt"),
+            ),
+            "a.txt → b.txt",
+        ),
+        (
+            DeleteFileOperation(type=OperationType.DELETE_FILE, path=Path("old.txt")),
+            "delete old.txt",
+        ),
+        (FileOperation(type=OperationType.FILE, path=Path("data.csv")), "data.csv"),
+        (FolderOperation(type=OperationType.FOLDER, path=Path("reports")), "reports"),
+        (
+            OpenResourceOperation(type=OperationType.OPEN_RESOURCE, target="https://example.test"),
+            "https://example.test",
+        ),
+        (
+            PromptFileOperation(type=OperationType.PROMPT_FILE, output_path=Path("prompt.md")),
+            "write prompt.md",
+        ),
+        (
+            CommonLlmTaskOperation(
+                type=OperationType.COMMON_LLM_TASK,
+                agent_id="writer",
+                task="review",
+                working_dir=Path("/tmp"),
+            ),
+            "review via writer",
+        ),
+        (
+            LocalVectorizeOperation(
+                type=OperationType.LOCAL_VECTORIZE,
+                source_path=Path("docs"),
+                index_path=Path("index"),
+            ),
+            "index docs",
+        ),
+        (
+            LocalSearchOperation(
+                type=OperationType.LOCAL_SEARCH,
+                index_path=Path("index"),
+                query="find it",
+            ),
+            "search index",
+        ),
+        (
+            ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message="Approve?",
+            ),
+            "approval required",
+        ),
+        (
+            NotificationOperation(type=OperationType.NOTIFICATION, title="Heads up"),
+            "Heads up",
+        ),
+        (
+            AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="codex",
+                prompt_path=Path("p.md"),
+                working_dir=Path("/tmp"),
+                skill_name="fix-ci",
+            ),
+            "codex /fix-ci",
+        ),
+    ],
+)
+def test_op_detail_all_operation_types(op: Any, expected: str) -> None:
+    assert _op_detail(op) == expected
+
+
+def test_op_detail_open_resource_truncation() -> None:
+    target = "https://example.test/" + ("long/" * 12)
+    detail = _op_detail(OpenResourceOperation(type=OperationType.OPEN_RESOURCE, target=target))
+    assert detail.endswith("…")
+    assert len(detail) <= 29
+
+
+@pytest.mark.parametrize(
+    ("op", "expected"),
+    [
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=Path("items.jsonl")),
+            ),
+            "tabular/jsonl",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=Path("docs"), glob="**/*.md"),
+            ),
+            "dir glob=**/*.md",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=7),
+            ),
+            "count=7",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=TriggerEventsFanSource(type="trigger_events"),
+            ),
+            "trigger events",
+        ),
+        (
+            LoopOperation(
+                type=OperationType.LOOP,
+                source=InfiniteFanSource(type="infinite"),
+            ),
+            "infinite",
+        ),
+        (BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo hi"), "—"),
+    ],
+)
+def test_loop_cell_supported_sources(op: Any, expected: str) -> None:
+    assert _loop_cell(op) == expected
 
 
 # ── _condition_label ──────────────────────────────────────────────────────────
@@ -131,6 +464,7 @@ def test_op_detail_agent() -> None:
     (EdgeConditionType.ON_SUCCESS, "✓"),
     (EdgeConditionType.ON_FAILURE, "✗"),
     (EdgeConditionType.OUTPUT_MATCHES, "~"),
+    (EdgeConditionType.AFTER_LOOP, "↧"),
     (EdgeConditionType.ALWAYS, " "),
 ])
 def test_condition_label(condition: EdgeConditionType, expected: str) -> None:
@@ -208,6 +542,72 @@ def test_build_arrow_column_fan_out() -> None:
     assert "╰" in text.plain
 
 
+def test_build_arrow_column_fan_in() -> None:
+    g = WorkflowGraph()
+    for node_id in ["src1", "src2", "dst"]:
+        g.add_node(_bash_node(node_id))
+    g.add_edge("src1", "dst", EdgeConfig(from_node="src1", to_node="dst"))
+    g.add_edge("src2", "dst", EdgeConfig(from_node="src2", to_node="dst"))
+
+    text = _build_arrow_column([g._nodes["src1"], g._nodes["src2"]], [g._nodes["dst"]], g)
+
+    assert "╯" in text.plain
+    assert "╭" in text.plain
+    assert "▶" in text.plain
+
+
+def test_build_arrow_column_downward_routing() -> None:
+    g = WorkflowGraph()
+    for node_id in ["src", "dst1", "dst2", "dst3"]:
+        g.add_node(_bash_node(node_id))
+    g.add_edge("src", "dst3", EdgeConfig(from_node="src", to_node="dst3"))
+
+    text = _build_arrow_column(
+        [g._nodes["src"]],
+        [g._nodes["dst1"], g._nodes["dst2"], g._nodes["dst3"]],
+        g,
+    )
+
+    assert "╮" in text.plain
+    assert "│" in text.plain
+    assert "╰▶" in text.plain
+
+
+def test_build_arrow_column_upward_routing() -> None:
+    g = WorkflowGraph()
+    for node_id in ["src1", "src2", "src3", "dst"]:
+        g.add_node(_bash_node(node_id))
+    g.add_edge("src3", "dst", EdgeConfig(from_node="src3", to_node="dst"))
+
+    text = _build_arrow_column(
+        [g._nodes["src1"], g._nodes["src2"], g._nodes["src3"]],
+        [g._nodes["dst"]],
+        g,
+    )
+
+    assert "╯" in text.plain
+    assert "│" in text.plain
+    assert "╭▶" in text.plain
+
+
+def test_build_arrow_column_overlapping_edges() -> None:
+    g = WorkflowGraph()
+    for node_id in ["left1", "left2", "right1", "right2", "right3"]:
+        g.add_node(_bash_node(node_id))
+    g.add_edge("left1", "right3", EdgeConfig(from_node="left1", to_node="right3"))
+    g.add_edge("left2", "right3", EdgeConfig(from_node="left2", to_node="right3"))
+
+    text = _build_arrow_column(
+        [g._nodes["left1"], g._nodes["left2"]],
+        [g._nodes["right1"], g._nodes["right2"], g._nodes["right3"]],
+        g,
+    )
+
+    assert "╮" in text.plain
+    assert "│" in text.plain
+    assert "╰▶" in text.plain
+
+
 def test_build_arrow_column_condition_on_success() -> None:
     g = _make_graph_with_edge("a", "b", EdgeConditionType.ON_SUCCESS)
     text = _build_arrow_column([g._nodes["a"]], [g._nodes["b"]], g)
@@ -218,6 +618,28 @@ def test_build_arrow_column_condition_on_failure() -> None:
     g = _make_graph_with_edge("a", "b", EdgeConditionType.ON_FAILURE)
     text = _build_arrow_column([g._nodes["a"]], [g._nodes["b"]], g)
     assert "✗" in text.plain
+
+
+def test_build_arrow_column_condition_output_matches() -> None:
+    g = _make_graph_with_edge("a", "b", EdgeConditionType.OUTPUT_MATCHES)
+    text = _build_arrow_column([g._nodes["a"]], [g._nodes["b"]], g)
+    assert "~" in text.plain
+
+
+def test_build_arrow_column_condition_after_loop() -> None:
+    g = _make_graph_with_edge("a", "b", EdgeConditionType.AFTER_LOOP)
+    text = _build_arrow_column([g._nodes["a"]], [g._nodes["b"]], g)
+    assert "↧" in text.plain
+
+
+def test_build_arrow_column_condition_always_has_no_status_label() -> None:
+    g = _make_graph_with_edge("a", "b", EdgeConditionType.ALWAYS)
+    text = _build_arrow_column([g._nodes["a"]], [g._nodes["b"]], g)
+    assert "▶" in text.plain
+    assert "✓" not in text.plain
+    assert "✗" not in text.plain
+    assert "~" not in text.plain
+    assert "↧" not in text.plain
 
 
 # ── render_workflow ───────────────────────────────────────────────────────────
@@ -257,8 +679,6 @@ def test_render_workflow_shows_name_and_id() -> None:
 
 
 def test_render_workflow_with_schedule() -> None:
-    from gofer.core.workflow import ScheduleConfig
-
     wf = AgenticWorkflow(
         WorkflowConfig(
             id="sched-wf",
@@ -270,6 +690,108 @@ def test_render_workflow_with_schedule() -> None:
     console, buf = _console()
     render_workflow(wf, console)
     assert "0 9 * * 1-5" in buf.getvalue()
+
+
+def test_render_workflow_shows_multiple_agents() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="agent-wf", name="Agent Workflow"))
+    wf.register_agent(
+        AgentConfig(agent_id="codex", subscription="codex", working_dir=Path("/tmp"))
+    )
+    wf.register_agent(
+        AgentConfig(agent_id="claude", subscription="claude_code", working_dir=Path("/tmp"))
+    )
+    wf.add_operation(_agent_node("ask-codex", "codex"))
+
+    console, buf = _console()
+    render_workflow(wf, console)
+
+    assert "1 node" in buf.getvalue()
+    assert "2 agents" in buf.getvalue()
+
+
+def test_render_workflow_shows_retry_and_timeout() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="retry-wf", name="Retry Workflow"))
+    wf.add_operation(
+        GraphNode(
+            node_id="fragile",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="exit 1"),
+            retry_count=2,
+            timeout_seconds=30,
+        )
+    )
+
+    console, buf = _console()
+    render_workflow(wf, console)
+    out = buf.getvalue()
+
+    assert "retry" in out
+    assert "2" in out
+    assert "30s" in out
+
+
+def test_render_workflow_mixed_operation_table() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="mixed-wf", name="Mixed Workflow"))
+    nodes = [
+        GraphNode(
+            node_id="read-config",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=Path("config.toml")),
+        ),
+        GraphNode(
+            node_id="write-report",
+            operation=WriteFileOperation(type=OperationType.WRITE_FILE, path=Path("report.md")),
+        ),
+        GraphNode(
+            node_id="copy-artifact",
+            operation=CopyFileOperation(
+                type=OperationType.COPY_FILE,
+                source_path=Path("report.md"),
+                destination_path=Path("dist/report.md"),
+            ),
+        ),
+        GraphNode(
+            node_id="delete-temp",
+            operation=DeleteFileOperation(type=OperationType.DELETE_FILE, path=Path("tmp.txt")),
+        ),
+        GraphNode(
+            node_id="search-index",
+            operation=LocalSearchOperation(
+                type=OperationType.LOCAL_SEARCH,
+                index_path=Path("index"),
+                query="needle",
+            ),
+        ),
+    ]
+    for node in nodes:
+        wf.add_operation(node)
+
+    console, buf = _console()
+    render_workflow(wf, console)
+    out = buf.getvalue()
+
+    assert "read file" in out
+    assert "write report.md" in out
+    assert "copy file" in out
+    assert "delete tmp.txt" in out
+    assert "search index" in out
+
+
+def test_render_workflow_shows_loop_table_cells() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="loop-wf", name="Loop Workflow"))
+    wf.add_operation(
+        GraphNode(
+            node_id="each-file",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=Path("docs"), glob="*.md"),
+            ),
+        )
+    )
+
+    console, buf = _console()
+    render_workflow(wf, console)
+
+    assert "files in docs/" in buf.getvalue()
+    assert "dir glob=*.md" in buf.getvalue()
 
 
 def test_render_empty_workflow() -> None:

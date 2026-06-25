@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import signal
 import sys
@@ -11,27 +12,36 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
 from gofer.core.scheduler import WorkflowScheduler
+from gofer.core.usage import summarize_node_outputs
 from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
+    WorkflowApprovalError,
     WorkflowCreateError,
     WorkflowLogError,
+    WorkflowPlanError,
     WorkflowRunError,
     WorkflowUpdateError,
     create_workflow_payload,
-    delete_workflow_payload,
+    decide_workflow_approval_payload,
     delete_workflow_chat_payload,
+    delete_workflow_payload,
     duplicate_workflow_payload,
+    health_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
+    list_workflow_approvals_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     rename_workflow_payload,
     run_workflow_payload,
     stop_workflow_run_payload,
     update_workflow_payload,
+    workflow_plan_payload,
+    workflow_run_events_payload,
     workflow_run_log_payload,
 )
 from gofer.ui.chat import (
@@ -95,13 +105,19 @@ def sync_workflow_watchers(data_dir: Path, watcher: WorkflowWatcher) -> None:
 
 
 class GoferUiServer(ThreadingHTTPServer):
-    def __init__(self, server_address: tuple[str, int], data_dir: Path) -> None:
+    def __init__(
+        self,
+        server_address: tuple[str, int],
+        data_dir: Path,
+        resource_limits: ResourceLimits | None = None,
+    ) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(server_address, GoferUiRequestHandler)
         self.data_dir = data_dir
+        self.resource_limits = resource_limits or DEFAULT_RESOURCE_LIMITS
         self.gofer_cli_path = ensure_local_gofer_cli(data_dir)
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
-        self.watcher = WorkflowWatcher()
+        self.watcher = WorkflowWatcher(resource_limits=self.resource_limits)
         self._continuous_runs: dict[str, threading.Thread] = {}
         self._continuous_lock = threading.Lock()
         self._continuous_stop = threading.Event()
@@ -137,6 +153,7 @@ class GoferUiServer(ThreadingHTTPServer):
 
     def ensure_continuous_runs(self) -> None:
         active_ids: set[str] = set()
+        continuous_workflows: list[AgenticWorkflow] = []
         for path in sorted(self.data_dir.glob("*.toml")):
             try:
                 workflow = AgenticWorkflow.from_file(path)
@@ -144,7 +161,23 @@ class GoferUiServer(ThreadingHTTPServer):
                 continue
             if not workflow.config.run_continuously:
                 continue
+            continuous_workflows.append(workflow)
+
+        global_limit = self.resource_limits.max_watcher_concurrency
+
+        for workflow in continuous_workflows:
             active_ids.add(workflow.config.id)
+            with self._continuous_lock:
+                active_count = sum(
+                    1 for thread in self._continuous_runs.values() if thread.is_alive()
+                )
+            if active_count >= global_limit:
+                log.warning(
+                    "Skipping continuous workflow '%s'; global concurrency limit %s reached",
+                    workflow.config.id,
+                    global_limit,
+                )
+                continue
             self._start_continuous_run_if_needed(workflow.config.id)
 
         with self._continuous_lock:
@@ -187,10 +220,53 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/api/health":
-            self._send_json({
-                "ok": True,
-                "dataDir": str(self._default_data_dir()),
-            })
+            self._send_json(
+                {
+                    "ok": True,
+                    "dataDir": str(self._default_data_dir()),
+                }
+            )
+            return
+
+        if parsed.path == "/api/doctor":
+            query = parse_qs(parsed.query)
+            self._send_json(health_payload(self._request_data_dir(query)))
+            return
+
+        if parsed.path.startswith("/workflows/") and parsed.path.endswith("/usage"):
+            workflow_id = parsed.path.removeprefix("/workflows/").removesuffix("/usage")
+            query = parse_qs(parsed.query)
+            try:
+                payload = workflow_usage_page_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowLogError as exc:
+                self._send_html(f"<p>{html.escape(str(exc))}</p>", status=404)
+                return
+
+            self._send_html(render_workflow_usage_html(payload))
+            return
+
+        if parsed.path.startswith("/workflows/") and "/logs/" in parsed.path:
+            remainder = parsed.path.removeprefix("/workflows/")
+            workflow_id, run_part = remainder.split("/logs/", 1)
+            if not run_part.endswith("/usage"):
+                self._send_json({"error": "Not found"}, status=404)
+                return
+            run_id = run_part.removesuffix("/usage")
+            query = parse_qs(parsed.query)
+            try:
+                payload = workflow_run_log_payload(
+                    workflow_id,
+                    run_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowLogError as exc:
+                self._send_html(f"<p>{html.escape(str(exc))}</p>", status=404)
+                return
+
+            self._send_html(render_usage_summary_html(payload.get("usageSummary") or {}))
             return
 
         if parsed.path == "/api/workflows":
@@ -204,10 +280,14 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(provider_payload())
             return
 
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/doctor"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/doctor")
+            query = parse_qs(parsed.query)
+            self._send_json(health_payload(self._request_data_dir(query), workflow_id))
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/logs/latest"):
-            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix(
-                "/logs/latest"
-            )
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/logs/latest")
             query = parse_qs(parsed.query)
             try:
                 payload = latest_workflow_log_payload(
@@ -219,6 +299,26 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json({"log": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/events"):
+            remainder = parsed.path.removeprefix("/api/workflows/").removesuffix("/events")
+            if "/logs/" not in remainder:
+                self._send_json({"error": "Invalid events path"}, status=404)
+                return
+            workflow_id, run_id = remainder.split("/logs/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                payload = workflow_run_events_payload(
+                    workflow_id,
+                    run_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=404)
+                return
+
+            self._send_json({"events": payload})
             return
 
         if parsed.path.startswith("/api/workflows/") and "/logs/" in parsed.path:
@@ -247,6 +347,22 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     self._request_data_dir(query),
                 )
             except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json(payload)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/approvals"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/approvals")
+            query = parse_qs(parsed.query)
+            try:
+                payload = list_workflow_approvals_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                    include_decided=query.get("all", ["1"])[0] != "0",
+                )
+            except WorkflowApprovalError as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
@@ -323,6 +439,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                         messages=body.get("messages") or [],
                         workflow=body.get("workflow"),
                         data_dir=self._request_data_dir(query),
+                        resource_limits=self._resource_limits(),
                     )
                 )
             except (ChatProviderError, json.JSONDecodeError) as exc:
@@ -336,22 +453,34 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(response)
             return
 
-        if parsed.path.startswith("/api/workflows/") and "/runs/" in parsed.path and parsed.path.endswith("/stop"):
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/runs/" in parsed.path
+            and parsed.path.endswith("/stop")
+        ):
             remainder = parsed.path.removeprefix("/api/workflows/")
             workflow_id, run_id = remainder.removesuffix("/stop").split("/runs/", 1)
             query = parse_qs(parsed.query)
-            payload = stop_workflow_run_payload(
-                workflow_id,
-                self._request_data_dir(query),
-                run_id=run_id,
-            )
+            try:
+                payload = stop_workflow_run_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                    run_id=run_id,
+                )
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
             self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/stop"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/stop")
             query = parse_qs(parsed.query)
-            payload = stop_workflow_run_payload(workflow_id, self._request_data_dir(query))
+            try:
+                payload = stop_workflow_run_payload(workflow_id, self._request_data_dir(query))
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
             self._sync_schedules()
             self._send_json(payload)
             return
@@ -399,23 +528,76 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"workflow": workflow}, status=201)
             return
 
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/plan"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/plan")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                trigger_context = body.get("triggerContext")
+                if trigger_context is not None and not isinstance(trigger_context, dict):
+                    raise WorkflowPlanError("triggerContext must be an object")
+                plan = workflow_plan_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                    trigger_context=trigger_context,
+                )
+            except (WorkflowPlanError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json({"plan": plan})
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/run"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/run")
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
-                run = asyncio.run(
+                dry_run = bool(body.get("dryRun", False))
+                trigger_context = body.get("triggerContext")
+                if trigger_context is not None and not isinstance(trigger_context, dict):
+                    raise WorkflowRunError("triggerContext must be an object")
+                result = asyncio.run(
                     run_workflow_payload(
                         workflow_id,
                         self._request_data_dir(query),
-                        dry_run=bool(body.get("dryRun", False)),
+                        dry_run=dry_run,
+                        trigger_context=trigger_context,
                     )
                 )
             except (WorkflowRunError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
-            self._send_json({"run": run})
+            self._send_json({"plan" if dry_run else "run": result})
+            return
+
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/approvals/" in parsed.path
+            and (parsed.path.endswith("/approve") or parsed.path.endswith("/reject"))
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/")
+            workflow_id, approval_part = remainder.split("/approvals/", 1)
+            approval_key, action = approval_part.rsplit("/", 1)
+            run_id, node_id = approval_key.split("/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = decide_workflow_approval_payload(
+                    workflow_id,
+                    run_id,
+                    node_id,
+                    "approved" if action == "approve" else "rejected",
+                    self._request_data_dir(query),
+                    decided_by=str(body.get("by") or "ui"),
+                    notes=str(body.get("notes") or ""),
+                )
+            except (WorkflowApprovalError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json(payload)
             return
 
         self._send_json({"error": "Not found"}, status=404)
@@ -445,30 +627,42 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if parsed.path == "/api/chat":
             query = parse_qs(parsed.query)
-            payload = delete_workflow_chat_payload(
-                "workflow-assistant",
-                self._request_data_dir(query),
-            )
+            try:
+                payload = delete_workflow_chat_payload(
+                    "workflow-assistant",
+                    self._request_data_dir(query),
+                )
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
             self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/chat/threads/"):
             thread_id = parsed.path.removeprefix("/api/chat/threads/")
             query = parse_qs(parsed.query)
-            payload = delete_workflow_chat_payload(
-                f"workflow-assistant:{thread_id}",
-                self._request_data_dir(query),
-            )
+            try:
+                payload = delete_workflow_chat_payload(
+                    f"workflow-assistant:{thread_id}",
+                    self._request_data_dir(query),
+                )
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
             self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/chat"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/chat")
             query = parse_qs(parsed.query)
-            payload = delete_workflow_chat_payload(
-                workflow_id,
-                self._request_data_dir(query),
-            )
+            try:
+                payload = delete_workflow_chat_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                )
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
             self._send_json(payload)
             return
 
@@ -520,6 +714,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 workflow=body.get("workflow"),
                 cancel_event=cancel_event,
                 data_dir=data_dir,
+                resource_limits=self._resource_limits(),
             ):
                 self._write_stream_event(event)
         except (BrokenPipeError, ConnectionResetError):
@@ -529,10 +724,12 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001
             cancel_event.set()
             log.exception("Unhandled workflow assistant stream error")
-            self._write_stream_event({
-                "type": "error",
-                "error": f"Workflow assistant failed: {exc}",
-            })
+            self._write_stream_event(
+                {
+                    "type": "error",
+                    "error": f"Workflow assistant failed: {exc}",
+                }
+            )
         finally:
             cancel_event.set()
 
@@ -542,13 +739,35 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             return server.data_dir
         return get_data_dir()
 
-    def _request_data_dir(self, query: dict[str, list[str]]) -> Path:
-        data_dir = query.get("data_dir", [None])[0]
-        return Path(data_dir) if data_dir else self._default_data_dir()
+    def _resource_limits(self) -> ResourceLimits:
+        server = getattr(self, "server", None)
+        if isinstance(server, GoferUiServer):
+            return server.resource_limits
+        return DEFAULT_RESOURCE_LIMITS
+
+    def _request_data_dir(self, _query: dict[str, list[str]]) -> Path:
+        return self._default_data_dir()
 
     def _read_json(self) -> dict[str, Any]:
-        content_length = int(self.headers.get("Content-Length", "0"))
+        limit = self._resource_limits().max_api_request_body_bytes
+        content_length_header = self.headers.get("Content-Length")
+        if content_length_header is None:
+            raise json.JSONDecodeError("Content-Length is required", "", 0)
+        try:
+            content_length = int(content_length_header)
+        except ValueError as exc:
+            raise json.JSONDecodeError("Invalid Content-Length", "", 0) from exc
+        if content_length < 0:
+            raise json.JSONDecodeError("Invalid Content-Length", "", 0)
+        if content_length > limit:
+            raise json.JSONDecodeError(
+                f"Request body exceeds limit {limit} bytes",
+                "",
+                0,
+            )
         raw_body = self.rfile.read(content_length)
+        if len(raw_body) != content_length:
+            raise json.JSONDecodeError("Incomplete request body", "", 0)
         payload = json.loads(raw_body.decode("utf-8") or "{}")
         if not isinstance(payload, dict):
             raise WorkflowCreateError("Request body must be a JSON object")
@@ -561,6 +780,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, markup: str, status: int = 200) -> None:
+        body = markup.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -583,16 +811,162 @@ def ready_payload(server: GoferUiServer) -> dict[str, Any]:
         "host": host,
         "port": port,
         "dataDir": str(server.data_dir),
-        "goferCliPath": str(server.gofer_cli_path) if server.gofer_cli_path else None,
+        "goferCliAvailable": server.gofer_cli_path is not None,
     }
+
+
+def workflow_usage_page_payload(
+    workflow_id: str,
+    data_dir: Path,
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    runs_payload = list_workflow_run_logs_payload(workflow_id, data_dir)
+    run_summaries: list[dict[str, Any]] = []
+    totals = {
+        "agent_calls": 0,
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "estimated_cost": 0.0,
+        "agent_time_seconds": 0.0,
+    }
+    for run_log in (runs_payload.get("runs") or [])[:limit]:
+        run_id = str(run_log["id"])
+        try:
+            payload = workflow_run_log_payload(workflow_id, run_id, data_dir)
+        except WorkflowLogError:
+            continue
+        summary = payload.get("usageSummary")
+        if not isinstance(summary, dict):
+            summary = summarize_node_outputs(payload.get("nodeOutputs") or {})
+        run_summaries.append(
+            {
+                "runId": run_id,
+                "status": payload.get("status"),
+                "startedAt": payload.get("startedAt"),
+                "summary": summary,
+            }
+        )
+        run_totals = summary.get("totals") if isinstance(summary, dict) else {}
+        if not isinstance(run_totals, dict):
+            continue
+        for key in ("agent_calls", "input_tokens", "output_tokens", "total_tokens"):
+            totals[key] += int(run_totals.get(key) or 0)
+        totals["estimated_cost"] += float(run_totals.get("estimated_cost") or 0.0)
+        totals["agent_time_seconds"] += float(run_totals.get("agent_time_seconds") or 0.0)
+    return {"workflowId": workflow_id, "runs": run_summaries, "totals": totals}
+
+
+def render_workflow_usage_html(payload: dict[str, Any]) -> str:
+    workflow_id = html.escape(str(payload.get("workflowId") or "workflow"))
+    totals_value = payload.get("totals")
+    totals: dict[str, Any] = totals_value if isinstance(totals_value, dict) else {}
+    rows = []
+    for run in payload.get("runs") or []:
+        if not isinstance(run, dict):
+            continue
+        summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
+        run_totals = summary.get("totals") if isinstance(summary, dict) else {}
+        if not isinstance(run_totals, dict):
+            run_totals = {}
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(run.get('runId') or ''))}</td>"
+            f"<td>{html.escape(str(run.get('status') or 'unknown'))}</td>"
+            f"<td>{html.escape(str(run_totals.get('agent_calls') or 0))}</td>"
+            f"<td>{html.escape(str(run_totals.get('total_tokens') or 0))}</td>"
+            f"<td>${float(run_totals.get('estimated_cost') or 0.0):.6f}</td>"
+            f"<td>{float(run_totals.get('agent_time_seconds') or 0.0):.2f}s</td>"
+            "</tr>"
+        )
+    table = "".join(rows) or "<tr><td colspan='6'>No usage records found.</td></tr>"
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        f"<title>LLM usage for {workflow_id}</title></head><body>"
+        f"<h1>LLM usage for {workflow_id}</h1>"
+        f"{_usage_totals_html(totals)}"
+        "<h2>Recent runs</h2><table>"
+        "<thead><tr><th>Run</th><th>Status</th><th>Calls</th><th>Tokens</th>"
+        "<th>Cost</th><th>Agent time</th></tr></thead>"
+        f"<tbody>{table}</tbody></table></body></html>"
+    )
+
+
+def render_usage_summary_html(summary: dict[str, Any]) -> str:
+    totals = summary.get("totals") if isinstance(summary, dict) else {}
+    if not isinstance(totals, dict):
+        totals = {}
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<title>LLM run usage</title></head><body>"
+        "<h1>LLM run usage</h1>"
+        f"{_usage_totals_html(totals)}"
+        f"{_usage_nodes_html('Most expensive nodes', summary.get('most_expensive_nodes'))}"
+        f"{_usage_nodes_html('Slowest nodes', summary.get('slowest_nodes'))}"
+        f"{_budget_failures_html(summary.get('budget_failures'))}"
+        "</body></html>"
+    )
+
+
+def _usage_totals_html(totals: dict[str, Any]) -> str:
+    return (
+        "<section><h2>Summary</h2><dl>"
+        f"<dt>Agent calls</dt><dd>{html.escape(str(totals.get('agent_calls') or 0))}</dd>"
+        f"<dt>Total tokens</dt><dd>{html.escape(str(totals.get('total_tokens') or 0))}</dd>"
+        f"<dt>Estimated cost</dt><dd>${float(totals.get('estimated_cost') or 0.0):.6f}</dd>"
+        f"<dt>Agent time</dt><dd>{float(totals.get('agent_time_seconds') or 0.0):.2f}s</dd>"
+        "</dl></section>"
+    )
+
+
+def _usage_nodes_html(title: str, nodes: Any) -> str:
+    rows = []
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(node.get('node_id') or ''))}</td>"
+            f"<td>{html.escape(str(node.get('model') or node.get('provider') or ''))}</td>"
+            f"<td>{html.escape(str(node.get('total_tokens') or 0))}</td>"
+            f"<td>${float(node.get('estimated_cost') or 0.0):.6f}</td>"
+            f"<td>{float(node.get('duration_seconds') or 0.0):.2f}s</td>"
+            "</tr>"
+        )
+    body = "".join(rows) or "<tr><td colspan='5'>None</td></tr>"
+    return (
+        f"<section><h2>{html.escape(title)}</h2><table>"
+        "<thead><tr><th>Node</th><th>Model</th><th>Tokens</th><th>Cost</th>"
+        "<th>Duration</th></tr></thead>"
+        f"<tbody>{body}</tbody></table></section>"
+    )
+
+
+def _budget_failures_html(nodes: Any) -> str:
+    items = []
+    for node in nodes or []:
+        if not isinstance(node, dict):
+            continue
+        violations = ", ".join(str(value) for value in node.get("budget_violations") or [])
+        items.append(
+            f"<li>{html.escape(str(node.get('node_id') or ''))}: {html.escape(violations)}</li>"
+        )
+    body = "".join(items) or "<li>None</li>"
+    return f"<section><h2>Budget failures</h2><ul>{body}</ul></section>"
 
 
 def create_server(
     host: str = "127.0.0.1",
     port: int = 8765,
     data_dir: Path | None = None,
+    resource_limits: ResourceLimits | None = None,
 ) -> GoferUiServer:
-    return GoferUiServer((host, port), data_dir or get_data_dir())
+    return GoferUiServer(
+        (host, port),
+        data_dir or get_data_dir(),
+        resource_limits=resource_limits,
+    )
 
 
 def _install_shutdown_handlers(server: GoferUiServer) -> None:

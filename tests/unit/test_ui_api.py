@@ -1,26 +1,38 @@
 from __future__ import annotations
 
+import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import anyio
 import pytest
 
+from gofer.core.approvals import ApprovalRequest, ApprovalStore
+from gofer.core.executor import NodeOutput
+from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits, byte_len
+from gofer.ui import api as api_module
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
+    WorkflowLogError,
     WorkflowRunError,
+    WorkflowUpdateError,
     create_workflow_payload,
+    decide_workflow_approval_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
     duplicate_workflow_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
+    list_workflow_approvals_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     rename_workflow_payload,
     run_workflow_payload,
     stop_workflow_run_payload,
     update_workflow_payload,
+    workflow_plan_payload,
+    workflow_run_events_payload,
     workflow_run_log_payload,
 )
 from gofer.ui.chat import workflow_chat_prompt_path
@@ -28,8 +40,7 @@ from gofer.utils.run_state import workflow_run_stop_path
 
 
 def test_list_workflow_payloads_serializes_real_nodes_and_edges(tmp_path: Path) -> None:
-    workflow_path = tmp_path / "daily.toml"
-    workflow_path.write_text(
+    (tmp_path / "daily.toml").write_text(
         """
 [workflow]
 id = "daily"
@@ -62,7 +73,7 @@ condition = "on_success"
     workflow = payload["workflows"][0]
     assert workflow["id"] == "daily"
     assert workflow["name"] == "Daily"
-    assert workflow["sourcePath"] == str(workflow_path)
+    assert workflow["sourcePath"] == "daily.toml"
     assert [node["id"] for node in workflow["nodes"]] == ["collect", "summarize"]
     assert workflow["nodes"][0]["meta"] == "echo hello"
     assert workflow["nodes"][0]["operation"]["command"] == "echo hello"
@@ -79,6 +90,123 @@ condition = "on_success"
     ]
 
 
+def test_list_workflow_payloads_serializes_http_request_node(tmp_path: Path) -> None:
+    (tmp_path / "api.toml").write_text(
+        """
+[workflow]
+id = "api"
+name = "API"
+
+[[nodes]]
+id = "create_issue"
+type = "http_request"
+method = "POST"
+url = "https://api.example.test/issues"
+expected_statuses = [201]
+response_mode = "json"
+
+[nodes.headers]
+Authorization = "{{secret.API_TOKEN}}"
+
+[nodes.json]
+title = "Bug"
+
+[nodes.output_mapping]
+issue_id = "json.id"
+""".strip()
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+
+    node = payload["workflows"][0]["nodes"][0]
+    assert node["type"] == "http_request"
+    assert node["meta"] == "POST https://api.example.test/issues"
+    assert node["operation"]["headers"]["Authorization"] == "{{secret.API_TOKEN}}"
+    assert node["operation"]["json"] == {"title": "Bug"}
+    assert node["operation"]["output_mapping"] == {"issue_id": "json.id"}
+
+
+def test_http_workflow_payload_masks_literal_secret_fields_and_preserves_on_save(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "api.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "api"
+name = "API"
+
+[[nodes]]
+id = "post"
+type = "http_request"
+method = "POST"
+url = "https://api.example.test/issues?token=real-token"
+secret_fields = ["Authorization", "password", "token"]
+
+[nodes.headers]
+Authorization = "Bearer real-token"
+
+[nodes.json]
+title = "Bug"
+password = "cleartext-secret"
+""".strip()
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+
+    node = payload["workflows"][0]["nodes"][0]
+    serialized = json.dumps(node)
+    assert "Bearer real-token" not in serialized
+    assert "cleartext-secret" not in serialized
+    assert "token=real-token" not in serialized
+    assert node["operation"]["headers"]["Authorization"] == "***"
+    assert node["operation"]["json"]["password"] == "***"
+
+    saved = update_workflow_payload("api", payload["workflows"][0], tmp_path)
+
+    assert saved["nodes"][0]["operation"]["headers"]["Authorization"] == "***"
+    assert "Bearer real-token" in workflow_path.read_text()
+    assert "token=real-token" in workflow_path.read_text()
+    assert "cleartext-secret" in workflow_path.read_text()
+
+
+def test_http_workflow_payload_preserves_masked_url_query_secrets_on_save(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "api.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "api"
+name = "API"
+
+[[nodes]]
+id = "post"
+type = "http_request"
+method = "POST"
+url = "https://api.example.test/issues?token=real-token&project=demo"
+secret_fields = ["token"]
+""".strip()
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+    node = payload["workflows"][0]["nodes"][0]
+
+    assert node["operation"]["url"] == (
+        "https://api.example.test/issues?token=%2A%2A%2A&project=demo"
+    )
+
+    saved = update_workflow_payload("api", payload["workflows"][0], tmp_path)
+
+    assert saved["nodes"][0]["operation"]["url"] == (
+        "https://api.example.test/issues?token=%2A%2A%2A&project=demo"
+    )
+    assert (
+        'url = "https://api.example.test/issues?token=real-token&project=demo"'
+        in workflow_path.read_text()
+    )
+
+
 def test_list_workflow_payloads_reports_invalid_workflows(tmp_path: Path) -> None:
     (tmp_path / "broken.toml").write_text("[workflow]\nid = 1\n")
 
@@ -90,9 +218,9 @@ def test_list_workflow_payloads_reports_invalid_workflows(tmp_path: Path) -> Non
     assert workflow["name"] == "Broken"
     assert workflow["invalid"] is True
     assert workflow["status"] == "Error"
-    assert workflow["sourcePath"] == str(tmp_path / "broken.toml")
+    assert workflow["sourcePath"] == "broken.toml"
     assert workflow["validationError"]
-    assert payload["errors"][0]["path"] == str(tmp_path / "broken.toml")
+    assert payload["errors"][0]["path"] == "broken.toml"
 
 
 def test_list_workflow_payloads_includes_empty_workflows(tmp_path: Path) -> None:
@@ -173,6 +301,31 @@ command = "echo hello"
     assert (tmp_path / "imported.toml").exists()
 
 
+@pytest.mark.parametrize("workflow_id", ["../outside", "bad/id", "bad\\id", "Bad"])
+def test_import_workflow_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    data_dir = tmp_path / "data"
+    with pytest.raises(WorkflowCreateError, match="Workflow id"):
+        import_workflow_payload(
+            f"""
+[workflow]
+id = '{workflow_id}'
+name = "Unsafe"
+
+[[nodes]]
+id = "hello"
+type = "bash_command"
+command = "echo hello"
+""".strip(),
+            data_dir,
+        )
+
+    assert not data_dir.exists()
+    assert not (tmp_path / "outside.toml").exists()
+
+
 def test_rename_workflow_payload_updates_label_without_changing_id(tmp_path: Path) -> None:
     create_workflow_payload("Original", tmp_path)
 
@@ -214,6 +367,19 @@ def test_duplicate_workflow_payload_creates_copy(tmp_path: Path) -> None:
     assert duplicated["nodes"][0]["id"] == "hello"
 
 
+@pytest.mark.parametrize("workflow_id", ["../original", "original/../x", "Bad"])
+def test_duplicate_workflow_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    create_workflow_payload("Original", tmp_path)
+
+    with pytest.raises(WorkflowUpdateError, match="Invalid workflow id"):
+        duplicate_workflow_payload(workflow_id, None, tmp_path)
+
+    assert not (tmp_path.parent / "original-2.toml").exists()
+
+
 def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     create_workflow_payload("Delete Me", tmp_path)
     log_dir = tmp_path / "logs" / "delete-me"
@@ -235,6 +401,19 @@ def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     assert not chat_prompt_path.exists()
 
 
+@pytest.mark.parametrize("workflow_id", ["../delete-me", "delete/me", "Delete-Me"])
+def test_delete_workflow_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    create_workflow_payload("Delete Me", tmp_path)
+
+    with pytest.raises(WorkflowUpdateError, match="Invalid workflow id"):
+        delete_workflow_payload(workflow_id, tmp_path)
+
+    assert (tmp_path / "delete-me.toml").exists()
+
+
 def test_delete_workflow_chat_payload_removes_prompt_handoff_file(tmp_path: Path) -> None:
     chat_prompt_path = workflow_chat_prompt_path(tmp_path, "chatty")
     chat_prompt_path.parent.mkdir(parents=True)
@@ -244,6 +423,68 @@ def test_delete_workflow_chat_payload_removes_prompt_handoff_file(tmp_path: Path
 
     assert result == {"workflowId": "chatty", "deleted": True}
     assert not chat_prompt_path.exists()
+
+
+@pytest.mark.parametrize(
+    "prompt_id",
+    ["../chatty", "chatty/path", "workflow-assistant:../thread", "workflow-assistant:bad/thread"],
+)
+def test_delete_workflow_chat_payload_rejects_unsafe_ids(
+    tmp_path: Path,
+    prompt_id: str,
+) -> None:
+    with pytest.raises(WorkflowUpdateError):
+        delete_workflow_chat_payload(prompt_id, tmp_path)
+
+
+def test_latest_workflow_log_payload_returns_bounded_tail(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "chatty"
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "2026-06-13T10-00-00-0400.log"
+    log_path.write_text("a" * (DEFAULT_RESOURCE_LIMITS.max_api_log_response_bytes + 10))
+
+    payload = latest_workflow_log_payload("chatty", tmp_path)
+
+    assert payload["truncated"] is True
+    assert len(payload["logText"].encode()) <= DEFAULT_RESOURCE_LIMITS.max_api_log_response_bytes
+
+
+@pytest.mark.parametrize("workflow_id", ["../chatty", "chatty/path", "Chatty"])
+def test_latest_workflow_log_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    with pytest.raises(WorkflowLogError, match="Invalid workflow id"):
+        latest_workflow_log_payload(workflow_id, tmp_path)
+
+
+@pytest.mark.parametrize("run_id", ["../run.log", "nested/run.log", "run.txt"])
+def test_workflow_run_log_payload_rejects_unsafe_run_ids(
+    tmp_path: Path,
+    run_id: str,
+) -> None:
+    with pytest.raises(WorkflowLogError, match="Invalid run log id"):
+        workflow_run_log_payload("chatty", run_id, tmp_path)
+
+
+def test_log_payloads_use_workflow_resource_limit_override(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Chatty", tmp_path)
+    workflow["resourceLimits"] = ResourceLimits(max_api_log_response_bytes=5).model_dump()
+    update_workflow_payload("chatty", workflow, tmp_path)
+    log_dir = tmp_path / "logs" / "chatty"
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "2026-06-13T10-00-00-0400.log"
+    log_path.write_text("0123456789")
+
+    latest = latest_workflow_log_payload("chatty", tmp_path)
+    specific = workflow_run_log_payload("chatty", log_path.name, tmp_path)
+
+    assert latest["maxBytes"] == 5
+    assert specific["maxBytes"] == 5
+    assert latest["truncated"] is True
+    assert specific["truncated"] is True
+    assert len(latest["logText"].encode()) <= 5
+    assert len(specific["logText"].encode()) <= 5
 
 
 def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path) -> None:
@@ -256,12 +497,14 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
             "prompt_path": "prompts/reviewer.md",
             "tools": ["Read"],
             "mcp_servers": [],
+            "extra_paths": [str(tmp_path.parent)],
             "env": {"MODE": "review"},
         }
     }
     workflow["nodes"] = [
         {
             "id": "collect",
+            "label": "Collect Git Diff",
             "type": "bash_command",
             "operation": {
                 "type": "bash_command",
@@ -277,6 +520,7 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
         },
         {
             "id": "review",
+            "label": "Review Changes",
             "type": "agent",
             "operation": {
                 "type": "agent",
@@ -287,6 +531,7 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
                 "input_mapping": {"diff": "collect.output"},
                 "fan_source": None,
             },
+            "inputs": {"summary": "collect.text"},
             "settings": {},
         },
     ]
@@ -303,12 +548,139 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
     reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
 
     assert saved["nodes"][0]["operation"]["command"] == "git diff --stat"
+    assert saved["nodes"][0]["label"] == "Collect Git Diff"
+    assert reloaded["nodes"][0]["label"] == "Collect Git Diff"
+    assert reloaded["nodes"][1]["label"] == "Review Changes"
     assert reloaded["nodes"][0]["settings"]["pipeOutput"] is True
     assert reloaded["nodes"][0]["settings"]["timeoutSeconds"] == 30.0
     assert reloaded["nodes"][1]["operation"]["input_mapping"] == {"diff": "collect.output"}
+    assert reloaded["nodes"][1]["inputs"] == {"summary": "collect.text"}
     assert reloaded["agents"]["reviewer"]["subscription"] == "codex"
     assert reloaded["agents"]["reviewer"]["env"] == {"MODE": "review"}
+    assert reloaded["agents"]["reviewer"]["extra_paths"] == [str(tmp_path.parent)]
+    assert "outside working_dir" in reloaded["resourceWarnings"][0]
     assert reloaded["edges"][0]["condition"] == "on_success"
+    text = (tmp_path / "autosave.toml").read_text(encoding="utf-8")
+    assert 'label = "Collect Git Diff"' in text
+    assert 'label = "Review Changes"' in text
+    assert "[nodes.inputs]" in text
+    assert 'summary = "collect.text"' in text
+
+
+def test_update_workflow_payload_persists_ui_node_positions(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Positions", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "collect",
+            "label": "Collect",
+            "type": "bash_command",
+            "operation": {"type": "bash_command", "command": "echo collect"},
+            "x": 480,
+            "y": 160,
+        },
+        {
+            "id": "review",
+            "label": "Review",
+            "type": "bash_command",
+            "operation": {"type": "bash_command", "command": "echo review"},
+            "x": 1280.4,
+            "y": 420.6,
+        },
+    ]
+    workflow["edges"] = [{"from": "collect", "to": "review", "condition": "always"}]
+
+    saved = update_workflow_payload("positions", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert [(node["id"], node["x"], node["y"]) for node in saved["nodes"]] == [
+        ("collect", 480, 160),
+        ("review", 1280, 421),
+    ]
+    assert [(node["id"], node["x"], node["y"]) for node in reloaded["nodes"]] == [
+        ("collect", 480, 160),
+        ("review", 1280, 421),
+    ]
+    text = (tmp_path / "positions.toml").read_text(encoding="utf-8")
+    assert "[ui.node_positions.collect]" in text
+    assert "x = 480" in text
+    assert "y = 160" in text
+    assert "[ui.node_positions.review]" in text
+    assert "x = 1280" in text
+    assert "y = 421" in text
+
+
+@pytest.mark.parametrize("workflow_id", ["../autosave", "autosave/path", "Autosave"])
+def test_update_workflow_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    workflow = create_workflow_payload("Autosave", tmp_path)
+    workflow["id"] = workflow_id
+
+    with pytest.raises(WorkflowUpdateError):
+        update_workflow_payload(workflow_id, workflow, tmp_path)
+
+
+@pytest.mark.parametrize("workflow_id", ["../runnable", "runnable/path", "Runnable"])
+def test_run_workflow_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    with pytest.raises(WorkflowRunError, match="Invalid workflow id"):
+        anyio.run(run_workflow_payload, workflow_id, tmp_path, True)
+
+
+def test_workflow_plan_payload_returns_execution_preview(tmp_path: Path) -> None:
+    (tmp_path / "preview.toml").write_text(
+        """
+[workflow]
+id = "preview"
+name = "Preview"
+
+[[nodes]]
+id = "write"
+type = "write_file"
+path = "out.txt"
+content = "hello"
+overwrite = true
+""".strip()
+    )
+
+    plan = workflow_plan_payload("preview", tmp_path)
+
+    assert plan["workflowId"] == "preview"
+    assert plan["generations"][0]["nodes"][0]["type"] == "write_file"
+    assert f"overwrite file: {tmp_path / 'out.txt'}" in plan["destructiveActions"]
+
+
+def test_workflow_plan_payload_uses_workflow_relative_agent_extra_paths(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "shared").mkdir()
+    (tmp_path / "relative-agent-paths.toml").write_text(
+        """
+[workflow]
+id = "relative-agent-paths"
+name = "Relative Agent Paths"
+
+[agents.reviewer]
+subscription = "codex"
+working_dir = "."
+extra_paths = ["shared"]
+
+[[nodes]]
+id = "review"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+""".strip()
+    )
+
+    plan = workflow_plan_payload("relative-agent-paths", tmp_path)
+
+    assert plan["providerRequirements"][0]["extraPaths"] == [
+        str((tmp_path / "shared").resolve())
+    ]
 
 
 def test_update_workflow_payload_allows_empty_agent_prompt_path(tmp_path: Path) -> None:
@@ -381,6 +753,7 @@ def test_update_workflow_payload_persists_allow_failure(tmp_path: Path) -> None:
             },
             "settings": {
                 "allowFailure": True,
+                "awaitAllInputs": False,
             },
         }
     ]
@@ -390,8 +763,11 @@ def test_update_workflow_payload_persists_allow_failure(tmp_path: Path) -> None:
     text = (tmp_path / "allowed-failure.toml").read_text(encoding="utf-8")
 
     assert saved["nodes"][0]["settings"]["allowFailure"] is True
+    assert saved["nodes"][0]["settings"]["awaitAllInputs"] is False
     assert reloaded["nodes"][0]["settings"]["allowFailure"] is True
+    assert reloaded["nodes"][0]["settings"]["awaitAllInputs"] is False
     assert "allow_failure = true" in text
+    assert "await_all_inputs = false" in text
 
 
 def test_update_workflow_payload_persists_run_continuously(tmp_path: Path) -> None:
@@ -422,12 +798,57 @@ def test_run_workflow_payload_supports_dry_run(tmp_path: Path) -> None:
     ]
     update_workflow_payload("runnable", workflow, tmp_path)
 
-    run = anyio.run(run_workflow_payload, "runnable", tmp_path, True)
+    plan = anyio.run(
+        run_workflow_payload,
+        "runnable",
+        tmp_path,
+        True,
+        {"event": {"kind": "manual"}},
+    )
 
-    assert run["workflowId"] == "runnable"
-    assert run["success"] is True
-    assert Path(run["logPath"]).parent == tmp_path / "logs" / "runnable"
-    assert run["nodeOutputs"]["hello"]["success"] is True
+    assert plan["workflowId"] == "runnable"
+    assert plan["generations"][0]["nodes"][0]["id"] == "hello"
+    assert plan["generations"][0]["nodes"][0]["type"] == "bash_command"
+    assert "unknown shell command effects: echo hello" in plan["destructiveActions"]
+    assert plan["triggerContext"]["provided"]["event"]["kind"] == "manual"
+    assert not (tmp_path / "logs" / "runnable").exists()
+
+
+def test_run_workflow_payload_includes_external_agent_access_warnings(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "work"
+    extra_dir = tmp_path.parent / "ui-run-extra-access"
+    work_dir.mkdir()
+    extra_dir.mkdir(exist_ok=True)
+    workflow = create_workflow_payload("Agent Access", tmp_path)
+    workflow["agents"] = {
+        "reviewer": {
+            "agent_id": "reviewer",
+            "subscription": "codex",
+            "working_dir": str(work_dir),
+            "extra_paths": [str(extra_dir)],
+        }
+    }
+    workflow["nodes"] = [
+        {
+            "id": "review",
+            "type": "agent",
+            "operation": {
+                "type": "agent",
+                "agent_id": "reviewer",
+                "working_dir": str(work_dir),
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("agent-access", workflow, tmp_path)
+
+    plan = anyio.run(run_workflow_payload, "agent-access", tmp_path, True)
+
+    assert "outside working_dir" in plan["warnings"][0]
+    assert str(extra_dir.resolve()) in plan["warnings"][0]
+    assert plan["providerRequirements"][0]["extraPaths"] == [str(extra_dir.resolve())]
 
 
 def test_run_workflow_payload_writes_node_output_to_log(tmp_path: Path) -> None:
@@ -448,11 +869,149 @@ def test_run_workflow_payload_writes_node_output_to_log(tmp_path: Path) -> None:
     run = anyio.run(run_workflow_payload, "logged-runnable", tmp_path, False)
 
     assert run["success"] is True
-    log_path = Path(run["logPath"])
+    log_path = tmp_path / str(run["logPath"])
     text = log_path.read_text()
     assert "hello - stdout:" in text
     assert "hello" in text
     assert "hello - node output:" in text
+
+
+def test_workflow_log_payload_includes_structured_run_events(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Timeline Runnable", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo hello",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("timeline-runnable", workflow, tmp_path)
+
+    run = anyio.run(run_workflow_payload, "timeline-runnable", tmp_path, False)
+    run_id = Path(str(run["logPath"])).name
+    latest = latest_workflow_log_payload("timeline-runnable", tmp_path)
+    selected = workflow_run_log_payload("timeline-runnable", run_id, tmp_path)
+    events = workflow_run_events_payload("timeline-runnable", run_id, tmp_path)
+
+    assert run["runEvents"]
+    assert latest["runEvents"] == selected["runEvents"] == events["runEvents"]
+    assert latest["runNodes"]["hello"]["status"] == "completed"
+    assert events["runNodes"]["hello"]["attempts"][0]["inputs"] == {}
+
+
+def test_run_workflow_payload_applies_trigger_context_to_execution(
+    tmp_path: Path,
+) -> None:
+    workflow = create_workflow_payload("Triggered Runnable", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "printf '%s' \"$EVENT_KIND\"",
+            },
+            "inputs": {"env.EVENT_KIND": "trigger.event.kind"},
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("triggered-runnable", workflow, tmp_path)
+
+    run = anyio.run(
+        run_workflow_payload,
+        "triggered-runnable",
+        tmp_path,
+        False,
+        {"event": {"kind": "watch"}},
+    )
+
+    assert run["success"] is True
+    assert run["nodeOutputs"]["hello"]["output"] == "watch"
+
+
+def test_http_node_output_payload_uses_masked_response_preview() -> None:
+    node_output = NodeOutput(
+        node_id="api",
+        success=True,
+        output='{"access_token": "real-token"}',
+        exit_code=0,
+        duration_seconds=0.1,
+        type="http_request",
+        value={"access_token": "real-token"},
+        data={
+            "status": 200,
+            "headers": {"Authorization": "real-token"},
+            "body": '{"access_token": "real-token"}',
+            "json": {"access_token": "real-token"},
+            "selected": {"token": "real-token"},
+            "responsePreview": {
+                "status": 200,
+                "headers": {"Authorization": "***"},
+                "body": '{"access_token": "***"}',
+                "json": {"access_token": "***"},
+                "selected": {"token": "***"},
+                "url": "***",
+                "method": "POST",
+            },
+        },
+    )
+
+    payload, truncated = api_module._node_outputs_payload(
+        {"api": node_output},
+        DEFAULT_RESOURCE_LIMITS,
+    )
+
+    assert truncated is False
+    assert payload["api"]["output"] == '{"access_token": "***"}'
+    assert payload["api"]["data"]["json"] == {"access_token": "***"}
+    assert payload["api"]["data"]["selected"] == {"token": "***"}
+    assert "real-token" not in json.dumps(payload)
+
+
+def test_run_workflow_payload_bounds_aggregate_node_output_text(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Bounded Response", tmp_path)
+    workflow["resourceLimits"] = ResourceLimits(
+        max_api_log_response_bytes=120,
+        max_log_bytes_per_node=1_000,
+    ).model_dump()
+    workflow["nodes"] = [
+        {
+            "id": "first",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "printf '%200s' | tr ' ' a",
+            },
+            "settings": {},
+        },
+        {
+            "id": "second",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "printf '%200s' | tr ' ' b",
+            },
+            "settings": {},
+        },
+    ]
+    update_workflow_payload("bounded-response", workflow, tmp_path)
+
+    run = anyio.run(run_workflow_payload, "bounded-response", tmp_path, False)
+
+    output_bytes = sum(
+        byte_len(node["output"])
+        + sum(byte_len(fan["output"]) for fan in node["fanOutputs"])
+        for node in run["nodeOutputs"].values()
+    )
+    assert run["success"] is True
+    assert run["nodeOutputsTruncated"] is True
+    assert run["nodeOutputsMaxBytes"] == 120
+    assert output_bytes <= 120
+    assert len(json.dumps(run["nodeOutputs"], separators=(",", ":")).encode()) <= 120
 
 
 def test_stop_workflow_run_payload_reports_no_active_run(tmp_path: Path) -> None:
@@ -533,7 +1092,10 @@ async def test_stop_workflow_run_payload_stops_active_run(tmp_path: Path) -> Non
 
     assert run_result is not None
     assert run_result["success"] is False
-    assert "stopped by user" in run_result["logText"] or "Process stopped by user" in run_result["logText"]
+    assert (
+        "stopped by user" in run_result["logText"]
+        or "Process stopped by user" in run_result["logText"]
+    )
 
 
 async def test_run_workflow_payload_allows_concurrent_runs(tmp_path: Path) -> None:
@@ -640,6 +1202,57 @@ def test_latest_workflow_log_payload_reads_last_run(tmp_path: Path) -> None:
     assert "hello" in payload["logText"]
 
 
+def test_workflow_log_payloads_include_historical_http_response_preview(
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / "logs" / "api-history"
+    log_dir.mkdir(parents=True)
+    log_path = log_dir / "2026-06-13T10-00-00-0400.log"
+    log_path.write_text(
+        "2026-06-13T10:00:00-04:00 - api-history started successfully\n"
+        "2026-06-13T10:00:00-04:00 - INFO - api-history completed successfully\n"
+    )
+    node_output = NodeOutput(
+        node_id="api",
+        success=True,
+        output='{"access_token": "real-token"}',
+        exit_code=0,
+        duration_seconds=0.1,
+        type="http_request",
+        data={
+            "status": 200,
+            "body": '{"access_token": "real-token"}',
+            "responsePreview": {
+                "status": 200,
+                "method": "POST",
+                "url": "https://api.example.test/issues",
+                "body": '{"access_token": "***"}',
+                "json": {"access_token": "***"},
+                "selected": {"token": "***"},
+            },
+        },
+    )
+    node_outputs, truncated = api_module._node_outputs_payload(
+        {"api": node_output},
+        DEFAULT_RESOURCE_LIMITS,
+    )
+    api_module._write_run_node_outputs_payload(
+        log_path,
+        workflow_id="api-history",
+        limits=DEFAULT_RESOURCE_LIMITS,
+        node_outputs=node_outputs,
+        node_outputs_truncated=truncated,
+    )
+
+    latest = latest_workflow_log_payload("api-history", tmp_path)
+    selected = workflow_run_log_payload("api-history", log_path.name, tmp_path)
+
+    assert latest["nodeOutputs"]["api"]["data"]["body"] == '{"access_token": "***"}'
+    assert selected["nodeOutputs"]["api"]["data"]["selected"] == {"token": "***"}
+    assert "real-token" not in json.dumps(latest["nodeOutputs"])
+    assert "real-token" not in json.dumps(selected["nodeOutputs"])
+
+
 def test_list_workflow_run_logs_payload_returns_runs_newest_first(tmp_path: Path) -> None:
     log_dir = tmp_path / "logs" / "history-flow"
     log_dir.mkdir(parents=True)
@@ -661,16 +1274,28 @@ def test_list_workflow_run_logs_payload_returns_runs_newest_first(tmp_path: Path
     assert payload["runs"][1]["status"] == "success"
 
 
+@pytest.mark.parametrize("workflow_id", ["../history-flow", "history/flow", "History-Flow"])
+def test_list_workflow_run_logs_payload_rejects_unsafe_workflow_ids(
+    tmp_path: Path,
+    workflow_id: str,
+) -> None:
+    with pytest.raises(WorkflowLogError, match="Invalid workflow id"):
+        list_workflow_run_logs_payload(workflow_id, tmp_path)
+
+
 def test_list_workflow_run_logs_payload_detects_multiline_failure(tmp_path: Path) -> None:
     log_dir = tmp_path / "logs" / "gofer-demo"
     log_dir.mkdir(parents=True)
     run = log_dir / "2026-06-18T09-52-26-0400.log"
     run.write_text(
         "2026-06-18T09:52:26-04:00 - gofer-demo started successfully\n"
-        "2026-06-18T09:52:26-04:00 - NODE - summarize-demo - attempt 1 finished success=False exit_code=1 duration=0.08s\n"
-        "2026-06-18T09:52:26-04:00 - ERROR - gofer-demo failed due to node summarize-demo failed: WARNING: proceeding\n"
+        "2026-06-18T09:52:26-04:00 - NODE - summarize-demo - attempt 1 finished "
+        "success=False exit_code=1 duration=0.08s\n"
+        "2026-06-18T09:52:26-04:00 - ERROR - gofer-demo failed due to node "
+        "summarize-demo failed: WARNING: proceeding\n"
         "Reading additional input from stdin...\n"
-        "Error: failed to initialize in-process app-server client: Read-only file system (os error 30)\n",
+        "Error: failed to initialize in-process app-server client: Read-only file system "
+        "(os error 30)\n",
         encoding="utf-8",
     )
 
@@ -731,3 +1356,286 @@ def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:
     anyio.run(run_workflow_payload, "status-flow", tmp_path, False)
 
     assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Error"
+
+    stopped_log = log_dir / "2026-06-13T10-00-02-0400.log"
+    stopped_log.write_text(
+        "2026-06-13T10:00:02-04:00 - status-flow started successfully\n"
+        "2026-06-13T10:00:02-04:00 - WARNING - status-flow stopped by user\n"
+    )
+    stopped_log.with_suffix(".events.json").write_text(
+        json.dumps({"events": [{"nodeId": "workflow", "status": "stopped"}], "nodes": {}})
+    )
+
+    assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Stopped"
+
+
+def test_workflow_approval_payloads_list_and_decide_requests(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    store.create_or_update(
+        ApprovalRequest(
+            workflow_id="approval-flow",
+            run_id="run.log",
+            node_id="approve",
+            message="Approve deploy?",
+            approvers=["ops"],
+            timeout_seconds=30,
+            timeout_decision="reject",
+        )
+    )
+
+    listed = list_workflow_approvals_payload("approval-flow", tmp_path)
+
+    assert listed["approvals"][0]["status"] == "pending"
+    assert listed["approvals"][0]["approvers"] == ["ops"]
+    assert listed["approvals"][0]["timeoutSeconds"] == 30
+    assert listed["approvals"][0]["timeoutDecision"] == "reject"
+
+    decided = decide_workflow_approval_payload(
+        "approval-flow",
+        "run.log",
+        "approve",
+        "approved",
+        tmp_path,
+        decided_by="ops",
+        notes="ship it",
+    )
+
+    approval = decided["approval"]
+    assert approval["status"] == "decided"
+    assert approval["decision"]["decision"] == "approved"
+    assert approval["decision"]["decidedBy"] == "ops"
+    assert approval["decision"]["notes"] == "ship it"
+    assert decided["resumed"] is False
+
+
+def test_workflow_approval_payload_enforces_configured_approvers(tmp_path: Path) -> None:
+    store = ApprovalStore(tmp_path)
+    store.create_or_update(
+        ApprovalRequest(
+            workflow_id="approval-flow",
+            run_id="run.log",
+            node_id="approve",
+            message="Approve deploy?",
+            approvers=["ops"],
+        )
+    )
+
+    with pytest.raises(api_module.WorkflowApprovalError, match="not allowed"):
+        decide_workflow_approval_payload(
+            "approval-flow",
+            "run.log",
+            "approve",
+            "approved",
+            tmp_path,
+            decided_by="ui",
+        )
+
+    request = store.get("approval-flow", "run.log", "approve")
+    assert request is not None
+    assert request.decision is None
+
+
+def test_workflow_approval_payload_rejects_already_decided_request(
+    tmp_path: Path,
+) -> None:
+    store = ApprovalStore(tmp_path)
+    store.create_or_update(
+        ApprovalRequest(
+            workflow_id="approval-flow",
+            run_id="run.log",
+            node_id="approve",
+            message="Approve deploy?",
+        )
+    )
+    store.decide(
+        "approval-flow",
+        "run.log",
+        "approve",
+        "rejected",
+        decided_by="ops",
+    )
+
+    with pytest.raises(api_module.WorkflowApprovalError, match="Pending approval"):
+        decide_workflow_approval_payload(
+            "approval-flow",
+            "run.log",
+            "approve",
+            "approved",
+            tmp_path,
+            decided_by="ui",
+        )
+
+    decided = store.get("approval-flow", "run.log", "approve")
+    assert decided is not None
+    assert decided.decision is not None
+    assert decided.decision.decision == "rejected"
+    assert decided.decision.decided_by == "ops"
+
+
+def test_workflow_approval_payload_resumes_checkpointed_request(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "approval-flow.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "approval-flow"
+name = "Approval Flow"
+
+[[nodes]]
+id = "plan"
+type = "bash_command"
+command = "echo deploy"
+
+[[nodes]]
+id = "approve"
+type = "approval_gate"
+message = "Approve {{plan.output}}?"
+
+[[nodes]]
+id = "notify"
+type = "notification"
+title = "Approval"
+body = "Gate: {{approve.data.message}}"
+
+[[edges]]
+from = "plan"
+to = "approve"
+
+[[edges]]
+from = "approve"
+to = "notify"
+condition = "on_success"
+""",
+        encoding="utf-8",
+    )
+    store = ApprovalStore(tmp_path)
+    run_id = "run.log"
+    log_path = tmp_path / "logs" / "approval-flow" / run_id
+    checkpoint_path = store.request_path(
+        "approval-flow",
+        run_id,
+        "approve",
+    ).with_suffix(".checkpoint.json")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "workflowId": "approval-flow",
+                "nodeId": "approve",
+                "trigger": {},
+                "nodeOutputs": {
+                    "plan": NodeOutput(
+                        node_id="plan",
+                        success=True,
+                        output="deploy",
+                        exit_code=0,
+                        duration_seconds=0,
+                        type="bash_command",
+                        data={"stdout": "deploy", "stderr": "", "command": "echo deploy"},
+                    ).contract(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    store.create_or_update(
+        ApprovalRequest(
+            workflow_id="approval-flow",
+            run_id=run_id,
+            node_id="approve",
+            message="Approve deploy?",
+            workflow_path=str(workflow_path),
+            log_path=str(log_path),
+            checkpoint_path=str(checkpoint_path),
+            waiter_seen_at="2099-01-01T00:00:00+00:00",
+        )
+    )
+
+    decided = decide_workflow_approval_payload(
+        "approval-flow",
+        run_id,
+        "approve",
+        "approved",
+        tmp_path,
+        decided_by="ui",
+    )
+
+    assert decided["resumed"] is True
+    run = workflow_run_log_payload("approval-flow", run_id, tmp_path)
+    assert run["nodeOutputs"]["approve"]["data"]["message"] == "Approve deploy?"
+    assert run["nodeOutputs"]["notify"]["data"]["body"] == "Gate: Approve deploy?"
+
+
+def test_workflow_approval_payload_list_resumes_expired_timeout(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "approval-flow.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "approval-flow"
+name = "Approval Flow"
+
+[[nodes]]
+id = "approve"
+type = "approval_gate"
+message = "Approve deploy?"
+timeout_seconds = 1
+
+[[nodes]]
+id = "notify"
+type = "notification"
+title = "Timed out"
+body = "Decision: {{approve.data.decision}}"
+
+[[edges]]
+from = "approve"
+to = "notify"
+condition = "on_failure"
+""",
+        encoding="utf-8",
+    )
+    store = ApprovalStore(tmp_path)
+    run_id = "run.log"
+    log_path = tmp_path / "logs" / "approval-flow" / run_id
+    checkpoint_path = store.request_path(
+        "approval-flow",
+        run_id,
+        "approve",
+    ).with_suffix(".checkpoint.json")
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_text(
+        json.dumps(
+            {
+                "workflowId": "approval-flow",
+                "nodeId": "approve",
+                "trigger": {},
+                "nodeOutputs": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    store.create_or_update(
+        ApprovalRequest(
+            workflow_id="approval-flow",
+            run_id=run_id,
+            node_id="approve",
+            message="Approve deploy?",
+            timeout_seconds=1,
+            workflow_path=str(workflow_path),
+            log_path=str(log_path),
+            checkpoint_path=str(checkpoint_path),
+            requested_at=(datetime.now(UTC) - timedelta(seconds=5)).isoformat(
+                timespec="seconds"
+            ),
+        )
+    )
+
+    listed = list_workflow_approvals_payload("approval-flow", tmp_path)
+
+    approval = listed["approvals"][0]
+    assert approval["decision"]["decision"] == "timeout"
+    run = workflow_run_log_payload("approval-flow", run_id, tmp_path)
+    assert run["nodeOutputs"]["approve"]["data"]["decision"] == "timeout"
+    assert run["nodeOutputs"]["notify"]["data"]["body"] == "Decision: timeout"

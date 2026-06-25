@@ -4,10 +4,17 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+from gofer.core.usage import LlmUsageBudget
 
 
 class OperationType(StrEnum):
+    START = "start"
+    PASS = "pass"
+    FAIL = "fail"
+    BREAK = "break"
+    LOOP = "loop"
     PYTHON_SCRIPT = "python_script"
     SHELL_SCRIPT = "shell_script"
     BASH_COMMAND = "bash_command"
@@ -24,11 +31,14 @@ class OperationType(StrEnum):
     COMMON_LLM_TASK = "common_llm_task"
     LOCAL_VECTORIZE = "local_vectorize"
     LOCAL_SEARCH = "local_search"
+    HTTP_REQUEST = "http_request"
+    APPROVAL_GATE = "approval_gate"
+    NOTIFICATION = "notification"
 
 
 class CountFanSource(BaseModel):
     type: Literal["count"]
-    count: int | str = 1
+    count: int | str | None = 1
     max_concurrency: int = 16
     fail_fast: bool = False
 
@@ -56,8 +66,18 @@ class TriggerEventsFanSource(BaseModel):
     fail_fast: bool = False
 
 
+class InfiniteFanSource(BaseModel):
+    type: Literal["infinite"]
+    max_concurrency: int = 16
+    fail_fast: bool = False
+
+
 FanSource = Annotated[
-    CountFanSource | TabularFanSource | DirectoryFanSource | TriggerEventsFanSource,
+    CountFanSource
+    | TabularFanSource
+    | DirectoryFanSource
+    | TriggerEventsFanSource
+    | InfiniteFanSource,
     Field(discriminator="type"),
 ]
 
@@ -81,6 +101,30 @@ class BashCommandOperation(BaseModel):
     command: str
     working_dir: Path | None = None
     env: dict[str, str] = {}
+
+
+class StartOperation(BaseModel):
+    type: Literal[OperationType.START]
+
+
+class PassOperation(BaseModel):
+    type: Literal[OperationType.PASS]
+    message: str = ""
+
+
+class FailOperation(BaseModel):
+    type: Literal[OperationType.FAIL]
+    message: str = ""
+
+
+class BreakOperation(BaseModel):
+    type: Literal[OperationType.BREAK]
+    message: str = ""
+
+
+class LoopOperation(BaseModel):
+    type: Literal[OperationType.LOOP]
+    source: FanSource
 
 
 class ReadFileOperation(BaseModel):
@@ -161,6 +205,7 @@ class CommonLlmTaskOperation(BaseModel):
     working_dir: Path
     memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
+    llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
 
 
 class LocalVectorizeOperation(BaseModel):
@@ -172,6 +217,9 @@ class LocalVectorizeOperation(BaseModel):
     chunk_size: int = 1200
     chunk_overlap: int = 120
     encoding: str = "utf-8"
+    mode: Literal["incremental", "full", "validate", "compact"] = "incremental"
+    embedding_strategy: str = "hash_token_v1"
+    search_strategy: str = "cosine_v1"
 
 
 class LocalSearchOperation(BaseModel):
@@ -179,6 +227,53 @@ class LocalSearchOperation(BaseModel):
     index_path: Path
     query: str
     top_k: int = 5
+    score_threshold: float = 0.0
+    include_snippets: bool = True
+    include_file_metadata: bool = True
+    embedding_strategy: str = "hash_token_v1"
+    search_strategy: str = "cosine_v1"
+
+
+class HttpRetryPolicy(BaseModel):
+    attempts: int = 1
+    backoff_seconds: float = 0.0
+    retry_on_statuses: list[int] = []
+
+
+class HttpRequestOperation(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal[OperationType.HTTP_REQUEST]
+    method: str = "GET"
+    url: str
+    headers: dict[str, str] = {}
+    params: dict[str, str] = {}
+    json_payload: object | None = Field(default=None, alias="json", serialization_alias="json")
+    body: str | None = None
+    timeout_seconds: float = 30.0
+    retry: HttpRetryPolicy = Field(default_factory=HttpRetryPolicy)
+    expected_statuses: list[int] = [200]
+    response_mode: Literal["auto", "json", "text", "none"] = "auto"
+    output_mapping: dict[str, str] = {}
+    secret_fields: list[str] = []
+
+
+class ApprovalGateOperation(BaseModel):
+    type: Literal[OperationType.APPROVAL_GATE]
+    message: str
+    timeout_seconds: float | None = None
+    timeout_decision: Literal["reject", "timeout"] = "timeout"
+    approvers: list[str] = []
+    notify: bool = False
+    notification_title: str = "Gofer Flow approval needed"
+
+
+class NotificationOperation(BaseModel):
+    type: Literal[OperationType.NOTIFICATION]
+    title: str = "Gofer Flow notification"
+    body: str = ""
+    channel: Literal["desktop"] = "desktop"
+    urgency: Literal["low", "normal", "critical"] = "normal"
 
 
 class AgentOperation(BaseModel):
@@ -190,11 +285,18 @@ class AgentOperation(BaseModel):
     dynamic_count: int | str = 1
     memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
+    llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
+    # Deprecated: fan-out belongs on LoopOperation. Kept for old TOML compatibility.
     fan_source: FanSource | None = None
 
 
 Operation = Annotated[
-    PythonScriptOperation
+    StartOperation
+    | PassOperation
+    | FailOperation
+    | BreakOperation
+    | LoopOperation
+    | PythonScriptOperation
     | ShellScriptOperation
     | BashCommandOperation
     | ReadFileOperation
@@ -209,6 +311,9 @@ Operation = Annotated[
     | CommonLlmTaskOperation
     | LocalVectorizeOperation
     | LocalSearchOperation
+    | HttpRequestOperation
+    | ApprovalGateOperation
+    | NotificationOperation
     | AgentOperation,
     Field(discriminator="type"),
 ]

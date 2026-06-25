@@ -7,9 +7,12 @@ import { fileURLToPath } from "node:url";
 const require = createRequire(import.meta.url);
 const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
 const { autoUpdater } = require("electron-updater");
+const { registerIpcHandlers } = require("./ipc-handlers.cjs");
+const { createIpcSecurity, isSafeExternalUrl } = require("./security.cjs");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const distIndexPath = path.join(__dirname, "..", "dist", "index.html");
+const backendErrorHtmlPath = path.join(__dirname, "backend-error.html");
 
 if (process.platform === "linux" && !process.env.GTK_USE_PORTAL) {
   process.env.GTK_USE_PORTAL = "0";
@@ -17,6 +20,9 @@ if (process.platform === "linux" && !process.env.GTK_USE_PORTAL) {
 
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
+if (process.env.GOFER_ELECTRON_SMOKE_TEST === "1") {
+  app.commandLine.appendSwitch("no-sandbox");
+}
 
 const VITE_DEV_SERVER_URL =
   process.env.GOFER_VITE_DEV_SERVER_URL ||
@@ -39,6 +45,8 @@ let activeApiBaseUrl;
 let selectedDataDir;
 let mainWindow;
 let backendErrorWindow;
+let ipcSecurity;
+let backendErrorIpcSecurity;
 let updateState = {
   available: false,
   checking: false,
@@ -68,7 +76,7 @@ function createWindow(apiBaseUrl) {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: !isSmokeTest,
       additionalArguments: [`--gofer-api-base-url=${apiBaseUrl}`],
     },
   });
@@ -103,7 +111,9 @@ function createWindow(apiBaseUrl) {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url);
+    if (isSafeExternalUrl(url)) {
+      shell.openExternal(url);
+    }
     return { action: "deny" };
   });
 
@@ -360,104 +370,21 @@ function createBackendErrorWindow(error, { title = "Gofer backend did not start"
       preload: path.join(__dirname, "error-preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: !isSmokeTest,
     },
   });
   backendErrorWindow = errorWindow;
 
-  errorWindow.loadURL(
-    `data:text/html;charset=utf-8,${encodeURIComponent(renderBackendErrorHtml(title, message))}`,
-  );
+  errorWindow.loadFile(backendErrorHtmlPath, {
+    query: {
+      message,
+      title,
+    },
+  });
   errorWindow.on("closed", () => {
     backendErrorWindow = undefined;
+    backendErrorIpcSecurity = undefined;
   });
-}
-
-function renderBackendErrorHtml(title, message) {
-  return `
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8" />
-    <title>Gofer Flow Backend Error</title>
-    <style>
-      body {
-        margin: 0;
-        min-height: 100vh;
-        display: grid;
-        place-items: center;
-        background: #1f1f1f;
-        color: #d4d4d4;
-        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      }
-      main {
-        max-width: 560px;
-        padding: 32px;
-      }
-      h1 {
-        margin: 0 0 12px;
-        color: #f2f2f2;
-        font-size: 24px;
-      }
-      p {
-        margin: 0 0 18px;
-        line-height: 1.5;
-      }
-      .actions {
-        display: flex;
-        gap: 10px;
-        margin: 18px 0;
-      }
-      button {
-        border: 1px solid #3c3c3c;
-        border-radius: 6px;
-        background: #2d2d30;
-        color: #f2f2f2;
-        cursor: pointer;
-        font: inherit;
-        padding: 9px 13px;
-      }
-      button:hover {
-        background: #383838;
-      }
-      pre {
-        white-space: pre-wrap;
-        overflow-wrap: anywhere;
-        padding: 16px;
-        background: #252526;
-        border: 1px solid #3c3c3c;
-        color: #f48771;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>${escapeHtml(title)}</h1>
-      <p>Electron could not keep the local Gofer Flow backend running. Restart it, or open the logs folder for troubleshooting details.</p>
-      <div class="actions">
-        <button id="restart">Restart backend</button>
-        <button id="logs">Open logs</button>
-      </div>
-      <pre>${escapeHtml(message)}</pre>
-    </main>
-    <script>
-      document.getElementById("restart").addEventListener("click", () => {
-        window.goferBackend.restart();
-      });
-      document.getElementById("logs").addEventListener("click", () => {
-        window.goferBackend.openLogs();
-      });
-    </script>
-  </body>
-</html>`;
-}
-
-function escapeHtml(value) {
-  return String(value)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
 }
 
 app.whenReady().then(async () => {
@@ -555,27 +482,58 @@ function setupApplicationMenu() {
 }
 
 function setupIpcHandlers() {
-  ipcMain.handle("gofer:restart-backend", restartBackend);
-  ipcMain.handle("gofer:open-logs", openLogsFolder);
-  ipcMain.handle("gofer:get-data-dir", getGoferDataDir);
-  ipcMain.handle("gofer:list-directory", listDirectory);
-  ipcMain.handle("gofer:open-path", openPath);
-  ipcMain.handle("gofer:reveal-path", revealPath);
-  ipcMain.handle("gofer:path-info", pathInfo);
-  ipcMain.handle("gofer:copy-path", copyPath);
-  ipcMain.handle("gofer:delete-path", deletePath);
-  ipcMain.handle("gofer:rename-path", renamePath);
-  ipcMain.handle("gofer:create-file", createFile);
-  ipcMain.handle("gofer:create-folder", createFolder);
-  ipcMain.handle("gofer:read-text-file", readTextFile);
-  ipcMain.handle("gofer:write-text-file", writeTextFile);
-  ipcMain.handle("gofer:set-data-dir", setDataDir);
-  ipcMain.handle("gofer:select-path", selectPath);
-  ipcMain.handle("gofer:check-for-updates", checkForUpdates);
-  ipcMain.handle("gofer:download-and-install-update", downloadAndInstallUpdate);
-  ipcMain.handle("gofer:install-downloaded-update", installDownloadedUpdate);
-  ipcMain.handle("gofer:open-update-release", openUpdateRelease);
-  ipcMain.handle("gofer:get-update-state", getUpdateState);
+  ipcSecurity = createIpcSecurity({
+    appRoots: [path.dirname(distIndexPath)],
+    devServerUrl: VITE_DEV_SERVER_URL,
+    getDataDir: getGoferDataDir,
+    getMainWebContents: () =>
+      mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+    isProduction,
+  });
+  backendErrorIpcSecurity = createIpcSecurity({
+    appRoots: [path.dirname(backendErrorHtmlPath)],
+    devServerUrl: VITE_DEV_SERVER_URL,
+    getDataDir: getGoferDataDir,
+    getMainWebContents: () =>
+      backendErrorWindow && !backendErrorWindow.isDestroyed()
+        ? backendErrorWindow.webContents
+        : null,
+    isProduction,
+  });
+  registerIpcHandlers(ipcMain, {
+    checkForUpdates,
+    copyPath,
+    createFile,
+    createFolder,
+    deletePath,
+    downloadAndInstallUpdate,
+    getGoferDataDir,
+    getUpdateState,
+    installDownloadedUpdate,
+    listDirectory,
+    openLogsFolder,
+    openPath,
+    openUpdateRelease,
+    pathInfo,
+    readTextFile,
+    renamePath,
+    restartBackend,
+    revealPath,
+    selectPath,
+    setDataDir,
+    writeTextFile,
+  }, {
+    secureHandler: (handler, channel) => async (event, ...args) => {
+      if (
+        (channel === "gofer:restart-backend" || channel === "gofer:open-logs") &&
+        backendErrorWindow &&
+        !backendErrorWindow.isDestroyed()
+      ) {
+        return backendErrorIpcSecurity.secureHandler(handler)(event, ...args);
+      }
+      return ipcSecurity.secureHandler(handler)(event, ...args);
+    },
+  });
 }
 
 function setupAutoUpdater() {
@@ -829,7 +787,10 @@ async function openPath(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const result = await shell.openPath(resolveExactPath(options.targetPath));
+  const result = await shell.openPath(resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  }));
   if (result) {
     throw new Error(result);
   }
@@ -841,7 +802,10 @@ async function revealPath(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const targetPath = resolveExactPath(options.targetPath);
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   if (fs.existsSync(targetPath)) {
     shell.showItemInFolder(targetPath);
     return { opened: true };
@@ -864,7 +828,10 @@ async function pathInfo(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const targetPath = resolveExactPath(options.targetPath);
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   const stat = await fs.promises.stat(targetPath);
   return pathInfoFromStat(targetPath, stat);
 }
@@ -877,8 +844,13 @@ async function copyPath(_event, options = {}) {
     throw new Error("A destination path is required.");
   }
 
-  const sourcePath = resolveExactPath(options.sourcePath);
-  const destinationPath = resolveExactPath(options.destinationPath);
+  const sourcePath = resolveExactPath(options.sourcePath, {
+    grantId: options.sourceGrantId,
+    mustExist: true,
+  });
+  const destinationPath = resolveExactPath(options.destinationPath, {
+    grantId: options.destinationGrantId,
+  });
   if (!fs.existsSync(sourcePath)) {
     throw new Error(`Path does not exist: ${sourcePath}`);
   }
@@ -890,7 +862,7 @@ async function copyPath(_event, options = {}) {
     force: false,
     recursive: true,
   });
-  return { path: destinationPath };
+  return pathHandle(destinationPath);
 }
 
 async function deletePath(_event, options = {}) {
@@ -898,11 +870,17 @@ async function deletePath(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const targetPath = resolveExactPath(options.targetPath);
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   if (!fs.existsSync(targetPath)) {
     throw new Error(`Path does not exist: ${targetPath}`);
   }
-  await fs.promises.rm(targetPath, { force: true, recursive: true });
+  if (typeof shell.trashItem !== "function") {
+    throw new Error("Trash is not available on this platform.");
+  }
+  await shell.trashItem(targetPath);
   return { deleted: true };
 }
 
@@ -914,29 +892,32 @@ async function renamePath(_event, options = {}) {
     throw new Error("A new name is required.");
   }
 
-  const sourcePath = resolveExactPath(options.sourcePath);
+  const sourcePath = resolveExactPath(options.sourcePath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   if (!fs.existsSync(sourcePath)) {
     throw new Error(`Path does not exist: ${sourcePath}`);
   }
-  const destinationPath = resolveNewChildPath(path.dirname(sourcePath), options.name);
+  const destinationPath = resolveNewChildPath(path.dirname(sourcePath), options.name, options.grantId);
   if (fs.existsSync(destinationPath)) {
     throw new Error(`Destination already exists: ${destinationPath}`);
   }
   await fs.promises.rename(sourcePath, destinationPath);
-  return { path: destinationPath };
+  return pathHandle(destinationPath);
 }
 
 async function createFile(_event, options = {}) {
-  const filePath = resolveNewChildPath(options.directory, options.name);
+  const filePath = resolveNewChildPath(options.directory, options.name, options.grantId);
   await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
   await fs.promises.writeFile(filePath, "", { encoding: "utf-8", flag: "wx" });
-  return { path: filePath };
+  return pathHandle(filePath);
 }
 
 async function createFolder(_event, options = {}) {
-  const folderPath = resolveNewChildPath(options.directory, options.name);
+  const folderPath = resolveNewChildPath(options.directory, options.name, options.grantId);
   await fs.promises.mkdir(folderPath, { recursive: false });
-  return { path: folderPath };
+  return pathHandle(folderPath);
 }
 
 async function readTextFile(_event, options = {}) {
@@ -944,7 +925,10 @@ async function readTextFile(_event, options = {}) {
     throw new Error("A path is required.");
   }
 
-  const targetPath = resolveExactPath(options.targetPath);
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   const stat = await fs.promises.stat(targetPath);
   if (!stat.isFile()) {
     throw new Error(`Path is not a file: ${targetPath}`);
@@ -954,7 +938,7 @@ async function readTextFile(_event, options = {}) {
   }
   return {
     content: await fs.promises.readFile(targetPath, "utf-8"),
-    path: targetPath,
+    ...pathHandle(targetPath),
   };
 }
 
@@ -966,9 +950,11 @@ async function writeTextFile(_event, options = {}) {
     throw new Error("File content is required.");
   }
 
-  const targetPath = resolveExactPath(options.targetPath);
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+  });
   await fs.promises.writeFile(targetPath, options.content, "utf-8");
-  return { path: targetPath };
+  return pathHandle(targetPath);
 }
 
 function pathInfoFromStat(targetPath, stat) {
@@ -981,18 +967,8 @@ function pathInfoFromStat(targetPath, stat) {
   };
 }
 
-function resolveNewChildPath(directory, name) {
-  if (!directory || typeof directory !== "string") {
-    throw new Error("A directory is required.");
-  }
-  if (!name || typeof name !== "string") {
-    throw new Error("A name is required.");
-  }
-  const cleanName = name.trim();
-  if (!cleanName || cleanName.includes("/") || cleanName.includes("\\") || cleanName === "." || cleanName === "..") {
-    throw new Error("Use a plain file or folder name.");
-  }
-  return path.join(resolveExactPath(directory), cleanName);
+function resolveNewChildPath(directory, name, grantId = "") {
+  return getIpcSecurity().resolveAllowedChildPath(directory, name, { grantId });
 }
 
 async function setDataDir(_event, options = {}) {
@@ -1000,9 +976,13 @@ async function setDataDir(_event, options = {}) {
     throw new Error("A data directory path is required.");
   }
 
-  selectedDataDir = path.resolve(options.dataDir);
+  selectedDataDir = resolveExactPath(options.dataDir, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
   process.env.GOFER_DATA_DIR = selectedDataDir;
   fs.mkdirSync(selectedDataDir, { recursive: true });
+  getIpcSecurity().grantPath(selectedDataDir);
   writePersistedDataDir(selectedDataDir);
   await restartBackend();
   return { dataDir: selectedDataDir };
@@ -1010,14 +990,18 @@ async function setDataDir(_event, options = {}) {
 
 async function listDirectory(_event, options = {}) {
   const directory = options.create === false
-    ? resolveExactPath(options.currentPath)
-    : resolvePickerDefaultPath(options.currentPath);
+    ? resolveExactPath(options.currentPath, {
+        grantId: options.grantId,
+        mustExist: true,
+      })
+    : resolvePickerDefaultPath(options.currentPath, options.grantId);
   if (options.create !== false) {
     fs.mkdirSync(directory, { recursive: true });
   }
   const entries = await fs.promises.readdir(directory, { withFileTypes: true });
 
   return {
+    ...pathHandle(directory),
     directory,
     parent: path.dirname(directory) === directory ? null : path.dirname(directory),
     entries: entries
@@ -1026,7 +1010,7 @@ async function listDirectory(_event, options = {}) {
         isDirectory: entry.isDirectory(),
         isFile: entry.isFile(),
         name: entry.name,
-        path: path.join(directory, entry.name),
+        ...pathHandle(path.join(directory, entry.name)),
       }))
       .sort((left, right) => {
         if (left.isDirectory !== right.isDirectory) {
@@ -1037,69 +1021,55 @@ async function listDirectory(_event, options = {}) {
   };
 }
 
-function resolveExactPath(currentPath) {
-  if (!currentPath || typeof currentPath !== "string") {
-    return getGoferDataDir();
-  }
-
-  const candidate = currentPath.trim();
-  if (!candidate) {
-    return getGoferDataDir();
-  }
-
-  return path.isAbsolute(candidate)
-    ? path.resolve(candidate)
-    : path.resolve(getGoferDataDir(), candidate);
+function resolveExactPath(currentPath, options = {}) {
+  return getIpcSecurity().resolveAllowedPath(currentPath, options);
 }
 
 async function selectPath(_event, options = {}) {
   const parentWindow =
     mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-  const defaultPath = resolvePickerDefaultPath(options.currentPath);
+  const defaultPath = resolvePickerDefaultPath(options.currentPath, options.grantId);
   fs.mkdirSync(defaultPath, { recursive: true });
+  const properties = options.directoryOnly === true
+    ? ["openDirectory", "showHiddenFiles", "createDirectory"]
+    : ["openFile", "openDirectory", "showHiddenFiles", "createDirectory"];
   const result = await dialog.showOpenDialog(parentWindow, {
     defaultPath,
-    properties: ["openFile", "openDirectory", "showHiddenFiles", "createDirectory"],
+    properties,
   });
 
   if (result.canceled || result.filePaths.length === 0) {
     return null;
   }
 
-  return result.filePaths[0];
+  return getIpcSecurity().grantPath(result.filePaths[0]);
 }
 
-function resolvePickerDefaultPath(currentPath) {
-  if (!currentPath || typeof currentPath !== "string") {
-    return getGoferDataDir();
-  }
+function resolvePickerDefaultPath(currentPath, grantId = "") {
+  return getIpcSecurity().resolvePickerPath(currentPath, { grantId });
+}
 
-  let candidate = currentPath.trim();
-  if (!candidate) {
-    return getGoferDataDir();
+function pathHandle(targetPath) {
+  const security = getIpcSecurity();
+  const existingGrantId = security.grantForPath(targetPath);
+  if (existingGrantId) {
+    return { grantId: existingGrantId, path: targetPath };
   }
+  return security.grantPath(targetPath);
+}
 
-  if (!path.isAbsolute(candidate)) {
-    candidate = path.resolve(getGoferDataDir(), candidate);
+function getIpcSecurity() {
+  if (!ipcSecurity) {
+    ipcSecurity = createIpcSecurity({
+      appRoot: path.dirname(distIndexPath),
+      devServerUrl: VITE_DEV_SERVER_URL,
+      getDataDir: getGoferDataDir,
+      getMainWebContents: () =>
+        mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null,
+      isProduction,
+    });
   }
-
-  if (fs.existsSync(candidate)) {
-    try {
-      return fs.statSync(candidate).isDirectory() ? candidate : path.dirname(candidate);
-    } catch {
-      return path.dirname(candidate);
-    }
-  }
-
-  let parent = path.dirname(candidate);
-  while (parent && parent !== path.dirname(parent)) {
-    if (fs.existsSync(parent)) {
-      return parent;
-    }
-    parent = path.dirname(parent);
-  }
-
-  return getGoferDataDir();
+  return ipcSecurity;
 }
 
 async function restartBackend() {

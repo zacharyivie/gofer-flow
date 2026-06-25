@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import enum
 import io
+import json
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import questionary
 from prompt_toolkit import Application
@@ -29,12 +30,13 @@ from gofer.core.operations import (
     BashCommandOperation,
     CopyFileOperation,
     DeleteFileOperation,
+    HttpRequestOperation,
+    HttpRetryPolicy,
     MoveFileOperation,
     OpenResourceOperation,
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
-    TriggerEventsFanSource,
     WriteFileOperation,
 )
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig
@@ -52,6 +54,7 @@ _AnyOp = (
     | MoveFileOperation
     | DeleteFileOperation
     | OpenResourceOperation
+    | HttpRequestOperation
     | AgentOperation
 )
 
@@ -120,6 +123,26 @@ def _coerce(kind: FieldKind, raw: str) -> Any:  # noqa: ANN401
             return Path(raw).expanduser()
         case _:
             return raw
+
+
+def _format_json_field(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, indent=2, sort_keys=True)
+
+
+def _parse_json_field(value: object) -> object | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return None
+    parsed: object = json.loads(text)
+    return parsed
 
 
 # ── TUI Application ──────────────────────────────────────────────────────────
@@ -474,7 +497,7 @@ def workflow_to_sections(wf: AgenticWorkflow) -> list[Section]:
 
 def _node_to_section(node: GraphNode) -> Section:
     op = node.operation
-    op_fields = _operation_fields(node.node_id, op)
+    op_fields = _operation_fields(node.node_id, cast(_AnyOp, op))
     shared: list[FieldDescriptor] = [
         FieldDescriptor(
             f"nodes.{node.node_id}.retry_count",
@@ -639,6 +662,81 @@ def _operation_fields(
             ),
         ]
 
+    if isinstance(op, HttpRequestOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.method",
+                "Method",
+                FieldKind.CHOICE,
+                op.method,
+                choices=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+            ),
+            FieldDescriptor(f"{prefix}.url", "URL", FieldKind.STRING, op.url),
+            FieldDescriptor(
+                f"{prefix}.headers", "Headers", FieldKind.DICT_STR_STR, dict(op.headers)
+            ),
+            FieldDescriptor(
+                f"{prefix}.params", "Query Params", FieldKind.DICT_STR_STR, dict(op.params)
+            ),
+            FieldDescriptor(
+                f"{prefix}.json_payload",
+                "JSON Body",
+                FieldKind.STRING,
+                _format_json_field(op.json_payload),
+            ),
+            FieldDescriptor(f"{prefix}.body", "Raw Body", FieldKind.STRING, op.body or ""),
+            FieldDescriptor(
+                f"{prefix}.timeout_seconds",
+                "HTTP Timeout (s)",
+                FieldKind.FLOAT,
+                op.timeout_seconds,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.attempts",
+                "Retry Attempts",
+                FieldKind.INT,
+                op.retry.attempts,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.backoff_seconds",
+                "Retry Backoff (s)",
+                FieldKind.FLOAT,
+                op.retry.backoff_seconds,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.retry_on_statuses",
+                "Retry Statuses",
+                FieldKind.LIST_STR,
+                [str(status) for status in op.retry.retry_on_statuses],
+            ),
+            FieldDescriptor(
+                f"{prefix}.expected_statuses",
+                "Expected Statuses",
+                FieldKind.LIST_STR,
+                [str(status) for status in op.expected_statuses],
+            ),
+            FieldDescriptor(
+                f"{prefix}.response_mode",
+                "Response Mode",
+                FieldKind.CHOICE,
+                op.response_mode,
+                choices=["auto", "json", "text", "none"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.output_mapping",
+                "Output Mapping",
+                FieldKind.DICT_STR_STR,
+                dict(op.output_mapping),
+            ),
+            FieldDescriptor(
+                f"{prefix}.secret_fields",
+                "Secret Fields",
+                FieldKind.LIST_STR,
+                list(op.secret_fields),
+            ),
+        ]
+
     # AgentOperation
     return [
         node_id_fd,
@@ -780,23 +878,66 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     resource_type=fm.get(f"{p}.resource_type") or op.resource_type,
                     args=fm.get(f"{p}.args") or [],
                 )
-            else:
+            elif isinstance(op, HttpRequestOperation):
+                retry_statuses = [
+                    int(status)
+                    for status in (fm.get(f"{p}.retry.retry_on_statuses") or [])
+                    if str(status).strip().isdigit()
+                ]
+                new_op = HttpRequestOperation(
+                    type=op.type,
+                    method=fm.get(f"{p}.method") or op.method,
+                    url=fm.get(f"{p}.url") or op.url,
+                    headers=fm.get(f"{p}.headers") or {},
+                    params=fm.get(f"{p}.params") or {},
+                    json=_parse_json_field(fm.get(f"{p}.json_payload")),
+                    body=fm.get(f"{p}.body") or None,
+                    timeout_seconds=float(
+                        fm.get(f"{p}.timeout_seconds") or op.timeout_seconds
+                    ),
+                    retry=HttpRetryPolicy(
+                        attempts=int(
+                            fm.get(f"{p}.retry.attempts") or op.retry.attempts
+                        ),
+                        backoff_seconds=float(
+                            fm.get(f"{p}.retry.backoff_seconds")
+                            or op.retry.backoff_seconds
+                        ),
+                        retry_on_statuses=retry_statuses,
+                    ),
+                    expected_statuses=[
+                        int(status)
+                        for status in (fm.get(f"{p}.expected_statuses") or [])
+                        if str(status).strip().isdigit()
+                    ] or op.expected_statuses,
+                    response_mode=fm.get(f"{p}.response_mode") or op.response_mode,
+                    output_mapping=fm.get(f"{p}.output_mapping") or {},
+                    secret_fields=fm.get(f"{p}.secret_fields") or [],
+                )
+            elif isinstance(op, AgentOperation):
                 dc_raw = fm.get(f"{p}.dynamic_count", "1")
                 dc: int | str
                 try:
                     dc = int(str(dc_raw))
                 except (ValueError, TypeError):
                     dc = str(dc_raw)
+                prompt_path_raw = fm.get(f"{p}.prompt_path")
                 new_op = AgentOperation(
                     type=op.type,
                     agent_id=fm.get(f"{p}.agent_id") or op.agent_id,
-                    prompt_path=_as_path(fm.get(f"{p}.prompt_path"), op.prompt_path),
+                    prompt_path=(
+                        op.prompt_path
+                        if prompt_path_raw is None
+                        else _as_path_or_none(prompt_path_raw)
+                    ),
                     working_dir=_as_path(fm.get(f"{p}.working_dir"), op.working_dir),
                     dynamic_count=dc,
                     memory=fm.get(f"{p}.memory") or op.memory,
                     input_mapping=fm.get(f"{p}.input_mapping") or {},
                     fan_source=op.fan_source,
                 )
+            else:
+                continue
 
             rc = fm.get(f"{p}.retry_count")
             rd = fm.get(f"{p}.retry_delay_seconds")
@@ -842,6 +983,9 @@ def agent_to_sections(cfg: AgentConfig) -> list[Section]:
             "agent.mcp_servers", "MCP Servers", FieldKind.LIST_STR, list(cfg.mcp_servers)
         ),
         FieldDescriptor(
+            "agent.extra_paths", "Extra Sandbox Paths", FieldKind.LIST_STR, list(cfg.extra_paths)
+        ),
+        FieldDescriptor(
             "agent.env", "Environment", FieldKind.DICT_STR_STR, dict(cfg.env)
         ),
     ]
@@ -850,13 +994,21 @@ def agent_to_sections(cfg: AgentConfig) -> list[Section]:
 
 def sections_to_agent(sections: list[Section], cfg: AgentConfig) -> AgentConfig:
     fm: dict[str, Any] = {fd.key: fd.value for sec in sections for fd in sec.fields}
+    prompt_path_raw = fm.get("agent.prompt_path")
     return cfg.model_copy(
         update={
             "subscription": fm.get("agent.subscription") or cfg.subscription,
             "working_dir": _as_path(fm.get("agent.working_dir"), cfg.working_dir),
-            "prompt_path": _as_path(fm.get("agent.prompt_path"), cfg.prompt_path),
+            "prompt_path": (
+                cfg.prompt_path
+                if prompt_path_raw is None
+                else _as_path_or_none(prompt_path_raw)
+            ),
             "tools": fm.get("agent.tools") or [],
             "mcp_servers": fm.get("agent.mcp_servers") or [],
+            "extra_paths": [
+                _as_path(path, Path(".")) for path in fm.get("agent.extra_paths") or []
+            ],
             "env": fm.get("agent.env") or {},
         }
     )

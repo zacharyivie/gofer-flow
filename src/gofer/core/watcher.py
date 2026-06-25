@@ -4,16 +4,19 @@ import asyncio
 import json
 import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 from gofer.core.executor import WorkflowExecutor
+from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimitError, ResourceLimits
+from gofer.core.run_outputs import write_run_node_outputs_payload
 from gofer.core.workflow import AgenticWorkflow, WatchConfig
-from gofer.utils.run_state import workflow_stop_path
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
 from gofer.utils.logging import get_logger
+from gofer.utils.run_state import workflow_stop_path
 
 log = get_logger(__name__)
 
@@ -51,19 +54,27 @@ class WatchedWorkflow:
     workflow_id: str
     workflow_path: Path
     config: WatchConfig
+    resource_limits: ResourceLimits = field(default_factory=ResourceLimits)
     snapshot: Snapshot = field(default_factory=dict)
     last_triggered_at: float = 0.0
     running_count: int = 0
     queued_events: list[list[WatchEvent]] = field(default_factory=list)
+    dropped_event_batches: int = 0
 
 
 class WorkflowWatcher:
-    def __init__(self, poll_interval_seconds: float = 1.0) -> None:
+    def __init__(
+        self,
+        poll_interval_seconds: float = 1.0,
+        resource_limits: ResourceLimits | None = None,
+    ) -> None:
         self._poll_interval_seconds = poll_interval_seconds
+        self._resource_limits = resource_limits or DEFAULT_RESOURCE_LIMITS
         self._workflows: dict[str, WatchedWorkflow] = {}
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
+        self._global_running_count = 0
 
     def add_workflow(self, workflow: AgenticWorkflow, workflow_path: Path) -> None:
         if workflow.config.watch is None:
@@ -75,6 +86,7 @@ class WorkflowWatcher:
                 existing is not None
                 and existing.workflow_path == workflow_path
                 and existing.config == workflow.config.watch
+                and existing.resource_limits == workflow.config.resource_limits
             ):
                 return
 
@@ -82,7 +94,12 @@ class WorkflowWatcher:
             workflow_id=workflow.config.id,
             workflow_path=workflow_path,
             config=workflow.config.watch,
-            snapshot=self._snapshot(workflow_path, workflow.config.watch),
+            resource_limits=workflow.config.resource_limits,
+            snapshot=self._snapshot(
+                workflow_path,
+                workflow.config.watch,
+                workflow.config.resource_limits,
+            ),
         )
         with self._lock:
             self._workflows[workflow.config.id] = watched
@@ -128,7 +145,11 @@ class WorkflowWatcher:
 
         for watched in watched_items:
             try:
-                next_snapshot = self._snapshot(watched.workflow_path, watched.config)
+                next_snapshot = self._snapshot(
+                    watched.workflow_path,
+                    watched.config,
+                    watched.resource_limits,
+                )
             except Exception as exc:  # noqa: BLE001
                 log.warning("Could not scan watcher for '%s': %s", watched.workflow_id, exc)
                 continue
@@ -137,7 +158,15 @@ class WorkflowWatcher:
                 self._start_queued_runs(watched)
                 continue
 
-            events = self._diff_events(watched.snapshot, next_snapshot)
+            def record_overflow(dropped: int, watched: WatchedWorkflow = watched) -> None:
+                self._record_diff_overflow(watched, dropped)
+
+            events = self._diff_events(
+                watched.snapshot,
+                next_snapshot,
+                watched.resource_limits,
+                on_drop=record_overflow,
+            )
             now = time.monotonic()
             watched.snapshot = next_snapshot
             if now - watched.last_triggered_at < watched.config.debounce_seconds:
@@ -154,18 +183,71 @@ class WorkflowWatcher:
         if not events:
             return
         with self._lock:
+            queue_depth = max(0, watched.resource_limits.max_watcher_queue_depth)
+            if queue_depth == 0:
+                watched.dropped_event_batches += len(events)
+                log.warning(
+                    "Watcher queue for '%s' has limit 0; dropped %s event(s)",
+                    watched.workflow_id,
+                    len(events),
+                )
+                return
+            if len(events) > queue_depth:
+                dropped = len(events) - queue_depth
+                events = events[-queue_depth:]
+                watched.dropped_event_batches += dropped
+                log.warning(
+                    "Watcher event batch for '%s' exceeded limit %s; dropped %s oldest event(s)",
+                    watched.workflow_id,
+                    queue_depth,
+                    dropped,
+                )
             if watched.config.mode == "queue":
                 watched.queued_events.extend([[event] for event in events])
             else:
                 watched.queued_events.append(events)
+            overflow = len(watched.queued_events) - queue_depth
+            if overflow > 0:
+                del watched.queued_events[:overflow]
+                watched.dropped_event_batches += overflow
+                log.warning(
+                    "Watcher queue for '%s' exceeded limit %s; dropped %s oldest event batch(es)",
+                    watched.workflow_id,
+                    queue_depth,
+                    overflow,
+                )
+
+    def _record_diff_overflow(self, watched: WatchedWorkflow, dropped: int) -> None:
+        if dropped <= 0:
+            return
+        with self._lock:
+            watched.dropped_event_batches += dropped
+        log.warning(
+            "Watcher diff for '%s' exceeded limit %s; dropped %s oldest event(s)",
+            watched.workflow_id,
+            watched.resource_limits.max_watcher_queue_depth,
+            dropped,
+        )
 
     def _start_queued_runs(self, watched: WatchedWorkflow) -> None:
         threads: list[threading.Thread] = []
         with self._lock:
-            max_concurrency = max(1, watched.config.max_concurrency)
-            while watched.queued_events and watched.running_count < max_concurrency:
+            max_concurrency = max(
+                1,
+                min(
+                    watched.config.max_concurrency,
+                    watched.resource_limits.max_watcher_concurrency,
+                ),
+            )
+            global_concurrency = self._global_concurrency_limit()
+            while (
+                watched.queued_events
+                and watched.running_count < max_concurrency
+                and self._global_running_count < global_concurrency
+            ):
                 events = watched.queued_events.pop(0)
                 watched.running_count += 1
+                self._global_running_count += 1
                 thread = threading.Thread(
                     target=self._run_workflow,
                     args=(watched, events),
@@ -176,10 +258,16 @@ class WorkflowWatcher:
         for thread in threads:
             thread.start()
 
+    def _global_concurrency_limit(self) -> int:
+        return self._resource_limits.max_watcher_concurrency
+
     def _run_workflow(self, watched: WatchedWorkflow, events: list[WatchEvent]) -> None:
         try:
             workflow = AgenticWorkflow.from_file(watched.workflow_path)
-            trigger_context = {
+            workflow.validate(watched.workflow_path)
+            for warning in workflow.resource_warnings(watched.workflow_path.parent):
+                log.warning("%s", warning)
+            trigger_context: dict[str, Any] = {
                 "type": "file_watch",
                 "mode": watched.config.mode,
                 "watch_path": str(watched.config.path),
@@ -193,16 +281,26 @@ class WorkflowWatcher:
                 trigger_context["event_json"] = json.dumps(event_context)
 
             async def execute() -> None:
-                result = await WorkflowExecutor(
-                    workflow,
-                    _subscriptions,
-                    log_base_dir=watched.workflow_path.parent / "logs",
-                    stop_file=workflow_stop_path(
-                        watched.workflow_id,
-                        watched.workflow_path.parent,
-                    ),
-                ).with_trigger_context(trigger_context).run()
-                log.info("Watched workflow %s finished: success=%s", watched.workflow_id, result.success)
+                result = (
+                    await WorkflowExecutor(
+                        workflow,
+                        _subscriptions,
+                        log_base_dir=watched.workflow_path.parent / "logs",
+                        workflow_path=watched.workflow_path,
+                        stop_file=workflow_stop_path(
+                            watched.workflow_id,
+                            watched.workflow_path.parent,
+                        ),
+                    )
+                    .with_trigger_context(trigger_context)
+                    .run()
+                )
+                log.info(
+                    "Watched workflow %s finished: success=%s",
+                    watched.workflow_id,
+                    result.success,
+                )
+                write_run_node_outputs_payload(result, workflow.config.resource_limits)
 
             asyncio.run(execute())
         except Exception as exc:  # noqa: BLE001
@@ -212,38 +310,89 @@ class WorkflowWatcher:
                 current = self._workflows.get(watched.workflow_id)
                 if current is watched:
                     current.running_count = max(0, current.running_count - 1)
+                    self._global_running_count = max(0, self._global_running_count - 1)
                     should_start_more = bool(current.queued_events)
                 else:
+                    self._global_running_count = max(0, self._global_running_count - 1)
                     should_start_more = False
             if should_start_more:
-                self._start_queued_runs(watched)
+                with self._lock:
+                    watched_items = list(self._workflows.values())
+                for queued in watched_items:
+                    self._start_queued_runs(queued)
 
-    def _snapshot(self, workflow_path: Path, config: WatchConfig) -> Snapshot:
-        return {
-            str(path): (stat.st_mtime_ns, stat.st_size)
-            for path in self._watched_paths(workflow_path, config)
-            if path.exists() and path.is_file()
-            for stat in [path.stat()]
-        }
+    def _snapshot(
+        self,
+        workflow_path: Path,
+        config: WatchConfig,
+        limits: ResourceLimits,
+    ) -> Snapshot:
+        snapshot: Snapshot = {}
+        scanned = 0
+        for path in self._watched_paths(workflow_path, config):
+            scanned += 1
+            if scanned > limits.max_files_scanned:
+                raise ResourceLimitError(
+                    "watcher scan exceeded limit "
+                    f"{limits.max_files_scanned} files for path '{config.path}'"
+                )
+            if path.exists() and path.is_file():
+                stat = path.stat()
+                snapshot[str(path)] = (stat.st_mtime_ns, stat.st_size)
+        return snapshot
 
-    def _watched_paths(self, workflow_path: Path, config: WatchConfig) -> list[Path]:
+    def _watched_paths(self, workflow_path: Path, config: WatchConfig) -> Iterator[Path]:
         target = config.path if config.path.is_absolute() else workflow_path.parent / config.path
         if target.is_dir():
             iterator = target.rglob(config.glob) if config.recursive else target.glob(config.glob)
-            return sorted(path for path in iterator if path.is_file())
-        return [target]
+            yield from iterator
+            return
+        yield target
 
-    def _diff_events(self, previous: Snapshot, current: Snapshot) -> list[WatchEvent]:
+    def _diff_events(
+        self,
+        previous: Snapshot,
+        current: Snapshot,
+        limits: ResourceLimits,
+        on_drop: Callable[[int], None] | None = None,
+    ) -> list[WatchEvent]:
         events: list[WatchEvent] = []
+        event_limit = max(0, limits.max_watcher_queue_depth)
+        if event_limit == 0:
+            if on_drop is not None:
+                dropped = (
+                    len(current.keys() - previous.keys())
+                    + len(previous.keys() - current.keys())
+                    + sum(
+                        1
+                        for path_str in current.keys() & previous.keys()
+                        if current[path_str] != previous[path_str]
+                    )
+                )
+                if dropped:
+                    on_drop(dropped)
+            return events
+        dropped = 0
+
+        def append_event(event: WatchEvent) -> None:
+            nonlocal dropped
+            events.append(event)
+            overflow = len(events) - event_limit
+            if overflow > 0:
+                del events[:overflow]
+                dropped += overflow
+
         for path_str in sorted(current.keys() - previous.keys()):
             mtime_ns, size = current[path_str]
-            events.append(self._event("created", path_str, size=size, mtime_ns=mtime_ns))
+            append_event(self._event("created", path_str, size=size, mtime_ns=mtime_ns))
         for path_str in sorted(previous.keys() - current.keys()):
-            events.append(self._event("deleted", path_str))
+            append_event(self._event("deleted", path_str))
         for path_str in sorted(current.keys() & previous.keys()):
             if current[path_str] != previous[path_str]:
                 mtime_ns, size = current[path_str]
-                events.append(self._event("modified", path_str, size=size, mtime_ns=mtime_ns))
+                append_event(self._event("modified", path_str, size=size, mtime_ns=mtime_ns))
+        if dropped and on_drop is not None:
+            on_drop(dropped)
         return events
 
     def _event(

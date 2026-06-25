@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from gofer.core.graph import GraphNode, WorkflowGraph
-from gofer.core.operations import BashCommandOperation, OperationType
+from gofer.core.operations import BashCommandOperation, OperationType, StartOperation
 
 
 def _bash_node(node_id: str, command: str = "echo ok") -> GraphNode:
@@ -60,6 +60,31 @@ def test_self_loop_is_allowed() -> None:
     g.add_node(_bash_node("a"))
     g.add_edge("a", "a")
     g.validate()
+
+
+def test_special_nodes_must_be_unique() -> None:
+    g = WorkflowGraph()
+    g.add_node(GraphNode(
+        node_id="start-a",
+        operation=StartOperation(type=OperationType.START),
+    ))
+    g.add_node(GraphNode(
+        node_id="start-b",
+        operation=StartOperation(type=OperationType.START),
+    ))
+
+    with pytest.raises(ValueError, match="one START node"):
+        g.validate()
+
+
+def test_special_node_label_is_forced() -> None:
+    node = GraphNode(
+        node_id="start",
+        label="Custom start label",
+        operation=StartOperation(type=OperationType.START),
+    )
+
+    assert node.label == "START"
 
 
 def test_edge_to_unknown_node_raises() -> None:

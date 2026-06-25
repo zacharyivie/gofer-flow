@@ -10,7 +10,9 @@ from rich.text import Text
 from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
@@ -18,9 +20,12 @@ from gofer.core.operations import (
     DirectoryFanSource,
     FileOperation,
     FolderOperation,
+    InfiniteFanSource,
     LocalSearchOperation,
     LocalVectorizeOperation,
+    LoopOperation,
     MoveFileOperation,
+    NotificationOperation,
     OpenResourceOperation,
     Operation,
     PromptFileOperation,
@@ -145,8 +150,16 @@ def _op_icon_color(op: Operation) -> tuple[str, str]:
         return "idx", "green"
     if isinstance(op, LocalSearchOperation):
         return "srch", "blue"
+    if isinstance(op, ApprovalGateOperation):
+        return "ok?", "yellow"
+    if isinstance(op, NotificationOperation):
+        return "bell", "cyan"
     if isinstance(op, AgentOperation):
         return "@", "magenta"
+    if isinstance(op, LoopOperation):
+        return "loop", "blue"
+    if isinstance(op, BreakOperation):
+        return "brk", "yellow"
     return "?", "white"
 
 
@@ -183,22 +196,27 @@ def _op_detail(op: Operation) -> str:
         return f"index {op.source_path.name}"
     if isinstance(op, LocalSearchOperation):
         return f"search {op.index_path.name}"
+    if isinstance(op, ApprovalGateOperation):
+        return "approval required"
+    if isinstance(op, NotificationOperation):
+        return op.title[:28] + "…" if len(op.title) > 29 else op.title
     if isinstance(op, AgentOperation):
         if op.skill_name:
             return f"{op.agent_id} /{op.skill_name}"
-        if op.fan_source is None:
-            detail = op.agent_id
-            if op.dynamic_count != 1:
-                detail += f" ×{op.dynamic_count}"
-            return detail
-        if isinstance(op.fan_source, TabularFanSource):
-            return f"{op.agent_id} ↦ {op.fan_source.path.name}"
-        if isinstance(op.fan_source, DirectoryFanSource):
-            return f"{op.agent_id} ↦ {op.fan_source.path.name}/"
-        if isinstance(op.fan_source, CountFanSource):
-            return f"{op.agent_id} ×{op.fan_source.count}"
-        if isinstance(op.fan_source, TriggerEventsFanSource):
-            return f"{op.agent_id} ↦ trigger events"
+        return op.agent_id
+    if isinstance(op, LoopOperation):
+        if isinstance(op.source, TabularFanSource):
+            return f"rows in {op.source.path.name}"
+        if isinstance(op.source, DirectoryFanSource):
+            return f"files in {op.source.path.name}/"
+        if isinstance(op.source, CountFanSource):
+            return f"×{op.source.count}"
+        if isinstance(op.source, TriggerEventsFanSource):
+            return "trigger events"
+        if isinstance(op.source, InfiniteFanSource):
+            return "until BREAK"
+    if isinstance(op, BreakOperation):
+        return op.message or "break loop"
     return ""
 
 
@@ -210,6 +228,7 @@ def _condition_label(condition: EdgeConditionType) -> str:
         EdgeConditionType.ON_SUCCESS: "✓",
         EdgeConditionType.ON_FAILURE: "✗",
         EdgeConditionType.OUTPUT_MATCHES: "~",
+        EdgeConditionType.AFTER_LOOP: "↧",
         EdgeConditionType.ALWAYS: " ",
     }[condition]
 
@@ -232,12 +251,12 @@ def _build_arrow_column(
     total_rows = max(total_left, total_right)
 
     # rows[i] is a list of chars; we'll overlay multiple edges
-    rows: list[list[str]] = [[" " for _ in range(8)] for _ in range(total_rows)]
+    rows: list[list[str]] = [[" " for _ in range(9)] for _ in range(total_rows)]
 
     def set_row(r: int, s: str) -> None:
         if 0 <= r < total_rows:
             for i, ch in enumerate(s):
-                if i < 8 and ch != " ":
+                if i < 9 and ch != " ":
                     rows[r][i] = ch
 
     edges = [
@@ -273,25 +292,25 @@ def _build_arrow_column(
 # ── Node Detail Table ─────────────────────────────────────────────────────────
 
 
-def _fan_out_cell(op: Operation) -> str:
-    if not isinstance(op, AgentOperation) or op.fan_source is None:
-        if isinstance(op, AgentOperation) and op.dynamic_count != 1:
-            return f"count={op.dynamic_count}"
+def _loop_cell(op: Operation) -> str:
+    if not isinstance(op, LoopOperation):
         return "—"
-    if isinstance(op.fan_source, TabularFanSource):
-        return f"tabular/{op.fan_source.path.suffix.lstrip('.')}"
-    if isinstance(op.fan_source, DirectoryFanSource):
-        return f"dir glob={op.fan_source.glob}"
-    if isinstance(op.fan_source, CountFanSource):
-        return f"count={op.fan_source.count}"
-    if isinstance(op.fan_source, TriggerEventsFanSource):
+    if isinstance(op.source, TabularFanSource):
+        return f"tabular/{op.source.path.suffix.lstrip('.')}"
+    if isinstance(op.source, DirectoryFanSource):
+        return f"dir glob={op.source.glob}"
+    if isinstance(op.source, CountFanSource):
+        return f"count={op.source.count}"
+    if isinstance(op.source, TriggerEventsFanSource):
         return "trigger events"
+    if isinstance(op.source, InfiniteFanSource):
+        return "infinite"
     return "—"
 
 
 def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
     table = Table(
-        "Node", "Type", "Detail", "Fan-out", "Retry", "Timeout",
+        "Node", "Type", "Detail", "Loop", "Retry", "Timeout",
         title="[bold]Nodes[/bold]",
         show_lines=False,
         header_style="bold",
@@ -308,7 +327,7 @@ def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
                 Text(node.node_id, style="bold white"),
                 Text(op_name, style=color),
                 _op_detail(op),
-                _fan_out_cell(op),
+                _loop_cell(op),
                 retry,
                 timeout,
             )

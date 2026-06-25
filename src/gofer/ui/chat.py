@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
 import os
 import shutil
 import sys
 import threading
+from collections.abc import AsyncIterator
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Literal
 
+from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits, byte_len
+from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess, stream_subprocess
 
 ProviderName = Literal["codex", "claude_code"]
 CHAT_COMPACT_CHAR_LIMIT = 32_000
 CHAT_COMPACT_RECENT_MESSAGES = 8
+log = get_logger(__name__)
 
 
 class ChatProviderError(ValueError):
@@ -28,6 +31,7 @@ async def run_workflow_chat(
     workflow: dict[str, Any] | None,
     working_dir: Path | None = None,
     data_dir: Path | None = None,
+    resource_limits: ResourceLimits | None = None,
 ) -> dict[str, Any]:
     if provider not in {"codex", "claude_code"}:
         raise ChatProviderError(f"Unknown provider '{provider}'")
@@ -39,6 +43,7 @@ async def run_workflow_chat(
 
     resolved_data_dir = data_dir or get_data_dir()
     resolved_working_dir = working_dir or resolved_data_dir
+    limits = _limits_from_workflow(workflow, resource_limits)
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
     gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
     messages, _ = await _compact_chat_messages_if_needed(
@@ -48,6 +53,7 @@ async def run_workflow_chat(
         binary_path=binary_path,
         data_dir=resolved_data_dir,
         working_dir=resolved_working_dir,
+        limits=limits,
     )
     prompt = build_chat_prompt(
         provider=provider,
@@ -56,6 +62,7 @@ async def run_workflow_chat(
         workflow=workflow,
         gofer_cli_path=gofer_cli_path,
     )
+    _ensure_prompt_within_limit(prompt, limits)
     prompt = _prepare_prompt_for_cli(
         provider=provider,
         binary_path=binary_path,
@@ -77,6 +84,7 @@ async def run_workflow_chat(
             command,
             cwd=resolved_working_dir,
             timeout=300,
+            max_output_bytes=limits.max_subprocess_output_bytes,
         )
     except OSError as exc:
         raise ChatProviderError(f"Could not start '{binary}' CLI: {exc}") from exc
@@ -102,6 +110,7 @@ async def stream_workflow_chat(
     cancel_event: threading.Event | None = None,
     working_dir: Path | None = None,
     data_dir: Path | None = None,
+    resource_limits: ResourceLimits | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     if provider not in {"codex", "claude_code"}:
         raise ChatProviderError(f"Unknown provider '{provider}'")
@@ -113,6 +122,7 @@ async def stream_workflow_chat(
 
     resolved_data_dir = data_dir or get_data_dir()
     resolved_working_dir = working_dir or resolved_data_dir
+    limits = _limits_from_workflow(workflow, resource_limits)
     resolved_working_dir.mkdir(parents=True, exist_ok=True)
     gofer_cli_path = ensure_local_gofer_cli(resolved_data_dir)
     messages, compacted = await _compact_chat_messages_if_needed(
@@ -122,6 +132,7 @@ async def stream_workflow_chat(
         binary_path=binary_path,
         data_dir=resolved_data_dir,
         working_dir=resolved_working_dir,
+        limits=limits,
     )
     if compacted:
         yield {
@@ -136,6 +147,7 @@ async def stream_workflow_chat(
         workflow=workflow,
         gofer_cli_path=gofer_cli_path,
     )
+    _ensure_prompt_within_limit(prompt, limits)
     prompt = _prepare_prompt_for_cli(
         provider=provider,
         binary_path=binary_path,
@@ -161,6 +173,7 @@ async def stream_workflow_chat(
             cancel_event=cancel_event,
             cwd=resolved_working_dir,
             timeout=300,
+            max_output_bytes=limits.max_subprocess_output_bytes,
         ):
             if event["type"] == "chunk":
                 text = event["text"]
@@ -224,33 +237,66 @@ def provider_payload() -> dict[str, Any]:
 
 
 def ensure_local_gofer_cli(data_dir: Path) -> Path | None:
-    """Copy the gof CLI into the active data directory for assistant sandbox access."""
+    """Copy the gof CLI into a trusted helper directory for assistant use."""
     source = _gofer_cli_source_path()
     destination = local_gofer_cli_path(data_dir, source)
-    if source is None or not source.exists():
-        return destination if destination.exists() else None
+    if source is None:
+        log.warning("Gofer CLI helper unavailable: no authoritative gof executable found")
+        return None
+    if not source.exists():
+        log.warning("Gofer CLI helper unavailable: source executable does not exist: %s", source)
+        return None
+    if _is_relative_to(source, data_dir):
+        log.warning(
+            "Gofer CLI helper unavailable: source executable is inside mutable data directory: %s",
+            source,
+        )
+        return None
 
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not _ensure_owner_only_dir(destination.parent):
+        log.warning(
+            "Gofer CLI helper unavailable: could not restrict helper directory permissions: %s",
+            destination.parent,
+        )
+        return None
 
     try:
         if source.samefile(destination):
-            _make_executable(destination)
-            return destination
+            if _make_owner_executable(destination):
+                return destination
+            log.warning(
+                "Gofer CLI helper unavailable: could not restrict helper file permissions: %s",
+                destination,
+            )
+            return None
     except OSError:
         pass
 
-    if destination.exists() and _same_file_signature(source, destination):
-        _make_executable(destination)
-        return destination
+    if destination.exists() and _same_file_hash(source, destination):
+        if _make_owner_executable(destination):
+            return destination
+        log.warning(
+            "Gofer CLI helper unavailable: could not restrict helper file permissions: %s",
+            destination,
+        )
+        return None
 
     temp_destination = destination.with_name(f".{destination.name}.tmp")
     try:
         shutil.copy2(source, temp_destination)
-        _make_executable(temp_destination)
+        if not _make_owner_executable(temp_destination):
+            raise OSError("could not restrict helper file permissions")
         os.replace(temp_destination, destination)
-    except OSError:
+        if not _make_owner_executable(destination):
+            raise OSError("could not restrict helper file permissions")
+    except OSError as exc:
+        log.warning(
+            "Gofer CLI helper unavailable: could not prepare trusted helper at %s: %s",
+            destination,
+            exc,
+        )
         temp_destination.unlink(missing_ok=True)
-        return destination if destination.exists() else None
+        return None
 
     return destination
 
@@ -261,7 +307,11 @@ def local_gofer_cli_path(data_dir: Path, source_path: Path | None = None) -> Pat
         executable_name = f"gof{source_suffix}" if source_suffix in {".bat", ".cmd"} else "gof.exe"
     else:
         executable_name = "gof"
-    return data_dir / "bin" / executable_name
+    return trusted_gofer_cli_dir(data_dir) / executable_name
+
+
+def trusted_gofer_cli_dir(data_dir: Path) -> Path:
+    return data_dir.resolve().parent / ".gofer-trusted-bin"
 
 
 def _gofer_cli_source_path() -> Path | None:
@@ -276,25 +326,58 @@ def _gofer_cli_source_path() -> Path | None:
     return Path(resolved) if resolved else None
 
 
-def _same_file_signature(left: Path, right: Path) -> bool:
+def _same_file_hash(left: Path, right: Path) -> bool:
+    left_hash = _file_sha256(left)
+    right_hash = _file_sha256(right)
+    return left_hash is not None and left_hash == right_hash
+
+
+def _file_sha256(path: Path) -> str | None:
+    digest = sha256()
     try:
-        left_stat = left.stat()
-        right_stat = right.stat()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.resolve().relative_to(parent.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def _ensure_owner_only_dir(path: Path) -> bool:
+    if sys.platform == "win32":
+        path.mkdir(parents=True, exist_ok=True)
+        return True
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
     except OSError:
         return False
-    return (
-        left_stat.st_size == right_stat.st_size
-        and int(left_stat.st_mtime) == int(right_stat.st_mtime)
-    )
+    return _has_file_mode(path, 0o700)
 
 
-def _make_executable(path: Path) -> None:
+def _make_owner_executable(path: Path) -> bool:
     if sys.platform == "win32":
-        return
+        return True
     try:
-        path.chmod(path.stat().st_mode | 0o755)
+        path.chmod(0o700)
     except OSError:
-        return
+        return False
+    return _has_file_mode(path, 0o700)
+
+
+def _has_file_mode(path: Path, mode: int) -> bool:
+    try:
+        return path.stat().st_mode & 0o777 == mode
+    except OSError:
+        return False
 
 
 def _build_chat_command(
@@ -410,6 +493,7 @@ async def _compact_chat_messages_if_needed(
     binary_path: str,
     data_dir: Path,
     working_dir: Path,
+    limits: ResourceLimits,
 ) -> tuple[list[dict[str, str]], bool]:
     if _messages_size(messages) <= CHAT_COMPACT_CHAR_LIMIT:
         return messages, False
@@ -423,6 +507,7 @@ async def _compact_chat_messages_if_needed(
         binary_path=binary_path,
         data_dir=data_dir,
         working_dir=working_dir,
+        limits=limits,
     )
     compacted_messages = [
         {
@@ -450,6 +535,7 @@ async def _summarize_chat_messages(
     binary_path: str,
     data_dir: Path,
     working_dir: Path,
+    limits: ResourceLimits,
 ) -> str:
     transcript = _messages_transcript(messages)
     prompt = (
@@ -458,6 +544,8 @@ async def _summarize_chat_messages(
         "errors, unresolved tasks, and important assistant outputs. Omit chatter.\n\n"
         f"{transcript}"
     )
+    if byte_len(prompt) > limits.max_chat_prompt_bytes:
+        return _fallback_chat_summary(messages)
     command = _build_chat_command(
         provider=provider,
         model=model,
@@ -471,6 +559,7 @@ async def _summarize_chat_messages(
             command,
             cwd=working_dir,
             timeout=180,
+            max_output_bytes=limits.max_subprocess_output_bytes,
         )
     except OSError:
         return _fallback_chat_summary(messages)
@@ -482,6 +571,28 @@ async def _summarize_chat_messages(
 
 def _messages_size(messages: list[dict[str, str]]) -> int:
     return sum(len(str(message.get("body", ""))) for message in messages)
+
+
+def _ensure_prompt_within_limit(prompt: str, limits: ResourceLimits) -> None:
+    size = byte_len(prompt)
+    limit = limits.max_chat_prompt_bytes
+    if size > limit:
+        raise ChatProviderError(
+            f"Chat prompt exceeds limit {limit} bytes (got {size} bytes)"
+        )
+
+
+def _limits_from_workflow(
+    workflow: dict[str, Any] | None,
+    fallback: ResourceLimits | None = None,
+) -> ResourceLimits:
+    limits = fallback or DEFAULT_RESOURCE_LIMITS
+    if not isinstance(workflow, dict):
+        return limits
+    raw_limits = workflow.get("resourceLimits") or workflow.get("resource_limits")
+    if not isinstance(raw_limits, dict):
+        return limits
+    return ResourceLimits(**{**limits.model_dump(), **raw_limits})
 
 
 def _messages_transcript(messages: list[dict[str, str]]) -> str:
@@ -496,7 +607,10 @@ def _fallback_chat_summary(messages: list[dict[str, str]]) -> str:
     transcript = _messages_transcript(messages)
     if len(transcript) <= 12_000:
         return transcript
-    return f"{transcript[:6_000]}\n\n[...middle omitted during compaction...]\n\n{transcript[-6_000:]}"
+    return (
+        f"{transcript[:6_000]}\n\n[...middle omitted during compaction...]\n\n"
+        f"{transcript[-6_000:]}"
+    )
 
 
 def build_chat_prompt(
@@ -546,8 +660,10 @@ changes, reference exact nodes, edges, agents, or TOML fields."""
 def _gofer_cli_prompt_context(gofer_cli_path: Path | None) -> str:
     if gofer_cli_path is None:
         return (
-            "Gofer Flow CLI: no local gof executable copy was available. If a bare `gof` "
-            "command is unavailable, explain that the CLI could not be located."
+            "Gofer Flow CLI automation is unavailable because no verified local `gof` "
+            "executable could be prepared. Do not run a stale helper from the Gofer data "
+            "directory. If a bare `gof` command is unavailable, explain that CLI "
+            "validation could not be run."
         )
 
     return (

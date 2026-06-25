@@ -30,12 +30,31 @@ def _sync_watchers(data_dir: Path, watcher: WorkflowWatcher) -> int:
         if workflow.config.watch is None:
             continue
         try:
+            workflow.validate()
+        except Exception as exc:  # noqa: BLE001
+            console.print(f"[yellow]Skipping invalid workflow[/yellow] {path}: {exc}")
+            continue
+        _print_agent_access_summary(workflow)
+        try:
             watcher.add_workflow(workflow, path)
         except Exception as exc:  # noqa: BLE001
             console.print(f"[yellow]Skipping invalid watcher[/yellow] {path}: {exc}")
             continue
         count += 1
     return count
+
+
+def _print_agent_access_summary(wf: AgenticWorkflow) -> None:
+    warnings = [
+        warning
+        for warning in wf.resource_warnings()
+        if "grants provider filesystem access outside working_dir" in warning
+    ]
+    if not warnings:
+        return
+    console.print("[yellow]Agent filesystem access outside working_dir:[/yellow]")
+    for warning in warnings:
+        console.print(f"[yellow]- {warning}[/yellow]")
 
 
 @app.command("list")

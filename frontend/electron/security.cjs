@@ -1,0 +1,236 @@
+const fs = require("node:fs");
+const crypto = require("node:crypto");
+const path = require("node:path");
+const { URL, fileURLToPath, pathToFileURL } = require("node:url");
+
+const LOCAL_DEV_ORIGINS = new Set(["http://127.0.0.1:5173", "http://localhost:5173"]);
+const SAFE_EXTERNAL_SCHEMES = new Set(["https:"]);
+
+function createIpcSecurity({
+  appRoot,
+  appRoots,
+  devServerUrl,
+  getDataDir,
+  getMainWebContents,
+  isProduction = false,
+} = {}) {
+  const grantedRoots = new Map();
+
+  function assertTrustedSender(event) {
+    const url = event?.senderFrame?.url || event?.sender?.getURL?.() || "";
+    const expectedWebContents =
+      typeof getMainWebContents === "function" ? getMainWebContents() : null;
+    if (expectedWebContents) {
+      if (event?.sender !== expectedWebContents) {
+        throw new Error("Rejected IPC message from an unexpected window.");
+      }
+      if (
+        expectedWebContents.mainFrame &&
+        event?.senderFrame &&
+        event.senderFrame !== expectedWebContents.mainFrame
+      ) {
+        throw new Error("Rejected IPC message from an unexpected frame.");
+      }
+    }
+    if (!isTrustedSenderUrl(url, { appRoot, appRoots, devServerUrl, isProduction })) {
+      throw new Error(`Rejected IPC message from untrusted sender: ${url || "unknown"}`);
+    }
+    return true;
+  }
+
+  function secureHandler(handler) {
+    return async (event, ...args) => {
+      assertTrustedSender(event);
+      return handler(event, ...args);
+    };
+  }
+
+  function grantPath(targetPath) {
+    if (!targetPath || typeof targetPath !== "string") return "";
+    const root = realpathIfPossible(path.resolve(targetPath));
+    const existingGrantId = findGrantIdForRoot(root);
+    if (existingGrantId) {
+      return { grantId: existingGrantId, path: root };
+    }
+    const grantId = crypto.randomUUID();
+    grantedRoots.set(grantId, root);
+    return { grantId, path: root };
+  }
+
+  function resolveAllowedPath(targetPath, { grantId = "", mustExist = false } = {}) {
+    const dataDir = getDataDir();
+    const candidate = resolveCandidatePath(targetPath, dataDir);
+    const roots = [dataDir].filter(Boolean);
+    if (grantId) {
+      const grantedRoot = grantedRoots.get(grantId);
+      if (!grantedRoot) {
+        throw new Error("Path grant is invalid or expired.");
+      }
+      roots.push(grantedRoot);
+    }
+    if (!isPathInsideAnyRoot(candidate, roots, { mustExist })) {
+      throw new Error("Path is outside the approved Gofer desktop roots.");
+    }
+    return candidate;
+  }
+
+  function resolveAllowedChildPath(directory, name, { grantId = "" } = {}) {
+    if (!directory || typeof directory !== "string") {
+      throw new Error("A directory is required.");
+    }
+    if (!name || typeof name !== "string") {
+      throw new Error("A name is required.");
+    }
+    const cleanName = name.trim();
+    if (!cleanName || cleanName.includes("/") || cleanName.includes("\\") || cleanName === "." || cleanName === "..") {
+      throw new Error("Use a plain file or folder name.");
+    }
+    const parent = resolveAllowedPath(directory, { grantId, mustExist: true });
+    return resolveAllowedPath(path.join(parent, cleanName), { grantId, mustExist: false });
+  }
+
+  function resolvePickerPath(currentPath, { grantId = "" } = {}) {
+    const candidate = resolveAllowedPath(currentPath, { grantId, mustExist: false });
+    if (fs.existsSync(candidate)) {
+      try {
+        return fs.statSync(candidate).isDirectory() ? candidate : path.dirname(candidate);
+      } catch {
+        return path.dirname(candidate);
+      }
+    }
+
+    let parent = path.dirname(candidate);
+    while (parent && parent !== path.dirname(parent)) {
+      if (fs.existsSync(parent)) {
+        return resolveAllowedPath(parent, { grantId, mustExist: true });
+      }
+      parent = path.dirname(parent);
+    }
+
+    return resolveAllowedPath("", { grantId, mustExist: false });
+  }
+
+  function grantForPath(targetPath) {
+    const candidate = realpathForContainment(path.resolve(targetPath));
+    for (const [grantId, root] of grantedRoots.entries()) {
+      if (isPathInside(candidate, realpathForContainment(root))) {
+        return grantId;
+      }
+    }
+    return "";
+  }
+
+  function findGrantIdForRoot(root) {
+    for (const [grantId, grantedRoot] of grantedRoots.entries()) {
+      if (grantedRoot === root) {
+        return grantId;
+      }
+    }
+    return "";
+  }
+
+  return {
+    assertTrustedSender,
+    grantForPath,
+    grantPath,
+    resolveAllowedChildPath,
+    resolveAllowedPath,
+    resolvePickerPath,
+    secureHandler,
+  };
+}
+
+function isTrustedSenderUrl(value, { appRoot, appRoots, devServerUrl, isProduction = false } = {}) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === "file:") {
+      const roots = Array.isArray(appRoots) ? appRoots : [appRoot].filter(Boolean);
+      if (!roots.length) return isProduction;
+      const filePath = path.resolve(fileURLToPath(url));
+      return roots.some((root) => isPathInside(filePath, path.resolve(root)));
+    }
+    if (isProduction) return false;
+    if (devServerUrl) {
+      const devUrl = new URL(devServerUrl);
+      if (url.origin === devUrl.origin) return true;
+    }
+    return LOCAL_DEV_ORIGINS.has(url.origin);
+  } catch {
+    return false;
+  }
+}
+
+function isSafeExternalUrl(value) {
+  try {
+    return SAFE_EXTERNAL_SCHEMES.has(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
+function resolveCandidatePath(currentPath, dataDir) {
+  if (!currentPath || typeof currentPath !== "string") {
+    return path.resolve(dataDir);
+  }
+
+  const candidate = currentPath.trim();
+  if (!candidate) {
+    return path.resolve(dataDir);
+  }
+
+  return path.isAbsolute(candidate)
+    ? path.resolve(candidate)
+    : path.resolve(dataDir, candidate);
+}
+
+function isPathInsideAnyRoot(candidate, roots, { mustExist = false } = {}) {
+  const checkedPath = mustExist ? realpathExisting(candidate) : realpathForContainment(candidate);
+  return roots.some((root) => isPathInside(checkedPath, realpathForContainment(root)));
+}
+
+function isPathInside(child, root) {
+  const relative = path.relative(root, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+function realpathExisting(targetPath) {
+  try {
+    return fs.realpathSync.native(targetPath);
+  } catch (error) {
+    throw new Error(`Path does not exist: ${targetPath}`, { cause: error });
+  }
+}
+
+function realpathForContainment(targetPath) {
+  if (fs.existsSync(targetPath)) {
+    return realpathIfPossible(targetPath);
+  }
+
+  let parent = path.dirname(targetPath);
+  const missingSegments = [path.basename(targetPath)];
+  while (parent && parent !== path.dirname(parent) && !fs.existsSync(parent)) {
+    missingSegments.unshift(path.basename(parent));
+    parent = path.dirname(parent);
+  }
+  const realParent = fs.existsSync(parent) ? realpathIfPossible(parent) : path.resolve(parent);
+  return path.resolve(realParent, ...missingSegments);
+}
+
+function realpathIfPossible(targetPath) {
+  try {
+    return fs.realpathSync.native(targetPath);
+  } catch {
+    return path.resolve(targetPath);
+  }
+}
+
+function fileUrlForPath(targetPath) {
+  return pathToFileURL(targetPath).toString();
+}
+
+module.exports = {
+  createIpcSecurity,
+  fileUrlForPath,
+  isSafeExternalUrl,
+  isTrustedSenderUrl,
+};

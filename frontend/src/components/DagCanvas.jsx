@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  AlertCircle,
+  Bell,
   Braces,
   CalendarDays,
   ChevronLeft,
@@ -18,23 +20,59 @@ import {
   FileText,
   FileX,
   FolderOpen,
+  Globe2,
   LocateFixed,
   Loader2,
+  Maximize2,
   MoveRight,
   Play,
   Plus,
   RefreshCw,
+  Repeat2,
   Route,
   Search,
+  ShieldCheck,
   Sparkles,
   Square,
   Terminal,
   Trash2,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
 } from "lucide-react";
 
 const nodeStyles = {
+  start: {
+    icon: Play,
+    accent: "bg-blue-700",
+    border: "border-blue-200",
+    chip: "bg-blue-50 text-blue-700 border-blue-100",
+  },
+  pass: {
+    icon: Check,
+    accent: "bg-emerald-700",
+    border: "border-emerald-200",
+    chip: "bg-emerald-50 text-emerald-700 border-emerald-100",
+  },
+  fail: {
+    icon: X,
+    accent: "bg-red-700",
+    border: "border-red-200",
+    chip: "bg-red-50 text-red-700 border-red-100",
+  },
+  break: {
+    icon: Square,
+    accent: "bg-orange-700",
+    border: "border-orange-200",
+    chip: "bg-orange-50 text-orange-700 border-orange-100",
+  },
+  loop: {
+    icon: Repeat2,
+    accent: "bg-indigo-700",
+    border: "border-indigo-200",
+    chip: "bg-indigo-50 text-indigo-700 border-indigo-100",
+  },
   agent: {
     icon: Braces,
     accent: "bg-teal-600",
@@ -131,10 +169,29 @@ const nodeStyles = {
     border: "border-purple-200",
     chip: "bg-purple-50 text-purple-700 border-purple-100",
   },
+  http_request: {
+    icon: Globe2,
+    accent: "bg-blue-700",
+    border: "border-blue-200",
+    chip: "bg-blue-50 text-blue-700 border-blue-100",
+  },
+  approval_gate: {
+    icon: ShieldCheck,
+    accent: "bg-amber-700",
+    border: "border-amber-200",
+    chip: "bg-amber-50 text-amber-700 border-amber-100",
+  },
+  notification: {
+    icon: Bell,
+    accent: "bg-cyan-700",
+    border: "border-cyan-200",
+    chip: "bg-cyan-50 text-cyan-700 border-cyan-100",
+  },
 };
 
 const defaultSettings = {
   allowFailure: false,
+  awaitAllInputs: true,
   pipeOutput: false,
   retryCount: 0,
   retryDelaySeconds: 1,
@@ -146,14 +203,60 @@ const graphWorldSize = 20000;
 const graphWorldOffset = graphWorldSize / 2;
 const nodeWidth = 220;
 const nodeHeight = 96;
+const layoutColumnGap = 330;
+const layoutRowGap = 154;
+const minimapWidth = 184;
+const minimapHeight = 128;
+const nodeStack = {
+  base: 10,
+  selected: 30,
+  activeSelected: 40,
+  dragging: 50,
+};
 const isWindows =
   typeof navigator !== "undefined" &&
   /win/i.test(`${navigator.userAgent} ${navigator.platform}`);
 const commandNodeLabel = isWindows ? "PowerShell command" : "Bash command";
 const defaultCommand = isWindows ? 'Write-Output "hello"' : "echo hello";
+const specialNodeLabels = {
+  start: "START",
+  pass: "PASS",
+  fail: "FAIL",
+};
 
-function defaultOperation(type, nodeNumber = 1) {
+function isSpecialNodeType(type) {
+  return Object.hasOwn(specialNodeLabels, type);
+}
+
+export function nodeStackIndex(
+  nodeId,
+  { draggingNodeId = null, selectedNodeId = null, selectedNodeIds = [] } = {},
+) {
+  if (draggingNodeId === nodeId) return nodeStack.dragging;
+  if (selectedNodeId === nodeId) return nodeStack.activeSelected;
+  if (selectedNodeIds.includes(nodeId)) return nodeStack.selected;
+  return nodeStack.base;
+}
+
+function specialNodeLabel(type) {
+  return specialNodeLabels[type] ?? null;
+}
+
+export function defaultOperation(type, nodeNumber = 1) {
   switch (type) {
+    case "start":
+      return { type };
+    case "pass":
+      return { type, message: "Workflow completed successfully" };
+    case "fail":
+      return { type, message: "Workflow failed" };
+    case "break":
+      return { type, message: "Stop this loop" };
+    case "loop":
+      return {
+        type,
+        source: defaultFanSource("count"),
+      };
     case "bash_command":
       return {
         type,
@@ -264,6 +367,7 @@ function defaultOperation(type, nodeNumber = 1) {
         chunk_size: 1200,
         chunk_overlap: 120,
         encoding: "utf-8",
+        mode: "incremental",
       };
     case "local_search":
       return {
@@ -271,6 +375,43 @@ function defaultOperation(type, nodeNumber = 1) {
         index_path: "indexes/docs.json",
         query: "",
         top_k: 5,
+        score_threshold: 0,
+        include_snippets: true,
+        include_file_metadata: true,
+      };
+    case "http_request":
+      return {
+        type,
+        method: "GET",
+        url: "https://api.example.com/resource",
+        headers: {},
+        params: {},
+        json: null,
+        body: "",
+        timeout_seconds: 30,
+        retry: { attempts: 1, backoff_seconds: 0, retry_on_statuses: [] },
+        expected_statuses: [200],
+        response_mode: "auto",
+        output_mapping: {},
+        secret_fields: [],
+      };
+    case "approval_gate":
+      return {
+        type,
+        message: "Approve continuing this workflow?",
+        timeout_seconds: null,
+        timeout_decision: "timeout",
+        approvers: [],
+        notify: false,
+        notification_title: "Gofer Flow approval needed",
+      };
+    case "notification":
+      return {
+        type,
+        title: "Gofer Flow notification",
+        body: "",
+        channel: "desktop",
+        urgency: "normal",
       };
     case "agent":
     default:
@@ -280,15 +421,13 @@ function defaultOperation(type, nodeNumber = 1) {
         prompt_path: "",
         working_dir: ".",
         skill_name: "",
-        dynamic_count: 1,
         memory: "none",
         input_mapping: {},
-        fan_source: null,
       };
   }
 }
 
-function defaultAgentConfig(agentId, overrides = {}) {
+export function defaultAgentConfig(agentId, overrides = {}) {
   return {
     agent_id: agentId,
     subscription: "codex",
@@ -303,6 +442,16 @@ function defaultAgentConfig(agentId, overrides = {}) {
 
 function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
   switch (operation.type) {
+    case "start":
+      return "starting point";
+    case "pass":
+      return operation.message || "stop with success";
+    case "fail":
+      return operation.message || "stop with error";
+    case "break":
+      return operation.message || "stop loop";
+    case "loop":
+      return `loop ${operation.source?.type || "items"}`;
     case "bash_command":
       return operation.command || commandNodeLabel.toLowerCase();
     case "python_script":
@@ -352,6 +501,14 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
       return `search ${
         operation.index_path ? resolveDisplayPath(operation.index_path, pathBasePath) : "index"
       }`;
+    case "http_request":
+      return `${operation.method || "GET"} ${operation.url || "url"}`;
+    case "approval_gate":
+      return operation.timeout_seconds
+        ? `approval timeout ${operation.timeout_seconds}s`
+        : "approval required";
+    case "notification":
+      return `${operation.channel || "desktop"} · ${operation.title || "notification"}`;
     case "agent":
       if (operation.skill_name) return `${operation.agent_id || "agent"} · /${operation.skill_name}`;
       return operation.prompt_path
@@ -360,6 +517,201 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
     default:
       return "operation";
   }
+}
+
+function buildInputSourceOptions(node, nodes, edges) {
+  const nodesById = Object.fromEntries(nodes.map((candidate) => [candidate.id, candidate]));
+  const upstreamNodes = edges
+    .filter((edge) => edge.to === node.id)
+    .map((edge) => nodesById[edge.from])
+    .filter(Boolean);
+  const options = [
+    ["previous.text", "Previous node text"],
+    ["previous.data.message", "Previous message"],
+    ["previous.data.stdout", "Previous stdout"],
+    ["previous.data.stderr", "Previous stderr"],
+    ["loop.current.file_path", "Loop current file path"],
+    ["loop.current.file_name", "Loop current file name"],
+    ["loop.current.file_stem", "Loop current file stem"],
+    ["loop.current.file_extension", "Loop current file extension"],
+    ["loop.current.directory", "Loop current directory"],
+    ["loop.current.parent_path", "Loop current parent path"],
+    ["loop.current.file_content", "Loop current file content"],
+    ["loop.current._row", "Loop current row JSON"],
+    ["loop.current.event_json", "Loop current event JSON"],
+    ["loop.current.kind", "Loop current event kind"],
+    ["loop.current.size", "Loop current file size"],
+    ["loop.current.mtime_ns", "Loop current modified time"],
+    ["loop.current.index", "Loop current index"],
+  ];
+
+  upstreamNodes.forEach((upstream) => {
+    const label = upstream.label || upstream.id;
+    nodeOutputFields(upstream).forEach(([path, fieldLabel]) => {
+      options.push([`${upstream.id}.${path}`, `${label} ${fieldLabel}`]);
+    });
+  });
+
+  return dedupeOptions(options);
+}
+
+export function nodeOutputFields(node) {
+  const type = node?.type || node?.operation?.type;
+  const common = [
+    ["text", "text"],
+    ["success", "success"],
+  ];
+  switch (type) {
+    case "bash_command":
+    case "python_script":
+    case "shell_script":
+      return [
+        ...common,
+        ["data.stdout", "stdout"],
+        ["data.stderr", "stderr"],
+        ["data.command", "command"],
+        ["data.script_path", "script path"],
+      ];
+    case "read_file":
+    case "prompt_file":
+    case "write_file":
+      return [
+        ...common,
+        ["data.file_path", "file path"],
+        ["data.file_name", "file name"],
+        ["data.file_stem", "file stem"],
+        ["data.file_extension", "file extension"],
+        ["data.parent_path", "parent folder"],
+        ["data.directory", "directory"],
+        ["data.content", "content"],
+        ["data.characters_written", "characters written"],
+        ["data.bytes_written", "bytes written"],
+      ];
+    case "copy_file":
+    case "move_file":
+      return [
+        ...common,
+        ["data.source_path", "source path"],
+        ["data.source_name", "source name"],
+        ["data.destination_path", "destination path"],
+        ["data.destination_name", "destination name"],
+        ["data.destination_directory", "destination directory"],
+      ];
+    case "delete_file":
+      return [
+        ...common,
+        ["data.path", "path"],
+        ["data.file_path", "file path"],
+        ["data.folder_path", "folder path"],
+        ["data.trash_path", "trash path"],
+        ["data.deleted", "deleted"],
+      ];
+    case "file":
+      return [
+        ...common,
+        ["data.file_path", "file path"],
+        ["data.file_name", "file name"],
+        ["data.file_stem", "file stem"],
+        ["data.file_extension", "file extension"],
+        ["data.parent_path", "parent folder"],
+        ["data.directory", "directory"],
+      ];
+    case "folder":
+      return [
+        ...common,
+        ["data.folder_path", "folder path"],
+        ["data.folder_name", "folder name"],
+        ["data.parent_path", "parent folder"],
+        ["data.directory", "directory"],
+      ];
+    case "loop":
+      return [
+        ...common,
+        ["items", "all items"],
+        ["data.count", "item count"],
+        ["data.source_type", "source type"],
+        ["data.source_path", "source path"],
+        ["data.glob", "glob"],
+      ];
+    case "agent":
+    case "common_llm_task":
+      return [
+        ...common,
+        ["data.message", "message"],
+        ["data.agent_id", "agent ID"],
+        ["data.thoughts", "thoughts"],
+      ];
+    case "local_vectorize":
+      return [
+        ...common,
+        ["data.source_path", "source path"],
+        ["data.index_path", "index path"],
+        ["data.file_count", "file count"],
+        ["data.indexed_file_count", "indexed files"],
+        ["data.chunk_count", "chunk count"],
+        ["data.current", "index current"],
+        ["data.status", "index status"],
+        ["data.added_files", "added files"],
+        ["data.updated_files", "updated files"],
+        ["data.deleted_files", "deleted files"],
+        ["data.stale_files", "stale files"],
+        ["data.strategy", "embedding strategy"],
+      ];
+    case "local_search":
+      return [
+        ...common,
+        ["items", "results"],
+        ["data.results", "results"],
+        ["data.index_path", "index path"],
+        ["data.query", "query"],
+        ["data.score_threshold", "score threshold"],
+        ["data.strategy", "search strategy"],
+      ];
+    case "http_request":
+      return [
+        ...common,
+        ["data.status", "status"],
+        ["data.headers", "headers"],
+        ["data.body", "body"],
+        ["data.json", "JSON"],
+        ["data.selected", "selected outputs"],
+      ];
+    case "approval_gate":
+      return [
+        ...common,
+        ["data.decision", "decision"],
+        ["data.approved", "approved"],
+        ["data.decidedBy", "decided by"],
+        ["data.notes", "notes"],
+        ["data.message", "message"],
+        ["data.runId", "run ID"],
+      ];
+    case "notification":
+      return [
+        ...common,
+        ["data.title", "title"],
+        ["data.body", "body"],
+        ["data.channel", "channel"],
+        ["data.urgency", "urgency"],
+      ];
+    case "open_resource":
+      return [...common, ["data.target", "target"], ["data.resource_type", "resource type"]];
+    case "pass":
+    case "fail":
+    case "break":
+      return [...common, ["data.message", "message"]];
+    default:
+      return common;
+  }
+}
+
+function dedupeOptions(options) {
+  const seen = new Set();
+  return options.filter(([value]) => {
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
 }
 
 function pathBasename(pathValue = "") {
@@ -414,6 +766,39 @@ function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 
+function normalizedSelectionBox(selectionBox) {
+  const left = Math.min(selectionBox.start.x, selectionBox.current.x);
+  const top = Math.min(selectionBox.start.y, selectionBox.current.y);
+  const right = Math.max(selectionBox.start.x, selectionBox.current.x);
+  const bottom = Math.max(selectionBox.start.y, selectionBox.current.y);
+  return {
+    left,
+    top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function selectionBoxArea(box) {
+  return box.width * box.height;
+}
+
+function nodeIntersectsBox(node, box) {
+  const nodeLeft = node.x ?? 0;
+  const nodeTop = node.y ?? 0;
+  const nodeRight = nodeLeft + nodeWidth;
+  const nodeBottom = nodeTop + nodeHeight;
+  const boxRight = box.left + box.width;
+  const boxBottom = box.top + box.height;
+
+  return (
+    nodeLeft < boxRight &&
+    nodeRight > box.left &&
+    nodeTop < boxBottom &&
+    nodeBottom > box.top
+  );
+}
+
 function nextAvailableNodeNumber(nodes) {
   const usedNumbers = new Set(
     nodes
@@ -451,6 +836,7 @@ function nextAvailableAgentNumber(nodes, agents, usedAgentIds = []) {
 }
 
 export default function DagCanvas({
+  approvalState,
   dataDir = "",
   logState,
   notice,
@@ -458,6 +844,7 @@ export default function DagCanvas({
   workflow,
   onImportWorkflow,
   onLoadLatestLog,
+  onDecideApproval,
   onRunWorkflow,
   onSelectRunLog,
   onStopRunLog,
@@ -468,28 +855,77 @@ export default function DagCanvas({
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
+  const searchInputRef = useRef(null);
   const nodeDragMovedRef = useRef(false);
+  const nodeDragSelectionRef = useRef([]);
   const [selectedNodeId, setSelectedNodeId] = useState();
+  const [selectedNodeIds, setSelectedNodeIds] = useState([]);
   const [draggingNodeId, setDraggingNodeId] = useState(null);
   const [panningPointerId, setPanningPointerId] = useState(null);
+  const [selectionBox, setSelectionBox] = useState(null);
   const [logCollapsed, setLogCollapsed] = useState(false);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
   const [inspectorWidth, setInspectorWidth] = useState(340);
   const [logHeight, setLogHeight] = useState(240);
   const [expandedFolderNodes, setExpandedFolderNodes] = useState({});
   const [folderNodeEntries, setFolderNodeEntries] = useState({});
+  const [filePreviewPath, setFilePreviewPath] = useState(null);
   const [runMenuOpen, setRunMenuOpen] = useState(false);
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [draftEdge, setDraftEdge] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatchIndex, setSearchMatchIndex] = useState(0);
+  const [minimapDragging, setMinimapDragging] = useState(false);
   const invalidWorkflow = Boolean(workflow.invalid);
-  const workflowNodes = workflow.nodes ?? [];
+  const workflowNodes = useMemo(
+    () =>
+      (workflow.nodes ?? []).map((node) => {
+        const forcedLabel = specialNodeLabel(node.type);
+        return forcedLabel && node.label !== forcedLabel
+          ? { ...node, label: forcedLabel }
+          : node;
+      }),
+    [workflow.nodes],
+  );
   const workflowEdges = workflow.edges ?? [];
+  const searchMatches = useMemo(
+    () => matchingNodeIds(workflowNodes, searchQuery),
+    [searchQuery, workflowNodes],
+  );
 
   const selectedNode = workflowNodes.find((node) => node.id === selectedNodeId);
   const selectedEdge = workflowEdges.find((edge) => edge.id === selectedEdgeId);
   const runResult = runState?.result?.workflowId === workflow.id ? runState.result : null;
-  const selectedNodeOutput = selectedNodeId ? runResult?.nodeOutputs?.[selectedNodeId] : null;
+  const historicalNodeOutputs = logState?.nodeOutputs ?? null;
+  const runEvents = useMemo(
+    () => (logState?.runEvents?.length ? logState.runEvents : runResult?.runEvents ?? []),
+    [logState?.runEvents, runResult?.runEvents],
+  );
+  const runNodes = useMemo(
+    () =>
+      logState?.runNodes && Object.keys(logState.runNodes).length
+        ? logState.runNodes
+        : runResult?.runNodes ?? {},
+    [logState?.runNodes, runResult?.runNodes],
+  );
+  const selectedRunId =
+    logState?.selectedRunId ??
+    (logState?.path ? logState.path.split(/[\\/]/).pop() : null) ??
+    (runResult?.logPath ? runResult.logPath.split(/[\\/]/).pop() : null);
+  const usageSummary = logState?.usageSummary ?? runResult?.usageSummary ?? null;
+  const selectedNodeOutput = selectedNodeId
+    ? runResult?.nodeOutputs?.[selectedNodeId] ?? historicalNodeOutputs?.[selectedNodeId] ?? null
+    : null;
+  const selectedRunNode = selectedNodeId ? runNodes?.[selectedNodeId] ?? null : null;
+  const selectedApproval = selectedNodeId
+    ? approvalState?.approvals?.find(
+        (approval) =>
+          approval.nodeId === selectedNodeId &&
+          selectedRunId &&
+          approval.runId === selectedRunId,
+      ) ?? null
+    : null;
   const workflowLogText =
     logState?.text || runResult?.logText || formatWorkflowRunLog(runResult);
   const displayedLog = selectedNodeId
@@ -497,8 +933,8 @@ export default function DagCanvas({
     : workflowLogText;
   const logTitle = selectedNodeId ? `${selectedNodeId} last run` : "Workflow log";
   const nodeStatuses = useMemo(() => {
-    return getNodeStatuses(workflowNodes, runResult, workflowLogText);
-  }, [runResult, workflowNodes, workflowLogText]);
+    return getNodeStatuses(workflowNodes, runResult, workflowLogText, runNodes, runEvents);
+  }, [runEvents, runNodes, runResult, workflowNodes, workflowLogText]);
   const currentWorkflowRunning =
     runState?.running && runState.workflowId === workflow.id;
   const workflowHasRunningRuns = currentWorkflowRunning || logState?.runs?.some(
@@ -510,17 +946,24 @@ export default function DagCanvas({
 
   useEffect(() => {
     setSelectedNodeId(undefined);
+    setSelectedNodeIds([]);
     setSelectedEdgeId(null);
     setDraftEdge(null);
     setDraggingNodeId(null);
     setPanningPointerId(null);
+    setSelectionBox(null);
     setViewport({ x: 0, y: 0, scale: 1 });
+    setSearchQuery("");
+    setSearchMatchIndex(0);
   }, [workflow.id]);
 
   useEffect(() => {
     if (selectedNodeId && !nodesById[selectedNodeId]) {
       setSelectedNodeId(undefined);
     }
+    setSelectedNodeIds((currentIds) =>
+      currentIds.filter((nodeId) => Boolean(nodesById[nodeId])),
+    );
   }, [nodesById, selectedNodeId]);
 
   useEffect(() => {
@@ -528,6 +971,12 @@ export default function DagCanvas({
       setSelectedEdgeId(null);
     }
   }, [selectedEdgeId, workflowEdges]);
+
+  useEffect(() => {
+    setSearchMatchIndex((currentIndex) =>
+      searchMatches.length ? Math.min(currentIndex, searchMatches.length - 1) : 0,
+    );
+  }, [searchMatches.length]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -553,7 +1002,106 @@ export default function DagCanvas({
   }, [selectedEdgeId, workflowEdges]);
 
   useEffect(() => {
-    if (!panningPointerId) return undefined;
+    function handleKeyDown(event) {
+      if (event.defaultPrevented) return;
+      const target = event.target;
+      const tagName = target?.tagName?.toLowerCase?.();
+      const editingText =
+        target?.isContentEditable ||
+        tagName === "input" ||
+        tagName === "textarea" ||
+        tagName === "select";
+
+      if (event.key === "Escape") {
+        setDraftEdge(null);
+        setSelectedEdgeId(null);
+        setSelectedNodeId(undefined);
+        setSelectedNodeIds([]);
+        setSelectionBox(null);
+        if (document.activeElement === searchInputRef.current) {
+          searchInputRef.current?.blur();
+        }
+        return;
+      }
+
+      if (editingText) return;
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+        event.preventDefault();
+        setSelectedEdgeId(null);
+        setSelectedNodeIds(workflowNodes.map((node) => node.id));
+        setSelectedNodeId(workflowNodes.at(-1)?.id);
+        return;
+      }
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select?.();
+        return;
+      }
+
+      if (event.key === "/") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select?.();
+        return;
+      }
+
+      if (event.key === "+" || event.key === "=") {
+        event.preventDefault();
+        setViewport((current) => {
+          const rect = canvasRef.current?.getBoundingClientRect();
+          const centerX = (rect?.width || 960) / 2;
+          const centerY = (rect?.height || 640) / 2;
+          const nextScale = clamp(current.scale * 1.14, minZoom, maxZoom);
+          const contentX = (centerX - current.x) / current.scale;
+          const contentY = (centerY - current.y) / current.scale;
+          return {
+            scale: nextScale,
+            x: centerX - contentX * nextScale,
+            y: centerY - contentY * nextScale,
+          };
+        });
+        return;
+      }
+
+      if (event.key === "-" || event.key === "_") {
+        event.preventDefault();
+        setViewport((current) => {
+          const rect = canvasRef.current?.getBoundingClientRect();
+          const centerX = (rect?.width || 960) / 2;
+          const centerY = (rect?.height || 640) / 2;
+          const nextScale = clamp(current.scale * 0.88, minZoom, maxZoom);
+          const contentX = (centerX - current.x) / current.scale;
+          const contentY = (centerY - current.y) / current.scale;
+          return {
+            scale: nextScale,
+            x: centerX - contentX * nextScale,
+            y: centerY - contentY * nextScale,
+          };
+        });
+        return;
+      }
+
+      if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        const rect = canvasRef.current?.getBoundingClientRect();
+        setViewport(
+          fitViewportToNodes(workflowNodes, {
+            width: rect?.width || 960,
+            height: rect?.height || 640,
+          }),
+        );
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [workflowNodes, selectedNodeIds]);
+
+  useEffect(() => {
+    if (panningPointerId === null) return undefined;
 
     const previousCursor = document.body.style.cursor;
     document.body.style.cursor = "grabbing";
@@ -565,7 +1113,12 @@ export default function DagCanvas({
   function updateNode(nodeId, patch) {
     onWorkflowChange({
       ...workflow,
-      nodes: workflowNodes.map((node) => (node.id === nodeId ? { ...node, ...patch } : node)),
+      nodes: workflowNodes.map((node) => {
+        if (node.id !== nodeId) return node;
+        const nextNode = { ...node, ...patch };
+        const forcedLabel = specialNodeLabel(nextNode.type);
+        return forcedLabel ? { ...nextNode, label: forcedLabel } : nextNode;
+      }),
     });
   }
 
@@ -577,6 +1130,10 @@ export default function DagCanvas({
       type: operation.type,
       meta: nodeMetaFromOperation(operation),
     };
+    const forcedLabel = specialNodeLabel(operation.type);
+    if (forcedLabel) {
+      nextNodePatch.label = forcedLabel;
+    }
     if (
       (operation.type === "file" || operation.type === "folder") &&
       Object.hasOwn(patch, "path") &&
@@ -636,6 +1193,12 @@ export default function DagCanvas({
   }
 
   function updateNodeType(nodeId, type) {
+    if (
+      isSpecialNodeType(type) &&
+      workflowNodes.some((node) => node.id !== nodeId && node.type === type)
+    ) {
+      return;
+    }
     const nextAgentNumber = nextAvailableAgentNumber(workflowNodes, workflow.agents, usedAgentIds);
     const nextOperation = defaultOperation(
       type,
@@ -645,6 +1208,7 @@ export default function DagCanvas({
     );
     const nextNode = {
       type,
+      label: specialNodeLabel(type) ?? nodesById[nodeId].label,
       operation: nextOperation,
       settings: {
         ...defaultSettings,
@@ -686,36 +1250,87 @@ export default function DagCanvas({
     });
   }
 
+  function canvasViewportSize() {
+    const rect = canvasRef.current?.getBoundingClientRect();
+    return {
+      width: rect?.width || 960,
+      height: rect?.height || 640,
+    };
+  }
+
+  function fitNodes(nodes) {
+    if (!nodes.length) return;
+    setViewport(fitViewportToNodes(nodes, canvasViewportSize()));
+  }
+
+  function fitGraph() {
+    fitNodes(workflowNodes);
+  }
+
+  function fitSelection() {
+    const selectedNodes = workflowNodes.filter((node) => selectedNodeIds.includes(node.id));
+    fitNodes(selectedNodes.length ? selectedNodes : workflowNodes);
+  }
+
+  function zoomViewport(multiplier) {
+    const size = canvasViewportSize();
+    const centerX = size.width / 2;
+    const centerY = size.height / 2;
+    setViewport((current) => {
+      const nextScale = clamp(current.scale * multiplier, minZoom, maxZoom);
+      const contentX = (centerX - current.x) / current.scale;
+      const contentY = (centerY - current.y) / current.scale;
+      return {
+        scale: nextScale,
+        x: centerX - contentX * nextScale,
+        y: centerY - contentY * nextScale,
+      };
+    });
+  }
+
+  function applyAutoLayout() {
+    const nextWorkflow = autoLayoutWorkflow(workflow);
+    onWorkflowChange(nextWorkflow);
+    const schedule = window.requestAnimationFrame ?? ((callback) => callback());
+    schedule(() => {
+      fitNodes(nextWorkflow.nodes ?? []);
+    });
+  }
+
+  function focusSearchMatch(matchIndex = searchMatchIndex) {
+    if (!searchMatches.length) return;
+    const boundedIndex = ((matchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
+    const nodeId = searchMatches[boundedIndex];
+    const node = workflowNodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    setSearchMatchIndex(boundedIndex);
+    setSelectedEdgeId(null);
+    setSelectedNodeId(nodeId);
+    setSelectedNodeIds([nodeId]);
+    fitNodes([node]);
+  }
+
+  function handleSearchSubmit(event) {
+    event.preventDefault();
+    focusSearchMatch(searchMatchIndex);
+  }
+
+  function moveSearchMatch(delta) {
+    if (!searchMatches.length) return;
+    focusSearchMatch(searchMatchIndex + delta);
+  }
+
   function addNode() {
     const nextNumber = nextAvailableNodeNumber(workflowNodes);
-    const nextAgentNumber = nextAvailableAgentNumber(
-      workflowNodes,
-      workflow.agents,
+    const nextWorkflow = addDefaultNodeToWorkflow(workflow, {
       usedAgentIds,
-    );
-    const nextOperation = defaultOperation("agent", nextAgentNumber);
-    const newNode = {
-      id: `node-${nextNumber}`,
-      label: `New Step ${nextNumber}`,
-      type: "agent",
-      operation: nextOperation,
-      settings: defaultSettings,
-      meta: nodeMetaFromOperation(nextOperation),
       x: 180 + nextNumber * 34,
       y: 180 + nextNumber * 24,
-    };
-    onWorkflowChange({
-      ...workflow,
-      agents: {
-        ...(workflow.agents ?? {}),
-        [newNode.operation.agent_id]: defaultAgentConfig(newNode.operation.agent_id, {
-          prompt_path: newNode.operation.prompt_path,
-          working_dir: newNode.operation.working_dir,
-        }),
-      },
-      nodes: [...workflowNodes, newNode],
     });
+    const newNode = nextWorkflow.nodes.at(-1);
+    onWorkflowChange(nextWorkflow);
     setSelectedNodeId(newNode.id);
+    setSelectedNodeIds([newNode.id]);
   }
 
   async function handleCanvasDrop(event) {
@@ -742,7 +1357,7 @@ export default function DagCanvas({
 
       let info = null;
       try {
-        info = await window.goferDesktop?.getPathInfo?.(droppedPath);
+        info = await window.goferDesktop?.workspace?.getPathInfo?.(droppedPath);
       } catch (error) {
         console.error("Failed to inspect dropped path", error);
       }
@@ -776,6 +1391,7 @@ export default function DagCanvas({
         nodes: [...workflowNodes, ...newNodes],
       });
       setSelectedNodeId(newNodes.at(-1).id);
+      setSelectedNodeIds(newNodes.map((node) => node.id));
     }
   }
 
@@ -785,15 +1401,25 @@ export default function DagCanvas({
   }
 
   function deleteNode(nodeId) {
+    const remainingNodes = workflowNodes.filter((node) => node.id !== nodeId);
+    const nextSelectedId = remainingNodes[0]?.id;
+
     onWorkflowChange({
       ...workflow,
-      nodes: workflowNodes.filter((node) => node.id !== nodeId),
+      nodes: remainingNodes,
       edges: workflowEdges.filter(
         (edge) => edge.from !== nodeId && edge.to !== nodeId,
       ),
     });
     setSelectedNodeId((currentId) =>
-      currentId === nodeId ? workflowNodes.find((node) => node.id !== nodeId)?.id : currentId,
+      currentId === nodeId ? nextSelectedId : currentId,
+    );
+    setSelectedNodeIds((currentIds) =>
+      currentIds.includes(nodeId)
+        ? nextSelectedId
+          ? [nextSelectedId]
+          : []
+        : currentIds,
     );
   }
 
@@ -801,7 +1427,10 @@ export default function DagCanvas({
     if (event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     nodeDragMovedRef.current = false;
+    const nextSelection = selectedNodeIds.includes(nodeId) ? selectedNodeIds : [nodeId];
+    nodeDragSelectionRef.current = nextSelection;
     setSelectedNodeId(nodeId);
+    setSelectedNodeIds(nextSelection);
     setSelectedEdgeId(null);
     setDraggingNodeId(nodeId);
   }
@@ -811,9 +1440,24 @@ export default function DagCanvas({
     if (Math.abs(event.movementX) > 1 || Math.abs(event.movementY) > 1) {
       nodeDragMovedRef.current = true;
     }
-    updateNode(nodeId, {
-      x: nodesById[nodeId].x + event.movementX / viewport.scale,
-      y: nodesById[nodeId].y + event.movementY / viewport.scale,
+    const movingNodeIds = nodeDragSelectionRef.current.length
+      ? nodeDragSelectionRef.current
+      : [nodeId];
+    const movingSet = new Set(movingNodeIds);
+    const dx = event.movementX / viewport.scale;
+    const dy = event.movementY / viewport.scale;
+
+    onWorkflowChange({
+      ...workflow,
+      nodes: workflowNodes.map((node) =>
+        movingSet.has(node.id)
+          ? {
+              ...node,
+              x: (node.x ?? 0) + dx,
+              y: (node.y ?? 0) + dy,
+            }
+          : node,
+      ),
     });
   }
 
@@ -829,6 +1473,7 @@ export default function DagCanvas({
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
     setDraggingNodeId(null);
+    nodeDragSelectionRef.current = [];
   }
 
   async function handleNodeDoubleClick(node) {
@@ -840,11 +1485,7 @@ export default function DagCanvas({
     if (node.type === "file") {
       const path = node.operation?.path;
       if (path) {
-        try {
-          await window.goferDesktop?.revealPath?.(path);
-        } catch (error) {
-          console.error("Failed to reveal file node path", error);
-        }
+        setFilePreviewPath(resolveDisplayPath(path, dataDir));
       }
       return;
     }
@@ -873,7 +1514,7 @@ export default function DagCanvas({
       }));
       if (nextExpanded && !folderNodeEntries[node.id]?.loaded) {
         try {
-          const listing = await window.goferDesktop?.listDirectory?.({
+          const listing = await window.goferDesktop?.workspace?.listDirectory?.({
             currentPath: folderPath,
             create: false,
           });
@@ -901,11 +1542,26 @@ export default function DagCanvas({
   function handleCanvasPointerDown(event) {
     if (draftEdge) return;
     if (event.button === 0) {
+      event.preventDefault();
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      const start = {
+        x: (event.clientX - rect.left - viewport.x) / viewport.scale,
+        y: (event.clientY - rect.top - viewport.y) / viewport.scale,
+      };
+      event.currentTarget.setPointerCapture(event.pointerId);
       setSelectedNodeId(undefined);
+      setSelectedNodeIds([]);
       setSelectedEdgeId(null);
+      setSelectionBox({
+        pointerId: event.pointerId,
+        start,
+        current: start,
+      });
+      return;
     }
 
-    if (event.button === 0 || event.button === 2) {
+    if (event.button === 2) {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       setPanningPointerId(event.pointerId);
@@ -929,6 +1585,23 @@ export default function DagCanvas({
       );
       return;
     }
+    if (selectionBox?.pointerId === event.pointerId) {
+      const rect = canvasRef.current?.getBoundingClientRect();
+      if (!rect) return;
+      event.preventDefault();
+      setSelectionBox((current) =>
+        current
+          ? {
+              ...current,
+              current: {
+                x: (event.clientX - rect.left - viewport.x) / viewport.scale,
+                y: (event.clientY - rect.top - viewport.y) / viewport.scale,
+              },
+            }
+          : current,
+      );
+      return;
+    }
     if (panningPointerId !== event.pointerId) return;
     event.preventDefault();
     setViewport((current) => ({
@@ -941,6 +1614,23 @@ export default function DagCanvas({
   function handleCanvasPointerUp(event) {
     if (draftEdge) {
       setDraftEdge(null);
+      return;
+    }
+    if (selectionBox?.pointerId === event.pointerId) {
+      event.preventDefault();
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+        event.currentTarget.releasePointerCapture(event.pointerId);
+      }
+      const box = normalizedSelectionBox(selectionBox);
+      const selectedIds = selectionBoxArea(box) > 9
+        ? workflowNodes
+            .filter((node) => nodeIntersectsBox(node, box))
+            .map((node) => node.id)
+        : [];
+      setSelectedNodeIds(selectedIds);
+      setSelectedNodeId(selectedIds.at(-1));
+      setSelectedEdgeId(null);
+      setSelectionBox(null);
       return;
     }
     if (panningPointerId !== event.pointerId) return;
@@ -962,6 +1652,7 @@ export default function DagCanvas({
       y: fromNode.y + nodeHeight / 2,
     };
     setSelectedNodeId(undefined);
+    setSelectedNodeIds([]);
     setSelectedEdgeId(null);
     setDraftEdge({
       from: nodeId,
@@ -1002,6 +1693,58 @@ export default function DagCanvas({
     });
   }
 
+  function viewportFromMinimapPointer(event) {
+    const rect = event.currentTarget.getBoundingClientRect();
+    const bounds = graphBounds(workflowNodes, 160);
+    const minimapScale = Math.min(
+      minimapWidth / Math.max(1, bounds.width),
+      minimapHeight / Math.max(1, bounds.height),
+    );
+    const worldX = bounds.left + (event.clientX - rect.left) / minimapScale;
+    const worldY = bounds.top + (event.clientY - rect.top) / minimapScale;
+    const size = canvasViewportSize();
+    setViewport((current) => ({
+      ...current,
+      x: size.width / 2 - worldX * current.scale,
+      y: size.height / 2 - worldY * current.scale,
+    }));
+  }
+
+  function handleMinimapPointerDown(event) {
+    if (event.button !== 0 || !workflowNodes.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    setMinimapDragging(true);
+    viewportFromMinimapPointer(event);
+  }
+
+  function handleMinimapPointerMove(event) {
+    if (!minimapDragging) return;
+    const rect = event.currentTarget.getBoundingClientRect();
+    const withinMinimap =
+      event.clientX >= rect.left &&
+      event.clientX <= rect.right &&
+      event.clientY >= rect.top &&
+      event.clientY <= rect.bottom;
+    if (!withinMinimap) {
+      setMinimapDragging(false);
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    viewportFromMinimapPointer(event);
+  }
+
+  function handleMinimapPointerUp(event) {
+    event.stopPropagation();
+    setMinimapDragging(false);
+  }
+
+  function handleMinimapWheel(event) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
   function deleteEdge(edgeId) {
     onWorkflowChange({
       ...workflow,
@@ -1031,6 +1774,7 @@ export default function DagCanvas({
       ],
     });
     setSelectedNodeId(undefined);
+    setSelectedNodeIds([]);
     setSelectedEdgeId(nextEdgeId);
   }
 
@@ -1106,8 +1850,14 @@ export default function DagCanvas({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex h-11 shrink-0 items-center justify-start border-b border-line bg-white px-6">
-          <div className="flex items-center gap-2">
+        <div
+          className="relative z-20 flex shrink-0 flex-col gap-2 overflow-visible border-b border-line bg-white px-6 py-2"
+          data-toolbar="graph-editor"
+        >
+          <div
+            className="flex min-w-0 items-center gap-2 overflow-visible"
+            data-toolbar-row="primary"
+          >
             <input
               ref={importInputRef}
               accept=".toml"
@@ -1152,6 +1902,33 @@ export default function DagCanvas({
               onShowLatest={onLoadLatestLog}
               onStopRun={onStopRunLog}
             />
+            <div className="relative ml-auto shrink-0">
+              <button
+                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={invalidWorkflow}
+                title="Validate workflow"
+                type="button"
+                onClick={onValidateWorkflow}
+              >
+                <Check size={17} />
+              </button>
+              {notice?.message ? (
+                <div
+                  className={`validation-pop absolute right-0 top-10 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
+                    notice.type === "error"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  }`}
+                >
+                  {notice.message}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          <div
+            className="flex min-w-0 flex-wrap items-center gap-2 overflow-visible [&>button]:shrink-0"
+            data-toolbar-row="secondary"
+          >
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
               disabled={invalidWorkflow}
@@ -1163,7 +1940,48 @@ export default function DagCanvas({
             </button>
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="reset view"
+              title="Auto-layout graph"
+              type="button"
+              onClick={applyAutoLayout}
+            >
+              <Route size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Fit graph"
+              type="button"
+              onClick={fitGraph}
+            >
+              <Maximize2 size={16} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={!selectedNodeIds.length}
+              title="Fit selection"
+              type="button"
+              onClick={fitSelection}
+            >
+              <LocateFixed size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Zoom out"
+              type="button"
+              onClick={() => zoomViewport(0.88)}
+            >
+              <ZoomOut size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Zoom in"
+              type="button"
+              onClick={() => zoomViewport(1.14)}
+            >
+              <ZoomIn size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Reset view"
               type="button"
               onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
             >
@@ -1194,35 +2012,51 @@ export default function DagCanvas({
             >
               <Download size={17} />
             </button>
-            <div className="relative">
+            <form
+              className="flex h-8 min-w-[9rem] max-w-[17rem] flex-1 items-center overflow-hidden rounded-lg border border-line bg-white text-xs text-muted shadow-sm"
+              onSubmit={handleSearchSubmit}
+            >
+              <Search size={15} className="ml-2 shrink-0" />
+              <input
+                ref={searchInputRef}
+                aria-label="Search nodes"
+                className="h-full w-28 border-0 bg-transparent px-2 text-xs text-ink outline-none placeholder:text-slate-400 sm:w-36 md:w-44"
+                placeholder="Search nodes"
+                value={searchQuery}
+                onChange={(event) => {
+                  setSearchQuery(event.target.value);
+                  setSearchMatchIndex(0);
+                }}
+              />
+              <span className="hidden w-12 shrink-0 text-center text-[11px] text-muted sm:block">
+                {searchQuery.trim() ? `${searchMatches.length ? searchMatchIndex + 1 : 0}/${searchMatches.length}` : ""}
+              </span>
               <button
-                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-                disabled={invalidWorkflow}
-                title="Validate workflow"
+                className="grid h-8 w-8 place-items-center border-l border-line text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
+                disabled={!searchMatches.length}
+                title="Previous search match"
                 type="button"
-                onClick={onValidateWorkflow}
+                onClick={() => moveSearchMatch(-1)}
               >
-                <Check size={17} />
+                <ChevronLeft size={15} />
               </button>
-              {notice?.message ? (
-                <div
-                  className={`validation-pop absolute left-2 top-11 z-40 min-w-[190px] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
-                    notice.type === "error"
-                      ? "border-red-200 bg-red-50 text-red-700"
-                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
-                  }`}
-                >
-                  {notice.message}
-                </div>
-              ) : null}
-            </div>
+              <button
+                className="grid h-8 w-8 place-items-center border-l border-line text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
+                disabled={!searchMatches.length}
+                title="Next search match"
+                type="button"
+                onClick={() => moveSearchMatch(1)}
+              >
+                <ChevronRight size={15} />
+              </button>
+            </form>
           </div>
         </div>
 
         <div
           ref={canvasRef}
           className={`relative min-h-0 flex-1 overflow-hidden bg-[#f9fbfd] bg-[radial-gradient(circle_at_1px_1px,#d5dee8_1px,transparent_0)] [touch-action:none] ${
-            panningPointerId ? "cursor-grabbing" : "cursor-default"
+            panningPointerId !== null ? "cursor-grabbing" : "cursor-default"
           }`}
           style={{
             backgroundPosition: `${viewport.x}px ${viewport.y}px`,
@@ -1310,6 +2144,7 @@ export default function DagCanvas({
                             event.preventDefault();
                             event.stopPropagation();
                             setSelectedNodeId(undefined);
+                            setSelectedNodeIds([]);
                             setSelectedEdgeId(edge.id);
                           }}
                         />
@@ -1351,6 +2186,10 @@ export default function DagCanvas({
                 </g>
               </svg>
 
+              {selectionBox ? (
+                <SelectionRectangle box={normalizedSelectionBox(selectionBox)} />
+              ) : null}
+
               {workflowNodes.map((node) => (
                 <WorkflowNode
                   key={node.id}
@@ -1358,8 +2197,13 @@ export default function DagCanvas({
                     ...node,
                     meta: nodeMetaFromOperation(node.operation ?? defaultOperation(node.type), dataDir),
                   }}
-                  selected={selectedNodeId === node.id}
+                  selected={selectedNodeIds.includes(node.id)}
                   status={nodeStatuses[node.id]}
+                  zIndex={nodeStackIndex(node.id, {
+                    draggingNodeId,
+                    selectedNodeId,
+                    selectedNodeIds,
+                  })}
                   expanded={Boolean(expandedFolderNodes[node.id])}
                   folderEntries={folderNodeEntries[node.id]}
                   onDelete={deleteNode}
@@ -1373,16 +2217,32 @@ export default function DagCanvas({
               ))}
             </div>
           )}
+          {!invalidWorkflow ? (
+            <GraphMinimap
+              nodes={workflowNodes}
+              selectedNodeIds={selectedNodeIds}
+              viewport={viewport}
+              viewportSize={canvasViewportSize()}
+              onPointerDown={handleMinimapPointerDown}
+              onPointerLeave={handleMinimapPointerUp}
+              onPointerMove={handleMinimapPointerMove}
+              onPointerUp={handleMinimapPointerUp}
+              onWheel={handleMinimapWheel}
+            />
+          ) : null}
         </div>
       </div>
 
         {!invalidWorkflow ? (
           <Inspector
             agents={workflow.agents ?? {}}
+            approval={selectedApproval}
             edges={workflowEdges}
             collapsed={inspectorCollapsed}
             edge={selectedEdge}
             node={selectedNode}
+            nodeRun={selectedRunNode}
+            nodeOutput={selectedNodeOutput}
             nodes={workflowNodes}
             workflow={workflow}
             dataDir={dataDir}
@@ -1390,6 +2250,7 @@ export default function DagCanvas({
             onAddEdge={addEdge}
             onDeleteEdge={deleteEdge}
             onAgentChange={updateAgentConfig}
+            onDecideApproval={onDecideApproval}
             onEdgeChange={updateEdge}
             onResizeStart={startInspectorResize}
             onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
@@ -1408,15 +2269,24 @@ export default function DagCanvas({
         loading={logState?.loading}
         logPath={logState?.path}
         runs={logState?.runs ?? []}
+        runEvents={runEvents}
         selectedRunId={logState?.selectedRunId}
         text={displayedLog}
         title={logTitle}
+        usageSummary={usageSummary}
         onResizeStart={startLogResize}
         onSelectRun={onSelectRunLog}
         onShowLatest={onLoadLatestLog}
         onStopRun={onStopRunLog}
         onToggle={() => setLogCollapsed((current) => !current)}
       />
+      {filePreviewPath ? (
+        <TextFileDialog
+          mode="preview"
+          path={filePreviewPath}
+          onClose={() => setFilePreviewPath(null)}
+        />
+      ) : null}
     </div>
   );
 }
@@ -1452,7 +2322,7 @@ function InvalidWorkflowCanvas({ workflow }) {
   async function openSourcePath() {
     if (!sourcePath) return;
     try {
-      await window.goferDesktop?.revealPath?.(sourcePath);
+      await window.goferDesktop?.workspace?.revealPath?.(sourcePath);
     } catch (error) {
       console.error("Failed to reveal workflow source path", error);
     }
@@ -1527,6 +2397,90 @@ function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, watch }) {
   );
 }
 
+function GraphMinimap({
+  nodes,
+  onPointerDown,
+  onPointerLeave,
+  onPointerMove,
+  onPointerUp,
+  onWheel,
+  selectedNodeIds,
+  viewport,
+  viewportSize,
+}) {
+  if (!nodes.length) return null;
+  const bounds = graphBounds(nodes, 160);
+  const scale = Math.min(
+    minimapWidth / Math.max(1, bounds.width),
+    minimapHeight / Math.max(1, bounds.height),
+  );
+  const viewportWorld = {
+    left: -viewport.x / viewport.scale,
+    top: -viewport.y / viewport.scale,
+    width: viewportSize.width / viewport.scale,
+    height: viewportSize.height / viewport.scale,
+  };
+  const selectedSet = new Set(selectedNodeIds);
+  const toMinimapRect = (rect) => ({
+    left: (rect.left - bounds.left) * scale,
+    top: (rect.top - bounds.top) * scale,
+    width: rect.width * scale,
+    height: rect.height * scale,
+  });
+  const viewportRect = toMinimapRect(viewportWorld);
+
+  return (
+    <div
+      className="absolute right-4 top-4 z-20 rounded-lg border border-line bg-white/95 p-2 shadow-panel backdrop-blur dark:border-[#3a3a3d] dark:bg-[#252526]/95"
+      title="Minimap"
+      onWheel={onWheel}
+    >
+      <div
+        className="relative cursor-crosshair overflow-hidden rounded-md bg-[#edf3f8] dark:bg-[#1b1f22]"
+        style={{ width: minimapWidth, height: minimapHeight }}
+        onPointerDown={onPointerDown}
+        onPointerLeave={onPointerLeave}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerCancel={onPointerUp}
+        onWheel={onWheel}
+      >
+        {nodes.map((node) => {
+          const rect = toMinimapRect({
+            left: node.x ?? 0,
+            top: node.y ?? 0,
+            width: nodeWidth,
+            height: nodeHeight,
+          });
+          return (
+            <div
+              key={node.id}
+              className={`absolute rounded-sm ${
+                selectedSet.has(node.id) ? "bg-teal-600 dark:bg-teal-400" : "bg-slate-500 dark:bg-slate-500"
+              }`}
+              style={{
+                left: rect.left,
+                top: rect.top,
+                width: Math.max(3, rect.width),
+                height: Math.max(3, rect.height),
+              }}
+            />
+          );
+        })}
+        <div
+          className="absolute rounded-sm border-2 border-teal-700 bg-teal-500/10 dark:border-teal-300 dark:bg-teal-300/15"
+          style={{
+            left: viewportRect.left,
+            top: viewportRect.top,
+            width: Math.max(8, viewportRect.width),
+            height: Math.max(8, viewportRect.height),
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function extractNodeLog(logText, nodeId) {
   if (!logText || !nodeId) return "";
   const lines = logText.split("\n");
@@ -1580,11 +2534,26 @@ function formatWorkflowRunLog(result) {
   return lines.join("\n").trim();
 }
 
-function getNodeStatuses(nodes, runResult, logText) {
+function getNodeStatuses(nodes, runResult, logText, runNodes = {}, runEvents = []) {
   const statuses = {};
+
+  for (const [nodeId, nodeRun] of Object.entries(runNodes ?? {})) {
+    const status = normalizeRunStatus(nodeRun?.status);
+    if (status) {
+      statuses[nodeId] = status;
+    }
+  }
+
+  for (const event of runEvents ?? []) {
+    const status = normalizeRunStatus(event?.status);
+    if (event?.nodeId && event.nodeId !== "workflow" && status) {
+      statuses[event.nodeId] = status;
+    }
+  }
 
   if (runResult?.nodeOutputs) {
     for (const [nodeId, output] of Object.entries(runResult.nodeOutputs)) {
+      if (statuses[nodeId]) continue;
       if (output.skipped) {
         statuses[nodeId] = "skipped";
       } else {
@@ -1594,6 +2563,7 @@ function getNodeStatuses(nodes, runResult, logText) {
   }
 
   for (const node of nodes) {
+    if (statuses[node.id]) continue;
     const logStatus = getNodeStatusFromLog(logText, node.id);
     if (logStatus) {
       statuses[node.id] = logStatus;
@@ -1603,22 +2573,47 @@ function getNodeStatuses(nodes, runResult, logText) {
   return statuses;
 }
 
+function normalizeRunStatus(status) {
+  if (["queued", "started", "retried"].includes(status)) return status;
+  if (status === "completed") return "success";
+  if (status === "failed") return "error";
+  if (status === "stopped") return "stopped";
+  if (status === "skipped") return "skipped";
+  return null;
+}
+
 function getNodeStatusFromLog(logText, nodeId) {
   if (!logText || !nodeId) return null;
-  const nodeLines = extractNodeLog(logText, nodeId);
-  if (!nodeLines) return null;
+  const nodePrefix = ` - NODE - ${nodeId} - `;
+  const events = [];
 
-  if (nodeLines.includes("skipped")) return "skipped";
-  const events = [
-    ...nodeLines.matchAll(/(?:run \d+ )?attempt \d+ started/gi),
-    ...nodeLines.matchAll(/(?:run \d+ )?attempt \d+ finished success=(true|false)/gi),
-  ].sort((left, right) => (left.index ?? 0) - (right.index ?? 0));
-  const latestEvent = events.at(-1);
-  if (!latestEvent) return null;
-  if (latestEvent[0].includes("started")) {
-    return "running";
+  for (const [lineIndex, line] of logText.split("\n").entries()) {
+    const prefixIndex = line.indexOf(nodePrefix);
+    if (prefixIndex === -1) continue;
+
+    const message = line.slice(prefixIndex + nodePrefix.length).trim();
+    if (message === "skipped") {
+      events.push({ index: lineIndex, status: "skipped" });
+      continue;
+    }
+
+    if (/(?:run \d+ )?attempt \d+ started/i.test(message)) {
+      events.push({ index: lineIndex, status: "running" });
+      continue;
+    }
+
+    const finishedMatch = message.match(
+      /(?:run \d+ )?attempt \d+ finished success=(true|false)/i,
+    );
+    if (finishedMatch) {
+      events.push({
+        index: lineIndex,
+        status: finishedMatch[1].toLowerCase() === "true" ? "success" : "error",
+      });
+    }
   }
-  return latestEvent[1].toLowerCase() === "true" ? "success" : "error";
+
+  return events.at(-1)?.status ?? null;
 }
 
 function ToolbarRunSelector({
@@ -1650,9 +2645,9 @@ function ToolbarRunSelector({
   }, [onOpenChange, open]);
 
   return (
-    <div ref={menuRef} className="relative">
+    <div ref={menuRef} className="relative shrink-0">
       <button
-        className={`flex h-8 items-center gap-2 rounded-lg border px-2 text-xs font-medium transition ${
+        className={`flex h-8 max-w-[10rem] items-center gap-2 rounded-lg border px-2 text-xs font-medium transition ${
           open
             ? "border-slate-300 bg-white text-ink"
             : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
@@ -1663,7 +2658,7 @@ function ToolbarRunSelector({
       >
         <RunStatusDot status={status} />
         <span className="max-w-[112px] truncate">{label}</span>
-        <ChevronDown size={14} />
+        <ChevronDown size={14} className="shrink-0" />
       </button>
       {open ? (
         <div className="absolute left-0 top-9 z-50 w-[300px] overflow-hidden rounded-lg border border-line bg-white shadow-panel">
@@ -1748,6 +2743,7 @@ function LogOverlay({
   height,
   loading,
   logPath,
+  runEvents = [],
   runs = [],
   selectedRunId,
   onResizeStart,
@@ -1757,10 +2753,18 @@ function LogOverlay({
   onToggle,
   text,
   title,
+  usageSummary,
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [expandedRowIds, setExpandedRowIds] = useState({});
-  const [filters, setFilters] = useState({ datetime: "", node: "", message: "" });
+  const [filters, setFilters] = useState({
+    attempt: "",
+    datetime: "",
+    fanOut: "",
+    message: "",
+    node: "",
+    status: "",
+  });
   const historyRef = useRef(null);
   const displayText = error
     ? error
@@ -1769,16 +2773,27 @@ function LogOverlay({
       : text?.trim()
         ? text.trim()
         : "No run log available.";
-  const logRows = useMemo(() => parseLogRows(displayText), [displayText]);
+  const timelineRows = useMemo(() => parseTimelineRows(runEvents), [runEvents]);
+  const logRows = useMemo(
+    () => (timelineRows.length ? timelineRows : parseLogRows(displayText)),
+    [displayText, timelineRows],
+  );
+  const usingTimeline = timelineRows.length > 0;
   const filteredRows = useMemo(() => {
     return logRows.filter((row) => {
+      const attempt = filters.attempt.trim().toLowerCase();
       const datetime = filters.datetime.trim().toLowerCase();
+      const fanOut = filters.fanOut.trim().toLowerCase();
       const node = filters.node.trim().toLowerCase();
       const message = filters.message.trim().toLowerCase();
+      const status = filters.status.trim().toLowerCase();
       return (
+        (!attempt || row.attempt.toLowerCase().includes(attempt)) &&
         (!datetime || row.datetime.toLowerCase().includes(datetime)) &&
+        (!fanOut || row.fanOut.toLowerCase().includes(fanOut)) &&
         (!node || row.node.toLowerCase().includes(node)) &&
-        (!message || row.message.toLowerCase().includes(message))
+        (!message || row.message.toLowerCase().includes(message)) &&
+        (!status || row.status.toLowerCase().includes(status))
       );
     });
   }, [filters, logRows]);
@@ -1830,7 +2845,7 @@ function LogOverlay({
             <Terminal size={15} />
           </span>
           <div className="min-w-0">
-            <h2 className="truncate text-sm font-semibold">{title}</h2>
+            <h2 className="truncate text-sm font-semibold">{usingTimeline ? "Run timeline" : title}</h2>
             {logPath ? <p className="truncate text-[11px] text-muted">{logPath}</p> : null}
           </div>
         </div>
@@ -1925,11 +2940,19 @@ function LogOverlay({
         className="workflow-scrollbar overflow-auto bg-white dark:bg-[#1e1e1e]"
         style={{ height: Math.max(0, height - 44) }}
       >
+        <UsageSummaryStrip summary={usageSummary} />
         <table className="w-full table-fixed border-collapse text-left text-xs">
           <thead className="sticky top-0 z-10 border-b border-line bg-[#f9fbfd] dark:bg-[#252526]">
             <tr className="text-[11px] uppercase tracking-wide text-muted">
-              <th className="w-[190px] px-3 pb-1 pt-2 font-semibold">Datetime</th>
-              <th className="w-[170px] px-3 pb-1 pt-2 font-semibold">Node</th>
+              <th className="w-[180px] px-3 pb-1 pt-2 font-semibold">Datetime</th>
+              <th className="w-[140px] px-3 pb-1 pt-2 font-semibold">Node</th>
+              {usingTimeline ? (
+                <>
+                  <th className="w-[105px] px-3 pb-1 pt-2 font-semibold">Status</th>
+                  <th className="w-[90px] px-3 pb-1 pt-2 font-semibold">Attempt</th>
+                  <th className="w-[110px] px-3 pb-1 pt-2 font-semibold">Fan-out</th>
+                </>
+              ) : null}
               <th className="px-3 pb-1 pt-2 font-semibold">Message</th>
             </tr>
             <tr className="border-t border-line/70">
@@ -1951,6 +2974,37 @@ function LogOverlay({
                   }
                 />
               </th>
+              {usingTimeline ? (
+                <>
+                  <th className="px-3 pb-2 pt-1">
+                    <LogFilterInput
+                      label="Filter status"
+                      value={filters.status}
+                      onChange={(value) =>
+                        setFilters((current) => ({ ...current, status: value }))
+                      }
+                    />
+                  </th>
+                  <th className="px-3 pb-2 pt-1">
+                    <LogFilterInput
+                      label="Filter attempt"
+                      value={filters.attempt}
+                      onChange={(value) =>
+                        setFilters((current) => ({ ...current, attempt: value }))
+                      }
+                    />
+                  </th>
+                  <th className="px-3 pb-2 pt-1">
+                    <LogFilterInput
+                      label="Filter item"
+                      value={filters.fanOut}
+                      onChange={(value) =>
+                        setFilters((current) => ({ ...current, fanOut: value }))
+                      }
+                    />
+                  </th>
+                </>
+              ) : null}
               <th className="px-3 pb-2 pt-1">
                 <LogFilterInput
                   label="Filter message"
@@ -1987,6 +3041,25 @@ function LogOverlay({
                       {row.node || "-"}
                     </div>
                   </td>
+                  {usingTimeline ? (
+                    <>
+                      <td className="px-3 py-2 font-mono text-[11px] text-muted">
+                        <div className={expanded ? "whitespace-pre-wrap" : "truncate"}>
+                          {row.status || "-"}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-[11px] text-muted">
+                        <div className={expanded ? "whitespace-pre-wrap" : "truncate"}>
+                          {row.attempt || "-"}
+                        </div>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-[11px] text-muted">
+                        <div className={expanded ? "whitespace-pre-wrap" : "truncate"}>
+                          {row.fanOut || "-"}
+                        </div>
+                      </td>
+                    </>
+                  ) : null}
                   <td className="px-3 py-2 font-mono text-[11px] leading-5">
                     <div
                       className={
@@ -2003,7 +3076,7 @@ function LogOverlay({
             })}
             {!filteredRows.length ? (
               <tr>
-                <td className="px-4 py-6 text-center text-xs text-muted" colSpan={3}>
+                <td className="px-4 py-6 text-center text-xs text-muted" colSpan={usingTimeline ? 6 : 3}>
                   {logRows.length ? "No log rows match the current filters." : displayText}
                 </td>
               </tr>
@@ -2013,6 +3086,62 @@ function LogOverlay({
       </div>
     </section>
   );
+}
+
+export function UsageSummaryStrip({ summary }) {
+  const totals = summary?.totals;
+  const calls = Number(totals?.agent_calls ?? 0);
+  if (!summary || !totals || !calls) return null;
+
+  const mostExpensive = firstUsageNode(summary.most_expensive_nodes);
+  const slowest = firstUsageNode(summary.slowest_nodes);
+  const budgetFailures = Array.isArray(summary.budget_failures)
+    ? summary.budget_failures
+    : [];
+
+  return (
+    <div className="border-b border-line bg-slate-50 px-3 py-2 text-xs text-slate-700 dark:bg-[#252526] dark:text-[#cccccc]">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="font-semibold text-ink dark:text-white">LLM usage</span>
+        <span>{calls} calls</span>
+        <span>{formatInteger(totals.total_tokens)} tokens</span>
+        <span>cost~{formatCurrency(totals.estimated_cost)}</span>
+        <span>{formatUsageSeconds(totals.agent_time_seconds)} agent time</span>
+        {mostExpensive ? (
+          <span>
+            Most expensive: {mostExpensive.node_id} ({formatCurrency(mostExpensive.estimated_cost)})
+          </span>
+        ) : null}
+        {slowest ? (
+          <span>
+            Slowest: {slowest.node_id} ({formatUsageSeconds(slowest.duration_seconds)})
+          </span>
+        ) : null}
+        {budgetFailures.length ? (
+          <span className="font-semibold text-red-700">
+            Budget failures: {budgetFailures.map((node) => node.node_id).join(", ")}
+          </span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function firstUsageNode(nodes) {
+  return Array.isArray(nodes) && nodes.length ? nodes[0] : null;
+}
+
+function formatCurrency(value) {
+  const number = Number(value ?? 0);
+  return `$${number.toFixed(number >= 1 ? 2 : 6)}`;
+}
+
+function formatInteger(value) {
+  return new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(value ?? 0));
+}
+
+function formatUsageSeconds(value) {
+  return `${Number(value ?? 0).toFixed(2)}s`;
 }
 
 function LogFilterInput({ label, onChange, value }) {
@@ -2038,8 +3167,11 @@ function parseLogRows(logText) {
   function pushRow(row) {
     if (!row) return;
     rows.push({
+      attempt: "",
+      fanOut: "",
       ...row,
       message: row.message.trimEnd(),
+      status: "",
     });
   }
 
@@ -2074,6 +3206,22 @@ function parseLogRows(logText) {
   return rows;
 }
 
+function parseTimelineRows(events = []) {
+  if (!Array.isArray(events) || !events.length) return [];
+  return events.map((event, index) => {
+    const fanOut = event?.fanOutItem?.index ?? event?.fanOutItem?.file_name ?? "";
+    return {
+      id: `timeline-row-${index}`,
+      attempt: event?.attempt == null ? "" : String(event.attempt),
+      datetime: event?.occurredAt ?? "",
+      fanOut: fanOut === "" ? "" : String(fanOut),
+      message: event?.message ?? "",
+      node: event?.nodeId ?? "",
+      status: event?.status ?? "",
+    };
+  });
+}
+
 function parseLogPayload(payload) {
   const nodeMatch = payload.match(/^NODE\s+-\s+(.+?)\s+-\s+(.*)$/);
   if (nodeMatch) {
@@ -2098,16 +3246,198 @@ function parseLogPayload(payload) {
 }
 
 function RunStatusDot({ status }) {
-  if (status === "running") {
+  if (["running", "started", "retried"].includes(status)) {
     return <Loader2 className="shrink-0 animate-spin text-blue-500" size={13} />;
+  }
+  if (status === "queued") {
+    return <span className="h-2.5 w-2.5 shrink-0 rounded-full border border-blue-400 bg-blue-50" />;
   }
   const color =
     status === "success"
       ? "bg-emerald-500"
       : status === "error"
         ? "bg-red-500"
-        : "bg-slate-400";
+        : status === "stopped"
+          ? "bg-amber-500"
+          : "bg-slate-400";
   return <span className={`h-2.5 w-2.5 shrink-0 rounded-full ${color}`} />;
+}
+
+function RunNodeInspector({ nodeRun }) {
+  const attempts = Array.isArray(nodeRun?.attempts) ? nodeRun.attempts : [];
+  const data = nodeRun?.data ?? {};
+  const edgeDecisions = Array.isArray(data.edgeDecisions) ? data.edgeDecisions : [];
+  const fanOut = data.fanOut ?? null;
+  const fanOutItems = Array.isArray(fanOut?.items) ? fanOut.items : [];
+  const [selectedFanOutIndex, setSelectedFanOutIndex] = useState(null);
+
+  useEffect(() => {
+    setSelectedFanOutIndex(null);
+  }, [nodeRun?.nodeId]);
+
+  const selectedFanOutItem =
+    selectedFanOutIndex === null
+      ? null
+      : fanOutItems.find((item) => Number(item.index) === Number(selectedFanOutIndex));
+  const visibleAttempts =
+    selectedFanOutIndex === null
+      ? attempts
+      : attempts.filter((attempt) => Number(attempt.fanOutItem?.index) === Number(selectedFanOutIndex));
+
+  return (
+    <InspectorSection title="Last run">
+      <KeyValueRows
+        rows={[
+          ["Status", nodeRun.status ?? ""],
+          ["Duration", formatSeconds(nodeRun.durationSeconds)],
+          ["Exit code", nodeRun.exitCode ?? ""],
+          ["Attempts", attempts.length || ""],
+          ["Message", data.message ?? nodeRun.message ?? ""],
+        ]}
+      />
+      {fanOut ? (
+        <KeyValueRows
+          rows={[
+            ["Fan-out items", fanOut.itemCount ?? ""],
+            ["Succeeded", fanOut.successCount ?? ""],
+            ["Failed", fanOut.failureCount ?? ""],
+          ]}
+        />
+      ) : null}
+      {fanOutItems.length ? (
+        <div className="space-y-2">
+          <div className="workflow-scrollbar flex max-h-28 flex-wrap gap-1 overflow-auto rounded-md border border-line bg-slate-50 p-2">
+            <button
+              className={`rounded border px-2 py-1 text-[11px] ${selectedFanOutIndex === null ? "border-teal-400 bg-teal-50 text-teal-700" : "border-line bg-white text-slate-600"}`}
+              type="button"
+              onClick={() => setSelectedFanOutIndex(null)}
+            >
+              All
+            </button>
+            {fanOutItems.map((item) => (
+              <button
+                key={item.index}
+                className={`rounded border px-2 py-1 text-[11px] ${Number(selectedFanOutIndex) === Number(item.index) ? "border-teal-400 bg-teal-50 text-teal-700" : "border-line bg-white text-slate-600"}`}
+                type="button"
+                onClick={() => setSelectedFanOutIndex(item.index)}
+              >
+                {item.index}: {item.status}
+              </button>
+            ))}
+          </div>
+          {selectedFanOutItem ? (
+            <div className="rounded-md border border-line bg-slate-50 p-2 text-xs">
+              <KeyValueRows
+                rows={[
+                  ["Item", selectedFanOutItem.index],
+                  ["Status", selectedFanOutItem.status ?? ""],
+                  ["Node", selectedFanOutItem.nodeId ?? ""],
+                  ["Duration", formatSeconds(selectedFanOutItem.durationSeconds)],
+                  ["Exit code", selectedFanOutItem.exitCode ?? ""],
+                ]}
+              />
+              {selectedFanOutItem.item ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {JSON.stringify(selectedFanOutItem.item, null, 2)}
+                </pre>
+              ) : null}
+              {selectedFanOutItem.output ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {selectedFanOutItem.output}
+                </pre>
+              ) : null}
+              {selectedFanOutItem.error ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
+                  {selectedFanOutItem.error}
+                </pre>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+      {attempts.length ? (
+        <div className="space-y-2">
+          {visibleAttempts.map((attempt, index) => (
+            <div key={`${attempt.runNumber}-${attempt.attempt}-${index}`} className="rounded-md border border-line bg-slate-50 p-2 text-xs">
+              <div className="flex items-center justify-between gap-2 font-medium text-ink">
+                <span>
+                  Attempt {attempt.attempt ?? index + 1}
+                  {attempt.fanOutItem?.index !== undefined ? ` item ${attempt.fanOutItem.index}` : ""}
+                </span>
+                <span>{formatSeconds(attempt.durationSeconds)}</span>
+              </div>
+              {attempt.inputs && Object.keys(attempt.inputs).length ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {JSON.stringify(attempt.inputs, null, 2)}
+                </pre>
+              ) : null}
+              {attempt.output ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {attempt.output}
+                </pre>
+              ) : null}
+              {attempt.stdout ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {attempt.stdout}
+                </pre>
+              ) : null}
+              {attempt.stderr ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
+                  {attempt.stderr}
+                </pre>
+              ) : null}
+              {attempt.error && attempt.error !== attempt.stderr ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
+                  {attempt.error}
+                </pre>
+              ) : null}
+              {attempt.prompt ? (
+                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
+                  {attempt.prompt}
+                </pre>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      ) : null}
+      {edgeDecisions.length ? (
+        <div className="space-y-1">
+          {edgeDecisions.map((decision, index) => (
+            <div key={`${decision.to}-${index}`} className="flex items-center justify-between gap-2 rounded-md border border-line px-2 py-1.5 text-xs">
+              <span className="truncate">
+                {decision.from} {"->"} {decision.to}
+              </span>
+              <span className={decision.matched ? "text-emerald-700" : "text-muted"}>
+                {decision.matched ? "matched" : "skipped"}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </InspectorSection>
+  );
+}
+
+function formatSeconds(value) {
+  if (value === null || value === undefined || value === "") return "";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "";
+  return `${number.toFixed(2)}s`;
+}
+
+function KeyValueRows({ rows }) {
+  const visibleRows = rows.filter(([, value]) => value !== "" && value !== null && value !== undefined);
+  if (!visibleRows.length) return null;
+  return (
+    <dl className="grid grid-cols-[110px_minmax(0,1fr)] gap-x-3 gap-y-1 text-xs">
+      {visibleRows.map(([label, value]) => (
+        <div key={label} className="contents">
+          <dt className="text-muted">{label}</dt>
+          <dd className="min-w-0 truncate font-medium text-slate-700">{String(value)}</dd>
+        </div>
+      ))}
+    </dl>
+  );
 }
 
 function formatRunLabel(run) {
@@ -2118,6 +3448,20 @@ function formatRunLabel(run) {
     dateStyle: "medium",
     timeStyle: "short",
   });
+}
+
+function SelectionRectangle({ box }) {
+  return (
+    <div
+      className="pointer-events-none absolute z-20 border border-teal-500 bg-teal-500/10"
+      style={{
+        left: box.left,
+        top: box.top,
+        width: box.width,
+        height: box.height,
+      }}
+    />
+  );
 }
 
 function WorkflowNode({
@@ -2133,6 +3477,7 @@ function WorkflowNode({
   onPointerDown,
   onPointerMove,
   onPointerUp,
+  zIndex,
 }) {
   const style = nodeStyles[node.type] ?? nodeStyles.agent;
   const Icon = style.icon;
@@ -2140,7 +3485,7 @@ function WorkflowNode({
   const isFolderNode = node.type === "folder";
   const extension = isFileNode ? fileExtension(node.operation?.path) : "";
   const title = isFileNode
-    ? "Double click to open"
+    ? "Double click to preview"
     : isFolderNode
       ? "Double click to expand"
       : undefined;
@@ -2150,7 +3495,7 @@ function WorkflowNode({
       className={`absolute w-[220px] cursor-grab rounded-lg border bg-white p-3 shadow-node transition active:cursor-grabbing ${
         selected ? "border-teal-500 ring-4 ring-teal-100" : style.border
       }`}
-      style={{ left: node.x, top: node.y }}
+      style={{ left: node.x, top: node.y, zIndex }}
       title={title}
       onDoubleClick={(event) => {
         event.stopPropagation();
@@ -2250,17 +3595,41 @@ function FolderNodePreview({ state }) {
 function NodeStatusBadge({ status }) {
   if (!status) return null;
 
-  if (status === "running") {
-    return <Loader2 size={13} className="animate-spin text-muted" />;
+  if (["running", "started", "retried"].includes(status)) {
+    return (
+      <span
+        className="flex items-center gap-1 rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-blue-700 dark:border-sky-700/70 dark:bg-sky-950/70 dark:text-sky-200"
+        title={status}
+      >
+        <Loader2 size={10} className="animate-spin text-blue-600 dark:text-sky-300" />
+        {status === "running" ? "run" : status}
+      </span>
+    );
+  }
+
+  if (status === "queued") {
+    return (
+      <span
+        className="rounded border border-blue-200 bg-blue-50 px-1.5 py-0.5 text-[9px] font-semibold uppercase text-blue-700 dark:border-sky-700/70 dark:bg-sky-950/70 dark:text-sky-200"
+        title="queued"
+      >
+        queued
+      </span>
+    );
   }
 
   const className = {
-    success: "bg-emerald-500",
-    error: "bg-red-500",
-    skipped: "border border-slate-400 bg-transparent",
+    success: "border-emerald-200 bg-emerald-50 text-emerald-700",
+    error: "border-red-200 bg-red-50 text-red-700",
+    stopped: "border-amber-200 bg-amber-50 text-amber-700",
+    skipped: "border-slate-200 bg-slate-50 text-slate-500",
   }[status];
 
-  return <span className={`h-2.5 w-2.5 rounded-full ${className}`} />;
+  return (
+    <span className={`rounded border px-1.5 py-0.5 text-[9px] font-semibold uppercase ${className}`} title={status}>
+      {status}
+    </span>
+  );
 }
 
 const edgeConditionOptions = [
@@ -2268,6 +3637,7 @@ const edgeConditionOptions = [
   ["on_success", "On success"],
   ["on_failure", "On failure"],
   ["output_matches", "Output matches"],
+  ["after_loop", "After loop finishes"],
 ];
 
 const compactEdgeConditionOptions = [
@@ -2275,19 +3645,24 @@ const compactEdgeConditionOptions = [
   ["on_success", "Success"],
   ["on_failure", "Failure"],
   ["output_matches", "Matches"],
+  ["after_loop", "After loop"],
 ];
 
 function Inspector({
   agents,
+  approval,
   collapsed,
   dataDir,
   edge,
   edges,
   node,
+  nodeRun,
+  nodeOutput,
   nodes,
   workflow,
   onAddEdge,
   onAgentChange,
+  onDecideApproval,
   onDeleteEdge,
   onEdgeChange,
   onNodeChange,
@@ -2306,6 +3681,37 @@ function Inspector({
   const [draftEdge, setDraftEdge] = useState(null);
   const operation = node?.operation ?? defaultOperation(node?.type ?? "agent");
   const settings = { ...defaultSettings, ...(node?.settings ?? {}) };
+  const existingSpecialTypes = new Set(
+    nodes
+      .filter((candidate) => candidate.id !== node?.id && isSpecialNodeType(candidate.type))
+      .map((candidate) => candidate.type),
+  );
+  const nodeTypeOptions = [
+    ["start", "START"],
+    ["pass", "PASS"],
+    ["fail", "FAIL"],
+    ["break", "BREAK"],
+    ["loop", "Loop"],
+    ["agent", "Agent"],
+    ["bash_command", commandNodeLabel],
+    ["python_script", "Python script"],
+    ["shell_script", "Shell script"],
+    ["read_file", "Read file"],
+    ["write_file", "Write file"],
+    ["copy_file", "Copy file"],
+    ["move_file", "Move file"],
+    ["delete_file", "Delete file"],
+    ["file", "File path"],
+    ["folder", "Folder path"],
+    ["open_resource", "Open app / URL / file"],
+    ["prompt_file", "Prompt file"],
+    ["common_llm_task", "Common LLM task"],
+    ["local_vectorize", "Local vector index"],
+    ["local_search", "Local search"],
+    ["http_request", "HTTP request"],
+    ["approval_gate", "Approval gate"],
+    ["notification", "Notification"],
+  ].filter(([type]) => type === node?.type || !existingSpecialTypes.has(type));
   const agentConfig =
     operation.type === "agent" || operation.type === "common_llm_task"
       ? agents[operation.agent_id] ?? defaultAgentConfig(operation.agent_id || "agent")
@@ -2314,6 +3720,14 @@ function Inspector({
   const watch = workflow.watch ?? null;
   const connectedEdges = node
     ? edges.filter((edge) => edge.from === node.id || edge.to === node.id)
+    : [];
+  const inputSourceOptions = node ? buildInputSourceOptions(node, nodes, edges) : [];
+  const workflowDiagnostics = workflowDiagnosticsForDisplay(workflow);
+  const nodeDiagnostics = node
+    ? diagnosticsForNode(workflowDiagnostics, node, agentConfig)
+    : [];
+  const agentDiagnostics = agentConfig
+    ? diagnosticsForAgent(workflowDiagnostics, operation.agent_id, agentConfig)
     : [];
 
   useEffect(() => {
@@ -2389,6 +3803,7 @@ function Inspector({
               {workflow.sourcePath ? (
                 <TextField label="Source path" value={workflow.sourcePath} readOnly pathLink />
               ) : null}
+              <HealthDiagnosticList diagnostics={workflowDiagnostics} />
               <NumberField
                 label="Max total node runs"
                 min="1"
@@ -2591,32 +4006,17 @@ function Inspector({
             <TextField label="ID" value={node.id} readOnly />
             <TextField
               label="Label"
-              value={node.label}
+              value={specialNodeLabel(node.type) ?? node.label}
               onChange={(value) => onNodeChange({ label: value })}
+              readOnly={isSpecialNodeType(node.type)}
             />
             <SelectField
               label="Type"
               value={node.type}
-              options={[
-                ["agent", "Agent"],
-                ["bash_command", commandNodeLabel],
-                ["python_script", "Python script"],
-                ["shell_script", "Shell script"],
-                ["read_file", "Read file"],
-                ["write_file", "Write file"],
-                ["copy_file", "Copy file"],
-                ["move_file", "Move file"],
-                ["delete_file", "Delete file"],
-                ["file", "File path"],
-                ["folder", "Folder path"],
-                ["open_resource", "Open app / URL / file"],
-                ["prompt_file", "Prompt file"],
-                ["common_llm_task", "Common LLM task"],
-                ["local_vectorize", "Local vector index"],
-                ["local_search", "Local search"],
-              ]}
+              options={nodeTypeOptions}
               onChange={onTypeChange}
             />
+            <HealthDiagnosticList diagnostics={nodeDiagnostics} />
           </InspectorSection>
 
           <InspectorSection title="Execution">
@@ -2625,6 +4025,16 @@ function Inspector({
               label="Pipe output"
               onChange={(checked) => onSettingsChange({ pipeOutput: checked })}
             />
+            <ToggleField
+              checked={settings.awaitAllInputs !== false}
+              label="Await all inputs"
+              onChange={(checked) => onSettingsChange({ awaitAllInputs: checked })}
+            />
+            {!settings.awaitAllInputs ? (
+              <p className="text-sm leading-6 text-muted">
+                This node can run as soon as any incoming edge is ready. Use this for loop entry points.
+              </p>
+            ) : null}
             <ToggleField
               checked={Boolean(settings.allowFailure)}
               label="Allow failure"
@@ -2656,6 +4066,163 @@ function Inspector({
               placeholder="None"
             />
           </InspectorSection>
+
+          {nodeRun ? (
+            <RunNodeInspector nodeRun={nodeRun} />
+          ) : null}
+
+          <InspectorSection title="Inputs">
+            <InputMappingField
+              nodeType={node.type}
+              sourceOptions={inputSourceOptions}
+              value={node.inputs ?? {}}
+              onChange={(value) => onNodeChange({ inputs: value })}
+            />
+          </InspectorSection>
+
+          {operation.type === "start" ? (
+            <InspectorSection title="START">
+              <p className="text-sm leading-6 text-muted">
+                This node does no work. It completes successfully and routes to the next matching edge.
+              </p>
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "pass" ? (
+            <InspectorSection title="PASS">
+              <TextareaField
+                label="Success message"
+                rows={3}
+                value={operation.message ?? ""}
+                onChange={(value) => onOperationChange({ message: value })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "fail" ? (
+            <InspectorSection title="FAIL">
+              <TextareaField
+                label="Failure message"
+                rows={3}
+                value={operation.message ?? ""}
+                onChange={(value) => onOperationChange({ message: value })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "break" ? (
+            <InspectorSection title="BREAK">
+              <TextareaField
+                label="Break message"
+                rows={3}
+                value={operation.message ?? ""}
+                onChange={(value) => onOperationChange({ message: value })}
+              />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "loop" ? (
+            <InspectorSection title="Loop">
+              <SelectField
+                label="Source"
+                value={operation.source?.type ?? "count"}
+                options={[
+                  ["count", "Count"],
+                  ["tabular", "JSONL or CSV rows"],
+                  ["directory", "Directory files"],
+                  ["trigger_events", "Trigger events"],
+                  ["infinite", "Until BREAK"],
+                ]}
+                onChange={(value) => onOperationChange({ source: defaultFanSource(value) })}
+              />
+              {operation.source?.type === "count" ? (
+                <NumberField
+                  label="Count"
+                  min="1"
+                  value={String(operation.source.count ?? 1)}
+                  onChange={(value) =>
+                    onOperationChange({ source: { ...operation.source, count: value || 1 } })
+                  }
+                />
+              ) : null}
+              {operation.source?.type === "tabular" ? (
+                <TextField
+                  label="Path"
+                  value={operation.source.path ?? ""}
+                  onChange={(value) =>
+                    onOperationChange({ source: { ...operation.source, path: value } })
+                  }
+                  pathPicker
+                  pathBasePath={dataDir}
+                />
+              ) : null}
+              {operation.source?.type === "directory" ? (
+                <>
+                  <TextField
+                    label="Path"
+                    value={operation.source.path ?? ""}
+                    onChange={(value) =>
+                      onOperationChange({ source: { ...operation.source, path: value } })
+                    }
+                    pathPicker
+                    pathBasePath={dataDir}
+                  />
+                  <TextField
+                    label="Glob"
+                    value={operation.source.glob ?? "*"}
+                    onChange={(value) =>
+                      onOperationChange({ source: { ...operation.source, glob: value } })
+                    }
+                  />
+                  <ToggleField
+                    checked={Boolean(operation.source.include_content)}
+                    label="Include content"
+                    onChange={(checked) =>
+                      onOperationChange({
+                        source: { ...operation.source, include_content: checked },
+                      })
+                    }
+                  />
+                </>
+              ) : null}
+              {operation.source?.type === "trigger_events" ? (
+                <ToggleField
+                  checked={Boolean(operation.source.include_content)}
+                  label="Include file content"
+                  onChange={(checked) =>
+                    onOperationChange({
+                      source: { ...operation.source, include_content: checked },
+                    })
+                  }
+                />
+              ) : null}
+              <NumberField
+                label="Max concurrency"
+                min="1"
+                value={operation.source?.max_concurrency ?? 16}
+                onChange={(value) =>
+                  onOperationChange({
+                    source: { ...operation.source, max_concurrency: value || 16 },
+                  })
+                }
+              />
+              <p className="text-xs leading-5 text-muted">
+                Use 1 for sequential loop iterations. Increase this only when child nodes are safe to run in parallel.
+              </p>
+              <ToggleField
+                checked={Boolean(operation.source?.fail_fast)}
+                label="Fail fast"
+                onChange={(checked) =>
+                  onOperationChange({
+                    source: { ...operation.source, fail_fast: checked },
+                  })
+                }
+              />
+              <p className="text-sm leading-6 text-muted">
+                The loop runs its full child chain for one item, then starts the next item. Downstream nodes can use loop variables like loop.index, loop.file_path, loop.file_name, and loop.file_content.
+              </p>
+            </InspectorSection>
+          ) : null}
 
           {operation.type === "bash_command" ? (
             <InspectorSection title={commandNodeLabel}>
@@ -2981,6 +4548,7 @@ function Inspector({
               </InspectorSection>
               <AgentConfigSection
                 agentConfig={agentConfig}
+                diagnostics={agentDiagnostics}
                 agentId={operation.agent_id}
                 pathBasePath={dataDir}
                 onAgentChange={onAgentChange}
@@ -2989,66 +4557,300 @@ function Inspector({
           ) : null}
 
           {operation.type === "local_vectorize" ? (
-            <InspectorSection title="Local vector index">
-              <TextField
-                label="Source path"
-                value={operation.source_path ?? ""}
-                onChange={(value) => onOperationChange({ source_path: value })}
-                pathPicker
-                pathBasePath={dataDir}
-              />
-              <TextField
-                label="Index path"
-                value={operation.index_path ?? ""}
-                onChange={(value) => onOperationChange({ index_path: value })}
-                pathPicker
-                pathBasePath={dataDir}
-              />
-              <TextField
-                label="Glob"
-                value={operation.glob ?? "**/*"}
-                onChange={(value) => onOperationChange({ glob: value })}
-              />
-              <ToggleField
-                checked={operation.recursive !== false}
-                label="Recursive"
-                onChange={(checked) => onOperationChange({ recursive: checked })}
-              />
-              <NumberField
-                label="Chunk size"
-                min="100"
-                value={operation.chunk_size ?? 1200}
-                onChange={(value) => onOperationChange({ chunk_size: value || 1200 })}
-              />
-              <NumberField
-                label="Chunk overlap"
-                min="0"
-                value={operation.chunk_overlap ?? 120}
-                onChange={(value) => onOperationChange({ chunk_overlap: value || 0 })}
-              />
-            </InspectorSection>
+            <>
+              <InspectorSection title="Local vector index">
+                <TextField
+                  label="Source path"
+                  value={operation.source_path ?? ""}
+                  onChange={(value) => onOperationChange({ source_path: value })}
+                  pathPicker
+                  pathBasePath={dataDir}
+                />
+                <TextField
+                  label="Index path"
+                  value={operation.index_path ?? ""}
+                  onChange={(value) => onOperationChange({ index_path: value })}
+                  pathPicker
+                  pathBasePath={dataDir}
+                />
+                <TextField
+                  label="Glob"
+                  value={operation.glob ?? "**/*"}
+                  onChange={(value) => onOperationChange({ glob: value })}
+                />
+                <SelectField
+                  label="Mode"
+                  value={operation.mode ?? "incremental"}
+                  options={[
+                    ["incremental", "Incremental"],
+                    ["full", "Full rebuild"],
+                    ["validate", "Validate only"],
+                    ["compact", "Compact deleted"],
+                  ]}
+                  onChange={(value) => onOperationChange({ mode: value })}
+                />
+                <ToggleField
+                  checked={operation.recursive !== false}
+                  label="Recursive"
+                  onChange={(checked) => onOperationChange({ recursive: checked })}
+                />
+                <NumberField
+                  label="Chunk size"
+                  min="100"
+                  value={operation.chunk_size ?? 1200}
+                  onChange={(value) => onOperationChange({ chunk_size: value || 1200 })}
+                />
+                <NumberField
+                  label="Chunk overlap"
+                  min="0"
+                  value={operation.chunk_overlap ?? 120}
+                  onChange={(value) => onOperationChange({ chunk_overlap: value || 0 })}
+                />
+              </InspectorSection>
+              <VectorIndexStats output={nodeOutput} />
+            </>
           ) : null}
 
           {operation.type === "local_search" ? (
-            <InspectorSection title="Local search">
+            <>
+              <InspectorSection title="Local search">
+                <TextField
+                  label="Index path"
+                  value={operation.index_path ?? ""}
+                  onChange={(value) => onOperationChange({ index_path: value })}
+                  pathPicker
+                  pathBasePath={dataDir}
+                />
+                <TextareaField
+                  label="Query"
+                  rows={3}
+                  value={operation.query ?? ""}
+                  onChange={(value) => onOperationChange({ query: value })}
+                />
+                <NumberField
+                  label="Top K"
+                  min="1"
+                  value={operation.top_k ?? 5}
+                  onChange={(value) => onOperationChange({ top_k: value || 5 })}
+                />
+                <NumberField
+                  label="Score threshold"
+                  min="0"
+                  step="0.01"
+                  value={operation.score_threshold ?? 0}
+                  onChange={(value) => onOperationChange({ score_threshold: value || 0 })}
+                />
+                <ToggleField
+                  checked={operation.include_snippets !== false}
+                  label="Include snippets"
+                  onChange={(checked) => onOperationChange({ include_snippets: checked })}
+                />
+                <ToggleField
+                  checked={operation.include_file_metadata !== false}
+                  label="Include file metadata"
+                  onChange={(checked) => onOperationChange({ include_file_metadata: checked })}
+                />
+              </InspectorSection>
+              <VectorSearchStats output={nodeOutput} />
+            </>
+          ) : null}
+
+          {operation.type === "http_request" ? (
+            <>
+              <InspectorSection title="HTTP request">
+                <SelectField
+                  label="Method"
+                  value={operation.method ?? "GET"}
+                  options={[
+                    ["GET", "GET"],
+                    ["POST", "POST"],
+                    ["PUT", "PUT"],
+                    ["PATCH", "PATCH"],
+                    ["DELETE", "DELETE"],
+                    ["HEAD", "HEAD"],
+                  ]}
+                  onChange={(value) => onOperationChange({ method: value })}
+                />
+                <TextField
+                  label="URL"
+                  value={operation.url ?? ""}
+                  onChange={(value) => onOperationChange({ url: value })}
+                  placeholder="https://api.example.com/resource"
+                />
+                <KeyValueField
+                  label="Headers"
+                  value={operation.headers ?? {}}
+                  onChange={(value) => onOperationChange({ headers: value })}
+                />
+                <KeyValueField
+                  label="Query params"
+                  value={operation.params ?? {}}
+                  onChange={(value) => onOperationChange({ params: value })}
+                />
+                <JsonBodyField
+                  label="JSON body"
+                  value={operation.json}
+                  onChange={(value) => onOperationChange({ json: value })}
+                />
+                <TextareaField
+                  label="Raw body"
+                  rows={4}
+                  value={operation.body ?? ""}
+                  onChange={(value) => onOperationChange({ body: value })}
+                />
+                <ListField
+                  label="Expected statuses"
+                  value={(operation.expected_statuses ?? [200]).map((status) => String(status))}
+                  onChange={(value) =>
+                    onOperationChange({ expected_statuses: value.map((status) => Number(status)) })
+                  }
+                  placeholder="200, 201"
+                />
+                <SelectField
+                  label="Response mode"
+                  value={operation.response_mode ?? "auto"}
+                  options={[
+                    ["auto", "Auto"],
+                    ["json", "JSON"],
+                    ["text", "Text"],
+                    ["none", "None"],
+                  ]}
+                  onChange={(value) => onOperationChange({ response_mode: value })}
+                />
+                <NumberField
+                  label="Timeout seconds"
+                  min="0.1"
+                  step="0.1"
+                  value={operation.timeout_seconds ?? 30}
+                  onChange={(value) => onOperationChange({ timeout_seconds: value || 30 })}
+                />
+                <NumberField
+                  label="Retry attempts"
+                  min="1"
+                  value={operation.retry?.attempts ?? 1}
+                  onChange={(value) =>
+                    onOperationChange({
+                      retry: { ...(operation.retry ?? {}), attempts: value || 1 },
+                    })
+                  }
+                />
+                <NumberField
+                  label="Retry backoff seconds"
+                  min="0"
+                  step="0.1"
+                  value={operation.retry?.backoff_seconds ?? 0}
+                  onChange={(value) =>
+                    onOperationChange({
+                      retry: { ...(operation.retry ?? {}), backoff_seconds: value || 0 },
+                    })
+                  }
+                />
+                <ListField
+                  label="Retry statuses"
+                  value={(operation.retry?.retry_on_statuses ?? []).map((status) => String(status))}
+                  onChange={(value) =>
+                    onOperationChange({
+                      retry: {
+                        ...(operation.retry ?? {}),
+                        retry_on_statuses: value.map((status) => Number(status)),
+                      },
+                    })
+                  }
+                  placeholder="429, 503"
+                />
+                <KeyValueField
+                  label="Output mapping"
+                  value={operation.output_mapping ?? {}}
+                  onChange={(value) => onOperationChange({ output_mapping: value })}
+                />
+                <ListField
+                  label="Secret fields"
+                  value={operation.secret_fields ?? []}
+                  onChange={(value) => onOperationChange({ secret_fields: value })}
+                  placeholder="Authorization, api_key"
+                />
+              </InspectorSection>
+              <HttpResponsePreview output={nodeOutput} />
+            </>
+          ) : null}
+
+          {operation.type === "approval_gate" ? (
+            <>
+              <InspectorSection title="Approval gate">
+                <TextareaField
+                  label="Message"
+                  rows={4}
+                  value={operation.message ?? ""}
+                  onChange={(value) => onOperationChange({ message: value })}
+                />
+                <NumberField
+                  label="Timeout seconds"
+                  min="0"
+                  step="1"
+                  value={operation.timeout_seconds ?? ""}
+                  onChange={(value) =>
+                    onOperationChange({ timeout_seconds: value === "" ? null : value })
+                  }
+                  placeholder="None"
+                />
+                <SelectField
+                  label="Timeout decision"
+                  value={operation.timeout_decision ?? "timeout"}
+                  options={[
+                    ["timeout", "Timeout"],
+                    ["reject", "Reject"],
+                  ]}
+                  onChange={(value) => onOperationChange({ timeout_decision: value })}
+                />
+                <ListField
+                  label="Approvers"
+                  value={operation.approvers ?? []}
+                  onChange={(value) => onOperationChange({ approvers: value })}
+                  placeholder="alice, ops-team"
+                />
+                <ToggleField
+                  checked={Boolean(operation.notify)}
+                  label="Desktop notification"
+                  onChange={(checked) => onOperationChange({ notify: checked })}
+                />
+                <TextField
+                  label="Notification title"
+                  value={operation.notification_title ?? "Gofer Flow approval needed"}
+                  onChange={(value) => onOperationChange({ notification_title: value })}
+                />
+              </InspectorSection>
+              <ApprovalRuntimePanel approval={approval} onDecideApproval={onDecideApproval} />
+            </>
+          ) : null}
+
+          {operation.type === "notification" ? (
+            <InspectorSection title="Notification">
               <TextField
-                label="Index path"
-                value={operation.index_path ?? ""}
-                onChange={(value) => onOperationChange({ index_path: value })}
-                pathPicker
-                pathBasePath={dataDir}
+                label="Title"
+                value={operation.title ?? ""}
+                onChange={(value) => onOperationChange({ title: value })}
               />
               <TextareaField
-                label="Query"
-                rows={3}
-                value={operation.query ?? ""}
-                onChange={(value) => onOperationChange({ query: value })}
+                label="Body"
+                rows={5}
+                value={operation.body ?? ""}
+                onChange={(value) => onOperationChange({ body: value })}
               />
-              <NumberField
-                label="Top K"
-                min="1"
-                value={operation.top_k ?? 5}
-                onChange={(value) => onOperationChange({ top_k: value || 5 })}
+              <SelectField
+                label="Channel"
+                value={operation.channel ?? "desktop"}
+                options={[["desktop", "Desktop"]]}
+                onChange={(value) => onOperationChange({ channel: value })}
+              />
+              <SelectField
+                label="Urgency"
+                value={operation.urgency ?? "normal"}
+                options={[
+                  ["low", "Low"],
+                  ["normal", "Normal"],
+                  ["critical", "Critical"],
+                ]}
+                onChange={(value) => onOperationChange({ urgency: value })}
               />
             </InspectorSection>
           ) : null}
@@ -3082,11 +4884,6 @@ function Inspector({
                   pathPicker
                   pathBasePath={dataDir}
                 />
-                <TextField
-                  label="Dynamic count"
-                  value={String(operation.dynamic_count ?? 1)}
-                  onChange={(value) => onOperationChange({ dynamic_count: value })}
-                />
                 <SelectField
                   label="Memory"
                   value={operation.memory ?? "none"}
@@ -3104,123 +4901,14 @@ function Inspector({
                 />
               </InspectorSection>
 
-              <InspectorSection title="Fan-out">
-                <SelectField
-                  label="Source"
-                  value={operation.fan_source?.type ?? "none"}
-                  options={[
-                    ["none", "None"],
-                    ["count", "Count"],
-                    ["tabular", "Tabular file"],
-                    ["directory", "Directory"],
-                    ["trigger_events", "Trigger events"],
-                  ]}
-                  onChange={(value) =>
-                    onOperationChange({
-                      fan_source: value === "none" ? null : defaultFanSource(value),
-                    })
-                  }
-                />
-                {operation.fan_source?.type === "count" ? (
-                  <TextField
-                    label="Count"
-                    value={String(operation.fan_source.count ?? 1)}
-                    onChange={(value) =>
-                      onOperationChange({
-                        fan_source: { ...operation.fan_source, count: value },
-                      })
-                    }
-                  />
-                ) : null}
-                {operation.fan_source?.type === "tabular" ? (
-                  <TextField
-                    label="Path"
-                    value={operation.fan_source.path ?? ""}
-                    onChange={(value) =>
-                    onOperationChange({
-                        fan_source: { ...operation.fan_source, path: value },
-                      })
-                    }
-                    pathPicker
-                    pathBasePath={dataDir}
-                  />
-                ) : null}
-                {operation.fan_source?.type === "directory" ? (
-                  <>
-                    <TextField
-                      label="Path"
-                      value={operation.fan_source.path ?? ""}
-                      onChange={(value) =>
-                        onOperationChange({
-                          fan_source: { ...operation.fan_source, path: value },
-                        })
-                      }
-                      pathPicker
-                      pathBasePath={dataDir}
-                    />
-                    <TextField
-                      label="Glob"
-                      value={operation.fan_source.glob ?? "*"}
-                      onChange={(value) =>
-                        onOperationChange({
-                          fan_source: { ...operation.fan_source, glob: value },
-                        })
-                      }
-                    />
-                    <ToggleField
-                      checked={Boolean(operation.fan_source.include_content)}
-                      label="Include content"
-                      onChange={(checked) =>
-                        onOperationChange({
-                          fan_source: { ...operation.fan_source, include_content: checked },
-                        })
-                      }
-                    />
-                  </>
-                ) : null}
-                {operation.fan_source?.type === "trigger_events" ? (
-                  <ToggleField
-                    checked={Boolean(operation.fan_source.include_content)}
-                    label="Include file content"
-                    onChange={(checked) =>
-                      onOperationChange({
-                        fan_source: { ...operation.fan_source, include_content: checked },
-                      })
-                    }
-                  />
-                ) : null}
-                {operation.fan_source ? (
-                  <>
-                    <NumberField
-                      label="Max concurrency"
-                      min="1"
-                      value={operation.fan_source.max_concurrency ?? 16}
-                      onChange={(value) =>
-                        onOperationChange({
-                          fan_source: { ...operation.fan_source, max_concurrency: value },
-                        })
-                      }
-                    />
-                    <ToggleField
-                      checked={Boolean(operation.fan_source.fail_fast)}
-                      label="Fail fast"
-                      onChange={(checked) =>
-                        onOperationChange({
-                          fan_source: { ...operation.fan_source, fail_fast: checked },
-                        })
-                      }
-                    />
-                  </>
-                ) : null}
-              </InspectorSection>
-
               <InspectorSection title="Agent config">
                 <AgentConfigFields
                   agentConfig={agentConfig}
-                agentId={operation.agent_id}
-                pathBasePath={dataDir}
-                onAgentChange={onAgentChange}
-              />
+                  diagnostics={agentDiagnostics}
+                  agentId={operation.agent_id}
+                  pathBasePath={dataDir}
+                  onAgentChange={onAgentChange}
+                />
               </InspectorSection>
             </>
           ) : null}
@@ -3298,7 +4986,7 @@ function Inspector({
   );
 }
 
-function defaultFanSource(type) {
+export function defaultFanSource(type) {
   switch (type) {
     case "count":
       return { type, count: 1, max_concurrency: 16, fail_fast: false };
@@ -3315,6 +5003,8 @@ function defaultFanSource(type) {
       };
     case "trigger_events":
       return { type, include_content: false, max_concurrency: 16, fail_fast: false };
+    case "infinite":
+      return { type, max_concurrency: 16, fail_fast: false };
     default:
       return null;
   }
@@ -3458,12 +5148,13 @@ function nodesForFrom(nodes) {
   return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
-function AgentConfigSection({ agentConfig, agentId, onAgentChange, pathBasePath }) {
+function AgentConfigSection({ agentConfig, diagnostics = [], agentId, onAgentChange, pathBasePath }) {
   if (!agentConfig) return null;
   return (
     <InspectorSection title="Agent config">
       <AgentConfigFields
         agentConfig={agentConfig}
+        diagnostics={diagnostics}
         agentId={agentId}
         onAgentChange={onAgentChange}
         pathBasePath={pathBasePath}
@@ -3472,7 +5163,7 @@ function AgentConfigSection({ agentConfig, agentId, onAgentChange, pathBasePath 
   );
 }
 
-function AgentConfigFields({ agentConfig, agentId, onAgentChange, pathBasePath }) {
+function AgentConfigFields({ agentConfig, diagnostics = [], agentId, onAgentChange, pathBasePath }) {
   return (
     <>
       <SelectField
@@ -3484,6 +5175,7 @@ function AgentConfigFields({ agentConfig, agentId, onAgentChange, pathBasePath }
         ]}
         onChange={(value) => onAgentChange(agentId, { subscription: value })}
       />
+      <HealthDiagnosticList diagnostics={diagnostics} />
       <TextField
         label="Prompt path"
         value={agentConfig.prompt_path ?? ""}
@@ -3519,7 +5211,325 @@ function AgentConfigFields({ agentConfig, agentId, onAgentChange, pathBasePath }
   );
 }
 
-function uniqueEdgeId(edges, fromNodeId, toNodeId) {
+function workflowDiagnosticsForDisplay(workflow) {
+  return [
+    ...(workflow?.healthErrors ?? []),
+    ...(workflow?.healthWarnings ?? []),
+  ];
+}
+
+function diagnosticsForNode(diagnostics, node, agentConfig) {
+  if (!node) return [];
+  const subjects = new Set([`node:${node.id}`]);
+  const agentId = node.operation?.agent_id;
+  if (agentId) {
+    subjects.add(`agent:${agentId}`);
+  }
+  return diagnostics.filter((diagnostic) => {
+    if (subjects.has(diagnostic.subject)) return true;
+    return isProviderDiagnosticForAgent(diagnostic, agentConfig);
+  });
+}
+
+function diagnosticsForAgent(diagnostics, agentId, agentConfig) {
+  return diagnostics.filter((diagnostic) => {
+    if (diagnostic.subject === `agent:${agentId}`) return true;
+    return isProviderDiagnosticForAgent(diagnostic, agentConfig);
+  });
+}
+
+function isProviderDiagnosticForAgent(diagnostic, agentConfig) {
+  if (!agentConfig?.subscription) return false;
+  return (
+    (diagnostic.id === "workflow.provider_cli" || diagnostic.id === "provider.cli") &&
+    diagnostic.subject === agentConfig.subscription
+  );
+}
+
+function HealthDiagnosticList({ diagnostics = [] }) {
+  const visibleDiagnostics = diagnostics.filter((diagnostic) =>
+    diagnostic?.severity === "error" || diagnostic?.severity === "warning",
+  );
+  if (!visibleDiagnostics.length) return null;
+  return (
+    <div className="space-y-2">
+      {visibleDiagnostics.map((diagnostic, index) => {
+        const error = diagnostic.severity === "error";
+        return (
+          <div
+            key={`${diagnostic.id}-${diagnostic.subject ?? "workflow"}-${index}`}
+            className={`rounded-md border px-3 py-2 text-xs leading-5 ${
+              error
+                ? "border-red-200 bg-red-50 text-red-700"
+                : "border-amber-200 bg-amber-50 text-amber-800"
+            }`}
+          >
+            <div className="flex items-start gap-2">
+              <AlertCircle className="mt-0.5 shrink-0" size={14} />
+              <span>{diagnostic.message}</span>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+export function createDefaultWorkflowNode(
+  workflow,
+  { type = "agent", usedAgentIds = [], x = 214, y = 204 } = {},
+) {
+  const workflowNodes = workflow.nodes ?? [];
+  const nextNumber = nextAvailableNodeNumber(workflowNodes);
+  const nextAgentNumber = nextAvailableAgentNumber(
+    workflowNodes,
+    workflow.agents,
+    usedAgentIds,
+  );
+  const operation = defaultOperation(
+    type,
+    type === "agent" || type === "common_llm_task" ? nextAgentNumber : nextNumber,
+  );
+  return {
+    id: `node-${nextNumber}`,
+    label: specialNodeLabel(type) ?? `New Step ${nextNumber}`,
+    type,
+    operation,
+    settings: defaultSettings,
+    meta: nodeMetaFromOperation(operation),
+    x,
+    y,
+  };
+}
+
+export function addDefaultNodeToWorkflow(workflow, options = {}) {
+  const node = createDefaultWorkflowNode(workflow, options);
+  const agents =
+    node.operation?.agent_id && !workflow.agents?.[node.operation.agent_id]
+      ? {
+          ...(workflow.agents ?? {}),
+          [node.operation.agent_id]: defaultAgentConfig(node.operation.agent_id, {
+            prompt_path: node.operation.prompt_path,
+            working_dir: node.operation.working_dir,
+          }),
+        }
+      : workflow.agents ?? {};
+
+  return {
+    ...workflow,
+    agents,
+    nodes: [...(workflow.nodes ?? []), node],
+  };
+}
+
+export function updateWorkflowNodeOperation(workflow, nodeId, patch) {
+  return {
+    ...workflow,
+    nodes: (workflow.nodes ?? []).map((node) => {
+      if (node.id !== nodeId) return node;
+      const operation = {
+        ...defaultOperation(node.type),
+        ...(node.operation ?? {}),
+        ...patch,
+      };
+      return {
+        ...node,
+        operation,
+        meta: nodeMetaFromOperation(operation),
+      };
+    }),
+  };
+}
+
+export function moveWorkflowNode(workflow, nodeId, delta) {
+  return {
+    ...workflow,
+    nodes: (workflow.nodes ?? []).map((node) =>
+      node.id === nodeId
+        ? {
+            ...node,
+            x: (node.x ?? 0) + (delta.x ?? 0),
+            y: (node.y ?? 0) + (delta.y ?? 0),
+          }
+        : node,
+    ),
+  };
+}
+
+export function autoLayoutWorkflow(workflow, options = {}) {
+  const nodes = [...(workflow.nodes ?? [])];
+  const edges = workflow.edges ?? [];
+  if (!nodes.length) return { ...workflow, nodes };
+
+  const columnGap = options.columnGap ?? layoutColumnGap;
+  const rowGap = options.rowGap ?? layoutRowGap;
+  const startX = options.startX ?? 80;
+  const startY = options.startY ?? 80;
+  const nodesById = new Map(nodes.map((node) => [node.id, node]));
+  const outgoing = new Map(nodes.map((node) => [node.id, []]));
+  const indegree = new Map(nodes.map((node) => [node.id, 0]));
+
+  for (const edge of edges) {
+    if (!nodesById.has(edge.from) || !nodesById.has(edge.to)) continue;
+    outgoing.get(edge.from).push(edge.to);
+    indegree.set(edge.to, indegree.get(edge.to) + 1);
+  }
+
+  const layers = new Map(nodes.map((node) => [node.id, 0]));
+  const queue = nodes
+    .filter((node) => indegree.get(node.id) === 0)
+    .sort(compareNodesForLayout);
+  const visited = new Set();
+
+  while (queue.length) {
+    const node = queue.shift();
+    if (visited.has(node.id)) continue;
+    visited.add(node.id);
+
+    const targets = [...outgoing.get(node.id)].sort((left, right) =>
+      compareNodesForLayout(nodesById.get(left), nodesById.get(right)),
+    );
+    for (const targetId of targets) {
+      layers.set(targetId, Math.max(layers.get(targetId), layers.get(node.id) + 1));
+      indegree.set(targetId, indegree.get(targetId) - 1);
+      if (indegree.get(targetId) === 0) {
+        queue.push(nodesById.get(targetId));
+        queue.sort(compareNodesForLayout);
+      }
+    }
+  }
+
+  for (const node of nodes) {
+    if (!visited.has(node.id)) {
+      const connectedLayer = edges
+        .filter((edge) => edge.to === node.id && layers.has(edge.from))
+        .map((edge) => layers.get(edge.from) + 1);
+      layers.set(node.id, connectedLayer.length ? Math.max(...connectedLayer) : 0);
+    }
+  }
+
+  const grouped = new Map();
+  for (const node of nodes) {
+    const layer = layers.get(node.id) ?? 0;
+    if (!grouped.has(layer)) grouped.set(layer, []);
+    grouped.get(layer).push(node);
+  }
+
+  const positioned = new Map();
+  for (const layer of [...grouped.keys()].sort((left, right) => left - right)) {
+    const layerNodes = grouped.get(layer).sort(compareNodesForLayout);
+    layerNodes.forEach((node, row) => {
+      positioned.set(node.id, {
+        ...node,
+        x: startX + layer * columnGap,
+        y: startY + row * rowGap,
+      });
+    });
+  }
+
+  return {
+    ...workflow,
+    nodes: nodes.map((node) => positioned.get(node.id) ?? node),
+  };
+}
+
+function compareNodesForLayout(left, right) {
+  const leftY = Number.isFinite(left?.y) ? left.y : 0;
+  const rightY = Number.isFinite(right?.y) ? right.y : 0;
+  if (leftY !== rightY) return leftY - rightY;
+  return String(left?.id ?? "").localeCompare(String(right?.id ?? ""));
+}
+
+export function graphBounds(nodes, padding = 0) {
+  if (!nodes.length) {
+    return { left: -padding, top: -padding, right: padding, bottom: padding, width: padding * 2, height: padding * 2 };
+  }
+  const left = Math.min(...nodes.map((node) => node.x ?? 0)) - padding;
+  const top = Math.min(...nodes.map((node) => node.y ?? 0)) - padding;
+  const right = Math.max(...nodes.map((node) => (node.x ?? 0) + nodeWidth)) + padding;
+  const bottom = Math.max(...nodes.map((node) => (node.y ?? 0) + nodeHeight)) + padding;
+  return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
+export function fitViewportToNodes(nodes, viewportSize, options = {}) {
+  const bounds = graphBounds(nodes, options.padding ?? 80);
+  const width = Math.max(1, viewportSize.width ?? 1);
+  const height = Math.max(1, viewportSize.height ?? 1);
+  const scale = clamp(
+    Math.min(width / Math.max(1, bounds.width), height / Math.max(1, bounds.height)),
+    options.minZoom ?? minZoom,
+    options.maxZoom ?? maxZoom,
+  );
+  return {
+    scale,
+    x: (width - bounds.width * scale) / 2 - bounds.left * scale,
+    y: (height - bounds.height * scale) / 2 - bounds.top * scale,
+  };
+}
+
+export function matchingNodeIds(nodes, query) {
+  const normalizedQuery = String(query ?? "").trim().toLowerCase();
+  if (!normalizedQuery) return [];
+  return nodes
+    .filter((node) => nodeSearchText(node).includes(normalizedQuery))
+    .map((node) => node.id);
+}
+
+function nodeSearchText(node) {
+  const operation = node.operation ?? {};
+  return [
+    node.id,
+    node.label,
+    node.type,
+    operation.type,
+    operation.agent_id,
+    operation.path,
+    operation.source_path,
+    operation.destination_path,
+    operation.output_path,
+    operation.prompt_path,
+    operation.script_path,
+    operation.working_dir,
+    operation.target,
+    operation.url,
+    operation.method,
+    operation.index_path,
+    operation.query,
+    operation.command,
+  ]
+    .filter(Boolean)
+    .join(" ")
+    .toLowerCase();
+}
+
+export function removeWorkflowNode(workflow, nodeId) {
+  return {
+    ...workflow,
+    nodes: (workflow.nodes ?? []).filter((node) => node.id !== nodeId),
+    edges: (workflow.edges ?? []).filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
+  };
+}
+
+export function addWorkflowEdge(workflow, fromNodeId, toNodeId, condition = "always", outputPattern = null) {
+  const nextCondition = condition || "always";
+  const nextOutputPattern = nextCondition === "output_matches" ? outputPattern || "" : null;
+  return {
+    ...workflow,
+    edges: [
+      ...(workflow.edges ?? []),
+      {
+        id: uniqueEdgeId(workflow.edges ?? [], fromNodeId, toNodeId),
+        from: fromNodeId,
+        to: toNodeId,
+        label: edgeLabel(nextCondition, nextOutputPattern),
+        condition: nextCondition,
+        outputPattern: nextOutputPattern,
+      },
+    ],
+  };
+}
+
+export function uniqueEdgeId(edges, fromNodeId, toNodeId) {
   const baseId = `${fromNodeId}-${toNodeId}`;
   if (!edges.some((edge) => edge.id === baseId)) {
     return baseId;
@@ -3532,9 +5542,10 @@ function uniqueEdgeId(edges, fromNodeId, toNodeId) {
   return `${baseId}-${index}`;
 }
 
-function edgeLabel(condition = "always", outputPattern = "") {
+export function edgeLabel(condition = "always", outputPattern = "") {
   if (condition === "always") return "always";
   if (condition === "output_matches" && outputPattern) return `matches ${outputPattern}`;
+  if (condition === "after_loop") return "after loop";
   return condition.replaceAll("_", " ");
 }
 
@@ -3647,6 +5658,233 @@ function InspectorSection({ children, className = "", title }) {
   );
 }
 
+function ApprovalRuntimePanel({ approval, onDecideApproval }) {
+  const [notes, setNotes] = useState("");
+  const [approver, setApprover] = useState(approval?.approvers?.[0] || "ui");
+  useEffect(() => {
+    setApprover(approval?.approvers?.[0] || "ui");
+  }, [approval?.runId, approval?.nodeId, approval?.approvers]);
+  if (!approval) return null;
+  const decision = approval.decision;
+  const pending = approval.status === "pending";
+  return (
+    <InspectorSection title="Approval status">
+      <div className="space-y-2 text-xs text-slate-700">
+        <div className="flex items-center justify-between gap-2">
+          <span className="font-medium text-ink">{pending ? "Pending" : "Decided"}</span>
+          <span className="font-mono text-[11px] text-muted">{approval.runId}</span>
+        </div>
+        <div className="whitespace-pre-wrap break-words leading-5">{approval.message}</div>
+        <div className="grid grid-cols-2 gap-2 text-[11px] text-muted">
+          <span>Requested</span>
+          <span className="truncate text-right">{approval.requestedAt || "-"}</span>
+          <span>Timeout</span>
+          <span className="truncate text-right">
+            {approval.timeoutSeconds ? `${approval.timeoutSeconds}s` : "None"}
+          </span>
+          {approval.timeoutSeconds ? (
+            <>
+              <span>Timeout action</span>
+              <span className="truncate text-right">
+                {approval.timeoutDecision === "reject" ? "Reject" : "Timeout"}
+              </span>
+            </>
+          ) : null}
+          <span>Approvers</span>
+          <span className="truncate text-right">
+            {approval.approvers?.length ? approval.approvers.join(", ") : "Any"}
+          </span>
+          {decision ? (
+            <>
+              <span>Decision</span>
+              <span className="truncate text-right">{decision.decision}</span>
+              <span>By</span>
+              <span className="truncate text-right">{decision.decidedBy || "-"}</span>
+              <span>Notes</span>
+              <span className="truncate text-right">{decision.notes || "-"}</span>
+            </>
+          ) : null}
+        </div>
+        {pending ? (
+          <div className="space-y-2 pt-1">
+            <input
+              className="h-8 w-full rounded-md border border-line bg-white px-2 text-xs text-ink outline-none transition placeholder:text-muted/70 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10"
+              placeholder="Approver identity"
+              value={approver}
+              onChange={(event) => setApprover(event.target.value)}
+            />
+            <textarea
+              className="min-h-[72px] w-full resize-y rounded-md border border-line bg-white px-2 py-1.5 text-xs text-ink outline-none transition placeholder:text-muted/70 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10"
+              placeholder="Decision notes"
+              value={notes}
+              onChange={(event) => setNotes(event.target.value)}
+            />
+            <div className="flex gap-2">
+              <button
+                className="btn-primary h-8 flex-1 justify-center text-xs"
+                type="button"
+                onClick={() => onDecideApproval?.(approval, "approved", notes, approver)}
+              >
+                <Check size={14} />
+                Approve
+              </button>
+              <button
+                className="h-8 flex-1 rounded-md border border-red-200 bg-red-50 px-2 text-xs font-medium text-red-700 transition hover:bg-red-100"
+                type="button"
+                onClick={() => onDecideApproval?.(approval, "rejected", notes, approver)}
+              >
+                Reject
+              </button>
+            </div>
+          </div>
+        ) : null}
+      </div>
+    </InspectorSection>
+  );
+}
+
+function VectorIndexStats({ output }) {
+  const data = output?.data ?? null;
+  if (!data || data.index_path == null || data.chunk_count == null) {
+    return null;
+  }
+  const stats = [
+    ["Status", data.status ?? (data.current ? "current" : "updated")],
+    ["Files", data.indexed_file_count ?? data.file_count ?? "-"],
+    ["Chunks", data.chunk_count ?? "-"],
+    ["Added", data.added_files ?? 0],
+    ["Updated", data.updated_files ?? 0],
+    ["Deleted", data.deleted_files ?? 0],
+    ["Stale", data.stale_files ?? 0],
+    ["Size", data.index_size_bytes ? `${data.index_size_bytes} B` : "-"],
+  ];
+  return (
+    <InspectorSection title="Index stats">
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        {stats.map(([label, value]) => (
+          <div key={label} className="rounded-md border border-line px-2 py-1.5">
+            <span className="block text-muted">{label}</span>
+            <span className="font-semibold text-slate-700 dark:text-slate-200">{value}</span>
+          </div>
+        ))}
+      </div>
+      <div className="space-y-1 text-xs">
+        <div>
+          <span className="font-medium text-muted">Strategy</span>
+          <span className="ml-2 text-slate-700 dark:text-slate-200">
+            {data.strategy ?? "hash_token_v1"}
+          </span>
+        </div>
+        <div className="break-all">
+          <span className="font-medium text-muted">Index</span>
+          <span className="ml-2 text-slate-700 dark:text-slate-200">{data.index_path}</span>
+        </div>
+        {data.last_update_time ? (
+          <div>
+            <span className="font-medium text-muted">Updated</span>
+            <span className="ml-2 text-slate-700 dark:text-slate-200">
+              {data.last_update_time}
+            </span>
+          </div>
+        ) : null}
+      </div>
+    </InspectorSection>
+  );
+}
+
+function VectorSearchStats({ output }) {
+  const data = output?.data ?? null;
+  if (!data || data.index_path == null || !Array.isArray(data.results)) {
+    return null;
+  }
+  return (
+    <InspectorSection title="Search stats">
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        <div className="rounded-md border border-line px-2 py-1.5">
+          <span className="block text-muted">Results</span>
+          <span className="font-semibold text-slate-700 dark:text-slate-200">
+            {data.results.length}
+          </span>
+        </div>
+        <div className="rounded-md border border-line px-2 py-1.5">
+          <span className="block text-muted">Threshold</span>
+          <span className="font-semibold text-slate-700 dark:text-slate-200">
+            {data.score_threshold ?? 0}
+          </span>
+        </div>
+      </div>
+      <div className="space-y-1 text-xs">
+        <div>
+          <span className="font-medium text-muted">Strategy</span>
+          <span className="ml-2 text-slate-700 dark:text-slate-200">
+            {data.strategy ?? "cosine_v1"}
+          </span>
+        </div>
+        <div className="break-all">
+          <span className="font-medium text-muted">Index</span>
+          <span className="ml-2 text-slate-700 dark:text-slate-200">{data.index_path}</span>
+        </div>
+      </div>
+    </InspectorSection>
+  );
+}
+
+function HttpResponsePreview({ output }) {
+  const data = output?.data ?? null;
+  if (!data || data.status == null) {
+    return null;
+  }
+  const body = typeof data.body === "string" ? data.body : "";
+  const headers = data.headers && typeof data.headers === "object" ? data.headers : {};
+  const selected = data.selected && typeof data.selected === "object" ? data.selected : {};
+  return (
+    <InspectorSection title="Response preview">
+      <div className="grid grid-cols-2 gap-2 text-xs">
+        <div className="rounded-lg border border-line px-3 py-2">
+          <span className="block text-muted">Status</span>
+          <span className="font-semibold text-slate-700">{data.status}</span>
+        </div>
+        <div className="rounded-lg border border-line px-3 py-2">
+          <span className="block text-muted">Method</span>
+          <span className="font-semibold text-slate-700">{data.method ?? "HTTP"}</span>
+        </div>
+      </div>
+      {data.url ? (
+        <div>
+          <span className="text-xs font-medium text-muted">URL</span>
+          <pre className="mt-1 max-h-24 overflow-auto whitespace-pre-wrap rounded-lg border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            {data.url}
+          </pre>
+        </div>
+      ) : null}
+      {Object.keys(selected).length ? (
+        <div>
+          <span className="text-xs font-medium text-muted">Output mapping</span>
+          <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap rounded-lg border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            {JSON.stringify(selected, null, 2)}
+          </pre>
+        </div>
+      ) : null}
+      {Object.keys(headers).length ? (
+        <div>
+          <span className="text-xs font-medium text-muted">Headers</span>
+          <pre className="mt-1 max-h-28 overflow-auto whitespace-pre-wrap rounded-lg border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            {JSON.stringify(headers, null, 2)}
+          </pre>
+        </div>
+      ) : null}
+      {body ? (
+        <div>
+          <span className="text-xs font-medium text-muted">Body</span>
+          <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded-lg border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
+            {body}
+          </pre>
+        </div>
+      ) : null}
+    </InspectorSection>
+  );
+}
+
 function TextField({
   label,
   onChange,
@@ -3675,7 +5913,7 @@ function TextField({
         return;
       }
       try {
-        const info = await window.goferDesktop?.getPathInfo?.(displayValue);
+        const info = await window.goferDesktop?.workspace?.getPathInfo?.(displayValue);
         if (!cancelled) {
           setPathInfo(info ?? null);
         }
@@ -3696,13 +5934,13 @@ function TextField({
     event.preventDefault();
     event.stopPropagation();
 
-    if (window.goferDesktop?.listDirectory) {
+    if (window.goferDesktop?.workspace?.listDirectory) {
       setPickerOpen(true);
       return;
     }
 
     try {
-      const selectedPath = await window.goferDesktop?.selectPath?.({
+      const selectedPath = await window.goferDesktop?.workspace?.selectPath?.({
         currentPath: displayValue,
       });
       if (selectedPath) {
@@ -3719,11 +5957,11 @@ function TextField({
     if (!displayValue) return;
 
     try {
-      const info = await window.goferDesktop?.getPathInfo?.(displayValue);
+      const info = await window.goferDesktop?.workspace?.getPathInfo?.(displayValue);
       if (info?.isDirectory) {
-        await window.goferDesktop?.openPath?.(displayValue);
+        await window.goferDesktop?.workspace?.openPath?.(displayValue);
       } else {
-        await window.goferDesktop?.revealPath?.(displayValue);
+        await window.goferDesktop?.workspace?.revealPath?.(displayValue);
       }
     } catch (error) {
       console.error("Failed to reveal path", error);
@@ -3827,7 +6065,7 @@ function TextFileDialog({ mode, path, onClose }) {
       setLoading(true);
       setError("");
       try {
-        const payload = await window.goferDesktop?.readTextFile?.(path);
+        const payload = await window.goferDesktop?.textFiles?.read?.(path);
         if (!cancelled) {
           setContent(payload?.content ?? "");
         }
@@ -3852,7 +6090,7 @@ function TextFileDialog({ mode, path, onClose }) {
     setSaving(true);
     setError("");
     try {
-      await window.goferDesktop?.writeTextFile?.({ targetPath: path, content });
+      await window.goferDesktop?.textFiles?.write?.({ targetPath: path, content });
       onClose();
     } catch (saveError) {
       setError(saveError instanceof Error ? saveError.message : "Unable to save file");
@@ -3940,6 +6178,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
   const [parent, setParent] = useState(null);
   const [pathCopied, setPathCopied] = useState(false);
   const [selectedPath, setSelectedPath] = useState(currentPath ?? "");
+  const titleLabel = typeof label === "string" && label.trim() ? label : "path";
 
   useEffect(() => {
     loadDirectory(currentPath);
@@ -3950,7 +6189,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     setLoading(true);
     setError("");
     try {
-      const payload = await window.goferDesktop.listDirectory({
+      const payload = await window.goferDesktop.workspace.listDirectory({
         currentPath: nextPath ?? "",
       });
       setDirectory(payload.directory);
@@ -3980,7 +6219,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     if (!directory) return;
 
     try {
-      await window.goferDesktop?.openPath?.(directory);
+      await window.goferDesktop?.workspace?.openPath?.(directory);
     } catch (openError) {
       setError(openError instanceof Error ? openError.message : "Unable to open path");
     }
@@ -4019,9 +6258,9 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     try {
       let result;
       if (kind === "file") {
-        result = await window.goferDesktop?.createFile?.({ directory, name });
+        result = await window.goferDesktop?.workspace?.createFile?.({ directory, name });
       } else {
-        result = await window.goferDesktop?.createFolder?.({ directory, name });
+        result = await window.goferDesktop?.workspace?.createFolder?.({ directory, name });
       }
       await loadDirectory(directory);
       if (result?.path) {
@@ -4037,7 +6276,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     if (!entry || !name) return;
 
     try {
-      const result = await window.goferDesktop?.renamePath?.({
+      const result = await window.goferDesktop?.workspace?.renamePath?.({
         sourcePath: entry.path,
         name,
       });
@@ -4064,7 +6303,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     const existingNames = new Set(entries.map((entry) => entry.name));
     const nextName = nextCopyName(copiedEntry.name, existingNames);
     try {
-      await window.goferDesktop?.copyPath?.({
+      await window.goferDesktop?.workspace?.copyPath?.({
         sourcePath: copiedEntry.path,
         destinationPath: joinPath(directory, nextName),
       });
@@ -4081,7 +6320,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
     if (!window.confirm(`Delete ${entry.name}?`)) return;
 
     try {
-      await window.goferDesktop?.deletePath?.(entry.path);
+      await window.goferDesktop?.workspace?.deletePath?.(entry.path);
       if (selectedPath === entry.path) {
         setSelectedPath(directory);
       }
@@ -4096,7 +6335,9 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
       <div className="flex max-h-[78vh] w-full max-w-[680px] flex-col rounded-lg border border-line bg-white shadow-panel">
         <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
           <div className="min-w-0">
-            <h2 className="text-sm font-semibold text-strong">Choose {label.toLowerCase()}</h2>
+            <h2 className="text-sm font-semibold text-strong">
+              Choose {titleLabel.toLowerCase()}
+            </h2>
             <div className="mt-1 flex min-w-0 items-center gap-1.5">
               <button
                 className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40 dark:hover:bg-[#2a2a2a]"
@@ -4693,6 +6934,226 @@ function KeyValueField({ label, onChange, value }) {
       onChange={(text) => onChange(keyValueTextToObject(text))}
     />
   );
+}
+
+export function formatJsonBodyEditorValue(value) {
+  if (value === null || value === undefined || value === "") return "";
+  return JSON.stringify(value, null, 2);
+}
+
+export function parseJsonBodyEditorValue(text) {
+  if (!text.trim()) return { ok: true, value: null };
+  try {
+    return { ok: true, value: JSON.parse(text) };
+  } catch (error) {
+    return {
+      ok: false,
+      error: error instanceof Error ? error.message : "Invalid JSON",
+    };
+  }
+}
+
+function JsonBodyField({ label, onChange, value }) {
+  const [text, setText] = useState(() => formatJsonBodyEditorValue(value));
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setText(formatJsonBodyEditorValue(value));
+    setError("");
+  }, [value]);
+
+  function update(nextText) {
+    setText(nextText);
+    const parsed = parseJsonBodyEditorValue(nextText);
+    if (!parsed.ok) {
+      setError(parsed.error);
+      return;
+    }
+    setError("");
+    onChange(parsed.value);
+  }
+
+  return (
+    <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
+      {label}
+      <textarea
+        className={`min-h-[8rem] rounded-lg border bg-white px-2 py-1.5 font-mono text-xs text-slate-900 outline-none transition focus:ring-2 focus:ring-brand/20 ${
+          error ? "border-red-300 focus:border-red-400" : "border-line focus:border-brand"
+        }`}
+        rows={6}
+        value={text}
+        onChange={(event) => update(event.target.value)}
+      />
+      {error ? <span className="text-[11px] font-medium text-red-600">{error}</span> : null}
+    </label>
+  );
+}
+
+const inputTargetOptions = [
+  ["stdin", "Standard input"],
+  ["env.FILE_PATH", "Env: FILE_PATH"],
+  ["env.FILE_NAME", "Env: FILE_NAME"],
+  ["env.FILE_STEM", "Env: FILE_STEM"],
+  ["env.FILE_EXTENSION", "Env: FILE_EXTENSION"],
+  ["env.FOLDER_PATH", "Env: FOLDER_PATH"],
+  ["env.CONTENT", "Env: CONTENT"],
+  ["env.INDEX", "Env: INDEX"],
+  ["file_path", "Prompt variable: file_path"],
+  ["file_name", "Prompt variable: file_name"],
+  ["file_stem", "Prompt variable: file_stem"],
+  ["file_extension", "Prompt variable: file_extension"],
+  ["folder_path", "Prompt variable: folder_path"],
+  ["content", "Prompt variable: content"],
+  ["index", "Prompt variable: index"],
+  ["row", "Prompt variable: row"],
+  ["query", "Prompt variable: query"],
+];
+
+function InputMappingField({ nodeType, onChange, sourceOptions, value }) {
+  const entries = Object.entries(value ?? {});
+  const hasLoopFileSources = sourceOptions.some(([source]) => source === "loop.current.file_path");
+  const targetOptions = useMemo(() => {
+    const usedTargets = new Set(inputTargetOptions.map(([optionValue]) => optionValue));
+    const customTargets = Object.keys(value ?? {})
+      .filter((target) => target && !usedTargets.has(target))
+      .map((target) => [target, target]);
+    return [...inputTargetOptions, ...customTargets];
+  }, [value]);
+  const sourceOptionsWithCustom = useMemo(() => {
+    const usedSources = new Set(sourceOptions.map(([optionValue]) => optionValue));
+    const customSources = Object.values(value ?? {})
+      .filter((source) => source && !usedSources.has(source))
+      .map((source) => [source, source]);
+    return [...sourceOptions, ...customSources];
+  }, [sourceOptions, value]);
+
+  function updateEntry(index, nextKey, nextValue) {
+    const next = {};
+    entries.forEach(([key, item], entryIndex) => {
+      if (entryIndex === index) {
+        if (nextKey.trim()) {
+          next[nextKey.trim()] = nextValue;
+        }
+      } else {
+        next[key] = item;
+      }
+    });
+    onChange(next);
+  }
+
+  function removeEntry(index) {
+    onChange(Object.fromEntries(entries.filter((_, entryIndex) => entryIndex !== index)));
+  }
+
+  function addEntry() {
+    const key = nextInputKey(value ?? {});
+    onChange({ ...(value ?? {}), [key]: "previous.text" });
+  }
+
+  function addLoopFileInputs() {
+    const mappings =
+      nodeType === "agent" || nodeType === "common_llm_task" || nodeType === "prompt_file"
+        ? {
+            file_path: "loop.current.file_path",
+            file_name: "loop.current.file_name",
+            file_stem: "loop.current.file_stem",
+            file_extension: "loop.current.file_extension",
+          }
+        : {
+            "env.FILE_PATH": "loop.current.file_path",
+            "env.FILE_NAME": "loop.current.file_name",
+            "env.FILE_STEM": "loop.current.file_stem",
+            "env.FILE_EXTENSION": "loop.current.file_extension",
+          };
+    onChange({ ...(value ?? {}), ...mappings });
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.2fr)_32px] gap-2 text-[11px] font-semibold uppercase tracking-[0.12em] text-muted">
+        <span>Input</span>
+        <span>Source output</span>
+        <span />
+      </div>
+      {entries.length ? (
+        entries.map(([key, source], index) => (
+          <div
+            key={`${key}-${index}`}
+            className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.2fr)_32px] gap-2"
+          >
+            <select
+              className="h-9 min-w-0 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
+              value={key}
+              onChange={(event) => updateEntry(index, event.target.value, source)}
+            >
+              {targetOptions.map(([optionValue, label]) => (
+                <option key={optionValue} value={optionValue}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <select
+              className="h-9 min-w-0 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
+              value={source}
+              onChange={(event) => updateEntry(index, key, event.target.value)}
+            >
+              {sourceOptionsWithCustom.map(([optionValue, label]) => (
+                <option key={optionValue} value={optionValue}>
+                  {label}
+                </option>
+              ))}
+            </select>
+            <button
+              className="grid h-9 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-red-600 dark:hover:bg-[#2a2a2a]"
+              title="Remove input"
+              type="button"
+              onClick={() => removeEntry(index)}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ))
+      ) : (
+        <p className="rounded-lg border border-dashed border-line px-3 py-2 text-xs leading-5 text-muted">
+          Map parent outputs into stdin, environment variables, or prompt variables.
+        </p>
+      )}
+      <div className="flex flex-wrap gap-2">
+        <button
+          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+          type="button"
+          onClick={addEntry}
+        >
+          <Plus size={13} />
+          Add input
+        </button>
+        {hasLoopFileSources ? (
+          <button
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+            title={
+              nodeType === "agent" || nodeType === "common_llm_task" || nodeType === "prompt_file"
+                ? "Map loop file fields as prompt variables"
+                : "Map loop file fields as environment variables"
+            }
+            type="button"
+            onClick={addLoopFileInputs}
+          >
+            <Files size={13} />
+            Loop file inputs
+          </button>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function nextInputKey(value = {}) {
+  if (!Object.hasOwn(value, "stdin")) return "stdin";
+  let index = 1;
+  while (Object.hasOwn(value, `input_${index}`)) {
+    index += 1;
+  }
+  return `input_${index}`;
 }
 
 function objectToKeyValueText(value = {}) {

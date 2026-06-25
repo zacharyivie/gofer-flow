@@ -7,15 +7,21 @@ from pydantic import TypeAdapter, ValidationError
 
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
     CommonLlmTaskOperation,
     CopyFileOperation,
+    CountFanSource,
     DeleteFileOperation,
     FileOperation,
     FolderOperation,
+    HttpRequestOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
+    LoopOperation,
     MoveFileOperation,
+    NotificationOperation,
     OpenResourceOperation,
     Operation,
     OperationType,
@@ -23,7 +29,6 @@ from gofer.core.operations import (
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
-    TriggerEventsFanSource,
     WriteFileOperation,
 )
 
@@ -112,8 +117,9 @@ def test_file_io_operations_roundtrip() -> None:
             agent_id="a",
             prompt_path=Path("p.md"),
             working_dir=Path("."),
-            fan_source=TriggerEventsFanSource(type="trigger_events"),
         ),
+        LoopOperation(type=OperationType.LOOP, source=CountFanSource(type="count", count=3)),
+        BreakOperation(type=OperationType.BREAK, message="done"),
         PromptFileOperation(
             type=OperationType.PROMPT_FILE,
             output_path=Path("prompts/generated.md"),
@@ -135,6 +141,24 @@ def test_file_io_operations_roundtrip() -> None:
             type=OperationType.LOCAL_SEARCH,
             index_path=Path("indexes/docs.json"),
             query="hello",
+        ),
+        HttpRequestOperation(
+            type=OperationType.HTTP_REQUEST,
+            method="POST",
+            url="https://api.example.test/issues",
+            headers={"Authorization": "{{secret.API_TOKEN}}"},
+            json={"title": "Bug"},
+            expected_statuses=[200, 201],
+        ),
+        ApprovalGateOperation(
+            type=OperationType.APPROVAL_GATE,
+            message="Approve deploy {{previous.output}}?",
+            timeout_seconds=60,
+        ),
+        NotificationOperation(
+            type=OperationType.NOTIFICATION,
+            title="Deploy",
+            body="Workflow finished",
         ),
     ]
 

@@ -8,6 +8,7 @@ from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 
+from gofer.core.run_outputs import write_run_node_outputs_payload
 from gofer.core.workflow import AgenticWorkflow
 from gofer.utils.logging import get_logger
 from gofer.utils.run_state import workflow_stop_path
@@ -16,7 +17,11 @@ log = get_logger(__name__)
 
 
 def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str, Any]) -> None:
-    wf = AgenticWorkflow.from_file(Path(workflow_path))
+    path = Path(workflow_path)
+    wf = AgenticWorkflow.from_file(path)
+    wf.validate(path)
+    for warning in wf.resource_warnings(path.parent):
+        log.warning("%s", warning)
     from gofer.core.executor import WorkflowExecutor
     from gofer.subscriptions.claude_code import ClaudeCodeSubscription
     from gofer.subscriptions.codex import CodexSubscription
@@ -30,10 +35,12 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
         executor = WorkflowExecutor(
             wf,
             runtime_subscriptions,
-            log_base_dir=Path(workflow_path).parent / "logs",
-            stop_file=workflow_stop_path(workflow_id, Path(workflow_path).parent),
+            log_base_dir=path.parent / "logs",
+            workflow_path=path,
+            stop_file=workflow_stop_path(workflow_id, path.parent),
         )
         result = await executor.run()
+        write_run_node_outputs_payload(result, wf.config.resource_limits)
         log.info("Workflow %s finished: success=%s", workflow_id, result.success)
 
     asyncio.run(_exec())
@@ -49,6 +56,7 @@ class WorkflowScheduler:
     def add_workflow(self, workflow: AgenticWorkflow, workflow_path: Path) -> None:
         if workflow.config.schedule is None:
             raise ValueError(f"Workflow '{workflow.config.id}' has no schedule configured")
+        workflow.validate(workflow_path)
 
         sched = workflow.config.schedule
         trigger = CronTrigger.from_crontab(sched.cron_expression, timezone=sched.timezone)
@@ -106,12 +114,15 @@ class WorkflowScheduler:
                 self._scheduler.shutdown(wait=False)
         jobs = []
         for job in jobs_raw:
-            jobs.append({
-                "id": job.id.removeprefix("workflow:"),
-                "name": job.name,
-                "next_run": str(job.next_run_time) if getattr(job, "next_run_time", None)
+            jobs.append(
+                {
+                    "id": job.id.removeprefix("workflow:"),
+                    "name": job.name,
+                    "next_run": str(job.next_run_time)
+                    if getattr(job, "next_run_time", None)
                     else "paused",
-            })
+                }
+            )
         return jobs
 
     def start(self, paused: bool = False) -> None:

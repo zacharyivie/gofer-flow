@@ -36,16 +36,36 @@ def _get_scheduler(db: Path) -> WorkflowScheduler:
     return WorkflowScheduler(db_path=db)
 
 
+def _print_agent_access_summary(wf: AgenticWorkflow) -> None:
+    warnings = [
+        warning
+        for warning in wf.resource_warnings()
+        if "grants provider filesystem access outside working_dir" in warning
+    ]
+    if not warnings:
+        return
+    console.print("[yellow]Agent filesystem access outside working_dir:[/yellow]")
+    for warning in warnings:
+        console.print(f"[yellow]- {warning}[/yellow]")
+
+
 @app.command("add")
 def add(
     workflow_file: Path = typer.Argument(..., help="Workflow TOML file"),
     db: Path | None = typer.Option(None, "--db"),
 ) -> None:
     """Add a workflow to the schedule."""
-    wf = AgenticWorkflow.from_file(workflow_file)
-    scheduler = _get_scheduler(db or _default_db())
-    scheduler.add_workflow(wf, workflow_file)
-    console.print(f"[green]Scheduled[/green] '{wf.config.id}'")
+    try:
+        wf = AgenticWorkflow.from_file(workflow_file)
+        wf.validate()
+        _print_agent_access_summary(wf)
+        scheduler = _get_scheduler(db or _default_db())
+        scheduler.add_workflow(wf, workflow_file)
+    except Exception as exc:
+        console.print(f"[red]Schedule failed: {exc}[/red]")
+        raise typer.Exit(1)
+    else:
+        console.print(f"[green]Scheduled[/green] '{wf.config.id}'")
 
 
 @app.command("remove")

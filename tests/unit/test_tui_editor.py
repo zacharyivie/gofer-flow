@@ -25,6 +25,8 @@ from gofer.core.graph import GraphNode
 from gofer.core.operations import (
     AgentOperation,
     BashCommandOperation,
+    HttpRequestOperation,
+    HttpRetryPolicy,
     OperationType,
     PythonScriptOperation,
     ShellScriptOperation,
@@ -364,6 +366,64 @@ def test_workflow_to_sections_agent_operation() -> None:
     assert "nodes.agent_node.agent_id" in keys
     assert "nodes.agent_node.prompt_path" in keys
     assert "nodes.agent_node.dynamic_count" in keys
+
+
+def test_workflow_to_sections_http_request_includes_json_and_retry_controls() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="http", name="HTTP"))
+    wf.add_operation(
+        GraphNode(
+            node_id="api",
+            operation=HttpRequestOperation(
+                type=OperationType.HTTP_REQUEST,
+                method="POST",
+                url="https://api.example.test/issues",
+                json={"title": "Bug"},
+                retry=HttpRetryPolicy(
+                    attempts=3,
+                    backoff_seconds=1.5,
+                    retry_on_statuses=[429, 503],
+                ),
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    node_sec = next(s for s in sections if "api" in s.title)
+    fm = {fd.key: fd.value for fd in node_sec.fields}
+
+    assert '"title": "Bug"' in fm["nodes.api.json_payload"]
+    assert fm["nodes.api.retry.attempts"] == 3
+    assert fm["nodes.api.retry.backoff_seconds"] == 1.5
+    assert fm["nodes.api.retry.retry_on_statuses"] == ["429", "503"]
+
+
+def test_sections_to_workflow_updates_http_json_and_retry_policy() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="http", name="HTTP"))
+    wf.add_operation(
+        GraphNode(
+            node_id="api",
+            operation=HttpRequestOperation(
+                type=OperationType.HTTP_REQUEST,
+                url="https://api.example.test/issues",
+            ),
+        )
+    )
+    sections = workflow_to_sections(wf)
+    node_sec = next(s for s in sections if "api" in s.title)
+    fields = {fd.key: fd for fd in node_sec.fields}
+    fields["nodes.api.json_payload"].value = '{"title": "{{previous.output}}"}'
+    fields["nodes.api.retry.attempts"].value = 4
+    fields["nodes.api.retry.backoff_seconds"].value = 2.0
+    fields["nodes.api.retry.retry_on_statuses"].value = ["429", "503"]
+
+    sections_to_workflow(sections, wf)
+    op = wf.graph._nodes["api"].operation
+
+    assert isinstance(op, HttpRequestOperation)
+    assert op.json_payload == {"title": "{{previous.output}}"}
+    assert op.retry.attempts == 4
+    assert op.retry.backoff_seconds == 2.0
+    assert op.retry.retry_on_statuses == [429, 503]
 
 
 # ── agent_to_sections / sections_to_agent ────────────────────────────────────

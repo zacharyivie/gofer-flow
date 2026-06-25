@@ -24,74 +24,202 @@ function isSafeLocalHttpUrl(value) {
 }
 
 contextBridge.exposeInMainWorld("goferApiBaseUrl", readApiBaseUrl());
+const pathGrants = new Map();
+
+function rememberPathGrant(payload) {
+  if (!payload || typeof payload !== "object") return payload;
+  if (typeof payload.path === "string" && typeof payload.grantId === "string") {
+    pathGrants.set(payload.path, payload.grantId);
+  }
+  if (typeof payload.directory === "string" && typeof payload.grantId === "string") {
+    pathGrants.set(payload.directory, payload.grantId);
+  }
+  if (Array.isArray(payload.entries)) {
+    for (const entry of payload.entries) {
+      rememberPathGrant(entry);
+    }
+  }
+  return payload;
+}
+
+function stripGrantIds(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripGrantIds(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  const clean = {};
+  const hasPathGrant = typeof value.path === "string" || typeof value.directory === "string";
+  for (const [key, item] of Object.entries(value)) {
+    if (hasPathGrant && key === "grantId") continue;
+    clean[key] = stripGrantIds(item);
+  }
+  return clean;
+}
+
+function grantForPath(targetPath) {
+  return typeof targetPath === "string" ? pathGrants.get(targetPath) || "" : "";
+}
+
+async function invokeDesktop(channel, payload = {}) {
+  const result = await ipcRenderer.invoke(channel, payload);
+  rememberPathGrant(result);
+  return stripGrantIds(result);
+}
+
 contextBridge.exposeInMainWorld("goferDesktop", {
   getDataDir: () => ipcRenderer.invoke("gofer:get-data-dir"),
-  listDirectory: (options = {}) =>
-    ipcRenderer.invoke("gofer:list-directory", {
-      currentPath:
-        typeof options.currentPath === "string" ? options.currentPath : "",
-      create: options.create !== false,
-    }),
-  openPath: (targetPath) =>
-    ipcRenderer.invoke("gofer:open-path", {
-      targetPath: typeof targetPath === "string" ? targetPath : "",
-    }),
-  revealPath: (targetPath) =>
-    ipcRenderer.invoke("gofer:reveal-path", {
-      targetPath: typeof targetPath === "string" ? targetPath : "",
-    }),
-  getPathInfo: (targetPath) =>
-    ipcRenderer.invoke("gofer:path-info", {
-      targetPath: typeof targetPath === "string" ? targetPath : "",
-    }),
-  copyPath: (options = {}) =>
-    ipcRenderer.invoke("gofer:copy-path", {
-      sourcePath:
-        typeof options.sourcePath === "string" ? options.sourcePath : "",
-      destinationPath:
-        typeof options.destinationPath === "string" ? options.destinationPath : "",
-    }),
-  deletePath: (targetPath) =>
-    ipcRenderer.invoke("gofer:delete-path", {
-      targetPath: typeof targetPath === "string" ? targetPath : "",
-    }),
-  renamePath: (options = {}) =>
-    ipcRenderer.invoke("gofer:rename-path", {
-      sourcePath:
-        typeof options.sourcePath === "string" ? options.sourcePath : "",
-      name: typeof options.name === "string" ? options.name : "",
-    }),
-  createFile: (options = {}) =>
-    ipcRenderer.invoke("gofer:create-file", {
-      directory: typeof options.directory === "string" ? options.directory : "",
-      name: typeof options.name === "string" ? options.name : "",
-    }),
-  createFolder: (options = {}) =>
-    ipcRenderer.invoke("gofer:create-folder", {
-      directory: typeof options.directory === "string" ? options.directory : "",
-      name: typeof options.name === "string" ? options.name : "",
-    }),
-  readTextFile: (targetPath) =>
-    ipcRenderer.invoke("gofer:read-text-file", {
-      targetPath: typeof targetPath === "string" ? targetPath : "",
-    }),
-  writeTextFile: (options = {}) =>
-    ipcRenderer.invoke("gofer:write-text-file", {
-      targetPath:
-        typeof options.targetPath === "string" ? options.targetPath : "",
-      content: typeof options.content === "string" ? options.content : "",
-    }),
+  dataDirectory: {
+    choose: async (options = {}) => {
+      let selectedPath = null;
+      try {
+        selectedPath = await selectPath({
+          currentPath:
+            typeof options.currentPath === "string" ? options.currentPath : "",
+          directoryOnly: true,
+        });
+      } catch {
+        selectedPath = null;
+      }
+      if (!selectedPath) return null;
+      return invokeDesktop("gofer:set-data-dir", {
+        dataDir: selectedPath,
+        grantId: grantForPath(selectedPath),
+      });
+    },
+    get: () => ipcRenderer.invoke("gofer:get-data-dir"),
+  },
+  workspace: {
+    listDirectory: (options = {}) =>
+      listDirectory(options),
+    openPath: (targetPath) =>
+      openPath(targetPath),
+    revealPath: (targetPath) =>
+      revealPath(targetPath),
+    getPathInfo: (targetPath) =>
+      getPathInfo(targetPath),
+    copyPath: (options = {}) =>
+      copyPath(options),
+    deletePath: (targetPath) =>
+      deletePath(targetPath),
+    renamePath: (options = {}) =>
+      renamePath(options),
+    createFile: (options = {}) =>
+      createFile(options),
+    createFolder: (options = {}) =>
+      createFolder(options),
+    selectPath: (options = {}) =>
+      selectPath(options),
+  },
+  textFiles: {
+    read: (targetPath) =>
+      readTextFile(targetPath),
+    write: (options = {}) =>
+      writeTextFile(options),
+  },
   getDroppedFilePath: (file) => webUtils.getPathForFile(file) || "",
-  setDataDir: (dataDir) =>
-    ipcRenderer.invoke("gofer:set-data-dir", {
-      dataDir: typeof dataDir === "string" ? dataDir : "",
-    }),
-  selectPath: (options = {}) =>
-    ipcRenderer.invoke("gofer:select-path", {
-      currentPath:
-        typeof options.currentPath === "string" ? options.currentPath : "",
-    }),
 });
+
+function listDirectory(options = {}) {
+  return (
+    invokeDesktop("gofer:list-directory", {
+      currentPath: typeof options.currentPath === "string" ? options.currentPath : "",
+      grantId: grantForPath(options.currentPath),
+      create: options.create !== false,
+    })
+  );
+}
+
+function openPath(targetPath) {
+  return invokeDesktop("gofer:open-path", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function revealPath(targetPath) {
+  return invokeDesktop("gofer:reveal-path", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function getPathInfo(targetPath) {
+  return invokeDesktop("gofer:path-info", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function copyPath(options = {}) {
+  return invokeDesktop("gofer:copy-path", {
+    destinationGrantId: grantForPath(options.destinationPath),
+    sourcePath:
+      typeof options.sourcePath === "string" ? options.sourcePath : "",
+    sourceGrantId: grantForPath(options.sourcePath),
+    destinationPath:
+      typeof options.destinationPath === "string" ? options.destinationPath : "",
+  });
+}
+
+function deletePath(targetPath) {
+  return invokeDesktop("gofer:delete-path", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function renamePath(options = {}) {
+  return invokeDesktop("gofer:rename-path", {
+    grantId: grantForPath(options.sourcePath),
+    sourcePath:
+      typeof options.sourcePath === "string" ? options.sourcePath : "",
+    name: typeof options.name === "string" ? options.name : "",
+  });
+}
+
+function createFile(options = {}) {
+  return invokeDesktop("gofer:create-file", {
+    directory: typeof options.directory === "string" ? options.directory : "",
+    grantId: grantForPath(options.directory),
+    name: typeof options.name === "string" ? options.name : "",
+  });
+}
+
+function createFolder(options = {}) {
+  return invokeDesktop("gofer:create-folder", {
+    directory: typeof options.directory === "string" ? options.directory : "",
+    grantId: grantForPath(options.directory),
+    name: typeof options.name === "string" ? options.name : "",
+  });
+}
+
+function readTextFile(targetPath) {
+  return invokeDesktop("gofer:read-text-file", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function writeTextFile(options = {}) {
+  return invokeDesktop("gofer:write-text-file", {
+    grantId: grantForPath(options.targetPath),
+    targetPath:
+      typeof options.targetPath === "string" ? options.targetPath : "",
+    content: typeof options.content === "string" ? options.content : "",
+  });
+}
+
+function selectPath(options = {}) {
+  return invokeDesktop("gofer:select-path", {
+    currentPath:
+      typeof options.currentPath === "string" ? options.currentPath : "",
+    directoryOnly: options.directoryOnly === true,
+    grantId: grantForPath(options.currentPath),
+  }).then((payload) => (payload && typeof payload.path === "string" ? payload.path : null));
+}
 
 contextBridge.exposeInMainWorld("goferUpdates", {
   check: () => ipcRenderer.invoke("gofer:check-for-updates"),
