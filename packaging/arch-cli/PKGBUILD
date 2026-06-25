@@ -1,6 +1,6 @@
 # Maintainer: Gofer Flow <maintainers@goferflow.local>
 pkgname=gofer-flow-cli
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="Command line workflow automation tool for Gofer Flow"
 arch=("x86_64")
