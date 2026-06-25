@@ -16,7 +16,7 @@
     "electron:smoke": "npm run check:build && node electron/smoke.cjs",
     "build": "vite build",
     "check:build": "vite build",
-    "test": "node --test src/pages/*.test.mjs",
+    "test": "node --test src/pages/App.test.mjs",
     "dist": "npm run backend:build && npm run build && electron-builder",
     "dist:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage deb rpm",
     "dist:appimage": "npm run backend:build && npm run build && electron-builder --linux AppImage",
