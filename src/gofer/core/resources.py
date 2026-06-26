@@ -23,8 +23,8 @@ class ResourceLimits(BaseModel):
     max_chat_prompt_bytes: int = 128_000
     max_subprocess_output_bytes: int = 2_000_000
     max_watcher_queue_depth: int = 1000
-    max_watcher_concurrency: int = 4
-    max_fanout_concurrency: int = 16
+    max_watcher_concurrency: int = 2
+    max_fanout_concurrency: int = 1
 
 
 DEFAULT_RESOURCE_LIMITS = ResourceLimits()
@@ -71,3 +71,14 @@ def tail_text_file(path: Path, max_bytes: int) -> tuple[str, bool]:
             data = fh.read(max_bytes)
             return data.decode("utf-8", errors="replace"), True
         return fh.read().decode("utf-8", errors="replace"), False
+
+
+def read_text_file_range(path: Path, *, offset: int = 0, max_bytes: int) -> tuple[str, int, int]:
+    size = path.stat().st_size
+    start = max(0, min(offset, size))
+    length = max(0, max_bytes)
+    with path.open("rb") as fh:
+        fh.seek(start)
+        data = fh.read(length)
+    end = start + len(data)
+    return data.decode("utf-8", errors="replace"), start, end

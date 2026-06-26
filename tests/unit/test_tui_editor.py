@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import questionary
+from prompt_toolkit.keys import Keys
 
 from gofer.cli.tui_editor import (
     FieldDescriptor,
@@ -24,14 +27,36 @@ from gofer.core.agent import AgentConfig
 from gofer.core.graph import GraphNode
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
+    CommonLlmTaskOperation,
+    CopyFileOperation,
+    CountFanSource,
+    DeleteFileOperation,
+    DirectoryFanSource,
+    FailOperation,
+    FileOperation,
+    FolderOperation,
     HttpRequestOperation,
     HttpRetryPolicy,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
+    LoopOperation,
+    MoveFileOperation,
+    NotificationOperation,
+    OpenResourceOperation,
     OperationType,
+    PassOperation,
+    PromptFileOperation,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
+    StartOperation,
+    WriteFileOperation,
 )
-from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
+from gofer.core.usage import LlmUsageBudget
+from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig, WorkflowConfig
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -71,6 +96,36 @@ def _agent_config() -> AgentConfig:
         mcp_servers=["filesystem"],
         env={"DEBUG": "1"},
     )
+
+
+class _Prompt:
+    def __init__(self, result: object) -> None:
+        self._result = result
+
+    def ask(self) -> object:
+        return self._result
+
+
+class _EventApp:
+    def __init__(self) -> None:
+        self.exited = False
+
+    def exit(self) -> None:
+        self.exited = True
+
+
+def _dispatch(app: FieldEditorApp, key: str | Keys) -> _EventApp:
+    event_app = _EventApp()
+    event = SimpleNamespace(app=event_app)
+    kb = app._build_key_bindings()
+    binding = next(binding for binding in kb.bindings if key in binding.keys)
+    binding.handler(event)
+    return event_app
+
+
+def _set_field(sections: list[Section], key: str, value: object) -> None:
+    field = next(fd for sec in sections for fd in sec.fields if fd.key == key)
+    field.value = value
 
 
 # ── _format_value ─────────────────────────────────────────────────────────────
@@ -426,6 +481,486 @@ def test_sections_to_workflow_updates_http_json_and_retry_policy() -> None:
     assert op.retry.retry_on_statuses == [429, 503]
 
 
+def test_sections_to_workflow_updates_file_operation_branches() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="files", name="Files"))
+    wf.add_operation(
+        GraphNode(
+            node_id="read",
+            operation=ReadFileOperation(
+                type=OperationType.READ_FILE,
+                path=Path("/old/read.txt"),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="write",
+            operation=WriteFileOperation(
+                type=OperationType.WRITE_FILE,
+                path=Path("/old/write.txt"),
+                content="old",
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="copy",
+            operation=CopyFileOperation(
+                type=OperationType.COPY_FILE,
+                source_path=Path("/old/source.txt"),
+                destination_path=Path("/old/dest.txt"),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="move",
+            operation=MoveFileOperation(
+                type=OperationType.MOVE_FILE,
+                source_path=Path("/old/move-source.txt"),
+                destination_path=Path("/old/move-dest.txt"),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="delete",
+            operation=DeleteFileOperation(
+                type=OperationType.DELETE_FILE,
+                path=Path("/old/delete.txt"),
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "nodes.read.path", Path("/new/read.txt"))
+    _set_field(sections, "nodes.read.encoding", "utf-16")
+    _set_field(sections, "nodes.read.errors", "ignore")
+    _set_field(sections, "nodes.write.path", Path("/new/write.txt"))
+    _set_field(sections, "nodes.write.content", "new content")
+    _set_field(sections, "nodes.write.create_dirs", False)
+    _set_field(sections, "nodes.write.overwrite", False)
+    _set_field(sections, "nodes.write.append", True)
+    _set_field(sections, "nodes.copy.source_path", Path("/new/copy-source.txt"))
+    _set_field(sections, "nodes.copy.destination_path", Path("/new/copy-dest.txt"))
+    _set_field(sections, "nodes.copy.create_dirs", False)
+    _set_field(sections, "nodes.copy.overwrite", True)
+    _set_field(sections, "nodes.move.source_path", Path("/new/move-source.txt"))
+    _set_field(sections, "nodes.move.destination_path", Path("/new/move-dest.txt"))
+    _set_field(sections, "nodes.move.create_dirs", False)
+    _set_field(sections, "nodes.move.overwrite", True)
+    _set_field(sections, "nodes.delete.path", Path("/new/delete.txt"))
+    _set_field(sections, "nodes.delete.use_trash", False)
+    _set_field(sections, "nodes.delete.recursive", True)
+    _set_field(sections, "nodes.delete.missing_ok", True)
+
+    sections_to_workflow(sections, wf)
+
+    read_op = wf.graph._nodes["read"].operation
+    write_op = wf.graph._nodes["write"].operation
+    copy_op = wf.graph._nodes["copy"].operation
+    move_op = wf.graph._nodes["move"].operation
+    delete_op = wf.graph._nodes["delete"].operation
+    assert isinstance(read_op, ReadFileOperation)
+    assert read_op.path == Path("/new/read.txt")
+    assert read_op.encoding == "utf-16"
+    assert read_op.errors == "ignore"
+    assert isinstance(write_op, WriteFileOperation)
+    assert write_op.path == Path("/new/write.txt")
+    assert write_op.content == "new content"
+    assert write_op.create_dirs is False
+    assert write_op.overwrite is False
+    assert write_op.append is True
+    assert isinstance(copy_op, CopyFileOperation)
+    assert copy_op.source_path == Path("/new/copy-source.txt")
+    assert copy_op.destination_path == Path("/new/copy-dest.txt")
+    assert copy_op.create_dirs is False
+    assert copy_op.overwrite is True
+    assert isinstance(move_op, MoveFileOperation)
+    assert move_op.source_path == Path("/new/move-source.txt")
+    assert move_op.destination_path == Path("/new/move-dest.txt")
+    assert move_op.create_dirs is False
+    assert move_op.overwrite is True
+    assert isinstance(delete_op, DeleteFileOperation)
+    assert delete_op.path == Path("/new/delete.txt")
+    assert delete_op.use_trash is False
+    assert delete_op.recursive is True
+    assert delete_op.missing_ok is True
+
+
+def test_sections_to_workflow_updates_open_resource_and_agent_branches() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="ops", name="Ops"))
+    wf.add_operation(
+        GraphNode(
+            node_id="open",
+            operation=OpenResourceOperation(
+                type=OperationType.OPEN_RESOURCE,
+                target="https://old.example.test",
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="old-agent",
+                prompt_path=Path("/old/prompt.md"),
+                working_dir=Path("/old/work"),
+                dynamic_count=1,
+            ),
+            timeout_seconds=20.0,
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "nodes.open.target", "/tmp/report.txt")
+    _set_field(sections, "nodes.open.resource_type", "file")
+    _set_field(sections, "nodes.open.args", ["--line", "10"])
+    _set_field(sections, "nodes.agent.agent_id", "new-agent")
+    _set_field(sections, "nodes.agent.prompt_path", Path("/new/prompt.md"))
+    _set_field(sections, "nodes.agent.working_dir", Path("/new/work"))
+    _set_field(sections, "nodes.agent.dynamic_count", "{{fanout.count}}")
+    _set_field(sections, "nodes.agent.memory", "run")
+    _set_field(sections, "nodes.agent.input_mapping", {"source": "read.output"})
+    _set_field(sections, "nodes.agent.timeout_seconds", 45.0)
+    _set_field(sections, "nodes.agent.pipe_output", True)
+
+    sections_to_workflow(sections, wf)
+
+    open_op = wf.graph._nodes["open"].operation
+    agent_node = wf.graph._nodes["agent"]
+    agent_op = agent_node.operation
+    assert isinstance(open_op, OpenResourceOperation)
+    assert open_op.target == "/tmp/report.txt"
+    assert open_op.resource_type == "file"
+    assert open_op.args == ["--line", "10"]
+    assert isinstance(agent_op, AgentOperation)
+    assert agent_op.agent_id == "new-agent"
+    assert agent_op.prompt_path == Path("/new/prompt.md")
+    assert agent_op.working_dir == Path("/new/work")
+    assert agent_op.dynamic_count == "{{fanout.count}}"
+    assert agent_op.memory == "run"
+    assert agent_op.input_mapping == {"source": "read.output"}
+    assert agent_node.timeout_seconds == 45.0
+    assert agent_node.pipe_output is True
+
+
+def test_sections_to_workflow_updates_schedule_watch_and_max_node_runs() -> None:
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="triggered",
+            name="Triggered",
+            schedule=ScheduleConfig(cron_expression="0 9 * * *"),
+            watch=WatchConfig(path=Path("/old/watch")),
+            max_total_node_runs=10,
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "config.max_total_node_runs", 250)
+    _set_field(sections, "config.schedule.cron_expression", "*/5 * * * *")
+    _set_field(sections, "config.schedule.timezone", "America/New_York")
+    _set_field(sections, "config.watch.path", Path("/new/watch"))
+    _set_field(sections, "config.watch.glob", "*.py")
+    _set_field(sections, "config.watch.recursive", True)
+    _set_field(sections, "config.watch.debounce_seconds", 2.5)
+    _set_field(sections, "config.watch.mode", "queue")
+    _set_field(sections, "config.watch.max_concurrency", 3)
+
+    sections_to_workflow(sections, wf)
+
+    assert wf.config.max_total_node_runs == 250
+    assert wf.config.schedule is not None
+    assert wf.config.schedule.cron_expression == "*/5 * * * *"
+    assert wf.config.schedule.timezone == "America/New_York"
+    assert wf.config.watch is not None
+    assert wf.config.watch.path == Path("/new/watch")
+    assert wf.config.watch.glob == "*.py"
+    assert wf.config.watch.recursive is True
+    assert wf.config.watch.debounce_seconds == 2.5
+    assert wf.config.watch.mode == "queue"
+    assert wf.config.watch.max_concurrency == 3
+
+
+def test_sections_to_workflow_updates_control_and_loop_operation_branches() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="control", name="Control"))
+    wf.add_operation(GraphNode(node_id="start", operation=StartOperation(type=OperationType.START)))
+    wf.add_operation(
+        GraphNode(
+            node_id="pass",
+            operation=PassOperation(type=OperationType.PASS, message="old pass"),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="fail",
+            operation=FailOperation(type=OperationType.FAIL, message="old fail"),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="break",
+            operation=BreakOperation(type=OperationType.BREAK, message="old break"),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=2),
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "nodes.pass.message", "new pass")
+    _set_field(sections, "nodes.fail.message", "new fail")
+    _set_field(sections, "nodes.break.message", "new break")
+    _set_field(sections, "nodes.loop.source.type", "directory")
+    _set_field(sections, "nodes.loop.source.max_concurrency", 4)
+    _set_field(sections, "nodes.loop.source.fail_fast", True)
+
+    loop_section = next(section for section in sections if "loop" in section.title)
+    loop_section.fields.extend(
+        [
+            FieldDescriptor(
+                "nodes.loop.source.path",
+                "Path",
+                FieldKind.PATH,
+                Path("/data/events"),
+            ),
+            FieldDescriptor("nodes.loop.source.glob", "Glob", FieldKind.STRING, "*.json"),
+            FieldDescriptor(
+                "nodes.loop.source.include_content",
+                "Include Content",
+                FieldKind.BOOL,
+                True,
+            ),
+        ]
+    )
+
+    sections_to_workflow(sections, wf)
+
+    assert isinstance(wf.graph._nodes["start"].operation, StartOperation)
+    pass_op = wf.graph._nodes["pass"].operation
+    fail_op = wf.graph._nodes["fail"].operation
+    break_op = wf.graph._nodes["break"].operation
+    loop_op = wf.graph._nodes["loop"].operation
+    assert isinstance(pass_op, PassOperation)
+    assert pass_op.message == "new pass"
+    assert isinstance(fail_op, FailOperation)
+    assert fail_op.message == "new fail"
+    assert isinstance(break_op, BreakOperation)
+    assert break_op.message == "new break"
+    assert isinstance(loop_op, LoopOperation)
+    assert isinstance(loop_op.source, DirectoryFanSource)
+    assert loop_op.source.path == Path("/data/events")
+    assert loop_op.source.glob == "*.json"
+    assert loop_op.source.include_content is True
+    assert loop_op.source.max_concurrency == 4
+    assert loop_op.source.fail_fast is True
+
+
+def test_sections_to_workflow_updates_more_file_and_index_operation_branches() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="more-files", name="More Files"))
+    wf.add_operation(
+        GraphNode(
+            node_id="file",
+            operation=FileOperation(type=OperationType.FILE, path=Path("/old/file.txt")),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="folder",
+            operation=FolderOperation(type=OperationType.FOLDER, path=Path("/old/folder")),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="prompt",
+            operation=PromptFileOperation(
+                type=OperationType.PROMPT_FILE,
+                output_path=Path("/old/prompt.md"),
+                template="old",
+                template_path=Path("/old/template.md"),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="vectorize",
+            operation=LocalVectorizeOperation(
+                type=OperationType.LOCAL_VECTORIZE,
+                source_path=Path("/old/src"),
+                index_path=Path("/old/index"),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="search",
+            operation=LocalSearchOperation(
+                type=OperationType.LOCAL_SEARCH,
+                index_path=Path("/old/index"),
+                query="old",
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "nodes.file.path", Path("/new/file.txt"))
+    _set_field(sections, "nodes.folder.path", Path("/new/folder"))
+    _set_field(sections, "nodes.prompt.output_path", Path("/new/prompt.md"))
+    _set_field(sections, "nodes.prompt.template", "new template")
+    _set_field(sections, "nodes.prompt.template_path", None)
+    _set_field(sections, "nodes.prompt.variables", {"name": "Ada"})
+    _set_field(sections, "nodes.prompt.encoding", "utf-16")
+    _set_field(sections, "nodes.prompt.create_dirs", False)
+    _set_field(sections, "nodes.prompt.overwrite", False)
+    _set_field(sections, "nodes.vectorize.source_path", Path("/new/src"))
+    _set_field(sections, "nodes.vectorize.index_path", Path("/new/index"))
+    _set_field(sections, "nodes.vectorize.glob", "*.md")
+    _set_field(sections, "nodes.vectorize.recursive", False)
+    _set_field(sections, "nodes.vectorize.chunk_size", 400)
+    _set_field(sections, "nodes.vectorize.chunk_overlap", 40)
+    _set_field(sections, "nodes.vectorize.mode", "full")
+    _set_field(sections, "nodes.search.index_path", Path("/new/index"))
+    _set_field(sections, "nodes.search.query", "new query")
+    _set_field(sections, "nodes.search.top_k", 8)
+    _set_field(sections, "nodes.search.score_threshold", 0.25)
+    _set_field(sections, "nodes.search.include_snippets", False)
+    _set_field(sections, "nodes.search.include_file_metadata", False)
+
+    sections_to_workflow(sections, wf)
+
+    file_op = wf.graph._nodes["file"].operation
+    folder_op = wf.graph._nodes["folder"].operation
+    prompt_op = wf.graph._nodes["prompt"].operation
+    vectorize_op = wf.graph._nodes["vectorize"].operation
+    search_op = wf.graph._nodes["search"].operation
+    assert isinstance(file_op, FileOperation)
+    assert file_op.path == Path("/new/file.txt")
+    assert isinstance(folder_op, FolderOperation)
+    assert folder_op.path == Path("/new/folder")
+    assert isinstance(prompt_op, PromptFileOperation)
+    assert prompt_op.output_path == Path("/new/prompt.md")
+    assert prompt_op.template == "new template"
+    assert prompt_op.template_path is None
+    assert prompt_op.variables == {"name": "Ada"}
+    assert prompt_op.encoding == "utf-16"
+    assert prompt_op.create_dirs is False
+    assert prompt_op.overwrite is False
+    assert isinstance(vectorize_op, LocalVectorizeOperation)
+    assert vectorize_op.source_path == Path("/new/src")
+    assert vectorize_op.index_path == Path("/new/index")
+    assert vectorize_op.glob == "*.md"
+    assert vectorize_op.recursive is False
+    assert vectorize_op.chunk_size == 400
+    assert vectorize_op.chunk_overlap == 40
+    assert vectorize_op.mode == "full"
+    assert isinstance(search_op, LocalSearchOperation)
+    assert search_op.index_path == Path("/new/index")
+    assert search_op.query == "new query"
+    assert search_op.top_k == 8
+    assert search_op.score_threshold == 0.25
+    assert search_op.include_snippets is False
+    assert search_op.include_file_metadata is False
+
+
+def test_sections_to_workflow_updates_llm_approval_and_notification_branches() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="advanced", name="Advanced"))
+    wf.add_operation(
+        GraphNode(
+            node_id="common",
+            operation=CommonLlmTaskOperation(
+                type=OperationType.COMMON_LLM_TASK,
+                agent_id="old-agent",
+                target="old target",
+                working_dir=Path("/old/work"),
+                llm_budget=LlmUsageBudget(max_agent_calls=1),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="approval",
+            operation=ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message="old approval",
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="notify",
+            operation=NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                title="old title",
+                body="old body",
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    _set_field(sections, "nodes.common.agent_id", "new-agent")
+    _set_field(sections, "nodes.common.task", "review")
+    _set_field(sections, "nodes.common.target", "{{build.output}}")
+    _set_field(sections, "nodes.common.instructions", "be terse")
+    _set_field(sections, "nodes.common.working_dir", Path("/new/work"))
+    _set_field(sections, "nodes.common.profile", "prod")
+    _set_field(sections, "nodes.common.model", "gpt-test")
+    _set_field(sections, "nodes.common.timeout", 12.5)
+    _set_field(sections, "nodes.common.memory", "run")
+    _set_field(sections, "nodes.common.input_mapping", {"diff": "build.output"})
+    _set_field(sections, "nodes.common.llm_budget.max_agent_calls", 3)
+    _set_field(sections, "nodes.common.llm_budget.max_estimated_tokens", 1000)
+    _set_field(sections, "nodes.common.llm_budget.max_estimated_cost", 0.25)
+    _set_field(sections, "nodes.common.llm_budget.max_agent_time_seconds", 60.0)
+    _set_field(sections, "nodes.approval.message", "new approval")
+    _set_field(sections, "nodes.approval.approval_timeout_seconds", 30.0)
+    _set_field(sections, "nodes.approval.timeout_decision", "reject")
+    _set_field(sections, "nodes.approval.approvers", ["ops", "security"])
+    _set_field(sections, "nodes.approval.notify", True)
+    _set_field(sections, "nodes.approval.notification_title", "Approve deploy")
+    _set_field(sections, "nodes.notify.title", "new title")
+    _set_field(sections, "nodes.notify.body", "new body")
+    _set_field(sections, "nodes.notify.urgency", "critical")
+
+    sections_to_workflow(sections, wf)
+
+    common_op = wf.graph._nodes["common"].operation
+    approval_op = wf.graph._nodes["approval"].operation
+    notify_op = wf.graph._nodes["notify"].operation
+    assert isinstance(common_op, CommonLlmTaskOperation)
+    assert common_op.agent_id == "new-agent"
+    assert common_op.task == "review"
+    assert common_op.target == "{{build.output}}"
+    assert common_op.instructions == "be terse"
+    assert common_op.working_dir == Path("/new/work")
+    assert common_op.profile == "prod"
+    assert common_op.model == "gpt-test"
+    assert common_op.timeout == 12.5
+    assert common_op.memory == "run"
+    assert common_op.input_mapping == {"diff": "build.output"}
+    assert common_op.llm_budget.max_agent_calls == 3
+    assert common_op.llm_budget.max_estimated_tokens == 1000
+    assert common_op.llm_budget.max_estimated_cost == 0.25
+    assert common_op.llm_budget.max_agent_time_seconds == 60.0
+    assert isinstance(approval_op, ApprovalGateOperation)
+    assert approval_op.message == "new approval"
+    assert approval_op.timeout_seconds == 30.0
+    assert approval_op.timeout_decision == "reject"
+    assert approval_op.approvers == ["ops", "security"]
+    assert approval_op.notify is True
+    assert approval_op.notification_title == "Approve deploy"
+    assert isinstance(notify_op, NotificationOperation)
+    assert notify_op.title == "new title"
+    assert notify_op.body == "new body"
+    assert notify_op.urgency == "critical"
+
+
 # ── agent_to_sections / sections_to_agent ────────────────────────────────────
 
 
@@ -506,3 +1041,160 @@ def test_field_editor_initial_cursor() -> None:
     app = FieldEditorApp(sections, title="T")
     assert app._cursor == 0
     assert app._saved is False
+
+
+def test_field_editor_key_bindings_navigate_save_and_quit() -> None:
+    app = FieldEditorApp(
+        [
+            Section(
+                "A",
+                [
+                    FieldDescriptor("a", "A", FieldKind.STRING, "a"),
+                    FieldDescriptor("b", "B", FieldKind.STRING, "b"),
+                    FieldDescriptor("c", "C", FieldKind.STRING, "c"),
+                ],
+            )
+        ]
+    )
+
+    _dispatch(app, "j")
+    assert app._cursor == 1
+    _dispatch(app, Keys.Up)
+    assert app._cursor == 0
+    _dispatch(app, Keys.PageDown)
+    assert app._cursor == 2
+    _dispatch(app, Keys.PageUp)
+    assert app._cursor == 0
+
+    saved_event = _dispatch(app, "s")
+    assert app._saved is True
+    assert saved_event.exited is True
+
+    quit_event = _dispatch(app, "q")
+    assert app._saved is False
+    assert quit_event.exited is True
+
+
+def test_field_editor_run_edit_loop_saves_without_real_tty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    field = FieldDescriptor("name", "Name", FieldKind.STRING, "old")
+    app = FieldEditorApp([Section("A", [field])])
+    keys = iter([Keys.ControlM, "s"])
+
+    class FakeApplication:
+        def __init__(self, **kwargs: object) -> None:
+            self.key_bindings = kwargs["key_bindings"]
+
+        def run(self) -> None:
+            key = next(keys)
+            event_app = _EventApp()
+            event = SimpleNamespace(app=event_app)
+            binding = next(
+                binding
+                for binding in self.key_bindings.bindings
+                if key in binding.keys
+            )
+            binding.handler(event)
+
+    monkeypatch.setattr("gofer.cli.tui_editor.Application", FakeApplication)
+    monkeypatch.setattr(questionary, "text", lambda *_, **__: _Prompt("new"))
+
+    assert app.run() is True
+    assert field.value == "new"
+
+
+def test_field_editor_enter_delete_read_only_and_required_errors() -> None:
+    readonly = FieldDescriptor("id", "ID", FieldKind.STRING, "wf", read_only=True)
+    required = FieldDescriptor("name", "Name", FieldKind.STRING, "old")
+    optional = FieldDescriptor("note", "Note", FieldKind.STRING, "text", optional=True)
+    app = FieldEditorApp([Section("A", [readonly, required, optional])])
+    app._pending_edit = None
+
+    readonly_event = _dispatch(app, Keys.ControlM)
+    assert app._pending_edit is None
+    assert readonly_event.exited is False
+    assert app._error == "'ID' is read-only"
+
+    app._cursor = 1
+    _dispatch(app, Keys.Delete)
+    assert required.value == "old"
+    assert app._error == "'Name' is required — cannot clear"
+
+    app._cursor = 2
+    _dispatch(app, Keys.Delete)
+    assert optional.value is None
+    assert app._error is None
+
+    enter_event = _dispatch(app, Keys.ControlM)
+    assert app._pending_edit is optional
+    assert enter_event.exited is True
+
+
+def test_field_editor_edit_field_prompt_variants(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FieldEditorApp([Section("A", [])])
+    bool_fd = FieldDescriptor("flag", "Flag", FieldKind.BOOL, False)
+    choice_fd = FieldDescriptor(
+        "mode", "Mode", FieldKind.CHOICE, "batch", choices=["batch", "queue"]
+    )
+    list_fd = FieldDescriptor("items", "Items", FieldKind.LIST_STR, ["a"])
+    dict_fd = FieldDescriptor("env", "Env", FieldKind.DICT_STR_STR, {"A": "1"})
+    int_fd = FieldDescriptor("count", "Count", FieldKind.INT, 1)
+
+    monkeypatch.setattr(questionary, "confirm", lambda *_, **__: _Prompt(True))
+    app._edit_field(bool_fd)
+    assert bool_fd.value is True
+
+    monkeypatch.setattr(questionary, "select", lambda *_, **__: _Prompt("queue"))
+    app._edit_field(choice_fd)
+    assert choice_fd.value == "queue"
+
+    monkeypatch.setattr(questionary, "text", lambda *_, **__: _Prompt("a, b, , c"))
+    app._edit_field(list_fd)
+    assert list_fd.value == ["a", "b", "c"]
+
+    monkeypatch.setattr(questionary, "text", lambda *_, **__: _Prompt("A=2, B=3"))
+    app._edit_field(dict_fd)
+    assert dict_fd.value == {"A": "2", "B": "3"}
+
+    monkeypatch.setattr(questionary, "text", lambda *_, **__: _Prompt("12"))
+    app._edit_field(int_fd)
+    assert int_fd.value == 12
+
+
+def test_field_editor_invalid_edit_keeps_value_and_sets_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = FieldEditorApp([Section("A", [])])
+    fd = FieldDescriptor("count", "Count", FieldKind.INT, 3)
+
+    monkeypatch.setattr(questionary, "text", lambda *_, **__: _Prompt("bad"))
+    app._edit_field(fd)
+
+    assert fd.value == 3
+    assert app._error is not None
+    assert "Invalid value" in app._error
+
+
+def test_field_editor_rendering_scrolls_cursor_into_view(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fields = [
+        FieldDescriptor(f"field{i}", f"Field {i}", FieldKind.STRING, str(i))
+        for i in range(20)
+    ]
+    app = FieldEditorApp([Section("Many", fields)], title="Scroll")
+    app._cursor = 19
+    monkeypatch.setattr(
+        "gofer.cli.tui_editor.shutil.get_terminal_size",
+        lambda fallback: SimpleNamespace(columns=80, lines=8),
+    )
+
+    rendered = app._get_formatted_text()
+
+    assert app._scroll_offset > 0
+    assert "Field 19" in str(rendered)
+    row = app._render_field_row(fields[19], is_cursor=True)
+    assert "Field 19" in row.plain

@@ -10,7 +10,18 @@ from typer.testing import CliRunner
 from gofer.cli.main import app
 from gofer.core.approvals import ApprovalRequest, ApprovalStore
 from gofer.core.graph import GraphNode
-from gofer.core.operations import DirectoryFanSource, LoopOperation, OperationType
+from gofer.core.operations import (
+    AgentOperation,
+    CommonLlmTaskOperation,
+    DirectoryFanSource,
+    LoopOperation,
+    OperationType,
+)
+from gofer.core.provider_profiles import (
+    ProviderProfile,
+    load_provider_profiles,
+    save_provider_profiles,
+)
 from gofer.core.resources import ResourceLimits
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from gofer.ui.chat import workflow_chat_prompt_path
@@ -82,6 +93,232 @@ def test_workflow_create(tmp_path: Path) -> None:
     assert result.exit_code == 0
     created = list(tmp_path.glob("*.toml"))
     assert len(created) == 1
+
+
+def test_provider_profile_cli_create_list_and_remove(tmp_path: Path) -> None:
+    create_result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "create",
+            "fast",
+            "--subscription",
+            "codex",
+            "--model",
+            "gpt-5-mini",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    list_result = runner.invoke(
+        app,
+        ["provider", "profile", "list", "--data-dir", str(tmp_path)],
+    )
+    rm_result = runner.invoke(
+        app,
+        ["provider", "profile", "rm", "fast", "--yes", "--data-dir", str(tmp_path)],
+    )
+
+    assert create_result.exit_code == 0, create_result.output
+    assert list_result.exit_code == 0, list_result.output
+    assert "fast" in list_result.output
+    assert "gpt-5-mini" in list_result.output
+    assert rm_result.exit_code == 0, rm_result.output
+
+
+def test_provider_profile_cli_create_and_edit_secret_refs(tmp_path: Path) -> None:
+    create_result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "create",
+            "secure",
+            "--subscription",
+            "claude_code",
+            "--env",
+            "PLAIN=value",
+            "--secret-ref",
+            "ANTHROPIC_API_KEY=ANTHROPIC_TOKEN",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    edit_result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "edit",
+            "secure",
+            "--secret-ref",
+            "ANTHROPIC_API_KEY=NEW_TOKEN",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    profiles = load_provider_profiles(tmp_path)
+
+    assert create_result.exit_code == 0, create_result.output
+    assert edit_result.exit_code == 0, edit_result.output
+    assert profiles["secure"].env == {"PLAIN": "value"}
+    assert profiles["secure"].secret_refs == {"ANTHROPIC_API_KEY": "NEW_TOKEN"}
+
+
+def test_runner_cli_register_queue_status_cancel(tmp_path: Path) -> None:
+    workflow = tmp_path / "remote.toml"
+    workflow.write_text(
+        """
+[workflow]
+id = "remote"
+name = "Remote"
+
+[[nodes]]
+id = "start"
+type = "pass"
+message = "ok"
+""",
+        encoding="utf-8",
+    )
+
+    register_result = runner.invoke(
+        app,
+        [
+            "runner",
+            "register",
+            "--id",
+            "runner-1",
+            "--name",
+            "CI",
+            "--label",
+            "ci",
+            "--provider-cli",
+            "codex",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    queue_result = runner.invoke(
+        app,
+        [
+            "runner",
+            "queue",
+            str(workflow),
+            "--label",
+            "ci",
+            "--priority",
+            "5",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    status_result = runner.invoke(
+        app,
+        ["runner", "status", "--data-dir", str(tmp_path)],
+    )
+    run_id = queue_result.output.split()[1]
+    cancel_result = runner.invoke(
+        app,
+        ["runner", "cancel", run_id, "--data-dir", str(tmp_path)],
+    )
+
+    assert register_result.exit_code == 0, register_result.output
+    assert queue_result.exit_code == 0, queue_result.output
+    assert status_result.exit_code == 0, status_result.output
+    assert "remote" in status_result.output
+    assert "queued" in status_result.output
+    assert cancel_result.exit_code == 0, cancel_result.output
+    assert "canceled" in cancel_result.output
+
+
+def test_runner_cli_start_once_executes_queued_workflow(tmp_path: Path) -> None:
+    workflow = tmp_path / "remote.toml"
+    workflow.write_text(
+        """
+[workflow]
+id = "remote"
+name = "Remote"
+
+[[nodes]]
+id = "start"
+type = "pass"
+message = "ok"
+""",
+        encoding="utf-8",
+    )
+
+    queue_result = runner.invoke(
+        app,
+        ["runner", "queue", str(workflow), "--data-dir", str(tmp_path)],
+    )
+    start_result = runner.invoke(
+        app,
+        [
+            "runner",
+            "start",
+            "--id",
+            "runner-1",
+            "--once",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    status_result = runner.invoke(
+        app,
+        ["runner", "status", "--data-dir", str(tmp_path)],
+    )
+
+    assert queue_result.exit_code == 0, queue_result.output
+    assert start_result.exit_code == 0, start_result.output
+    assert "completed" in start_result.output
+    assert status_result.exit_code == 0, status_result.output
+    assert "completed" in status_result.output
+
+
+def test_workflow_validate_uses_data_dir_provider_profiles(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    workflow_dir = tmp_path / "exported"
+    workflow_dir.mkdir()
+    save_provider_profiles(
+        {
+            "fast": ProviderProfile(
+                name="fast",
+                subscription="codex",
+                model="gpt-5-mini",
+            )
+        },
+        data_dir,
+    )
+    workflow = workflow_dir / "portable.toml"
+    workflow.write_text(
+        f"""
+[workflow]
+id = "portable"
+name = "Portable"
+
+[agents.reviewer]
+subscription = "codex"
+profile = "fast"
+working_dir = "{workflow_dir}"
+
+[[nodes]]
+id = "review"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "{workflow_dir}"
+prompt = "Review"
+""",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["workflow", "validate", str(workflow), "--data-dir", str(data_dir)],
+    )
+
+    assert result.exit_code == 0, result.output
 
 
 def test_workflow_add_file_and_folder_nodes(tmp_path: Path) -> None:
@@ -372,6 +609,80 @@ def test_workflow_add_agent_node_supports_memory_option(tmp_path: Path) -> None:
     assert wf.graph._nodes["remember"].operation.memory == "all"
 
 
+def test_workflow_add_agent_nodes_persist_provider_overrides(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Provider Flow", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "add-node",
+            "provider-flow",
+            "--id",
+            "agent-task",
+            "--type",
+            "agent",
+            "--agent-id",
+            "agent-1",
+            "--prompt-path",
+            "prompts/agent-1.md",
+            "--working-dir",
+            ".",
+            "--profile",
+            "fast",
+            "--model",
+            "gpt-5-mini",
+            "--provider-timeout",
+            "45",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "add-node",
+            "provider-flow",
+            "--id",
+            "common-task",
+            "--type",
+            "common_llm_task",
+            "--agent-id",
+            "agent-1",
+            "--working-dir",
+            ".",
+            "--profile",
+            "quality",
+            "--model",
+            "claude-sonnet-4-5",
+            "--provider-timeout",
+            "90",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "provider-flow.toml")
+    agent_op = wf.graph._nodes["agent-task"].operation
+    assert isinstance(agent_op, AgentOperation)
+    assert agent_op.profile == "fast"
+    assert agent_op.model == "gpt-5-mini"
+    assert agent_op.timeout == 45
+
+    common_op = wf.graph._nodes["common-task"].operation
+    assert isinstance(common_op, CommonLlmTaskOperation)
+    assert common_op.profile == "quality"
+    assert common_op.model == "claude-sonnet-4-5"
+    assert common_op.timeout == 90
+
+
 def test_workflow_rename_and_duplicate_commands(tmp_path: Path) -> None:
     result = runner.invoke(
         app, ["workflow", "create", "--name", "Original", "--output", str(tmp_path)]
@@ -656,7 +967,14 @@ def test_workflow_reject_cli_records_decision(tmp_path: Path) -> None:
     assert decided.decision.decided_by == "bob"
 
 
-def test_workflow_approval_cli_resume_writes_node_outputs_sidecar(tmp_path: Path) -> None:
+def test_workflow_approval_cli_resume_writes_node_outputs_sidecar(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_send(_adapter, _notification) -> None:
+        return None
+
+    monkeypatch.setattr("gofer.core.approvals.DesktopNotificationAdapter.send", fake_send)
     workflow_path = tmp_path / "approval-flow.toml"
     workflow_path.write_text(
         """
@@ -860,7 +1178,14 @@ working_dir = "."
     assert payload["totals"]["total_tokens"] > 0
 
 
-def test_workflow_approval_cli_list_resumes_expired_timeout(tmp_path: Path) -> None:
+def test_workflow_approval_cli_list_resumes_expired_timeout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_send(_adapter, _notification) -> None:
+        return None
+
+    monkeypatch.setattr("gofer.core.approvals.DesktopNotificationAdapter.send", fake_send)
     workflow_path = tmp_path / "approval-flow.toml"
     workflow_path.write_text(
         """

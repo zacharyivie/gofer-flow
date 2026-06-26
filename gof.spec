@@ -6,11 +6,13 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 block_cipher = None
 
 datas = []
+datas += collect_data_files("openpyxl")
 datas += collect_data_files("tzdata")
 
 hiddenimports = []
 hiddenimports += collect_submodules("apscheduler")
 hiddenimports += collect_submodules("gofer")
+hiddenimports += collect_submodules("openpyxl")
 hiddenimports += collect_submodules("pydantic")
 hiddenimports += collect_submodules("pydantic_settings")
 hiddenimports += collect_submodules("sqlalchemy")

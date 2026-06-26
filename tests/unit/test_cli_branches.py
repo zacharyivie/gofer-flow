@@ -394,6 +394,24 @@ def test_schedule_start_foreground_uses_runner(
     assert calls == [tmp_path / "sched.db"]
 
 
+def test_schedule_foreground_shutdowns_scheduler(
+    fake_scheduler: type[_FakeScheduler], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(
+        "gofer.cli.commands.schedule.time.sleep",
+        lambda seconds: (_ for _ in ()).throw(KeyboardInterrupt),
+    )
+
+    result = runner.invoke(
+        app, ["schedule", "start", "--foreground", "--db", str(tmp_path / "sched.db")]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert fake_scheduler.started_paths == [tmp_path / "sched.db"]
+    assert fake_scheduler.shutdowns == 1
+    assert "Scheduler stopped" in result.output
+
+
 def test_schedule_background_start_running_and_stale_pid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -867,6 +885,8 @@ def test_workflow_edit_cancel_save_and_validation_failure(
     assert saved.exit_code == 0, saved.output
     assert "Saved" in saved.output
 
+    original_toml = (tmp_path / "simple.toml").read_text(encoding="utf-8")
+
     def fail_validate(self: AgenticWorkflow, *_args: object) -> None:
         raise ValueError("invalid edit")
 
@@ -876,6 +896,7 @@ def test_workflow_edit_cancel_save_and_validation_failure(
     )
     assert failed.exit_code == 1
     assert "Validation failed: invalid edit" in failed.output
+    assert (tmp_path / "simple.toml").read_text(encoding="utf-8") == original_toml
 
 
 def test_workflow_delete_confirmation_behavior(tmp_path: Path) -> None:

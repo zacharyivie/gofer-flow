@@ -59,4 +59,4 @@ def test_validate_surfaces_resource_risk_warnings(tmp_path: Path) -> None:
     assert "local_vectorize scans local files" in messages
     assert "may exceed max_files_scanned=2" in messages
     assert "oldest queued event batches are dropped on overflow" in messages
-    assert "will be capped by global max_watcher_concurrency=4" in messages
+    assert "will be capped by global max_watcher_concurrency=2" in messages

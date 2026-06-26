@@ -328,11 +328,21 @@ def _desktop_notification_diagnostic() -> HealthDiagnostic:
             detail={"binary": "osascript", "path": path},
         )
     if sys.platform == "win32":
+        path = _windows_powershell_path()
+        if path is None:
+            return HealthDiagnostic(
+                id="desktop.notifications",
+                severity="warning",
+                subject="Windows",
+                message="Desktop notifications require PowerShell on Windows.",
+                detail={"binary": "powershell.exe"},
+            )
         return HealthDiagnostic(
             id="desktop.notifications",
-            severity="warning",
+            severity="ok",
             subject="Windows",
-            message="Desktop notifications are not implemented for Windows yet.",
+            message="Desktop notifications are available through PowerShell.",
+            detail={"binary": "powershell.exe", "path": path},
         )
 
     display = os.environ.get("DISPLAY")
@@ -381,6 +391,15 @@ def _desktop_notification_diagnostic() -> HealthDiagnostic:
             "binary": "notify-send",
             "path": path,
         },
+    )
+
+
+def _windows_powershell_path() -> str | None:
+    return (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+        or shutil.which("pwsh.exe")
+        or shutil.which("pwsh")
     )
 
 

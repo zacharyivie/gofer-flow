@@ -297,7 +297,7 @@ async def _terminate_process_tree(process: Any) -> None:
         else:
             process.terminate()
     else:
-        process.terminate()
+        await _terminate_windows_process_tree(process, force=False)
 
     with anyio.move_on_after(2):
         await process.wait()
@@ -316,4 +316,25 @@ async def _terminate_process_tree(process: Any) -> None:
         else:
             process.kill()
     else:
-        process.kill()
+        await _terminate_windows_process_tree(process, force=True)
+
+
+async def _terminate_windows_process_tree(process: Any, *, force: bool) -> None:
+    pid = getattr(process, "pid", None)
+    if pid is None:
+        if force:
+            process.kill()
+        else:
+            process.terminate()
+        return
+
+    command = ["taskkill", "/PID", str(pid), "/T"]
+    if force:
+        command.append("/F")
+    try:
+        await anyio.run_process(command, check=False)
+    except OSError:
+        if force:
+            process.kill()
+        else:
+            process.terminate()

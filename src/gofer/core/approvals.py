@@ -354,6 +354,9 @@ class DesktopNotificationAdapter:
     async def send(self, notification: Notification) -> None:
         if notification.channel != "desktop":
             raise ValueError(f"Unsupported notification channel: {notification.channel}")
+        if sys.platform == "win32":
+            await _send_windows_desktop_notification(notification)
+            return
         if sys.platform == "darwin" and shutil.which("osascript"):
             script = (
                 "display notification "
@@ -370,8 +373,6 @@ class DesktopNotificationAdapter:
             return
         if sys.platform == "darwin":
             raise RuntimeError("Desktop notifications require 'osascript' on macOS.")
-        if sys.platform == "win32":
-            raise RuntimeError("Desktop notifications are not implemented for Windows yet.")
         if not os.environ.get("DISPLAY"):
             raise RuntimeError("Desktop notifications require DISPLAY on Unix desktop sessions.")
         notify_send = shutil.which("notify-send")
@@ -393,6 +394,68 @@ class DesktopNotificationAdapter:
             raise RuntimeError(
                 _notification_failure_message("notify-send", returncode, stdout, stderr)
             )
+
+
+async def _send_windows_desktop_notification(notification: Notification) -> None:
+    powershell = _windows_powershell_path()
+    if powershell is None:
+        raise RuntimeError("Desktop notifications require PowerShell on Windows.")
+    script = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$displayMilliseconds = 5000
+$notifyIcon = New-Object System.Windows.Forms.NotifyIcon
+try {
+    $notifyIcon.Icon = [System.Drawing.SystemIcons]::Information
+    $notifyIcon.Visible = $true
+    $notifyIcon.BalloonTipTitle = $env:GOFER_NOTIFICATION_TITLE
+    $notifyIcon.BalloonTipText = $env:GOFER_NOTIFICATION_BODY
+    if ($env:GOFER_NOTIFICATION_URGENCY -eq 'critical') {
+        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Error
+    } elseif ($env:GOFER_NOTIFICATION_URGENCY -eq 'low') {
+        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+    } else {
+        $notifyIcon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+    }
+    $notifyIcon.ShowBalloonTip($displayMilliseconds)
+    Start-Sleep -Milliseconds $displayMilliseconds
+} finally {
+    $notifyIcon.Dispose()
+}
+""".strip()
+    returncode, stdout, stderr = await run_subprocess(
+        [
+            powershell,
+            "-STA",
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ],
+        env={
+            "GOFER_NOTIFICATION_TITLE": notification.title,
+            "GOFER_NOTIFICATION_BODY": notification.body,
+            "GOFER_NOTIFICATION_URGENCY": notification.urgency,
+        },
+        timeout=8,
+    )
+    if returncode != 0:
+        raise RuntimeError(
+            _notification_failure_message("PowerShell", returncode, stdout, stderr)
+        )
+
+
+def _windows_powershell_path() -> str | None:
+    return (
+        shutil.which("powershell.exe")
+        or shutil.which("powershell")
+        or shutil.which("pwsh.exe")
+        or shutil.which("pwsh")
+    )
 
 
 def _notification_failure_message(

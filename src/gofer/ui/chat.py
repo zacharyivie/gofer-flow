@@ -71,6 +71,7 @@ async def run_workflow_chat(
         prompt=prompt,
         workflow=workflow,
     )
+    extra_paths = _trusted_workflow_paths(workflow, resolved_working_dir)
     command = _build_chat_command(
         provider=provider,
         model=model,
@@ -78,6 +79,7 @@ async def run_workflow_chat(
         binary_path=binary_path,
         data_dir=resolved_data_dir,
         working_dir=resolved_working_dir,
+        extra_paths=extra_paths,
     )
     try:
         returncode, stdout, stderr = await run_subprocess(
@@ -156,6 +158,7 @@ async def stream_workflow_chat(
         prompt=prompt,
         workflow=workflow,
     )
+    extra_paths = _trusted_workflow_paths(workflow, resolved_working_dir)
     command = _build_chat_command(
         provider=provider,
         model=model,
@@ -163,6 +166,7 @@ async def stream_workflow_chat(
         binary_path=binary_path,
         data_dir=resolved_data_dir,
         working_dir=resolved_working_dir,
+        extra_paths=extra_paths,
     )
 
     stdout_chunks: list[str] = []
@@ -387,10 +391,12 @@ def _build_chat_command(
     binary_path: str | None = None,
     data_dir: Path | None = None,
     working_dir: Path | None = None,
+    extra_paths: list[Path] | None = None,
 ) -> list[str]:
     if provider == "codex":
         data_dir = data_dir or get_data_dir()
         working_dir = working_dir or Path.cwd()
+        trusted_paths = _unique_existing_directories([data_dir, *(extra_paths or [])])
         command = [
             binary_path or "codex",
             "exec",
@@ -401,26 +407,77 @@ def _build_chat_command(
             "workspace-write",
             "--cd",
             str(working_dir),
-            "--add-dir",
-            str(data_dir),
         ]
+        for path in trusted_paths:
+            command += ["--add-dir", str(path)]
         if model != "cli-default":
             command += ["--model", model]
         command.append(prompt)
         return command
 
     data_dir = data_dir or get_data_dir()
+    trusted_paths = _unique_existing_directories([data_dir, *(extra_paths or [])])
     command = [
         binary_path or "claude",
         "--print",
-        "--add-dir",
-        str(data_dir),
-        "-p",
-        prompt,
     ]
+    for path in trusted_paths:
+        command += ["--add-dir", str(path)]
+    command += ["-p", prompt]
     if model != "cli-default":
         command += ["--model", model]
     return command
+
+
+def _trusted_workflow_paths(
+    workflow: dict[str, Any] | None,
+    path_base: Path,
+) -> list[Path]:
+    if not isinstance(workflow, dict):
+        return []
+    trusted_paths: list[Path] = []
+    for entry in workflow.get("filesystemAccess") or []:
+        if not isinstance(entry, dict) or not entry.get("path"):
+            continue
+        if entry.get("read", True) is False or entry.get("write", True) is False:
+            continue
+        path = Path(str(entry["path"])).expanduser()
+        if not path.is_absolute():
+            path = path_base / path
+        trusted_paths.append(path)
+    return trusted_paths
+
+
+def _unique_existing_directories(paths: list[Path]) -> list[Path]:
+    unique_paths: list[Path] = []
+    seen: set[Path] = set()
+    for raw_path in paths:
+        if _looks_like_windows_absolute_path(raw_path):
+            resolved = Path(str(raw_path))
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            unique_paths.append(resolved)
+            continue
+        path = raw_path.expanduser()
+        if path.exists() and path.is_file():
+            path = path.parent
+        elif not path.exists() and path.suffix:
+            path = path.parent
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        unique_paths.append(resolved)
+    return unique_paths
+
+
+def _looks_like_windows_absolute_path(path: Path) -> bool:
+    value = str(path)
+    return len(value) >= 3 and value[1:3] in {":\\", ":/"}
 
 
 def _prepare_prompt_for_cli(

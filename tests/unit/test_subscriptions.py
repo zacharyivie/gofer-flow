@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -14,7 +15,7 @@ def test_claude_code_command_basic(monkeypatch) -> None:
     monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     sub = ClaudeCodeSubscription()
     cmd = sub._build_command("hello", [], [])
-    assert cmd[:5] == ["claude", "--print", "--output-format", "json", "-p"]
+    assert cmd[:5] == ["claude", "--print", "--output-format", "stream-json", "-p"]
     assert "hello" in cmd
 
 
@@ -81,7 +82,7 @@ def test_claude_code_command_adds_extra_sandbox_dirs(
 
     cmd = sub._build_command("hi", [], [], [extra_dir])
 
-    assert cmd[:5] == ["claude", "--print", "--output-format", "json", "--add-dir"]
+    assert cmd[:5] == ["claude", "--print", "--output-format", "stream-json", "--add-dir"]
     assert cmd[5] == str(extra_dir)
     assert cmd[6:8] == ["-p", "hi"]
 
@@ -127,6 +128,111 @@ async def test_subscription_execute_splits_thoughts_from_final_message(
     assert result.thoughts == ["thinking\n", "final answer\n"]
     assert result.message == "final answer\n"
     assert result.output == "final answer\n"
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_ignores_prompt_echo_when_extracting_final_message(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Return FIX REQUIRED or NO FIX NEEDED.",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n",
+            "returncode": None,
+        }
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "NO FIX NEEDED",
+                            }
+                        ],
+                    },
+                }
+            )
+            + "\n",
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(base, "stream_subprocess", fake_stream_subprocess)
+
+    result = await CodexSubscription().execute(
+        prompt="Return FIX REQUIRED or NO FIX NEEDED.",
+        working_dir=tmp_path,
+        tools=[],
+        mcp_servers=[],
+        env={},
+    )
+
+    assert result.message == "NO FIX NEEDED"
+    assert result.output == "NO FIX NEEDED"
+    assert "FIX REQUIRED" not in result.output
+
+
+@pytest.mark.asyncio
+async def test_codex_execute_extracts_last_transcript_codex_block(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": (
+                "user\n"
+                "Return FIX REQUIRED or NO FIX NEEDED.\n"
+                "codex\n"
+                "I am reviewing the workflow.\n"
+                "exec\n"
+                "some tool output\n"
+                "codex\n"
+                "NO FIX NEEDED\n"
+                "tokens used\n"
+                "123\n"
+            ),
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(base, "stream_subprocess", fake_stream_subprocess)
+
+    result = await CodexSubscription().execute(
+        prompt="Return FIX REQUIRED or NO FIX NEEDED.",
+        working_dir=tmp_path,
+        tools=[],
+        mcp_servers=[],
+        env={},
+    )
+
+    assert result.message == "NO FIX NEEDED"
+    assert result.output == "NO FIX NEEDED"
+    assert "FIX REQUIRED" not in result.output
 
 
 @pytest.mark.asyncio
@@ -203,6 +309,90 @@ async def test_subscription_execute_extracts_nested_provider_usage_metadata(
         "model": "gpt-5-codex",
         "source": "provider_metadata",
     }
+
+
+@pytest.mark.asyncio
+async def test_subscription_execute_streams_structured_agent_events(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    streamed: list[str] = []
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": (
+                '{"type":"item.completed",'
+                '"item":{"type":"agent_message","text":"hello live"}}\n'
+            ),
+            "returncode": None,
+        }
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": '{"type":"node-4","data":{"message":"final from data"}}\n',
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(base, "stream_subprocess", fake_stream_subprocess)
+
+    result = await CodexSubscription().execute(
+        prompt="hello",
+        working_dir=tmp_path,
+        tools=[],
+        mcp_servers=[],
+        env={},
+        on_thought=streamed.append,
+    )
+
+    assert streamed == ["hello live", "final from data"]
+    assert result.thoughts == streamed
+    assert result.message == "final from data"
+    assert result.output == "final from data"
+
+
+@pytest.mark.asyncio
+async def test_subscription_execute_streams_claude_message_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    streamed: list[str] = []
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": (
+                '{"type":"assistant","message":{"content":['
+                '{"type":"text","text":"first live"},'
+                '{"type":"tool_use","name":"Read"},'
+                '{"type":"text","text":"second live"}]}}\n'
+            ),
+            "returncode": None,
+        }
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": '{"type":"result","result":"final answer"}\n',
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(base, "stream_subprocess", fake_stream_subprocess)
+
+    result = await ClaudeCodeSubscription().execute(
+        prompt="hello",
+        working_dir=tmp_path,
+        tools=[],
+        mcp_servers=[],
+        env={},
+        on_thought=streamed.append,
+    )
+
+    assert streamed == ["first live\nsecond live"]
+    assert result.thoughts == streamed
+    assert result.message == "final answer"
+    assert result.output == "final answer"
 
 
 @pytest.mark.asyncio

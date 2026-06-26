@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -67,6 +68,70 @@ def test_workflow_watcher_detects_directory_glob_changes(tmp_path: Path) -> None
     assert triggered[0][0] == "watcher"
     assert triggered[0][1][0].kind == "created"
     assert triggered[0][1][0].path == str(watch_dir / "input.txt")
+
+
+def test_workflow_watcher_reports_deleted_event_payload(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    watched_file = watch_dir / "input.txt"
+    watched_file.write_text("old")
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(path=watch_dir, glob="*.txt"),
+        )
+    )
+    workflow.to_file(workflow_path)
+    triggered: list[list[WatchEvent]] = []
+
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watcher.add_workflow(workflow, workflow_path)
+    watcher._trigger = lambda watched, events: triggered.append(events)  # type: ignore[method-assign]
+
+    watched_file.unlink()
+    watcher.poll_once()
+
+    assert len(triggered) == 1
+    event = triggered[0][0]
+    assert event.kind == "deleted"
+    assert event.to_context() == {
+        "kind": "deleted",
+        "path": str(watched_file),
+        "name": "input.txt",
+        "directory": str(watch_dir),
+        "size": None,
+        "mtime_ns": None,
+    }
+
+
+def test_workflow_watcher_respects_recursive_glob_filtering(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "inputs"
+    nested_dir = watch_dir / "nested"
+    nested_dir.mkdir(parents=True)
+    root_file = watch_dir / "root.txt"
+    nested_file = nested_dir / "child.txt"
+    ignored_file = nested_dir / "child.md"
+    root_file.write_text("root")
+    nested_file.write_text("nested")
+    ignored_file.write_text("ignored")
+    workflow_path = tmp_path / "watcher.toml"
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+
+    non_recursive = watcher._snapshot(  # noqa: SLF001
+        workflow_path,
+        WatchConfig(path=watch_dir, glob="*.txt", recursive=False),
+        DEFAULT_RESOURCE_LIMITS,
+    )
+    recursive = watcher._snapshot(  # noqa: SLF001
+        workflow_path,
+        WatchConfig(path=watch_dir, glob="*.txt", recursive=True),
+        DEFAULT_RESOURCE_LIMITS,
+    )
+
+    assert set(non_recursive) == {str(root_file)}
+    assert set(recursive) == {str(root_file), str(nested_file)}
 
 
 def test_workflow_watcher_resync_preserves_snapshot_when_config_unchanged(
@@ -237,6 +302,125 @@ working_dir = "."
     assert payload["nodeOutputs"]["ask"]["data"]["prompt"] == "***"
 
 
+def test_watched_execution_passes_trigger_context_to_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(path=watch_dir, glob="*.txt", mode="fanout"),
+        )
+    )
+    workflow.to_file(workflow_path)
+    captured_contexts: list[dict[str, object]] = []
+
+    class FakeExecutor:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def with_trigger_context(self, context: dict[str, object]) -> FakeExecutor:
+            captured_contexts.append(context)
+            return self
+
+        async def run(self) -> SimpleNamespace:
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(watcher_module, "WorkflowExecutor", FakeExecutor)
+    monkeypatch.setattr(watcher_module, "write_run_node_outputs_payload", lambda *args: None)
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watched = WatchedWorkflow(
+        workflow_id="watcher",
+        workflow_path=workflow_path,
+        config=workflow.config.watch or WatchConfig(path=watch_dir),
+    )
+    events = [
+        WatchEvent(
+            kind="created",
+            path=str(watch_dir / "a.txt"),
+            name="a.txt",
+            directory=str(watch_dir),
+            size=1,
+            mtime_ns=10,
+        ),
+        WatchEvent(
+            kind="modified",
+            path=str(watch_dir / "b.txt"),
+            name="b.txt",
+            directory=str(watch_dir),
+            size=2,
+            mtime_ns=20,
+        ),
+    ]
+
+    watcher._run_workflow(watched, events)
+
+    assert len(captured_contexts) == 1
+    context = captured_contexts[0]
+    expected_events = [event.to_context() for event in events]
+    assert context["type"] == "file_watch"
+    assert context["mode"] == "fanout"
+    assert context["watch_path"] == str(watch_dir)
+    assert context["glob"] == "*.txt"
+    assert context["events"] == expected_events
+    assert json.loads(str(context["events_json"])) == expected_events
+    assert "event" not in context
+    assert "event_json" not in context
+
+
+def test_watched_execution_adds_single_event_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(path=watch_dir),
+        )
+    )
+    workflow.to_file(workflow_path)
+    captured_contexts: list[dict[str, object]] = []
+
+    class FakeExecutor:
+        def __init__(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+            pass
+
+        def with_trigger_context(self, context: dict[str, object]) -> FakeExecutor:
+            captured_contexts.append(context)
+            return self
+
+        async def run(self) -> SimpleNamespace:
+            return SimpleNamespace(success=True)
+
+    monkeypatch.setattr(watcher_module, "WorkflowExecutor", FakeExecutor)
+    monkeypatch.setattr(watcher_module, "write_run_node_outputs_payload", lambda *args: None)
+    event = WatchEvent(
+        kind="deleted",
+        path=str(watch_dir / "a.txt"),
+        name="a.txt",
+        directory=str(watch_dir),
+    )
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watched = WatchedWorkflow(
+        workflow_id="watcher",
+        workflow_path=workflow_path,
+        config=workflow.config.watch or WatchConfig(path=watch_dir),
+    )
+
+    watcher._run_workflow(watched, [event])
+
+    assert captured_contexts[0]["event"] == event.to_context()
+    assert json.loads(str(captured_contexts[0]["event_json"])) == event.to_context()
+
+
 def test_workflow_watcher_batches_multiple_files_added_at_once(tmp_path: Path) -> None:
     watch_dir = tmp_path / "inputs"
     watch_dir.mkdir()
@@ -262,6 +446,56 @@ def test_workflow_watcher_batches_multiple_files_added_at_once(tmp_path: Path) -
     assert len(triggered) == 1
     assert [event.name for event in triggered[0]] == ["a.txt", "b.txt"]
     assert all(event.kind == "created" for event in triggered[0])
+
+
+def test_workflow_watcher_debounces_and_releases_queued_events(tmp_path: Path) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(
+                path=watch_dir,
+                glob="*.txt",
+                mode="batch",
+                debounce_seconds=60,
+            ),
+        )
+    )
+    workflow.to_file(workflow_path)
+    runs: list[list[str]] = []
+
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watcher.add_workflow(workflow, workflow_path)
+
+    def record_run(watched: WatchedWorkflow, events: list[WatchEvent]) -> None:
+        runs.append([event.name for event in events])
+        with watcher._lock:  # noqa: SLF001
+            watched.running_count = max(0, watched.running_count - 1)
+            watcher._global_running_count = max(0, watcher._global_running_count - 1)  # noqa: SLF001
+
+    watcher._run_workflow = record_run  # type: ignore[method-assign]
+
+    (watch_dir / "a.txt").write_text("a")
+    watcher.poll_once()
+    deadline = time.monotonic() + 1
+    while len(runs) < 1 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    (watch_dir / "b.txt").write_text("b")
+    watcher.poll_once()
+    time.sleep(0.05)
+    assert runs == [["a.txt"]]
+    assert len(watcher._workflows["watcher"].queued_events) == 1
+
+    watcher.poll_once()
+    deadline = time.monotonic() + 1
+    while len(runs) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert runs == [["a.txt"], ["b.txt"]]
 
 
 def test_workflow_watcher_queue_mode_enqueues_one_run_per_event(tmp_path: Path) -> None:
@@ -361,6 +595,40 @@ def test_workflow_watcher_uses_workflow_queue_limit_override(tmp_path: Path) -> 
     assert len(watched.queued_events) == 2
     assert watched.dropped_event_batches == 2
     assert [batch[0].name for batch in watched.queued_events] == ["2.txt", "3.txt"]
+
+
+def test_workflow_watcher_scan_errors_do_not_drop_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    watched_file = watch_dir / "input.txt"
+    watched_file.write_text("old")
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(path=watch_dir),
+        )
+    )
+    workflow.to_file(workflow_path)
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watcher.add_workflow(workflow, workflow_path)
+    watched = watcher._workflows["watcher"]
+    original_snapshot = dict(watched.snapshot)
+
+    def fail_snapshot(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise OSError("scan failed")
+
+    monkeypatch.setattr(watcher, "_snapshot", fail_snapshot)
+
+    watcher.poll_once()
+
+    assert watched.snapshot == original_snapshot
+    assert "Could not scan watcher for 'watcher': scan failed" in caplog.text
 
 
 def test_workflow_watcher_scan_stops_at_file_limit(
@@ -554,3 +822,84 @@ def test_workflow_watcher_global_concurrency_ignores_workflow_raise(
     assert workflows[1].running_count == 0
     assert len(workflows[1].queued_events) == 1
     release.set()
+
+
+def test_watched_execution_failure_cleans_up_and_allows_queued_work(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    watch_dir = tmp_path / "inputs"
+    watch_dir.mkdir()
+    workflow_path = tmp_path / "watcher.toml"
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="watcher",
+            name="Watcher",
+            watch=WatchConfig(path=watch_dir),
+        )
+    )
+    workflow.to_file(workflow_path)
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+    watched = WatchedWorkflow(
+        workflow_id="watcher",
+        workflow_path=workflow_path,
+        config=workflow.config.watch or WatchConfig(path=watch_dir),
+        running_count=1,
+        queued_events=[
+            [
+                WatchEvent(
+                    kind="created",
+                    path=str(watch_dir / "queued.txt"),
+                    name="queued.txt",
+                    directory=str(watch_dir),
+                )
+            ]
+        ],
+    )
+    watcher._workflows["watcher"] = watched  # noqa: SLF001
+    watcher._global_running_count = 1  # noqa: SLF001
+    start_calls: list[str] = []
+    monkeypatch.setattr(
+        watcher_module.AgenticWorkflow,
+        "from_file",
+        staticmethod(lambda path: (_ for _ in ()).throw(ValueError("load failed"))),
+    )
+    monkeypatch.setattr(
+        watcher,
+        "_start_queued_runs",
+        lambda queued: start_calls.append(queued.workflow_id),
+    )
+
+    watcher._run_workflow(
+        watched,
+        [
+            WatchEvent(
+                kind="created",
+                path=str(watch_dir / "failed.txt"),
+                name="failed.txt",
+                directory=str(watch_dir),
+            )
+        ],
+    )
+
+    assert watched.running_count == 0
+    assert watcher._global_running_count == 0  # noqa: SLF001
+    assert start_calls == ["watcher"]
+
+
+def test_workflow_watcher_start_shutdown_and_is_running() -> None:
+    watcher = WorkflowWatcher(poll_interval_seconds=0.01)
+
+    watcher.start()
+    deadline = time.monotonic() + 1
+    while not watcher.is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert watcher.is_running() is True
+
+    watcher.start()
+    watcher.shutdown()
+
+    deadline = time.monotonic() + 1
+    while watcher.is_running() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert watcher.is_running() is False

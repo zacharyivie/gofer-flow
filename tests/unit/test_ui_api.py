@@ -9,7 +9,9 @@ import pytest
 
 from gofer.core.approvals import ApprovalRequest, ApprovalStore
 from gofer.core.executor import NodeOutput
+from gofer.core.operations import OperationType
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits, byte_len
+from gofer.core.runner import RunnerQueueStore
 from gofer.ui import api as api_module
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
@@ -17,6 +19,7 @@ from gofer.ui.api import (
     WorkflowLogError,
     WorkflowRunError,
     WorkflowUpdateError,
+    cancel_queued_run_payload,
     create_workflow_payload,
     decide_workflow_approval_payload,
     delete_workflow_chat_payload,
@@ -27,9 +30,15 @@ from gofer.ui.api import (
     list_workflow_approvals_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
+    prune_workflow_run_logs_payload,
+    queue_workflow_run_payload,
     rename_workflow_payload,
+    resume_workflow_payload,
+    retention_settings_payload,
     run_workflow_payload,
+    runner_queue_payload,
     stop_workflow_run_payload,
+    update_retention_settings_payload,
     update_workflow_payload,
     workflow_plan_payload,
     workflow_run_events_payload,
@@ -88,6 +97,45 @@ condition = "on_success"
             "outputPattern": None,
         }
     ]
+
+
+def test_runner_queue_payload_round_trip(tmp_path: Path) -> None:
+    (tmp_path / "remote.toml").write_text(
+        """
+[workflow]
+id = "remote"
+name = "Remote"
+
+[[nodes]]
+id = "start"
+type = "pass"
+message = "ok"
+""".strip(),
+        encoding="utf-8",
+    )
+    RunnerQueueStore(tmp_path).register_runner(
+        "runner-1",
+        "CI",
+        ["ci"],
+        {"provider_clis": []},
+    )
+
+    queued = queue_workflow_run_payload(
+        "remote",
+        tmp_path,
+        priority=3,
+        trigger="ui",
+        target_labels=["ci"],
+    )
+    listed = runner_queue_payload(tmp_path)
+    canceled = cancel_queued_run_payload(queued["run"]["id"], tmp_path)
+
+    assert queued["run"]["workflowId"] == "remote"
+    assert queued["run"]["targetLabels"] == ["ci"]
+    assert listed["executionModes"] == ["local", "remote"]
+    assert listed["runners"][0]["id"] == "runner-1"
+    assert listed["runs"][0]["id"] == queued["run"]["id"]
+    assert canceled["run"]["status"] == "canceled"
 
 
 def test_list_workflow_payloads_serializes_http_request_node(tmp_path: Path) -> None:
@@ -876,6 +924,52 @@ def test_run_workflow_payload_writes_node_output_to_log(tmp_path: Path) -> None:
     assert "hello - node output:" in text
 
 
+def test_resume_workflow_payload_resumes_existing_run(tmp_path: Path) -> None:
+    marker = tmp_path / "marker"
+    calls = tmp_path / "calls.txt"
+    workflow = create_workflow_payload("Resume Runnable", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "first",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": f"echo first >> {calls}; echo first",
+            },
+            "settings": {},
+        },
+        {
+            "id": "second",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": (
+                    f"echo second >> {calls}; "
+                    f"if [ ! -f {marker} ]; then touch {marker}; exit 1; fi; "
+                    "echo second-ok"
+                ),
+            },
+            "settings": {},
+        },
+    ]
+    workflow["edges"] = [{"from": "first", "to": "second"}]
+    update_workflow_payload("resume-runnable", workflow, tmp_path)
+
+    first = anyio.run(run_workflow_payload, "resume-runnable", tmp_path, False)
+
+    async def run_resume() -> dict[str, object]:
+        return await resume_workflow_payload(
+            "resume-runnable",
+            tmp_path,
+            run_id=Path(str(first["logPath"])).name,
+        )
+
+    resumed = anyio.run(run_resume)
+
+    assert resumed["success"] is True
+    assert calls.read_text(encoding="utf-8").splitlines() == ["first", "second", "second"]
+
+
 def test_workflow_log_payload_includes_structured_run_events(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Timeline Runnable", tmp_path)
     workflow["nodes"] = [
@@ -970,6 +1064,62 @@ def test_http_node_output_payload_uses_masked_response_preview() -> None:
     assert payload["api"]["data"]["json"] == {"access_token": "***"}
     assert payload["api"]["data"]["selected"] == {"token": "***"}
     assert "real-token" not in json.dumps(payload)
+
+
+def test_agent_node_output_payload_preserves_full_data_message() -> None:
+    final_message = "final-" + ("m" * 200)
+    node_output = NodeOutput(
+        node_id="node-4",
+        success=True,
+        output=final_message,
+        exit_code=0,
+        duration_seconds=0.1,
+        type=str(OperationType.AGENT),
+        data={
+            "message": final_message,
+            "thoughts": ["thought-" + ("t" * 200)],
+        },
+    )
+
+    payload, truncated = api_module._node_outputs_payload(
+        {"node-4": node_output},
+        ResourceLimits(
+            max_api_log_response_bytes=2_000,
+            max_log_bytes_per_node=80,
+        ),
+    )
+
+    assert truncated is True
+    assert payload["node-4"]["data"]["message"] == final_message
+    assert "node-4 data.message truncated" not in payload["node-4"]["data"]["message"]
+
+
+def test_agent_node_output_payload_keeps_data_message_when_data_exceeds_budget() -> None:
+    final_message = "final-" + ("m" * 500)
+    node_output = NodeOutput(
+        node_id="node-4",
+        success=True,
+        output=final_message,
+        exit_code=0,
+        duration_seconds=0.1,
+        type=str(OperationType.AGENT),
+        data={
+            "message": final_message,
+            "prompt": "prompt-" + ("p" * 500),
+            "thoughts": ["thought-" + ("t" * 500)],
+        },
+    )
+
+    payload, truncated = api_module._node_outputs_payload(
+        {"node-4": node_output},
+        ResourceLimits(
+            max_api_log_response_bytes=180,
+            max_log_bytes_per_node=80,
+        ),
+    )
+
+    assert truncated is True
+    assert payload["node-4"]["data"] == {"message": final_message}
 
 
 def test_run_workflow_payload_bounds_aggregate_node_output_text(tmp_path: Path) -> None:
@@ -1274,6 +1424,60 @@ def test_list_workflow_run_logs_payload_returns_runs_newest_first(tmp_path: Path
     assert payload["runs"][1]["status"] == "success"
 
 
+def test_list_workflow_run_logs_payload_paginates_and_filters(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    for index in range(5):
+        status_line = (
+            "INFO - history-flow completed successfully"
+            if index % 2 == 0
+            else "ERROR - history-flow failed due to bad"
+        )
+        run = log_dir / f"2026-06-13T1{index}-00-00-0400.log"
+        run.write_text(
+            f"2026-06-13T1{index}:00:00-04:00 - history-flow started successfully\n"
+            f"2026-06-13T1{index}:00:01-04:00 - {status_line}\n",
+            encoding="utf-8",
+        )
+
+    payload = list_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        offset=1,
+        limit=2,
+        status="success",
+    )
+
+    assert payload["pagination"] == {"offset": 1, "limit": 2, "total": 3}
+    assert len(payload["runs"]) == 2
+    assert all(run["status"] == "success" for run in payload["runs"])
+
+
+def test_list_workflow_run_logs_payload_filters_dates_with_timezone(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    old = log_dir / "2026-06-13T10-00-00-0400.log"
+    old.write_text(
+        "2026-06-13T10:00:00-04:00 - history-flow started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    newer = log_dir / "2026-06-13T12-00-00-0400.log"
+    newer.write_text(
+        "2026-06-13T12:00:00-04:00 - history-flow started successfully\n"
+        "2026-06-13T12:00:01-04:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+
+    payload = list_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        started_after=datetime(2026, 6, 13, 15, 0, tzinfo=UTC),
+    )
+
+    assert [run["id"] for run in payload["runs"]] == [newer.name]
+
+
 @pytest.mark.parametrize("workflow_id", ["../history-flow", "history/flow", "History-Flow"])
 def test_list_workflow_run_logs_payload_rejects_unsafe_workflow_ids(
     tmp_path: Path,
@@ -1319,6 +1523,277 @@ def test_workflow_run_log_payload_reads_specific_run(tmp_path: Path) -> None:
     assert payload["runId"] == run.name
     assert payload["status"] == "success"
     assert "custom output" in payload["logText"]
+
+
+def test_workflow_run_log_payload_reads_byte_range(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text("0123456789", encoding="utf-8")
+
+    payload = workflow_run_log_payload(
+        "history-flow",
+        run.name,
+        tmp_path,
+        offset=3,
+        limit=4,
+        include_details=False,
+    )
+
+    assert payload["logText"] == "3456"
+    assert payload["logStart"] == 3
+    assert payload["logEnd"] == 7
+    assert payload["logSize"] == 10
+    assert payload["hasMoreBefore"] is True
+    assert payload["hasMoreAfter"] is True
+
+
+def test_workflow_run_log_payload_uses_bounded_status_without_details(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text("running\n", encoding="utf-8")
+
+    def fail_unbounded_status(path: Path) -> str:
+        raise AssertionError(f"unbounded status read for {path.name}")
+
+    monkeypatch.setattr(api_module, "_log_status", fail_unbounded_status)
+
+    payload = workflow_run_log_payload(
+        "history-flow",
+        run.name,
+        tmp_path,
+        tail_bytes=4,
+        include_details=False,
+    )
+
+    assert payload["logText"] == "ing\n"
+    assert payload["status"] == "running"
+
+
+def test_list_workflow_run_logs_payload_reads_trigger_from_bounded_head(
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text(
+        "2026-06-13T10:00:00-04:00 - INFO - trigger=schedule=nightly\n"
+        + ("x" * 200_000),
+        encoding="utf-8",
+    )
+
+    payload = list_workflow_run_logs_payload("history-flow", tmp_path)
+
+    assert payload["runs"][0]["triggerType"] == "schedule"
+    assert payload["runs"][0]["logSizeBytes"] > 64 * 1024
+
+
+def test_list_workflow_run_logs_payload_summarizes_only_requested_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    for index in range(10):
+        run = log_dir / f"2026-06-13T10-00-{index:02d}-0400.log"
+        run.write_text(
+            f"2026-06-13T10:00:{index:02d}-04:00 - history-flow started successfully\n",
+            encoding="utf-8",
+        )
+
+    calls: list[str] = []
+
+    def fake_log_status(path: Path) -> str:
+        calls.append(path.name)
+        return "running"
+
+    monkeypatch.setattr(api_module, "_log_status", fake_log_status)
+
+    payload = list_workflow_run_logs_payload("history-flow", tmp_path, limit=3)
+
+    assert len(payload["runs"]) == 3
+    assert len(calls) == 3
+
+
+def test_list_workflow_run_logs_payload_uses_summary_sidecar_for_cheap_page(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text(
+        "2026-06-13T10:00:00-04:00 - history-flow started successfully\n",
+        encoding="utf-8",
+    )
+    run.with_suffix(".summary.json").write_text(
+        json.dumps(
+            {
+                "startedAt": "2026-06-13T10:00:00-04:00",
+                "finishedAt": "2026-06-13T10:00:01-04:00",
+                "durationSeconds": 1,
+                "status": "success",
+                "success": True,
+                "triggerType": "manual",
+                "nodeCount": 2,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_events_read(path: Path) -> dict[str, object]:
+        raise AssertionError(f"events read for cheap summary {path.name}")
+
+    def fail_unbounded_status(path: Path) -> str:
+        raise AssertionError(f"unbounded status read for cheap summary {path.name}")
+
+    monkeypatch.setattr(api_module, "_read_run_events_document", fail_events_read)
+    monkeypatch.setattr(api_module, "_log_status", fail_unbounded_status)
+
+    payload = list_workflow_run_logs_payload("history-flow", tmp_path, status="success")
+
+    assert payload["runs"][0]["id"] == run.name
+    assert payload["runs"][0]["nodeCount"] == 2
+    assert payload["runs"][0]["status"] == "success"
+
+
+def test_retention_settings_persist_and_prune_uses_saved_defaults(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    old = log_dir / "2020-01-01T10-00-00-0000.log"
+    old.write_text(
+        "2020-01-01T10:00:00+00:00 - history-flow started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+
+    saved = update_retention_settings_payload(
+        tmp_path,
+        workflow_id="history-flow",
+        settings={"keepDays": 1, "keepFailedDays": 2, "keepLast": 0},
+    )
+    preview = prune_workflow_run_logs_payload("history-flow", tmp_path, dry_run=True)
+
+    assert saved["settings"] == {"keepDays": 1, "keepFailedDays": 2, "keepLast": 0}
+    assert retention_settings_payload(tmp_path, "history-flow")["settings"] == saved["settings"]
+    assert [run["id"] for run in preview["runs"]] == [old.name]
+
+
+def test_run_workflow_payload_applies_saved_retention_policy(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Auto Retention", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo hello",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("auto-retention", workflow, tmp_path)
+    log_dir = tmp_path / "logs" / "auto-retention"
+    log_dir.mkdir(parents=True)
+    old = log_dir / "2020-01-01T10-00-00-0000.log"
+    old.write_text(
+        "2020-01-01T10:00:00+00:00 - auto-retention started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - auto-retention completed successfully\n",
+        encoding="utf-8",
+    )
+    update_retention_settings_payload(
+        tmp_path,
+        workflow_id="auto-retention",
+        settings={"keepDays": 1, "keepFailedDays": 2, "keepLast": 1},
+    )
+
+    result = anyio.run(run_workflow_payload, "auto-retention", tmp_path, False)
+
+    assert result["success"] is True
+    assert not old.exists()
+    assert result["logPath"]
+    assert (tmp_path / result["logPath"]).exists()
+
+
+def test_prune_workflow_run_logs_payload_previews_and_preserves_running(
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    old = log_dir / "2020-01-01T10-00-00-0000.log"
+    old.write_text(
+        "2020-01-01T10:00:00+00:00 - history-flow started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    old.with_suffix(".events.json").write_text("{}", encoding="utf-8")
+    running = log_dir / "2020-01-02T10-00-00-0000.log"
+    running.write_text(
+        "2020-01-02T10:00:00+00:00 - history-flow started successfully\n",
+        encoding="utf-8",
+    )
+
+    preview = prune_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        keep_days=1,
+        dry_run=True,
+    )
+    applied = prune_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        keep_days=1,
+        dry_run=False,
+    )
+
+    assert [run["id"] for run in preview["runs"]] == [old.name]
+    assert old.name in applied["deleted"]
+    assert not old.exists()
+    assert not old.with_suffix(".events.json").exists()
+    assert running.exists()
+
+
+def test_prune_workflow_run_logs_payload_preserves_active_registry_run(
+    tmp_path: Path,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    misleading_active = log_dir / "2020-01-01T10-00-00-0000.log"
+    misleading_active.write_text(
+        "2020-01-01T10:00:00+00:00 - history-flow started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    newer_completed = log_dir / "2020-01-02T10-00-00-0000.log"
+    newer_completed.write_text(
+        "2020-01-02T10:00:00+00:00 - history-flow started successfully\n"
+        "2020-01-02T10:00:01+00:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    key = api_module._run_key(tmp_path, "history-flow")
+    event = api_module.threading.Event()
+    with api_module._active_run_lock:
+        api_module._active_run_stop_events[key] = {event}
+        api_module._active_run_log_paths[key] = {event: misleading_active}
+    try:
+        applied = prune_workflow_run_logs_payload(
+            "history-flow",
+            tmp_path,
+            keep_days=1,
+            dry_run=False,
+        )
+    finally:
+        with api_module._active_run_lock:
+            api_module._active_run_stop_events.pop(key, None)
+            api_module._active_run_log_paths.pop(key, None)
+
+    assert applied["deleted"] == [newer_completed.name]
+    assert misleading_active.exists()
+    assert not newer_completed.exists()
 
 
 def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:
@@ -1473,8 +1948,13 @@ def test_workflow_approval_payload_rejects_already_decided_request(
 
 
 def test_workflow_approval_payload_resumes_checkpointed_request(
+    monkeypatch,
     tmp_path: Path,
 ) -> None:
+    async def fake_send(_adapter, _notification) -> None:
+        return None
+
+    monkeypatch.setattr("gofer.core.approvals.DesktopNotificationAdapter.send", fake_send)
     workflow_path = tmp_path / "approval-flow.toml"
     workflow_path.write_text(
         """
@@ -1568,8 +2048,13 @@ condition = "on_success"
 
 
 def test_workflow_approval_payload_list_resumes_expired_timeout(
+    monkeypatch,
     tmp_path: Path,
 ) -> None:
+    async def fake_send(_adapter, _notification) -> None:
+        return None
+
+    monkeypatch.setattr("gofer.core.approvals.DesktopNotificationAdapter.send", fake_send)
     workflow_path = tmp_path / "approval-flow.toml"
     workflow_path.write_text(
         """

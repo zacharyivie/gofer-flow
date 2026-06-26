@@ -107,7 +107,7 @@ updateTextFile("packaging/arch/PKGBUILD", (text) => {
   if (appImageSha256) {
     next = replaceOnce(
       next,
-      /(sha256sums_x86_64=\(\n\s+")[a-fA-F0-9]{64}("\n\))/,
+      /(sha256sums_x86_64=\(\s*['"])[a-fA-F0-9]{64}(['"]\s*\))/,
       `$1${appImageSha256.toLowerCase()}$2`,
       "PKGBUILD AppImage checksum",
     );

@@ -7,6 +7,7 @@ import threading
 import anyio
 import pytest
 
+import gofer.utils.process as process_module
 from gofer.utils.process import build_subprocess_env, run_subprocess, stream_subprocess
 
 
@@ -193,6 +194,75 @@ async def test_run_subprocess_returns_timeout_stderr() -> None:
     assert returncode == 124
     assert stdout == "ready\n"
     assert "Process timed out after" in stderr
+
+
+@pytest.mark.skipif(os.name == "nt", reason="process groups are POSIX-specific")
+@pytest.mark.asyncio
+async def test_run_subprocess_timeout_terminates_process_group(tmp_path) -> None:
+    marker = tmp_path / "timeout-child-survived.txt"
+    child_code = (
+        "import pathlib, time\n"
+        "time.sleep(1)\n"
+        f"pathlib.Path({str(marker)!r}).write_text('alive')\n"
+    )
+    parent_code = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+        "print('ready', flush=True)\n"
+        "time.sleep(10)\n"
+    )
+
+    returncode, stdout, stderr = await run_subprocess(
+        [sys.executable, "-u", "-c", parent_code],
+        timeout=0.2,
+    )
+
+    await anyio.sleep(1.2)
+
+    assert returncode == 124
+    assert stdout == "ready\n"
+    assert "Process timed out after" in stderr
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_terminate_process_tree_uses_taskkill_for_windows_tree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    class FakeProcess:
+        pid = 123
+        returncode = None
+        terminated = False
+        killed = False
+
+        async def wait(self) -> None:
+            return
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+        def kill(self) -> None:
+            self.killed = True
+
+    async def fake_run_process(command: list[str], *, check: bool) -> object:
+        commands.append(command)
+        assert check is False
+        return object()
+
+    fake_process = FakeProcess()
+    monkeypatch.setattr(process_module.os, "name", "nt")
+    monkeypatch.setattr(process_module.anyio, "run_process", fake_run_process)
+
+    await process_module._terminate_process_tree(fake_process)
+
+    assert commands == [
+        ["taskkill", "/PID", "123", "/T"],
+        ["taskkill", "/PID", "123", "/T", "/F"],
+    ]
+    assert fake_process.terminated is False
+    assert fake_process.killed is False
 
 
 @pytest.mark.asyncio

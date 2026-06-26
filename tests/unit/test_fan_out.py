@@ -4,7 +4,7 @@ import json
 import sys
 import threading
 import types
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import anyio
@@ -22,6 +22,7 @@ from gofer.core.operations import (
     TabularFanSource,
     TriggerEventsFanSource,
 )
+from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.core.resources import ResourceLimitError, ResourceLimits
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
@@ -424,6 +425,8 @@ async def test_fan_out_max_concurrency_respected(tmp_path: Path) -> None:
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             active[0] += 1
             concurrency_log.append(active[0])
@@ -444,6 +447,7 @@ async def test_fan_out_max_concurrency_respected(tmp_path: Path) -> None:
 
     sub = TrackingSubscription()
     wf, sub_name = _make_agent_workflow(tmp_path, sub)
+    wf.config.resource_limits = ResourceLimits(max_fanout_concurrency=3)
 
     data = tmp_path / "input.jsonl"
     data.write_text("\n".join(json.dumps({"i": k}) for k in range(10)) + "\n")
@@ -478,7 +482,7 @@ async def test_fan_out_max_concurrency_respected(tmp_path: Path) -> None:
     assert len(result.node_runs["agent"]) == 10
 
 
-async def test_directory_loop_preserves_parallel_default(tmp_path: Path) -> None:
+async def test_directory_loop_defaults_to_sequential_execution(tmp_path: Path) -> None:
     concurrency_log: list[int] = []
     active: list[int] = [0]
 
@@ -494,6 +498,8 @@ async def test_directory_loop_preserves_parallel_default(tmp_path: Path) -> None
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             active[0] += 1
             concurrency_log.append(active[0])
@@ -547,7 +553,7 @@ async def test_directory_loop_preserves_parallel_default(tmp_path: Path) -> None
 
     assert result.success
     assert len(sub.calls) == 4
-    assert max(concurrency_log) == 4
+    assert max(concurrency_log) == 1
 
 
 async def test_fan_out_failures_aggregate_when_fail_fast_false(tmp_path: Path) -> None:
@@ -563,6 +569,8 @@ async def test_fan_out_failures_aggregate_when_fail_fast_false(tmp_path: Path) -
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             self.calls.append({"prompt": prompt, "extra_paths": extra_paths or []})
             failed = '"i": 1' in prompt
@@ -629,6 +637,8 @@ async def test_fan_out_fail_fast(tmp_path: Path) -> None:
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             raise RuntimeError("boom")
 
@@ -681,6 +691,8 @@ async def test_fan_out_fail_fast_cancels_pending_iterations(tmp_path: Path) -> N
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             started.append(prompt)
             if '"i": 0' in prompt:

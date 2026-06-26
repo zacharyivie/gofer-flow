@@ -102,6 +102,11 @@ test("workflow save payload keeps graph positions and serializes defaults", () =
   const payload = appModule.workflowPayloadForSave({
     id: "demo",
     name: "Demo",
+    filesystemAccess: [
+      { path: "/outside/shared", read: false, write: false, execute: true },
+      { path: "/outside/shared/", read: true, write: true, execute: true },
+      { path: "" },
+    ],
     nodes: [
       {
         id: "step",
@@ -114,6 +119,9 @@ test("workflow save payload keeps graph positions and serializes defaults", () =
 
   assert.deepEqual(payload.edges, []);
   assert.deepEqual(payload.agents, {});
+  assert.deepEqual(payload.filesystemAccess, [
+    { path: "/outside/shared", read: true, write: true, execute: false },
+  ]);
   assert.equal(payload.nodes[0].x, 0);
   assert.equal(payload.nodes[0].y, 0);
   assert.equal(payload.nodes[0].operation.command, "echo hi");
@@ -125,6 +133,38 @@ test("workflow deletion helpers remove the selected workflow and choose the next
   assert.deepEqual(appModule.workflowIdsAfterDelete(workflows, "b"), ["a", "c"]);
   assert.equal(appModule.nextActiveWorkflowIdAfterDelete(workflows, "b", "b"), "a");
   assert.equal(appModule.nextActiveWorkflowIdAfterDelete(workflows, "c", "b"), "c");
+});
+
+test("App keeps the new workflow name field enabled after deleting a workflow", async () => {
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([
+        workflowFixture({ id: "demo", name: "Demo" }),
+        workflowFixture({ id: "other", name: "Other" }),
+      ])),
+      jsonResponse("/api/chat/providers", {
+        providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+      }),
+      jsonResponse("/api/workflows/demo/logs/latest", {
+        log: { logText: "latest demo log", logPath: "/tmp/demo.log" },
+      }),
+      jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
+      jsonResponse("/api/workflows/demo", { deleted: true }, { method: "DELETE" }),
+    ]),
+  );
+
+  await dom.flush();
+  await dom.click(dom.allByTitle("Workflow actions")[0]);
+  await dom.click(dom.byText("Delete workflow"));
+  await dom.flush();
+
+  await dom.click(dom.byTitle("Create workflow"));
+  const nameInput = dom.controlAfterLabel("Name");
+
+  assert.equal(nameInput.disabled, false);
+
+  await dom.unmount();
 });
 
 test("run, plan, and log helpers build backend requests without a real server", () => {
@@ -149,10 +189,39 @@ test("run, plan, and log helpers build backend requests without a real server", 
     triggerContext: { watch: { path: "/tmp/inbox" } },
   });
 
+  const resumeRequest = appModule.workflowResumeRequest("demo workflow", "run/1", {
+    fromNode: "step",
+    skipCache: true,
+  });
+  assert.equal(
+    resumeRequest.url,
+    "http://127.0.0.1:8765/api/workflows/demo%20workflow/runs/run%2F1/resume",
+  );
+  assert.deepEqual(JSON.parse(resumeRequest.options.body), {
+    force: false,
+    fromNode: "step",
+    onlyNode: null,
+    skipCache: true,
+    triggerContext: {},
+  });
+
+  const replayRequest = appModule.workflowReplayTriggerRequest(
+    "demo workflow",
+    "run/1",
+    "github",
+  );
+  assert.equal(
+    replayRequest.url,
+    "http://127.0.0.1:8765/api/workflows/demo%20workflow/webhooks/github/replay",
+  );
+  assert.equal(replayRequest.options.method, "POST");
+  assert.deepEqual(JSON.parse(replayRequest.options.body), { runId: "run/1" });
+
   assert.deepEqual(appModule.workflowLogUrls("demo workflow", "run/1"), {
     latest: "http://127.0.0.1:8765/api/workflows/demo%20workflow/logs/latest",
     runs: "http://127.0.0.1:8765/api/workflows/demo%20workflow/logs",
-    selected: "http://127.0.0.1:8765/api/workflows/demo%20workflow/logs/run%2F1",
+    selected:
+      "http://127.0.0.1:8765/api/workflows/demo%20workflow/logs/run%2F1?tailBytes=65536&details=0",
   });
 });
 
@@ -208,6 +277,9 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
         binary: "codex",
         available: false,
         workingDir: "/workspace/agents",
+        profile: "quality",
+        model: "gpt-5",
+        timeout: 45,
         extraPaths: ["/workspace/shared"],
       },
     ],
@@ -257,7 +329,10 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
   assert.match(html, /Required secrets/);
   assert.match(html, /OPENAI_API_KEY/);
   assert.match(html, /Provider CLI requirements/);
-  assert.match(html, /reviewer: codex binary=codex \(missing\) cwd=\/workspace\/agents/);
+  assert.match(
+    html,
+    /reviewer: codex binary=codex \(missing\) cwd=\/workspace\/agents profile=quality model=gpt-5 timeout=45s/,
+  );
   assert.match(html, /Trigger context/);
   assert.match(html, /Watch: \/workspace\/inbox glob=\*\.md mode=fanout/);
   assert.match(html, /<details/);
@@ -309,11 +384,14 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
       jsonResponse("/api/workflows/demo/logs/latest", {
         log: { logText: "latest demo log", logPath: "/tmp/demo.log" },
       }),
-      jsonResponse("/api/workflows/demo/logs", {
+      jsonResponse("/api/workflows/demo/logs?limit=100", {
         runs: [{ id: "run-1", status: "success", startedAt: "2026-01-02T03:04:05Z" }],
       }),
       jsonResponse("/api/workflows/demo", { error: "Save rejected" }, { method: "PUT", ok: false, status: 400 }),
       jsonResponse("/api/workflows/demo", { deleted: true }, { method: "DELETE" }),
+      jsonResponse("/api/workflows/other/export", {
+        bundlePath: "/workspace/other.gof.zip",
+      }, { method: "POST" }),
       jsonResponse("/api/workflows", workflowsPayload([
         workflowFixture({ id: "demo", name: "Demo", label: "Remote refreshed label" }),
         workflowFixture({ id: "other", name: "Other", label: "Other label" }),
@@ -324,6 +402,10 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   await dom.flush();
   assert.match(dom.text(), /Demo/);
   assert.match(dom.text(), /latest demo log/);
+  assert.equal(
+    dom.fetchCalls.some((call) => call.url === "/api/workflows/demo/logs/latest"),
+    true,
+  );
 
   const labelInput = dom.controlAfterLabel("Label");
   await dom.change(labelInput, "Local unsaved label");
@@ -346,6 +428,23 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   assert.equal(dom.fetchCalls.some((call) => call.url === "/api/workflows/demo" && call.options.method === "DELETE"), true);
   assert.match(dom.text(), /Other/);
 
+  await dom.click(dom.byTitle("Export workflow bundle"));
+  await dom.flush();
+  assert.match(dom.text(), /Export workflow bundle/);
+  await dom.change(dom.controlAfterLabel("Output path"), "/workspace/other.gof.zip");
+  await dom.pointer(dom.ancestor(dom.byTitle("Confirm workflow export"), "FORM"), "onSubmit");
+  await dom.flush();
+  assert.equal(
+    dom.fetchCalls.some(
+      (call) =>
+        call.url === "/api/workflows/other/export" &&
+        call.options.method === "POST" &&
+        JSON.parse(call.options.body).outputPath === "/workspace/other.gof.zip",
+    ),
+    true,
+  );
+  assert.match(dom.text(), /Exported bundle to \/workspace\/other\.gof\.zip/);
+
   await dom.unmount();
 });
 
@@ -367,7 +466,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     jsonResponse("/api/workflows/demo/logs/latest", {
       log: { logText: "running log", logPath: "/tmp/demo.log" },
     }),
-    jsonResponse("/api/workflows/demo/logs", {
+    jsonResponse("/api/workflows/demo/logs?limit=100", {
       runs: [{ id: "run-1", status: "running", startedAt: "2026-01-02T03:04:05Z" }],
     }),
     jsonResponse("/api/workflows/demo", {
@@ -391,7 +490,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
         nodeOutputs: {},
       },
     }, { method: "POST" }),
-    jsonResponse("/api/workflows/demo/logs", { runs: [] }),
+    jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
     jsonResponse("/api/workflows/demo/stop", { stopped: true }, { method: "POST" }),
     (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
   ]);
@@ -457,7 +556,7 @@ test("App shows workflow health diagnostics before running", async () => {
     }),
     jsonResponse("/api/workflows", workflowsPayload([workflow])),
     jsonResponse("/api/workflows/doctor/logs/latest", { log: null }),
-    jsonResponse("/api/workflows/doctor/logs", { runs: [] }),
+    jsonResponse("/api/workflows/doctor/logs?limit=100", { runs: [] }),
     jsonResponse("/api/workflows/doctor/approvals", { approvals: [] }),
   ]);
 
@@ -468,6 +567,58 @@ test("App shows workflow health diagnostics before running", async () => {
   assert.match(dom.text(), /Shell executable 'bash' is not on PATH/);
   assert.match(dom.text(), /Workflow requires provider CLI 'codex'/);
   assert.equal(fetchMock.calls.some((call) => call.url === "/api/doctor"), true);
+
+  await dom.click(dom.byTitle("Hide environment warning"));
+  await dom.flush();
+  assert.doesNotMatch(dom.text(), /Environment setup needs attention/);
+  assert.doesNotMatch(dom.text(), /Shell executable 'bash' is not on PATH/);
+
+  await dom.unmount();
+});
+
+test("App does not show an environment notice when health checks are clean", async () => {
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/doctor", { errors: [], warnings: [] }),
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "clean", name: "Clean" }),
+    ])),
+    jsonResponse("/api/workflows/clean/logs/latest", { log: null }),
+    jsonResponse("/api/workflows/clean/logs?limit=100", { runs: [] }),
+    jsonResponse("/api/workflows/clean/approvals", { approvals: [] }),
+  ]);
+
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  assert.doesNotMatch(dom.text(), /Environment health checks passed/);
+  assert.doesNotMatch(dom.text(), /Environment setup/);
+  assert.equal(fetchMock.calls.some((call) => call.url === "/api/doctor"), true);
+
+  await dom.unmount();
+});
+
+test("App lets users dismiss a doctor load failure warning", async () => {
+  const fetchMock = createFetchMock([
+    (url) => {
+      if (url !== "/api/doctor") return null;
+      throw new Error("Unable to reach doctor API");
+    },
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "doctor-error", name: "Doctor Error" }),
+    ])),
+    jsonResponse("/api/workflows/doctor-error/logs/latest", { log: null }),
+    jsonResponse("/api/workflows/doctor-error/logs?limit=100", { runs: [] }),
+    jsonResponse("/api/workflows/doctor-error/approvals", { approvals: [] }),
+  ]);
+
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  assert.match(dom.text(), /Unable to reach doctor API/);
+
+  await dom.click(dom.byTitle("Hide environment warning"));
+  await dom.flush();
+  assert.doesNotMatch(dom.text(), /Unable to reach doctor API/);
 
   await dom.unmount();
 });
@@ -530,9 +681,97 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   assert.equal(changes.at(-1).edges[0].from, "step");
   assert.equal(changes.at(-1).edges[0].to, "node-1");
 
-  await dom.click(dom.allByTitle("Delete node")[0]);
+  await dom.pointer(nodeCard, "onPointerDown", { button: 2, clientX: 80, clientY: 90, pointerId: 8 });
+  await dom.pointer(nodeCard, "onContextMenu", { button: 2, clientX: 80, clientY: 90 });
+  await dom.click(dom.byText("Duplicate node"));
+  assert.equal(changes.at(-1).nodes.length, 3);
+  assert.equal(changes.at(-1).nodes.at(-1).label, "Initial command copy");
+  assert.equal(changes.at(-1).nodes.at(-1).x, 53);
+  assert.equal(changes.at(-1).nodes.at(-1).y, 63);
+
+  await dom.pointer(
+    dom.ancestor(dom.byText("Initial command copy"), "ARTICLE"),
+    "onContextMenu",
+    { button: 2, clientX: 90, clientY: 100 },
+  );
+  await dom.click(dom.byText("Rename node"));
+  await dom.change(dom.controlAfterLabel("Node label"), "Renamed command");
+  await dom.pointer(dom.ancestor(dom.byTitle("Confirm node rename"), "FORM"), "onSubmit");
+  assert.equal(changes.at(-1).nodes.at(-1).label, "Renamed command");
+
+  await dom.pointer(
+    dom.ancestor(dom.byText("Renamed command"), "ARTICLE"),
+    "onContextMenu",
+    { button: 2, clientX: 90, clientY: 100 },
+  );
+  await dom.click(dom.byText("Delete node"));
+  assert.equal(changes.at(-1).nodes.some((node) => node.label === "Renamed command"), false);
+
+  await dom.pointer(dom.ancestor(dom.byText("Initial command"), "ARTICLE"), "onContextMenu", {
+    button: 2,
+    clientX: 80,
+    clientY: 90,
+  });
+  await dom.click(dom.byText("Delete node"));
   assert.equal(changes.at(-1).nodes.some((node) => node.id === "step"), false);
   assert.deepEqual(changes.at(-1).edges, []);
+
+  await dom.unmount();
+});
+
+test("DagCanvas renders pending approvals as a centered graph overlay", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "approval-canvas", name: "Approval Canvas" }),
+    nodes: [
+      {
+        id: "approve",
+        type: "approval_gate",
+        label: "Review deployment",
+        x: 0,
+        y: 0,
+        operation: { type: "approval_gate", message: "Approve deployment?" },
+      },
+    ],
+  };
+  const decisions = [];
+  const approval = {
+    workflowId: "approval-canvas",
+    runId: "run.log",
+    nodeId: "approve",
+    message: "Approve deployment?",
+    status: "pending",
+    approvers: ["ops"],
+    requestedAt: "2026-06-25T12:00:00-04:00",
+    timeoutSeconds: null,
+    timeoutDecision: "timeout",
+    decision: null,
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      approvalState: { approvals: [approval], error: "", loading: false },
+      dataDir: "/workspace",
+      workflow,
+      onDecideApproval(nextApproval, decision, notes, approver) {
+        decisions.push({ approval: nextApproval, decision, notes, approver });
+      },
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  assert.ok(dom.byText("Approval Required"));
+  assert.ok(dom.byText("Review deployment"));
+  assert.ok(dom.byText("Approve deployment?"));
+
+  await dom.change(dom.controlAfterLabel("Notes"), "ship it");
+  await dom.click(dom.byTitle("Approve pending approval"));
+
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].approval, approval);
+  assert.equal(decisions[0].decision, "approved");
+  assert.equal(decisions[0].notes, "ship it");
+  assert.equal(decisions[0].approver, "ops");
 
   await dom.unmount();
 });
@@ -617,6 +856,12 @@ test("DagCanvas renders structured run timeline and selected node details", asyn
             occurredAt: "2026-01-02T03:04:06Z",
             message: "attempt 1 finished success=true exit_code=0",
           },
+          {
+            nodeId: "step",
+            status: "reused",
+            occurredAt: "2026-01-02T03:04:07Z",
+            message: "reused output from resumed run",
+          },
         ],
         runNodes: {
           step: {
@@ -645,6 +890,7 @@ test("DagCanvas renders structured run timeline and selected node details", asyn
               },
             ],
             data: {
+              reused: true,
               message: "agent summary message",
               fanOut: {
                 itemCount: 2,
@@ -701,13 +947,173 @@ test("DagCanvas renders structured run timeline and selected node details", asyn
   await dom.pointer(dom.ancestor(dom.byText("Run command"), "ARTICLE"), "onPointerDown");
   await dom.flush();
   assert.match(dom.text(), /Last run/);
+  assert.match(dom.text(), /ReusedYes/);
+  assert.ok(dom.byTitle("reused"));
   assert.match(dom.text(), /0\.25s/);
   assert.match(dom.text(), /agent summary message/);
   assert.match(dom.text(), /Fan-out items/);
   assert.match(dom.text(), /1: failed/);
+  assert.match(dom.text(), /Iteration 1 - Attempt 1/);
+  assert.match(dom.text(), /Outputok/);
+  await dom.click(dom.byText("Next"));
+  assert.match(dom.text(), /Iteration 2 - Attempt 1/);
+  assert.match(dom.text(), /OutputStderrPromptbad item/);
+  await dom.click(dom.byTitle("Show Stderr"));
   assert.match(dom.text(), /stderr detail/);
+  await dom.click(dom.byTitle("Show Prompt"));
   assert.match(dom.text(), /rendered prompt/);
   assert.match(dom.text(), /step -> next/);
+
+  await dom.unmount();
+});
+
+test("DagCanvas run history exposes resume and rerun controls", async () => {
+  const resumeCalls = [];
+  const workflow = workflowFixture({ id: "history-actions", name: "History actions" });
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      logState: {
+        loading: false,
+        error: "",
+        text: "failed run",
+        path: "logs/history-actions/run-1.log",
+        runs: [{ id: "run-1.log", status: "error", startedAt: "2026-01-02T03:04:05Z" }],
+        selectedRunId: "run-1.log",
+      },
+      onResumeRunLog(runId, options) {
+        resumeCalls.push({ runId, options });
+      },
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  await dom.click(dom.byTitle("Select workflow run"));
+  assert.match(dom.text(), /Resume/);
+  assert.match(dom.text(), /Rerun failed nodes/);
+  assert.match(dom.text(), /Rerun from selected node/);
+
+  await dom.click(dom.ancestor(dom.byText("Resume"), "BUTTON"));
+  await dom.click(dom.ancestor(dom.byText("Rerun failed nodes"), "BUTTON"));
+
+  await dom.pointer(dom.ancestor(dom.byText("Run command"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  await dom.click(dom.ancestor(dom.byText("Rerun from selected node"), "BUTTON"));
+
+  assert.deepEqual(resumeCalls, [
+    { runId: "run-1.log", options: {} },
+    { runId: "run-1.log", options: { skipCache: true } },
+    { runId: "run-1.log", options: { fromNode: "step" } },
+  ]);
+
+  await dom.unmount();
+});
+
+test("DagCanvas surfaces webhook trigger state and replay controls", async () => {
+  const replayCalls = [];
+  const workflow = {
+    ...workflowFixture({ id: "hooked", name: "Hooked" }),
+    webhooks: {
+      github: {
+        id: "github",
+        enabled: true,
+        source: "github",
+        fanout_path: "payload.items",
+        tokenConfigured: true,
+        concurrency_policy: "reject_if_running",
+      },
+    },
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      logState: {
+        loading: false,
+        error: "",
+        text: "webhook run",
+        path: "logs/hooked/run-1.log",
+        runs: [
+          {
+            id: "run-1.log",
+            status: "success",
+            startedAt: "2026-01-02T03:04:05Z",
+            triggerId: "github",
+            triggerType: "webhook",
+            hasTriggerReplay: true,
+          },
+        ],
+        selectedRunId: "run-1.log",
+      },
+      onReplayRunLog(runId, triggerId) {
+        replayCalls.push({ runId, triggerId });
+      },
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  assert.match(dom.text(), /API trigger: github \(github\)/);
+  assert.match(dom.text(), /Webhook\/API triggers/);
+  assert.match(dom.text(), /Token required/);
+
+  await dom.click(dom.byTitle("Select workflow run"));
+  await dom.click(dom.ancestor(dom.byText("Replay webhook payload"), "BUTTON"));
+  assert.deepEqual(replayCalls, [{ runId: "run-1.log", triggerId: "github" }]);
+
+  await dom.unmount();
+});
+
+test("DagCanvas retention controls send configured cleanup settings", async () => {
+  const pruneCalls = [];
+  const settingsChanges = [];
+  const workflow = workflowFixture({ id: "history-actions", name: "History actions" });
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      retentionSettings: { keepDays: 7, keepFailedDays: 21, keepLast: 50 },
+      logState: {
+        loading: false,
+        error: "",
+        text: "completed run",
+        path: "logs/history-actions/run-1.log",
+        runs: [{ id: "run-1.log", status: "success", startedAt: "2026-01-02T03:04:05Z" }],
+      },
+      onPruneRunLogs(options) {
+        pruneCalls.push(options);
+      },
+      onRetentionSettingsChange(nextSettings) {
+        settingsChanges.push(nextSettings);
+      },
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  await dom.click(dom.byTitle("Run retention settings"));
+  await dom.change(dom.controlAfterLabel("Keep latest runs"), "25");
+  await dom.change(dom.controlAfterLabel("Keep runs for days"), "5");
+  await dom.change(dom.controlAfterLabel("Keep failed runs for days"), "12");
+  const previewButton = allElements(dom.container).find(
+    (node) => node.tagName === "BUTTON" && directText(node) === "Preview",
+  );
+  assert.ok(previewButton, "Unable to find retention preview button");
+  await dom.click(previewButton);
+
+  assert.deepEqual(settingsChanges, [
+    { keepDays: 7, keepFailedDays: 21, keepLast: 25 },
+    { keepDays: 5, keepFailedDays: 21, keepLast: 25 },
+    { keepDays: 5, keepFailedDays: 12, keepLast: 25 },
+  ]);
+  assert.deepEqual(pruneCalls, [
+    { dryRun: true, keepDays: 5, keepFailedDays: 12, keepLast: 25 },
+  ]);
 
   await dom.unmount();
 });
@@ -1096,6 +1502,35 @@ test("DagCanvas helpers create default agent nodes and serialize node edits", ()
   assert.match(withHttpNode.nodes[0].meta, /https:\/\/api\.example\.com\/resource/);
 });
 
+test("DagCanvas helper duplicates nodes with unique ids and agent configs", () => {
+  const workflow = {
+    id: "wf",
+    agents: {
+      "agent-1": { subscription: "codex", model: "gpt-5" },
+    },
+    nodes: [
+      {
+        id: "node-1",
+        type: "agent",
+        label: "Review",
+        operation: { type: "agent", agent_id: "agent-1", prompt: "Read this" },
+        x: 10,
+        y: 20,
+      },
+    ],
+    edges: [],
+  };
+
+  const duplicated = canvasModule.duplicateWorkflowNode(workflow, "node-1");
+
+  assert.deepEqual(duplicated.nodes.map((node) => node.id), ["node-1", "node-2"]);
+  assert.equal(duplicated.nodes[1].label, "Review copy");
+  assert.equal(duplicated.nodes[1].operation.agent_id, "agent-2");
+  assert.equal(duplicated.agents["agent-2"].subscription, "codex");
+  assert.equal(duplicated.nodes[1].x, 38);
+  assert.equal(duplicated.nodes[1].y, 48);
+});
+
 test("DagCanvas HTTP JSON body editor preserves nested values and rejects invalid text", () => {
   const body = {
     issue: { title: "Bug", labels: ["api", "urgent"] },
@@ -1413,7 +1848,7 @@ test("DagCanvas rendered navigation controls auto-layout, fit, zoom, and search 
   await dom.unmount();
 });
 
-test("DagCanvas minimap sits top right, handles dark mode styling, and traps navigation events", async () => {
+test("DagCanvas minimap sits top left, handles translucent dark mode styling, and traps navigation events", async () => {
   const workflow = {
     ...workflowFixture({ id: "minimap", name: "Minimap", label: "Scan" }),
     nodes: [
@@ -1445,16 +1880,23 @@ test("DagCanvas minimap sits top right, handles dark mode styling, and traps nav
   );
 
   const minimap = dom.byTitle("Minimap");
-  assert.match(minimap.getAttribute("class"), /right-4/);
+  assert.match(minimap.getAttribute("class"), /left-4/);
   assert.match(minimap.getAttribute("class"), /top-4/);
-  assert.match(minimap.getAttribute("class"), /dark:bg-\[#252526\]\/95/);
+  assert.match(minimap.getAttribute("class"), /bg-white\/70/);
+  assert.match(minimap.getAttribute("class"), /opacity-80/);
+  assert.match(minimap.getAttribute("class"), /dark:bg-\[#252526\]\/70/);
 
   const minimapSurface = minimap.childNodes[0];
-  assert.match(minimapSurface.getAttribute("class"), /dark:bg-\[#1b1f22\]/);
+  assert.match(minimapSurface.getAttribute("class"), /dark:bg-\[#1b1f22\]\/80/);
+  assert.equal(minimapSurface.style.width, "124px");
+  assert.equal(minimapSurface.style.height, "86px");
   assert.equal(typeof reactProps(minimapSurface).onPointerLeave, "function");
 
+  const viewportIndicator = minimapSurface.childNodes[minimapSurface.childNodes.length - 1];
+  const viewportWidthBeforeWheel = viewportIndicator.style.width;
   let wheelStopped = false;
   const wheelEvent = testEvent(minimapSurface, {
+    deltaY: -100,
     stopPropagation() {
       wheelStopped = true;
     },
@@ -1464,6 +1906,7 @@ test("DagCanvas minimap sits top right, handles dark mode styling, and traps nav
   });
   assert.equal(wheelEvent.defaultPrevented, true);
   assert.equal(wheelStopped, true);
+  assert.notEqual(viewportIndicator.style.width, viewportWidthBeforeWheel);
 
   minimapSurface.getBoundingClientRect = () => ({
     bottom: 128,
@@ -1497,6 +1940,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "dataDirectory",
     "getDataDir",
     "getDroppedFilePath",
+    "grantDroppedPath",
     "textFiles",
     "workspace",
   ]);
@@ -1506,6 +1950,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "createFolder",
     "deletePath",
     "getPathInfo",
+    "grantPath",
     "listDirectory",
     "openPath",
     "renamePath",
@@ -1531,6 +1976,10 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     channel: "gofer:copy-path",
     payload: { destinationGrantId: "", sourcePath: "/a", sourceGrantId: "", destinationPath: "" },
   });
+  assert.equal(
+    await exposed.goferDesktop.grantDroppedPath({ path: "/outside/file.txt" }),
+    "/outside/file.txt",
+  );
 });
 
 test("Electron preload keeps file grants private while attaching them to later calls", async () => {
@@ -1544,6 +1993,9 @@ test("Electron preload keeps file grants private while attaching them to later c
       }
       if (channel === "gofer:path-info") {
         return { basename: "workflow.toml", grantId: "grant-1", isFile: true, path: payload.targetPath };
+      }
+      if (channel === "gofer:grant-path") {
+        return { grantId: "grant-dir", path: payload.targetPath };
       }
       return { channel, payload };
     },
@@ -1560,6 +2012,15 @@ test("Electron preload keeps file grants private while attaching them to later c
     payload: {
       grantId: "grant-1",
       targetPath: "/outside/workflow.toml",
+    },
+  });
+  assert.equal(await exposed.goferDesktop.workspace.grantPath("/outside/shared"), "/outside/shared");
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/shared" })), {
+    channel: "gofer:list-directory",
+    payload: {
+      create: true,
+      currentPath: "/outside/shared",
+      grantId: "grant-dir",
     },
   });
 });
@@ -1651,29 +2112,57 @@ function toPlainObject(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function DagCanvasHarness({ dataDir, logState, notice, onWorkflowChange, workflow }) {
+function DagCanvasHarness({
+  approvalState,
+  dataDir,
+  logState,
+  notice,
+  onDecideApproval,
+  onPruneRunLogs,
+  onReplayRunLog,
+  onRetentionSettingsChange,
+  onResumeRunLog,
+  onWorkflowChange,
+  retentionSettings,
+  workflow,
+}) {
   const [currentWorkflow, setCurrentWorkflow] = React.useState(workflow);
+  const [currentRetentionSettings, setCurrentRetentionSettings] = React.useState(
+    retentionSettings,
+  );
 
   function handleChange(nextWorkflow) {
     setCurrentWorkflow(nextWorkflow);
     onWorkflowChange(nextWorkflow);
   }
 
+  function handleRetentionSettingsChange(nextSettings) {
+    setCurrentRetentionSettings(nextSettings);
+    onRetentionSettingsChange?.(nextSettings);
+  }
+
   return React.createElement(canvasModule.default, {
     dataDir,
     logState: logState ?? { loading: false, error: "", text: "", path: null, runs: [] },
     notice,
+    retentionSettings: currentRetentionSettings,
+    approvalState: approvalState ?? { approvals: [], error: "", loading: false },
     runResult: null,
     runState: { running: false },
     usedAgentIds: [],
     workflow: currentWorkflow,
     onImportWorkflow: () => {},
     onLoadLatestLog: () => {},
+    onPruneRunLogs: onPruneRunLogs ?? (() => {}),
+    onReplayRunLog: onReplayRunLog ?? (() => {}),
+    onRetentionSettingsChange: handleRetentionSettingsChange,
+    onResumeRunLog: onResumeRunLog ?? (() => {}),
     onRunWorkflow: () => {},
     onSelectRunLog: () => {},
     onStopRunLog: () => {},
     onStopWorkflow: () => {},
     onValidateWorkflow: () => {},
+    onDecideApproval: onDecideApproval ?? (() => {}),
     onWorkflowChange: handleChange,
   });
 }

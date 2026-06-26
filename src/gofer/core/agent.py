@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import inspect
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field
 
+from gofer.core.provider_profiles import ResolvedProviderSettings, resolved_provider_env
 from gofer.core.usage import LlmPricing
 
 if TYPE_CHECKING:
@@ -55,6 +57,8 @@ class Agent:
         memory: list[dict[str, str]] | None = None,
         max_output_bytes: int | None = None,
         timeout: float | None = None,
+        on_thought: Callable[[str], None] | None = None,
+        provider_settings: ResolvedProviderSettings | None = None,
     ) -> AgentResult:
         from gofer.prompts.manager import PromptManager
 
@@ -76,37 +80,35 @@ class Agent:
         if memory:
             prompt_text = format_agent_memory(memory, current_prompt)
         extra_paths = configured_extra_paths(self._config)
+        execute_kwargs: dict[str, Any] = {}
         if max_output_bytes is not None and _accepts_execute_kwarg(
             self._subscription,
             "max_output_bytes",
         ):
-            execute_kwargs: dict[str, Any] = {"max_output_bytes": max_output_bytes}
-            if timeout is not None and _accepts_execute_kwarg(self._subscription, "timeout"):
-                execute_kwargs["timeout"] = timeout
-            result = await self._subscription.execute(
-                prompt=prompt_text,
-                working_dir=self._config.working_dir,
-                tools=self._config.tools,
-                mcp_servers=self._config.mcp_servers,
-                env=self._config.env,
-                cancel_event=cancel_event,
-                extra_paths=extra_paths,
-                **execute_kwargs,
-            )
-        else:
-            execute_kwargs = {}
-            if timeout is not None and _accepts_execute_kwarg(self._subscription, "timeout"):
-                execute_kwargs["timeout"] = timeout
-            result = await self._subscription.execute(
-                prompt=prompt_text,
-                working_dir=self._config.working_dir,
-                tools=self._config.tools,
-                mcp_servers=self._config.mcp_servers,
-                env=self._config.env,
-                cancel_event=cancel_event,
-                extra_paths=extra_paths,
-                **execute_kwargs,
-            )
+            execute_kwargs["max_output_bytes"] = max_output_bytes
+        if timeout is not None and _accepts_execute_kwarg(self._subscription, "timeout"):
+            execute_kwargs["timeout"] = timeout
+        if on_thought is not None and _accepts_execute_kwarg(self._subscription, "on_thought"):
+            execute_kwargs["on_thought"] = on_thought
+        if provider_settings is not None and _accepts_execute_kwarg(
+            self._subscription,
+            "provider_settings",
+        ):
+            execute_kwargs["provider_settings"] = provider_settings
+        effective_env = {
+            **(resolved_provider_env(provider_settings) if provider_settings else {}),
+            **self._config.env,
+        }
+        result = await self._subscription.execute(
+            prompt=prompt_text,
+            working_dir=self._config.working_dir,
+            tools=self._config.tools,
+            mcp_servers=self._config.mcp_servers,
+            env=effective_env,
+            cancel_event=cancel_event,
+            extra_paths=extra_paths,
+            **execute_kwargs,
+        )
         return AgentResult(
             agent_id=self._config.agent_id,
             success=result.success,
@@ -116,9 +118,12 @@ class Agent:
             thoughts=result.thoughts,
             message=result.message,
             prompt=prompt_text,
-            provider=result.provider or self._config.subscription,
-            profile=result.profile or self._config.profile,
-            model=result.model or self._config.model,
+            provider=result.provider
+            or (provider_settings.subscription if provider_settings else self._config.subscription),
+            profile=result.profile
+            or (provider_settings.profile_name if provider_settings else self._config.profile),
+            model=result.model
+            or (provider_settings.model if provider_settings else self._config.model),
             usage_metadata=result.usage_metadata,
         )
 

@@ -100,6 +100,8 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       revealPath(targetPath),
     getPathInfo: (targetPath) =>
       getPathInfo(targetPath),
+    grantPath: (targetPath) =>
+      grantPath(targetPath),
     copyPath: (options = {}) =>
       copyPath(options),
     deletePath: (targetPath) =>
@@ -120,6 +122,12 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       writeTextFile(options),
   },
   getDroppedFilePath: (file) => webUtils.getPathForFile(file) || "",
+  grantDroppedPath: async (file) => {
+    const targetPath = webUtils.getPathForFile(file) || "";
+    if (!targetPath) return null;
+    const payload = await invokeDesktop("gofer:grant-path", { targetPath });
+    return payload?.path || targetPath;
+  },
 });
 
 function listDirectory(options = {}) {
@@ -151,6 +159,12 @@ function getPathInfo(targetPath) {
     grantId: grantForPath(targetPath),
     targetPath: typeof targetPath === "string" ? targetPath : "",
   });
+}
+
+function grantPath(targetPath) {
+  return invokeDesktop("gofer:grant-path", {
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  }).then((payload) => (payload && typeof payload.path === "string" ? payload.path : null));
 }
 
 function copyPath(options = {}) {

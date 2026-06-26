@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bell,
@@ -25,6 +25,7 @@ import {
   Loader2,
   Maximize2,
   MoveRight,
+  PencilLine,
   Play,
   Plus,
   RefreshCw,
@@ -37,10 +38,19 @@ import {
   Terminal,
   Trash2,
   Upload,
+  Webhook,
   X,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
+
+import { apiUrl } from "../lib/api.js";
+
+const DEFAULT_RETENTION_SETTINGS = {
+  keepDays: 14,
+  keepFailedDays: 30,
+  keepLast: 100,
+};
 
 const nodeStyles = {
   start: {
@@ -205,8 +215,8 @@ const nodeWidth = 220;
 const nodeHeight = 96;
 const layoutColumnGap = 330;
 const layoutRowGap = 154;
-const minimapWidth = 184;
-const minimapHeight = 128;
+const minimapWidth = 124;
+const minimapHeight = 86;
 const nodeStack = {
   base: 10,
   selected: 30,
@@ -431,6 +441,8 @@ export function defaultAgentConfig(agentId, overrides = {}) {
   return {
     agent_id: agentId,
     subscription: "codex",
+    profile: "",
+    model: "",
     working_dir: ".",
     prompt_path: "",
     tools: [],
@@ -762,6 +774,62 @@ function resolveDisplayPath(pathValue = "", basePath = "") {
   return normalizeDisplayPath(joinPath(basePath, value));
 }
 
+function canonicalPath(pathValue = "") {
+  return String(pathValue ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+}
+
+function pathParent(pathValue = "") {
+  const value = canonicalPath(pathValue);
+  if (!value) return "";
+  const index = value.lastIndexOf("/");
+  if (index <= 0) return value.startsWith("/") ? "/" : "";
+  return value.slice(0, index);
+}
+
+function isPathInsideRoot(pathValue = "", rootValue = "") {
+  const path = canonicalPath(pathValue);
+  const root = canonicalPath(rootValue);
+  if (!path || !root) return false;
+  return path === root || path.startsWith(`${root}/`);
+}
+
+function workflowAccessCoversPath(workflow, pathValue, dataDir = "") {
+  if (dataDir && isPathInsideRoot(pathValue, dataDir)) return true;
+  return (workflow.filesystemAccess ?? []).some((entry) =>
+    entry?.path ? isPathInsideRoot(pathValue, entry.path) : false,
+  );
+}
+
+function pathsMatch(pathValue = "", otherPathValue = "") {
+  const path = canonicalPath(pathValue);
+  const otherPath = canonicalPath(otherPathValue);
+  return Boolean(path && otherPath && path === otherPath);
+}
+
+function uniqueAccessEntries(entries = []) {
+  const seen = new Set();
+  return entries
+    .map((entry) => ({
+      path: String(entry?.path ?? "").trim(),
+      read: true,
+      write: true,
+      execute: false,
+    }))
+    .filter((entry) => {
+    const path = canonicalPath(entry?.path ?? "");
+    if (!path || seen.has(path)) return false;
+    seen.add(path);
+    return true;
+    });
+}
+
+function mergeWorkflowFilesystemAccess(workflow, entries) {
+  return uniqueAccessEntries([...(workflow.filesystemAccess ?? []), ...entries]);
+}
+
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
@@ -835,17 +903,27 @@ function nextAvailableAgentNumber(nodes, agents, usedAgentIds = []) {
   return nextNumber;
 }
 
+function structuredCloneCompatible(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
 export default function DagCanvas({
   approvalState,
   dataDir = "",
   logState,
   notice,
+  retentionSettings = DEFAULT_RETENTION_SETTINGS,
   runState,
   workflow,
+  onExportWorkflow,
   onImportWorkflow,
   onLoadLatestLog,
   onDecideApproval,
+  onPruneRunLogs,
+  onRetentionSettingsChange,
   onRunWorkflow,
+  onReplayRunLog,
+  onResumeRunLog,
   onSelectRunLog,
   onStopRunLog,
   onStopWorkflow,
@@ -868,8 +946,24 @@ export default function DagCanvas({
   const [inspectorWidth, setInspectorWidth] = useState(340);
   const [logHeight, setLogHeight] = useState(240);
   const [expandedFolderNodes, setExpandedFolderNodes] = useState({});
+  const [providerProfiles, setProviderProfiles] = useState([]);
+
+  useEffect(() => {
+    async function loadProviderProfiles() {
+      try {
+        const response = await fetch(apiUrl("/provider/profiles"));
+        if (!response.ok) return;
+        const payload = await response.json();
+        setProviderProfiles(payload.profiles ?? []);
+      } catch {
+        setProviderProfiles([]);
+      }
+    }
+    loadProviderProfiles();
+  }, []);
   const [folderNodeEntries, setFolderNodeEntries] = useState({});
   const [filePreviewPath, setFilePreviewPath] = useState(null);
+  const [pendingTrustPrompt, setPendingTrustPrompt] = useState(null);
   const [runMenuOpen, setRunMenuOpen] = useState(false);
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [draftEdge, setDraftEdge] = useState(null);
@@ -877,7 +971,14 @@ export default function DagCanvas({
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const [minimapDragging, setMinimapDragging] = useState(false);
+  const [nodeContextMenu, setNodeContextMenu] = useState(null);
+  const [nodeRenameDialog, setNodeRenameDialog] = useState(null);
   const invalidWorkflow = Boolean(workflow.invalid);
+  const validationDiagnostics = workflowValidationDiagnostics(workflow);
+  const blockingValidationErrors = validationDiagnostics.filter(
+    (diagnostic) => diagnostic.severity === "error",
+  );
+  const runDisabled = invalidWorkflow || blockingValidationErrors.length > 0;
   const workflowNodes = useMemo(
     () =>
       (workflow.nodes ?? []).map((node) => {
@@ -889,6 +990,14 @@ export default function DagCanvas({
     [workflow.nodes],
   );
   const workflowEdges = workflow.edges ?? [];
+  const edgeDiagnostics = useMemo(
+    () => diagnosticsByTarget(validationDiagnostics, "edge"),
+    [validationDiagnostics],
+  );
+  const nodeDiagnostics = useMemo(
+    () => diagnosticsByTarget(validationDiagnostics, "node"),
+    [validationDiagnostics],
+  );
   const searchMatches = useMemo(
     () => matchingNodeIds(workflowNodes, searchQuery),
     [searchQuery, workflowNodes],
@@ -918,6 +1027,9 @@ export default function DagCanvas({
     ? runResult?.nodeOutputs?.[selectedNodeId] ?? historicalNodeOutputs?.[selectedNodeId] ?? null
     : null;
   const selectedRunNode = selectedNodeId ? runNodes?.[selectedNodeId] ?? null : null;
+  const nodesById = useMemo(() => {
+    return Object.fromEntries(workflowNodes.map((node) => [node.id, node]));
+  }, [workflowNodes]);
   const selectedApproval = selectedNodeId
     ? approvalState?.approvals?.find(
         (approval) =>
@@ -926,6 +1038,18 @@ export default function DagCanvas({
           approval.runId === selectedRunId,
       ) ?? null
     : null;
+  const pendingApproval = useMemo(() => {
+    const pendingApprovals = approvalState?.approvals?.filter(
+      (approval) => approval.status === "pending" && nodesById[approval.nodeId],
+    ) ?? [];
+    if (!pendingApprovals.length) return null;
+    return pendingApprovals
+      .slice()
+      .sort((first, second) =>
+        String(first.requestedAt || "").localeCompare(String(second.requestedAt || "")),
+      )[0];
+  }, [approvalState?.approvals, nodesById]);
+  const pendingApprovalNode = pendingApproval ? nodesById[pendingApproval.nodeId] : null;
   const workflowLogText =
     logState?.text || runResult?.logText || formatWorkflowRunLog(runResult);
   const displayedLog = selectedNodeId
@@ -940,9 +1064,11 @@ export default function DagCanvas({
   const workflowHasRunningRuns = currentWorkflowRunning || logState?.runs?.some(
     (run) => run.status === "running",
   );
-  const nodesById = useMemo(() => {
-    return Object.fromEntries(workflowNodes.map((node) => [node.id, node]));
-  }, [workflowNodes]);
+  const runTitle = blockingValidationErrors.length
+    ? blockingValidationErrors[0].message
+    : workflowHasRunningRuns
+      ? "Start another workflow run"
+      : "Run workflow now";
 
   useEffect(() => {
     setSelectedNodeId(undefined);
@@ -1333,6 +1459,97 @@ export default function DagCanvas({
     setSelectedNodeIds([newNode.id]);
   }
 
+  async function applyValidationFix(fix) {
+    const action = fix?.action;
+    const payload = fix?.payload ?? {};
+    if (!action) return;
+
+    if (action === "remove_edge") {
+      const edgeId = payload.edgeId;
+      onWorkflowChange({
+        ...workflow,
+        edges: (workflow.edges ?? []).filter(
+          (edge) =>
+            edge.id !== edgeId &&
+            !(edge.from === payload.from && edge.to === payload.to),
+        ),
+      });
+      return;
+    }
+
+    if (action === "replace_edge_pattern") {
+      const edgeId = payload.edgeId;
+      onWorkflowChange({
+        ...workflow,
+        edges: (workflow.edges ?? []).map((edge) => {
+          const matches =
+            edge.id === edgeId || (edge.from === payload.from && edge.to === payload.to);
+          if (!matches) return edge;
+          const outputPattern = payload.outputPattern ?? "";
+          return {
+            ...edge,
+            condition: "output_matches",
+            outputPattern,
+            label: edgeLabel("output_matches", outputPattern),
+          };
+        }),
+      });
+      return;
+    }
+
+    if (action === "create_agent") {
+      const agentId = payload.agentId;
+      if (!agentId || workflow.agents?.[agentId]) return;
+      onWorkflowChange({
+        ...workflow,
+        agents: {
+          ...(workflow.agents ?? {}),
+          [agentId]: defaultAgentConfig(agentId),
+        },
+      });
+      return;
+    }
+
+    if (action === "create_prompt_file") {
+      const response = await fetch(apiUrl(`/workflows/${workflow.id}/validate/fix`), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(fix),
+      });
+      if (response.ok) {
+        onValidateWorkflow?.();
+      }
+      return;
+    }
+
+    if (action === "disable_schedule") {
+      onWorkflowChange({ ...workflow, schedule: null });
+      return;
+    }
+
+    if (action === "set_schedule_timezone") {
+      onWorkflowChange({
+        ...workflow,
+        schedule: {
+          ...(workflow.schedule ?? { cron_expression: "0 9 * * *" }),
+          timezone: payload.timezone ?? "UTC",
+        },
+      });
+      return;
+    }
+
+    if (action === "disable_conflicting_triggers") {
+      onWorkflowChange({ ...workflow, schedule: null, watch: null });
+      return;
+    }
+
+    if (action === "disable_continuous") {
+      onWorkflowChange({ ...workflow, runContinuously: false });
+    }
+  }
+
   async function handleCanvasDrop(event) {
     event.preventDefault();
     event.stopPropagation();
@@ -1345,15 +1562,21 @@ export default function DagCanvas({
     if (!rect) return;
 
     const newNodes = [];
+    const untrustedDrops = [];
     let nextNumber = nextAvailableNodeNumber(workflowNodes);
     const usedNodeIds = new Set(workflowNodes.map((node) => node.id));
 
     for (const [index, file] of droppedFiles.entries()) {
-      const droppedPath =
+      let droppedPath =
         window.goferDesktop?.getDroppedFilePath?.(file) ||
         file.path ||
         file.webkitRelativePath;
       if (!droppedPath) continue;
+      try {
+        droppedPath = await window.goferDesktop?.grantDroppedPath?.(file) ?? droppedPath;
+      } catch (error) {
+        console.error("Failed to grant dropped path", error);
+      }
 
       let info = null;
       try {
@@ -1364,6 +1587,9 @@ export default function DagCanvas({
 
       const path = info?.path ?? droppedPath;
       const kind = info?.isDirectory ? "folder" : "file";
+      if (!workflowAccessCoversPath(workflow, path, dataDir)) {
+        untrustedDrops.push({ path, parent: pathParent(path), kind });
+      }
       const operation = { type: kind, path };
       const worldX = (event.clientX - rect.left - viewport.x) / viewport.scale;
       const worldY = (event.clientY - rect.top - viewport.y) / viewport.scale;
@@ -1386,13 +1612,45 @@ export default function DagCanvas({
     }
 
     if (newNodes.length) {
-      onWorkflowChange({
-        ...workflow,
-        nodes: [...workflowNodes, ...newNodes],
-      });
-      setSelectedNodeId(newNodes.at(-1).id);
-      setSelectedNodeIds(newNodes.map((node) => node.id));
+      if (untrustedDrops.length) {
+        setPendingTrustPrompt({
+          nodes: newNodes,
+          drops: untrustedDrops,
+          parentPath: untrustedDrops[0].parent || untrustedDrops[0].path,
+        });
+        return;
+      }
+      addDroppedNodes(newNodes);
     }
+  }
+
+  function addDroppedNodes(newNodes, accessEntries = []) {
+    if (!newNodes.length) return;
+    onWorkflowChange({
+      ...workflow,
+      filesystemAccess: mergeWorkflowFilesystemAccess(workflow, accessEntries),
+      nodes: [...workflowNodes, ...newNodes],
+    });
+    setSelectedNodeId(newNodes.at(-1).id);
+    setSelectedNodeIds(newNodes.map((node) => node.id));
+  }
+
+  function trustPendingDroppedNodes(trustParents) {
+    if (!pendingTrustPrompt) return;
+    const accessEntries = uniqueAccessEntries(
+      pendingTrustPrompt.drops.map((drop) => ({
+        path: trustParents ? drop.parent || drop.path : drop.path,
+        read: true,
+        write: true,
+        execute: false,
+      })),
+    );
+    addDroppedNodes(pendingTrustPrompt.nodes, accessEntries);
+    setPendingTrustPrompt(null);
+  }
+
+  function cancelPendingDroppedNodes() {
+    setPendingTrustPrompt(null);
   }
 
   function deleteSelectedNode() {
@@ -1421,10 +1679,59 @@ export default function DagCanvas({
           : []
         : currentIds,
     );
+    setNodeContextMenu((current) => (current?.nodeId === nodeId ? null : current));
+  }
+
+  function duplicateNode(nodeId) {
+    const nextWorkflow = duplicateWorkflowNode(workflow, nodeId, { usedAgentIds });
+    const duplicatedNode = nextWorkflow.nodes.at(-1);
+    if (!duplicatedNode || nextWorkflow === workflow) return;
+    onWorkflowChange(nextWorkflow);
+    setSelectedNodeId(duplicatedNode.id);
+    setSelectedNodeIds([duplicatedNode.id]);
+    setSelectedEdgeId(null);
+    setNodeContextMenu(null);
+  }
+
+  function renameNode(nodeId) {
+    const node = workflowNodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    setNodeContextMenu(null);
+    setNodeRenameDialog({
+      nodeId,
+      label: node.label ?? node.id,
+    });
+  }
+
+  function confirmRenameNode(nodeId, nextLabel) {
+    const trimmedLabel = nextLabel.trim();
+    if (!trimmedLabel) {
+      setNodeRenameDialog(null);
+      return;
+    }
+    updateNode(nodeId, { label: trimmedLabel });
+    setSelectedNodeId(nodeId);
+    setSelectedNodeIds([nodeId]);
+    setSelectedEdgeId(null);
+    setNodeRenameDialog(null);
+  }
+
+  function showNodeContextMenu(event, nodeId) {
+    event.preventDefault();
+    event.stopPropagation();
+    setSelectedNodeId(nodeId);
+    setSelectedNodeIds([nodeId]);
+    setSelectedEdgeId(null);
+    setNodeContextMenu({
+      nodeId,
+      x: event.clientX,
+      y: event.clientY,
+    });
   }
 
   function handleNodePointerDown(event, nodeId) {
     if (event.button !== 0) return;
+    setNodeContextMenu(null);
     event.currentTarget.setPointerCapture(event.pointerId);
     nodeDragMovedRef.current = false;
     const nextSelection = selectedNodeIds.includes(nodeId) ? selectedNodeIds : [nodeId];
@@ -1541,6 +1848,7 @@ export default function DagCanvas({
 
   function handleCanvasPointerDown(event) {
     if (draftEdge) return;
+    setNodeContextMenu(null);
     if (event.button === 0) {
       event.preventDefault();
       const rect = canvasRef.current?.getBoundingClientRect();
@@ -1680,7 +1988,10 @@ export default function DagCanvas({
     const pointerX = event.clientX - rect.left;
     const pointerY = event.clientY - rect.top;
     const zoomMultiplier = event.deltaY < 0 ? 1.08 : 0.92;
+    zoomViewportAtPoint(pointerX, pointerY, zoomMultiplier);
+  }
 
+  function zoomViewportAtPoint(pointerX, pointerY, zoomMultiplier) {
     setViewport((current) => {
       const nextScale = clamp(current.scale * zoomMultiplier, minZoom, maxZoom);
       const contentX = (pointerX - current.x) / current.scale;
@@ -1743,6 +2054,9 @@ export default function DagCanvas({
   function handleMinimapWheel(event) {
     event.preventDefault();
     event.stopPropagation();
+    const size = canvasViewportSize();
+    const zoomMultiplier = event.deltaY < 0 ? 1.08 : 0.92;
+    zoomViewportAtPoint(size.width / 2, size.height / 2, zoomMultiplier);
   }
 
   function deleteEdge(edgeId) {
@@ -1860,7 +2174,7 @@ export default function DagCanvas({
           >
             <input
               ref={importInputRef}
-              accept=".toml"
+              accept=".toml,.zip,.gof"
               className="hidden"
               type="file"
               onChange={(event) => {
@@ -1873,12 +2187,8 @@ export default function DagCanvas({
             />
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={invalidWorkflow}
-              title={
-                workflowHasRunningRuns
-                  ? "Start another workflow run"
-                  : "Run workflow now"
-              }
+              disabled={runDisabled}
+              title={runTitle}
               type="button"
               onClick={() => onRunWorkflow(workflow)}
             >
@@ -1900,7 +2210,10 @@ export default function DagCanvas({
               onOpenChange={setRunMenuOpen}
               onSelectRun={onSelectRunLog}
               onShowLatest={onLoadLatestLog}
+              onReplayRun={onReplayRunLog}
+              onResumeRun={onResumeRunLog}
               onStopRun={onStopRunLog}
+              selectedNodeId={selectedNodeId}
             />
             <div className="relative ml-auto shrink-0">
               <button
@@ -1998,17 +2311,18 @@ export default function DagCanvas({
             </button>
             <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Import workflow TOML"
+              title="Import workflow TOML or bundle"
               type="button"
               onClick={() => importInputRef.current?.click()}
             >
               <Upload size={17} />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted opacity-50"
-              disabled
-              title="Export workflow"
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={invalidWorkflow}
+              title="Export workflow bundle"
               type="button"
+              onClick={onExportWorkflow}
             >
               <Download size={17} />
             </button>
@@ -2079,6 +2393,7 @@ export default function DagCanvas({
             dataDir={dataDir}
             runContinuously={workflow.runContinuously}
             schedule={workflow.schedule}
+            webhooks={workflow.webhooks}
             watch={workflow.watch}
           />
           {invalidWorkflow ? (
@@ -2152,9 +2467,21 @@ export default function DagCanvas({
                           d={geometry.path}
                           fill="none"
                           markerEnd="url(#arrowhead)"
-                          stroke={selectedEdgeId === edge.id ? "#0f766e" : "#718096"}
+                          stroke={
+                            edgeDiagnostics[edge.id]?.some(
+                              (diagnostic) => diagnostic.severity === "error",
+                            )
+                              ? "#dc2626"
+                              : selectedEdgeId === edge.id
+                                ? "#0f766e"
+                                : "#718096"
+                          }
                           strokeLinecap="round"
-                          strokeWidth={selectedEdgeId === edge.id ? "4" : "2.5"}
+                          strokeWidth={
+                            edgeDiagnostics[edge.id]?.length || selectedEdgeId === edge.id
+                              ? "4"
+                              : "2.5"
+                          }
                           style={{ pointerEvents: "none" }}
                         />
                         <text
@@ -2206,10 +2533,12 @@ export default function DagCanvas({
                   })}
                   expanded={Boolean(expandedFolderNodes[node.id])}
                   folderEntries={folderNodeEntries[node.id]}
+                  diagnostics={nodeDiagnostics[node.id] ?? []}
                   onDelete={deleteNode}
                   onDoubleClick={handleNodeDoubleClick}
                   onConnectorPointerDown={handleConnectorPointerDown}
                   onConnectorPointerUp={handleConnectorPointerUp}
+                  onContextMenu={showNodeContextMenu}
                   onPointerDown={handleNodePointerDown}
                   onPointerMove={handleNodePointerMove}
                   onPointerUp={handleNodePointerUp}
@@ -2217,6 +2546,38 @@ export default function DagCanvas({
               ))}
             </div>
           )}
+          {nodeContextMenu ? (
+            <NodeContextMenu
+              x={nodeContextMenu.x}
+              y={nodeContextMenu.y}
+              onDelete={() => deleteNode(nodeContextMenu.nodeId)}
+              onDuplicate={() => duplicateNode(nodeContextMenu.nodeId)}
+              onRename={() => renameNode(nodeContextMenu.nodeId)}
+            />
+          ) : null}
+          {nodeRenameDialog ? (
+            <NodeRenameDialog
+              initialLabel={nodeRenameDialog.label}
+              onCancel={() => setNodeRenameDialog(null)}
+              onRename={(nextLabel) =>
+                confirmRenameNode(nodeRenameDialog.nodeId, nextLabel)
+              }
+            />
+          ) : null}
+          {pendingTrustPrompt ? (
+            <FilesystemTrustPrompt
+              parentPath={pendingTrustPrompt.parentPath}
+              onCancel={cancelPendingDroppedNodes}
+              onConfirm={trustPendingDroppedNodes}
+            />
+          ) : null}
+          {!invalidWorkflow && pendingApproval ? (
+            <ApprovalDecisionOverlay
+              approval={pendingApproval}
+              node={pendingApprovalNode}
+              onDecideApproval={onDecideApproval}
+            />
+          ) : null}
           {!invalidWorkflow ? (
             <GraphMinimap
               nodes={workflowNodes}
@@ -2244,6 +2605,7 @@ export default function DagCanvas({
             nodeRun={selectedRunNode}
             nodeOutput={selectedNodeOutput}
             nodes={workflowNodes}
+            providerProfiles={providerProfiles}
             workflow={workflow}
             dataDir={dataDir}
             width={inspectorWidth}
@@ -2255,10 +2617,12 @@ export default function DagCanvas({
             onResizeStart={startInspectorResize}
             onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
             onOperationChange={(patch) => updateNodeOperation(selectedNode.id, patch)}
+            onProviderProfilesChange={setProviderProfiles}
             onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
             onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
             onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
             onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
+            onApplyFix={applyValidationFix}
           />
         ) : null}
       </div>
@@ -2271,14 +2635,20 @@ export default function DagCanvas({
         runs={logState?.runs ?? []}
         runEvents={runEvents}
         selectedRunId={logState?.selectedRunId}
+        retentionSettings={retentionSettings}
         text={displayedLog}
         title={logTitle}
         usageSummary={usageSummary}
         onResizeStart={startLogResize}
         onSelectRun={onSelectRunLog}
         onShowLatest={onLoadLatestLog}
+        onResumeRun={onResumeRunLog}
+        onReplayRun={onReplayRunLog}
+        onPruneRuns={onPruneRunLogs}
+        onRetentionSettingsChange={onRetentionSettingsChange}
         onStopRun={onStopRunLog}
         onToggle={() => setLogCollapsed((current) => !current)}
+        selectedNodeId={selectedNodeId}
       />
       {filePreviewPath ? (
         <TextFileDialog
@@ -2364,8 +2734,9 @@ function InvalidWorkflowCanvas({ workflow }) {
   );
 }
 
-function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, watch }) {
-  if (!runContinuously && !schedule && !watch) return null;
+function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, webhooks, watch }) {
+  const enabledWebhooks = Object.entries(webhooks ?? {}).filter(([, config]) => config?.enabled);
+  if (!runContinuously && !schedule && !watch && !enabledWebhooks.length) return null;
   const watchPath = watch?.path ? resolveDisplayPath(watch.path, dataDir) : "";
 
   return (
@@ -2393,6 +2764,18 @@ function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, watch }) {
           </span>
         </div>
       ) : null}
+      {enabledWebhooks.map(([triggerId, config]) => (
+        <div
+          key={triggerId}
+          className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95"
+        >
+          <Webhook size={14} className="text-teal-600" />
+          <span className="truncate">
+            API trigger: {triggerId}
+            {config.source ? ` (${config.source})` : ""}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
@@ -2431,12 +2814,12 @@ function GraphMinimap({
 
   return (
     <div
-      className="absolute right-4 top-4 z-20 rounded-lg border border-line bg-white/95 p-2 shadow-panel backdrop-blur dark:border-[#3a3a3d] dark:bg-[#252526]/95"
+      className="absolute left-4 top-4 z-20 rounded-lg border border-line bg-white/70 p-2 opacity-80 shadow-panel backdrop-blur transition-opacity hover:opacity-100 dark:border-[#3a3a3d] dark:bg-[#252526]/70"
       title="Minimap"
       onWheel={onWheel}
     >
       <div
-        className="relative cursor-crosshair overflow-hidden rounded-md bg-[#edf3f8] dark:bg-[#1b1f22]"
+        className="relative cursor-crosshair overflow-hidden rounded-md bg-[#edf3f8]/80 dark:bg-[#1b1f22]/80"
         style={{ width: minimapWidth, height: minimapHeight }}
         onPointerDown={onPointerDown}
         onPointerLeave={onPointerLeave}
@@ -2579,6 +2962,7 @@ function normalizeRunStatus(status) {
   if (status === "failed") return "error";
   if (status === "stopped") return "stopped";
   if (status === "skipped") return "skipped";
+  if (status === "reused") return "reused";
   return null;
 }
 
@@ -2618,12 +3002,15 @@ function getNodeStatusFromLog(logText, nodeId) {
 
 function ToolbarRunSelector({
   onOpenChange,
+  onReplayRun,
+  onResumeRun,
   onSelectRun,
   onShowLatest,
   onStopRun,
   open,
   runs,
   selectedRunId,
+  selectedNodeId,
 }) {
   const menuRef = useRef(null);
   const selectedRun = runs.find((run) => run.id === selectedRunId);
@@ -2677,6 +3064,14 @@ function ToolbarRunSelector({
               </button>
             ) : null}
           </div>
+          {selectedRun ? (
+            <RunHistoryActions
+              run={selectedRun}
+              selectedNodeId={selectedNodeId}
+              onReplayRun={onReplayRun}
+              onResumeRun={onResumeRun}
+            />
+          ) : null}
           <div className="workflow-scrollbar max-h-60 overflow-y-auto py-1">
             <button
               className={`flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition hover:bg-slate-50 ${
@@ -2746,16 +3141,23 @@ function LogOverlay({
   runEvents = [],
   runs = [],
   selectedRunId,
+  onReplayRun,
+  onResumeRun,
+  onPruneRuns,
+  onRetentionSettingsChange,
   onResizeStart,
   onSelectRun,
   onShowLatest,
   onStopRun,
   onToggle,
+  selectedNodeId,
+  retentionSettings = DEFAULT_RETENTION_SETTINGS,
   text,
   title,
   usageSummary,
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
+  const [retentionOpen, setRetentionOpen] = useState(false);
   const [expandedRowIds, setExpandedRowIds] = useState({});
   const [filters, setFilters] = useState({
     attempt: "",
@@ -2778,6 +3180,26 @@ function LogOverlay({
     () => (timelineRows.length ? timelineRows : parseLogRows(displayText)),
     [displayText, timelineRows],
   );
+  const resolvedRetentionSettings = {
+    ...DEFAULT_RETENTION_SETTINGS,
+    ...(retentionSettings ?? {}),
+  };
+  const updateRetentionSetting = (key, value) => {
+    const parsed = Number.parseInt(value, 10);
+    onRetentionSettingsChange?.({
+      ...resolvedRetentionSettings,
+      [key]: Number.isNaN(parsed) ? 0 : Math.max(0, parsed),
+    });
+  };
+  const pruneWithRetention = (dryRun) => {
+    setRetentionOpen(false);
+    onPruneRuns?.({
+      dryRun,
+      keepDays: resolvedRetentionSettings.keepDays,
+      keepFailedDays: resolvedRetentionSettings.keepFailedDays,
+      keepLast: resolvedRetentionSettings.keepLast,
+    });
+  };
   const usingTimeline = timelineRows.length > 0;
   const filteredRows = useMemo(() => {
     return logRows.filter((row) => {
@@ -2920,6 +3342,25 @@ function LogOverlay({
                             >
                               <Square size={12} fill="currentColor" strokeWidth={1.7} />
                             </button>
+                          ) : (
+                            <button
+                              className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line bg-white text-teal-700 transition hover:border-teal-200 hover:bg-teal-50 disabled:cursor-not-allowed disabled:opacity-40"
+                              title="Resume this run"
+                              type="button"
+                              onClick={() => onResumeRun?.(run.id, {})}
+                            >
+                              <Repeat2 size={13} />
+                            </button>
+                          )}
+                          {run.hasTriggerReplay ? (
+                            <button
+                              className="grid h-7 w-7 shrink-0 place-items-center rounded-md border border-line bg-white text-blue-700 transition hover:border-blue-200 hover:bg-blue-50"
+                              title="Replay saved webhook payload"
+                              type="button"
+                              onClick={() => onReplayRun?.(run.id, run.triggerId)}
+                            >
+                              <Webhook size={13} />
+                            </button>
                           ) : null}
                         </div>
                       ))
@@ -2929,6 +3370,80 @@ function LogOverlay({
                   </div>
                 </div>
               ) : null}
+              <div className="relative">
+                <button
+                  className={`grid h-7 w-7 place-items-center rounded-md border text-muted transition ${
+                    retentionOpen
+                      ? "border-slate-300 bg-white text-ink"
+                      : "border-line bg-white hover:bg-slate-50"
+                  }`}
+                  title="Run retention settings"
+                  type="button"
+                  onClick={() => setRetentionOpen((current) => !current)}
+                >
+                  <Trash2 size={13} />
+                </button>
+                {retentionOpen ? (
+                  <div className="absolute right-0 top-9 z-50 w-[280px] rounded-lg border border-line bg-white p-3 text-xs shadow-panel">
+                    <div className="font-semibold text-ink">Retention</div>
+                    <div className="mt-1 text-muted">Preview cleanup before pruning logs.</div>
+                    <div className="mt-3 grid gap-2">
+                      <label className="grid gap-1">
+                        <span className="font-medium text-muted">Keep latest runs</span>
+                        <input
+                          className="h-8 rounded-md border border-line px-2 text-ink outline-none focus:border-teal-300"
+                          min="0"
+                          type="number"
+                          value={resolvedRetentionSettings.keepLast}
+                          onChange={(event) =>
+                            updateRetentionSetting("keepLast", event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className="grid gap-1">
+                        <span className="font-medium text-muted">Keep runs for days</span>
+                        <input
+                          className="h-8 rounded-md border border-line px-2 text-ink outline-none focus:border-teal-300"
+                          min="0"
+                          type="number"
+                          value={resolvedRetentionSettings.keepDays}
+                          onChange={(event) =>
+                            updateRetentionSetting("keepDays", event.target.value)
+                          }
+                        />
+                      </label>
+                      <label className="grid gap-1">
+                        <span className="font-medium text-muted">Keep failed runs for days</span>
+                        <input
+                          className="h-8 rounded-md border border-line px-2 text-ink outline-none focus:border-teal-300"
+                          min="0"
+                          type="number"
+                          value={resolvedRetentionSettings.keepFailedDays}
+                          onChange={(event) =>
+                            updateRetentionSetting("keepFailedDays", event.target.value)
+                          }
+                        />
+                      </label>
+                    </div>
+                    <div className="mt-3 flex items-center justify-end gap-2">
+                      <button
+                        className="h-7 rounded-md border border-line px-2 font-medium text-muted transition hover:bg-slate-50"
+                        type="button"
+                        onClick={() => pruneWithRetention(true)}
+                      >
+                        Preview
+                      </button>
+                      <button
+                        className="h-7 rounded-md border border-red-200 bg-red-50 px-2 font-medium text-red-700 transition hover:bg-red-100"
+                        type="button"
+                        onClick={() => pruneWithRetention(false)}
+                      >
+                        Prune
+                      </button>
+                    </div>
+                  </div>
+                ) : null}
+              </div>
             </div>
           ) : null}
           <span className="grid h-8 w-8 place-items-center rounded-md text-muted">
@@ -3085,6 +3600,55 @@ function LogOverlay({
         </table>
       </div>
     </section>
+  );
+}
+
+function RunHistoryActions({ onReplayRun, onResumeRun, run, selectedNodeId }) {
+  const canResume = run?.id && run.status !== "running";
+  const canReplay = canResume && run?.hasTriggerReplay;
+  return (
+    <div className="grid gap-1 border-b border-line bg-slate-50 px-2 py-2">
+      <button
+        className="flex h-8 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-ink transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!canResume}
+        title="Resume this run"
+        type="button"
+        onClick={() => onResumeRun?.(run.id, {})}
+      >
+        <Repeat2 size={13} />
+        <span className="truncate">Resume</span>
+      </button>
+      <button
+        className="flex h-8 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-ink transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!canResume}
+        title="Rerun failed nodes"
+        type="button"
+        onClick={() => onResumeRun?.(run.id, { skipCache: true })}
+      >
+        <RefreshCw size={13} />
+        <span className="truncate">Rerun failed nodes</span>
+      </button>
+      <button
+        className="flex h-8 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-ink transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!canResume || !selectedNodeId}
+        title={selectedNodeId ? "Rerun from selected node" : "Select a node to rerun from it"}
+        type="button"
+        onClick={() => onResumeRun?.(run.id, { fromNode: selectedNodeId })}
+      >
+        <Route size={13} />
+        <span className="truncate">Rerun from selected node</span>
+      </button>
+      <button
+        className="flex h-8 items-center gap-2 rounded-md px-2 text-left text-xs font-medium text-ink transition hover:bg-white disabled:cursor-not-allowed disabled:opacity-40"
+        disabled={!canReplay}
+        title={canReplay ? "Replay saved webhook payload" : "This run has no saved webhook payload"}
+        type="button"
+        onClick={() => onReplayRun?.(run.id, run.triggerId)}
+      >
+        <Webhook size={13} />
+        <span className="truncate">Replay webhook payload</span>
+      </button>
+    </div>
   );
 }
 
@@ -3255,6 +3819,8 @@ function RunStatusDot({ status }) {
   const color =
     status === "success"
       ? "bg-emerald-500"
+      : status === "reused"
+        ? "bg-teal-500"
       : status === "error"
         ? "bg-red-500"
         : status === "stopped"
@@ -3270,9 +3836,14 @@ function RunNodeInspector({ nodeRun }) {
   const fanOut = data.fanOut ?? null;
   const fanOutItems = Array.isArray(fanOut?.items) ? fanOut.items : [];
   const [selectedFanOutIndex, setSelectedFanOutIndex] = useState(null);
+  const [attemptPage, setAttemptPage] = useState(0);
+  const [selectedTextFieldId, setSelectedTextFieldId] = useState("output");
+  const attemptsPerPage = 1;
 
   useEffect(() => {
     setSelectedFanOutIndex(null);
+    setAttemptPage(0);
+    setSelectedTextFieldId("output");
   }, [nodeRun?.nodeId]);
 
   const selectedFanOutItem =
@@ -3283,6 +3854,19 @@ function RunNodeInspector({ nodeRun }) {
     selectedFanOutIndex === null
       ? attempts
       : attempts.filter((attempt) => Number(attempt.fanOutItem?.index) === Number(selectedFanOutIndex));
+  const attemptPageCount = Math.max(1, Math.ceil(visibleAttempts.length / attemptsPerPage));
+  const clampedAttemptPage = Math.min(attemptPage, attemptPageCount - 1);
+  const selectedAttempt = visibleAttempts[clampedAttemptPage] ?? null;
+
+  useEffect(() => {
+    setAttemptPage(0);
+  }, [selectedFanOutIndex]);
+
+  useEffect(() => {
+    if (attemptPage !== clampedAttemptPage) {
+      setAttemptPage(clampedAttemptPage);
+    }
+  }, [attemptPage, clampedAttemptPage]);
 
   return (
     <InspectorSection title="Last run">
@@ -3292,6 +3876,7 @@ function RunNodeInspector({ nodeRun }) {
           ["Duration", formatSeconds(nodeRun.durationSeconds)],
           ["Exit code", nodeRun.exitCode ?? ""],
           ["Attempts", attempts.length || ""],
+          ["Reused", data.reused ? "Yes" : ""],
           ["Message", data.message ?? nodeRun.message ?? ""],
         ]}
       />
@@ -3336,68 +3921,63 @@ function RunNodeInspector({ nodeRun }) {
                   ["Exit code", selectedFanOutItem.exitCode ?? ""],
                 ]}
               />
-              {selectedFanOutItem.item ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {JSON.stringify(selectedFanOutItem.item, null, 2)}
-                </pre>
-              ) : null}
-              {selectedFanOutItem.output ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {selectedFanOutItem.output}
-                </pre>
-              ) : null}
-              {selectedFanOutItem.error ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
-                  {selectedFanOutItem.error}
-                </pre>
-              ) : null}
+              <ScrollableFieldViewer
+                fields={fanOutItemTextFields(selectedFanOutItem)}
+                selectedFieldId={selectedTextFieldId}
+                onSelectField={setSelectedTextFieldId}
+              />
             </div>
           ) : null}
         </div>
       ) : null}
       {attempts.length ? (
         <div className="space-y-2">
-          {visibleAttempts.map((attempt, index) => (
-            <div key={`${attempt.runNumber}-${attempt.attempt}-${index}`} className="rounded-md border border-line bg-slate-50 p-2 text-xs">
-              <div className="flex items-center justify-between gap-2 font-medium text-ink">
-                <span>
-                  Attempt {attempt.attempt ?? index + 1}
-                  {attempt.fanOutItem?.index !== undefined ? ` item ${attempt.fanOutItem.index}` : ""}
+          <div className="flex items-center justify-between gap-3 text-xs text-muted">
+            <span>
+              Attempt {visibleAttempts.length ? clampedAttemptPage + 1 : 0} of {visibleAttempts.length}
+            </span>
+            {attemptPageCount > 1 ? (
+              <div className="flex items-center gap-1">
+                <button
+                  className="rounded border border-line bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={clampedAttemptPage <= 0}
+                  type="button"
+                  onClick={() => setAttemptPage((current) => Math.max(0, current - 1))}
+                >
+                  Previous
+                </button>
+                <span className="px-1 text-[11px]">
+                  {clampedAttemptPage + 1}/{attemptPageCount}
                 </span>
-                <span>{formatSeconds(attempt.durationSeconds)}</span>
+                <button
+                  className="rounded border border-line bg-white px-2 py-1 text-[11px] font-medium text-slate-600 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={clampedAttemptPage >= attemptPageCount - 1}
+                  type="button"
+                  onClick={() =>
+                    setAttemptPage((current) => Math.min(attemptPageCount - 1, current + 1))
+                  }
+                >
+                  Next
+                </button>
               </div>
-              {attempt.inputs && Object.keys(attempt.inputs).length ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {JSON.stringify(attempt.inputs, null, 2)}
-                </pre>
-              ) : null}
-              {attempt.output ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {attempt.output}
-                </pre>
-              ) : null}
-              {attempt.stdout ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {attempt.stdout}
-                </pre>
-              ) : null}
-              {attempt.stderr ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
-                  {attempt.stderr}
-                </pre>
-              ) : null}
-              {attempt.error && attempt.error !== attempt.stderr ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-red-50 p-2 font-mono text-[11px] text-red-700">
-                  {attempt.error}
-                </pre>
-              ) : null}
-              {attempt.prompt ? (
-                <pre className="mt-2 max-h-28 overflow-auto whitespace-pre-wrap rounded bg-white p-2 font-mono text-[11px] text-slate-700">
-                  {attempt.prompt}
-                </pre>
-              ) : null}
+            ) : null}
+          </div>
+          {selectedAttempt ? (
+            <div
+              key={`${selectedAttempt.runNumber}-${selectedAttempt.attempt}-${clampedAttemptPage}`}
+              className="rounded-md border border-line bg-slate-50 p-2 text-xs"
+            >
+              <div className="flex items-center justify-between gap-2 font-medium text-ink">
+                <span>{attemptRunLabel(selectedAttempt, clampedAttemptPage)}</span>
+                <span>{formatSeconds(selectedAttempt.durationSeconds)}</span>
+              </div>
+              <ScrollableFieldViewer
+                fields={attemptTextFields(selectedAttempt)}
+                selectedFieldId={selectedTextFieldId}
+                onSelectField={setSelectedTextFieldId}
+              />
             </div>
-          ))}
+          ) : null}
         </div>
       ) : null}
       {edgeDecisions.length ? (
@@ -3415,6 +3995,82 @@ function RunNodeInspector({ nodeRun }) {
         </div>
       ) : null}
     </InspectorSection>
+  );
+}
+
+function attemptRunLabel(attempt, fallbackIndex) {
+  const attemptNumber = attempt.attempt ?? fallbackIndex + 1;
+  const iteration = attemptIterationNumber(attempt);
+  return iteration === null
+    ? `Attempt ${attemptNumber}`
+    : `Iteration ${iteration} - Attempt ${attemptNumber}`;
+}
+
+function attemptIterationNumber(attempt) {
+  const rawIndex = attempt?.fanOutItem?.index ?? attempt?.loopItem?.index ?? attempt?.loop?.index;
+  if (rawIndex === null || rawIndex === undefined || rawIndex === "") return null;
+  const number = Number(rawIndex);
+  if (!Number.isFinite(number)) return String(rawIndex);
+  return number + 1;
+}
+
+function attemptTextFields(attempt) {
+  return [
+    attempt.inputs && Object.keys(attempt.inputs).length
+      ? { id: "inputs", label: "Inputs", text: JSON.stringify(attempt.inputs, null, 2) }
+      : null,
+    attempt.output ? { id: "output", label: "Output", text: attempt.output } : null,
+    attempt.stdout ? { id: "stdout", label: "Stdout", text: attempt.stdout } : null,
+    attempt.stderr ? { id: "stderr", label: "Stderr", text: attempt.stderr, tone: "error" } : null,
+    attempt.error && attempt.error !== attempt.stderr
+      ? { id: "error", label: "Error", text: attempt.error, tone: "error" }
+      : null,
+    attempt.prompt ? { id: "prompt", label: "Prompt", text: attempt.prompt } : null,
+  ].filter(Boolean);
+}
+
+function fanOutItemTextFields(item) {
+  return [
+    item.item ? { id: "item", label: "Iteration item", text: JSON.stringify(item.item, null, 2) } : null,
+    item.output ? { id: "output", label: "Output", text: item.output } : null,
+    item.error ? { id: "error", label: "Error", text: item.error, tone: "error" } : null,
+  ].filter(Boolean);
+}
+
+function ScrollableFieldViewer({ fields, selectedFieldId, onSelectField }) {
+  if (!fields.length) return null;
+  const selectedField = fields.find((field) => field.id === selectedFieldId) ?? fields[0];
+  const errorTone = selectedField.tone === "error";
+  return (
+    <div className="mt-2 overflow-hidden rounded-md border border-line bg-white">
+      <div className="flex flex-wrap gap-1 border-b border-line bg-slate-50 p-1">
+        {fields.map((field) => {
+          const selected = field.id === selectedField.id;
+          return (
+            <button
+              key={field.id}
+              className={`rounded px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] transition ${
+                selected
+                  ? "bg-white text-ink shadow-sm"
+                  : "text-muted hover:bg-white/70 hover:text-ink"
+              }`}
+              title={`Show ${field.label}`}
+              type="button"
+              onClick={() => onSelectField(field.id)}
+            >
+              {field.label}
+            </button>
+          );
+        })}
+      </div>
+      <pre
+        className={`workflow-scrollbar max-h-[min(48vh,520px)] min-h-72 overflow-auto whitespace-pre-wrap p-2 font-mono text-[11px] leading-5 ${
+          errorTone ? "bg-red-50 text-red-700" : "bg-white text-slate-700"
+        }`}
+      >
+        {selectedField.text}
+      </pre>
+    </div>
   );
 }
 
@@ -3467,11 +4123,12 @@ function SelectionRectangle({ box }) {
 function WorkflowNode({
   expanded,
   folderEntries,
+  diagnostics = [],
   node,
   onConnectorPointerDown,
   onConnectorPointerUp,
+  onContextMenu,
   onDoubleClick,
-  onDelete,
   selected,
   status,
   onPointerDown,
@@ -3484,17 +4141,24 @@ function WorkflowNode({
   const isFileNode = node.type === "file";
   const isFolderNode = node.type === "folder";
   const extension = isFileNode ? fileExtension(node.operation?.path) : "";
+  const hasError = diagnostics.some((diagnostic) => diagnostic.severity === "error");
+  const hasWarning = diagnostics.some((diagnostic) => diagnostic.severity === "warning");
   const title = isFileNode
     ? "Double click to preview"
     : isFolderNode
       ? "Double click to expand"
-      : undefined;
+      : diagnostics[0]?.message;
+  const borderClass = hasError
+    ? "border-red-500 ring-4 ring-red-100"
+    : hasWarning
+      ? "border-amber-400 ring-4 ring-amber-100"
+      : selected
+        ? "border-teal-500 ring-4 ring-teal-100"
+        : style.border;
 
   return (
     <article
-      className={`absolute w-[220px] cursor-grab rounded-lg border bg-white p-3 shadow-node transition active:cursor-grabbing ${
-        selected ? "border-teal-500 ring-4 ring-teal-100" : style.border
-      }`}
+      className={`absolute w-[220px] cursor-grab rounded-lg border bg-white p-3 shadow-node transition active:cursor-grabbing ${borderClass}`}
       style={{ left: node.x, top: node.y, zIndex }}
       title={title}
       onDoubleClick={(event) => {
@@ -3502,12 +4166,18 @@ function WorkflowNode({
         onDoubleClick?.(node);
       }}
       onPointerDown={(event) => {
-        if (event.button !== 0) return;
         event.stopPropagation();
+        if (event.button !== 0) {
+          if (event.button === 2) {
+            event.preventDefault();
+          }
+          return;
+        }
         onPointerDown(event, node.id);
       }}
       onPointerMove={(event) => onPointerMove(event, node.id)}
       onPointerUp={(event) => onPointerUp(event, node.id)}
+      onContextMenu={(event) => onContextMenu?.(event, node.id)}
     >
       <button
         className="absolute -right-2 top-1/2 z-10 h-4 w-4 -translate-y-1/2 rounded-full border border-teal-300 bg-white shadow-sm transition hover:scale-110 hover:border-teal-500 hover:bg-teal-50"
@@ -3516,46 +4186,186 @@ function WorkflowNode({
         onPointerDown={(event) => onConnectorPointerDown?.(event, node.id)}
         onPointerUp={(event) => onConnectorPointerUp?.(event, node.id)}
       />
-      <div className="flex items-start justify-between gap-3">
-        <div className="flex min-w-0 items-start gap-3">
-          <span className={`relative grid h-9 w-9 shrink-0 place-items-center rounded-lg text-white ${style.accent}`}>
-            <Icon size={18} />
-            {extension ? (
-              <span className="absolute -bottom-1 -right-1 rounded bg-white px-1 text-[8px] font-bold leading-3 text-slate-700 shadow-sm">
-                {extension.slice(0, 4)}
-              </span>
-            ) : null}
-          </span>
-          <div className="min-w-0">
-            <h3 className="truncate text-sm font-semibold">{node.label}</h3>
-            <p className="mt-1 truncate text-xs text-muted">{node.meta}</p>
-          </div>
-        </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <NodeStatusBadge status={status} />
-          <button
-            className="grid h-6 w-6 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-            title="Delete node"
-            type="button"
-            onPointerDown={(event) => event.stopPropagation()}
-            onClick={(event) => {
-              event.stopPropagation();
-              onDelete(node.id);
-            }}
-          >
-            <X size={14} />
-          </button>
-        </div>
+      <div className="min-w-0">
+        <h3 className="truncate text-sm font-semibold leading-5">{node.label}</h3>
+        <p className="mt-1 truncate text-xs leading-5 text-muted">{node.meta}</p>
       </div>
-      <div className="mt-4 flex items-center gap-2">
+      <div className="mt-3 flex items-end justify-between gap-2">
+        <span className={`relative grid h-8 w-8 shrink-0 place-items-center rounded-lg text-white ${style.accent}`}>
+          <Icon size={16} />
+          {extension ? (
+            <span className="absolute -bottom-1 -right-1 rounded bg-white px-1 text-[8px] font-bold leading-3 text-slate-700 shadow-sm">
+              {extension.slice(0, 4)}
+            </span>
+          ) : null}
+        </span>
         <span className={`rounded-md border px-2 py-1 text-[11px] font-medium ${style.chip}`}>
           {node.type}
         </span>
+        <div className="ml-auto flex shrink-0 items-center gap-2">
+          {hasError || hasWarning ? (
+            <AlertCircle
+              className={hasError ? "text-red-600" : "text-amber-600"}
+              size={15}
+            />
+          ) : null}
+          <NodeStatusBadge status={status} />
+        </div>
       </div>
       {isFolderNode && expanded ? (
         <FolderNodePreview state={folderEntries} />
       ) : null}
     </article>
+  );
+}
+
+function NodeContextMenu({ onDelete, onDuplicate, onRename, x, y }) {
+  return (
+    <div
+      className="fixed z-[90] w-48 rounded-lg border border-line bg-white p-1 text-sm shadow-panel"
+      style={{ left: x, top: y }}
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      <button
+        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-ink"
+        type="button"
+        onClick={onDuplicate}
+      >
+        <Copy size={15} />
+        Duplicate node
+      </button>
+      <button
+        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-ink"
+        type="button"
+        onClick={onRename}
+      >
+        <PencilLine size={15} />
+        Rename node
+      </button>
+      <div className="my-1 border-t border-line" />
+      <button
+        className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
+        type="button"
+        onClick={onDelete}
+      >
+        <Trash2 size={15} />
+        Delete node
+      </button>
+    </div>
+  );
+}
+
+function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
+  const [label, setLabel] = useState(initialLabel || "");
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    onRename(label);
+  }
+
+  return (
+    <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4">
+      <form
+        className="w-full max-w-sm rounded-lg border border-line bg-white shadow-panel"
+        onSubmit={handleSubmit}
+      >
+        <div className="flex items-center justify-between border-b border-line px-4 py-3">
+          <div>
+            <h2 className="text-sm font-semibold text-ink">Rename node</h2>
+            <p className="text-xs text-muted">Update the label shown on the graph.</p>
+          </div>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            title="Close"
+            type="button"
+            onClick={onCancel}
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="px-4 py-4">
+          <label className="block">
+            <span className="text-xs font-medium text-muted">Node label</span>
+            <input
+              autoFocus
+              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
+              value={label}
+              onChange={(event) => setLabel(event.target.value)}
+            />
+          </label>
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-line px-4 py-3">
+          <button
+            className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300"
+            type="button"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={!label.trim()}
+            title="Confirm node rename"
+            type="submit"
+          >
+            <PencilLine size={15} />
+            Rename
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
+  const [trustParent, setTrustParent] = useState(true);
+  return (
+    <div className="absolute inset-0 z-50 grid place-items-center bg-slate-950/20 px-4 backdrop-blur-sm">
+      <section className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold text-ink">Trust the files in</h2>
+            <p className="mt-1 break-all text-sm text-muted">{parentPath}</p>
+          </div>
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-muted transition hover:bg-slate-50 hover:text-ink"
+            title="Cancel"
+            type="button"
+            onClick={onCancel}
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <label className="mt-4 flex items-start gap-3 rounded-md border border-line bg-slate-50 px-3 py-2 text-sm text-ink">
+          <input
+            checked={trustParent}
+            className="mt-0.5 h-4 w-4 rounded border-slate-300"
+            type="checkbox"
+            onChange={(event) => setTrustParent(event.target.checked)}
+          />
+          <span>Trust this parent folder and all files and subfolders inside it.</span>
+        </label>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            className="inline-flex h-9 items-center justify-center rounded-md border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-slate-50"
+            type="button"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-brand px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-dark"
+            type="button"
+            onClick={() => onConfirm(trustParent)}
+          >
+            <Check size={15} />
+            Add access
+          </button>
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -3623,6 +4433,7 @@ function NodeStatusBadge({ status }) {
     error: "border-red-200 bg-red-50 text-red-700",
     stopped: "border-amber-200 bg-amber-50 text-amber-700",
     skipped: "border-slate-200 bg-slate-50 text-slate-500",
+    reused: "border-teal-200 bg-teal-50 text-teal-700",
   }[status];
 
   return (
@@ -3659,6 +4470,7 @@ function Inspector({
   nodeRun,
   nodeOutput,
   nodes,
+  providerProfiles = [],
   workflow,
   onAddEdge,
   onAgentChange,
@@ -3667,6 +4479,8 @@ function Inspector({
   onEdgeChange,
   onNodeChange,
   onOperationChange,
+  onApplyFix,
+  onProviderProfilesChange,
   onResizeStart,
   onSettingsChange,
   onToggleCollapsed,
@@ -3679,6 +4493,8 @@ function Inspector({
   const [nodeInspectorOpen, setNodeInspectorOpen] = useState(Boolean(node));
   const [cronPickerOpen, setCronPickerOpen] = useState(false);
   const [draftEdge, setDraftEdge] = useState(null);
+  const [addingFilesystemPath, setAddingFilesystemPath] = useState(false);
+  const [filesystemPathDraft, setFilesystemPathDraft] = useState("");
   const operation = node?.operation ?? defaultOperation(node?.type ?? "agent");
   const settings = { ...defaultSettings, ...(node?.settings ?? {}) };
   const existingSpecialTypes = new Set(
@@ -3718,6 +4534,11 @@ function Inspector({
       : null;
   const schedule = workflow.schedule ?? null;
   const watch = workflow.watch ?? null;
+  const webhooks = workflow.webhooks ?? {};
+  const filesystemAccess = workflow.filesystemAccess ?? [];
+  const manualFilesystemAccess = filesystemAccess
+    .map((entry, index) => ({ entry, index }))
+    .filter(({ entry }) => !dataDir || !pathsMatch(entry.path, dataDir));
   const connectedEdges = node
     ? edges.filter((edge) => edge.from === node.id || edge.to === node.id)
     : [];
@@ -3729,6 +4550,11 @@ function Inspector({
   const agentDiagnostics = agentConfig
     ? diagnosticsForAgent(workflowDiagnostics, operation.agent_id, agentConfig)
     : [];
+  const edgeDiagnostics = edge ? diagnosticsForEdge(workflowDiagnostics, edge) : [];
+  const workflowFieldDiagnostics = (...fields) =>
+    diagnosticsForField(workflowDiagnostics, ...fields);
+  const nodeFieldDiagnostics = (...fields) => diagnosticsForField(nodeDiagnostics, ...fields);
+  const edgeFieldDiagnostics = (...fields) => diagnosticsForField(edgeDiagnostics, ...fields);
 
   useEffect(() => {
     setWorkflowSettingsOpen(!node && !edge);
@@ -3736,6 +4562,17 @@ function Inspector({
     setNodeInspectorOpen(Boolean(node));
     setDraftEdge(null);
   }, [edge?.id, node?.id]);
+
+  useEffect(() => {
+    if (!window.goferDesktop?.workspace?.grantPath) return;
+    for (const entry of filesystemAccess) {
+      if (entry?.path) {
+        window.goferDesktop.workspace.grantPath(entry.path).catch((error) => {
+          console.error("Failed to trust workflow path", error);
+        });
+      }
+    }
+  }, [filesystemAccess]);
 
   function updateWorkflowSchedule(patch) {
     const currentSchedule = schedule ?? { cron_expression: "0 9 * * *", timezone: "UTC" };
@@ -3753,6 +4590,69 @@ function Inspector({
       max_concurrency: 1,
     };
     onWorkflowChange({ watch: { ...currentWatch, ...patch } });
+  }
+
+  function updateWorkflowWebhook(triggerId, patch) {
+    const currentWebhook = webhooks[triggerId] ?? {
+      id: triggerId,
+      enabled: true,
+      source: "webhook",
+      concurrency_policy: "allow",
+    };
+    onWorkflowChange({
+      webhooks: {
+        ...webhooks,
+        [triggerId]: { ...currentWebhook, ...patch, id: triggerId },
+      },
+    });
+  }
+
+  function addWorkflowWebhook() {
+    let index = 1;
+    let triggerId = "default";
+    while (webhooks[triggerId]) {
+      index += 1;
+      triggerId = `webhook-${index}`;
+    }
+    updateWorkflowWebhook(triggerId, {});
+  }
+
+  function removeWorkflowWebhook(triggerId) {
+    const nextWebhooks = { ...webhooks };
+    delete nextWebhooks[triggerId];
+    onWorkflowChange({ webhooks: nextWebhooks });
+  }
+
+  function updateFilesystemAccess(index, patch) {
+    const current = workflow.filesystemAccess ?? [];
+    onWorkflowChange({
+      filesystemAccess: uniqueAccessEntries(
+        current.map((entry, currentIndex) =>
+          currentIndex === index ? { ...entry, ...patch } : entry,
+        ),
+      ),
+    });
+  }
+
+  function addFilesystemAccess(pathValue = filesystemPathDraft) {
+    const path = String(pathValue ?? "").trim();
+    if (!path) return;
+    onWorkflowChange({
+      filesystemAccess: uniqueAccessEntries([...filesystemAccess, { path }]),
+    });
+    setFilesystemPathDraft("");
+    setAddingFilesystemPath(false);
+    window.goferDesktop?.workspace?.grantPath?.(path).catch((error) => {
+      console.error("Failed to trust workflow path", error);
+    });
+  }
+
+  function removeFilesystemAccess(index) {
+    onWorkflowChange({
+      filesystemAccess: (workflow.filesystemAccess ?? []).filter(
+        (_entry, currentIndex) => currentIndex !== index,
+      ),
+    });
   }
 
   return (
@@ -3803,7 +4703,7 @@ function Inspector({
               {workflow.sourcePath ? (
                 <TextField label="Source path" value={workflow.sourcePath} readOnly pathLink />
               ) : null}
-              <HealthDiagnosticList diagnostics={workflowDiagnostics} />
+              <HealthDiagnosticList diagnostics={workflowDiagnostics} onApplyFix={onApplyFix} />
               <NumberField
                 label="Max total node runs"
                 min="1"
@@ -3812,6 +4712,7 @@ function Inspector({
               />
               <ToggleField
                 checked={Boolean(workflow.runContinuously)}
+                diagnostics={workflowFieldDiagnostics("runContinuously")}
                 label="Run continuously"
                 onChange={(checked) => onWorkflowChange({ runContinuously: checked })}
               />
@@ -3821,6 +4722,92 @@ function Inspector({
                   Stop all runs to turn it off.
                 </p>
               ) : null}
+            </InspectorSection>
+
+            <InspectorSection title="Filesystem access">
+              <div className="grid gap-3">
+                {dataDir ? (
+                  <div className="rounded-lg border border-line bg-slate-50 p-3">
+                    <TextField label="Project folder" value={dataDir} readOnly pathLink />
+                    <p className="mt-2 text-xs leading-5 text-muted">
+                      The project folder is trusted automatically.
+                    </p>
+                  </div>
+                ) : null}
+                {manualFilesystemAccess.map(({ entry, index }) => (
+                  <div
+                    key={`${entry.path}-${index}`}
+                    className="rounded-lg border border-line bg-slate-50 p-3"
+                  >
+                    <div className="flex items-start gap-2">
+                      <div className="min-w-0 flex-1">
+                        <TextField
+                          label="Trusted directory"
+                          value={entry.path ?? ""}
+                          onChange={(value) => updateFilesystemAccess(index, { path: value })}
+                          pathPicker
+                          pathBasePath={dataDir}
+                          pathLink
+                          placeholder="/absolute/path"
+                        />
+                      </div>
+                      <button
+                        className="mt-6 grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
+                        title="Remove trusted directory"
+                        type="button"
+                        onClick={() => removeFilesystemAccess(index)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+                {addingFilesystemPath ? (
+                  <div className="rounded-lg border border-brand/30 bg-white p-3 shadow-sm">
+                    <TextField
+                      label="Trusted directory"
+                      value={filesystemPathDraft}
+                      onChange={setFilesystemPathDraft}
+                      pathPicker
+                      pathBasePath={dataDir}
+                      placeholder="/absolute/path"
+                    />
+                    <div className="mt-3 flex justify-end gap-2">
+                      <button
+                        className="h-8 rounded-md border border-line bg-white px-3 text-xs font-medium text-muted transition hover:bg-slate-50 hover:text-ink"
+                        type="button"
+                        onClick={() => {
+                          setFilesystemPathDraft("");
+                          setAddingFilesystemPath(false);
+                        }}
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        className="h-8 rounded-md bg-brand px-3 text-xs font-semibold text-white transition hover:bg-brand-strong disabled:cursor-not-allowed disabled:opacity-50"
+                        type="button"
+                        disabled={!filesystemPathDraft.trim()}
+                        onClick={() => addFilesystemAccess()}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <button
+                    className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
+                    type="button"
+                    onClick={() => setAddingFilesystemPath(true)}
+                  >
+                    <Plus size={14} />
+                    Add trusted directory
+                  </button>
+                )}
+                <p className="text-xs leading-5 text-muted">
+                  Trusted directories are saved with the workflow. Gofer can read and write files
+                  in them, and Codex or Claude agent nodes receive them as sandbox paths.
+                </p>
+              </div>
             </InspectorSection>
 
             <InspectorSection
@@ -3842,6 +4829,7 @@ function Inspector({
               {schedule ? (
                 <>
                   <CronExpressionField
+                    diagnostics={workflowFieldDiagnostics("cron_expression")}
                     label="Cron expression"
                     value={schedule.cron_expression ?? ""}
                     onChange={(value) => updateWorkflowSchedule({ cron_expression: value })}
@@ -3850,6 +4838,7 @@ function Inspector({
                     onPickerOpenChange={setCronPickerOpen}
                   />
                   <TextField
+                    diagnostics={workflowFieldDiagnostics("timezone")}
                     label="Timezone"
                     value={schedule.timezone ?? "UTC"}
                     onChange={(value) => updateWorkflowSchedule({ timezone: value })}
@@ -3889,6 +4878,7 @@ function Inspector({
               {watch ? (
                 <>
                   <TextField
+                    diagnostics={workflowFieldDiagnostics("path")}
                     label="Path"
                     value={watch.path ?? ""}
                     onChange={(value) => updateWorkflowWatch({ path: value })}
@@ -3897,6 +4887,7 @@ function Inspector({
                     placeholder="Absolute folder path"
                   />
                   <TextField
+                    diagnostics={workflowFieldDiagnostics("glob")}
                     label="Glob"
                     value={watch.glob ?? "*"}
                     onChange={(value) => updateWorkflowWatch({ glob: value })}
@@ -3937,6 +4928,77 @@ function Inspector({
                 </p>
               )}
             </InspectorSection>
+
+            <InspectorSection title="Webhook/API triggers">
+              <div className="grid gap-3">
+                {Object.entries(webhooks).map(([triggerId, config]) => (
+                  <div key={triggerId} className="rounded-lg border border-line bg-slate-50 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-ink">{triggerId}</div>
+                        <div className="truncate text-xs text-muted">
+                          {config.tokenConfigured || config.token_env ? "Token required" : "No token required"}
+                        </div>
+                      </div>
+                      <button
+                        className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
+                        title="Remove webhook trigger"
+                        type="button"
+                        onClick={() => removeWorkflowWebhook(triggerId)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
+                    <ToggleField
+                      checked={Boolean(config.enabled)}
+                      label="Enabled"
+                      onChange={(checked) => updateWorkflowWebhook(triggerId, { enabled: checked })}
+                    />
+                    <TextField
+                      label="Source"
+                      value={config.source ?? "webhook"}
+                      onChange={(value) => updateWorkflowWebhook(triggerId, { source: value })}
+                      placeholder="github"
+                    />
+                    <TextField
+                      label="Fan-out path"
+                      value={config.fanout_path ?? ""}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { fanout_path: value || null })
+                      }
+                      placeholder="payload.items"
+                    />
+                    <TextField
+                      label="Token environment variable"
+                      value={config.token_env ?? ""}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { token_env: value || null })
+                      }
+                      placeholder="GOFER_GITHUB_WEBHOOK_TOKEN"
+                    />
+                    <SelectField
+                      label="Concurrency"
+                      value={config.concurrency_policy ?? "allow"}
+                      options={[
+                        ["allow", "Allow concurrent runs"],
+                        ["reject_if_running", "Reject while running"],
+                      ]}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { concurrency_policy: value })
+                      }
+                    />
+                  </div>
+                ))}
+                <button
+                  className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
+                  type="button"
+                  onClick={addWorkflowWebhook}
+                >
+                  <Plus size={14} />
+                  Add webhook trigger
+                </button>
+              </div>
+            </InspectorSection>
           </div>
         </InspectorPanel>
 
@@ -3949,7 +5011,9 @@ function Inspector({
           >
             <div className="space-y-4 p-4">
               <InspectorSection title="Relationship">
+                <HealthDiagnosticList diagnostics={edgeDiagnostics} onApplyFix={onApplyFix} />
                 <SelectField
+                  diagnostics={edgeFieldDiagnostics("condition")}
                   label="Type"
                   value={edge.condition ?? "always"}
                   options={edgeConditionOptions}
@@ -3963,6 +5027,8 @@ function Inspector({
                 />
                 {edge.condition === "output_matches" ? (
                   <TextField
+                    diagnostics={edgeFieldDiagnostics("outputPattern")}
+                    label="Output pattern"
                     value={edge.outputPattern ?? ""}
                     onChange={(value) => onEdgeChange(edge.id, { outputPattern: value })}
                     placeholder="Regex pattern"
@@ -3972,6 +5038,7 @@ function Inspector({
 
               <InspectorSection title="Endpoints">
                 <SelectField
+                  diagnostics={edgeFieldDiagnostics("from")}
                   label="Source"
                   value={edge.from}
                   options={nodes.map((candidate) => [
@@ -3981,6 +5048,7 @@ function Inspector({
                   onChange={(value) => onEdgeChange(edge.id, { from: value })}
                 />
                 <SelectField
+                  diagnostics={edgeFieldDiagnostics("to")}
                   label="Target"
                   value={edge.to}
                   options={nodes.map((candidate) => [
@@ -4016,7 +5084,7 @@ function Inspector({
               options={nodeTypeOptions}
               onChange={onTypeChange}
             />
-            <HealthDiagnosticList diagnostics={nodeDiagnostics} />
+            <HealthDiagnosticList diagnostics={nodeDiagnostics} onApplyFix={onApplyFix} />
           </InspectorSection>
 
           <InspectorSection title="Execution">
@@ -4066,10 +5134,6 @@ function Inspector({
               placeholder="None"
             />
           </InspectorSection>
-
-          {nodeRun ? (
-            <RunNodeInspector nodeRun={nodeRun} />
-          ) : null}
 
           <InspectorSection title="Inputs">
             <InputMappingField
@@ -4147,6 +5211,7 @@ function Inspector({
               ) : null}
               {operation.source?.type === "tabular" ? (
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.source.path")}
                   label="Path"
                   value={operation.source.path ?? ""}
                   onChange={(value) =>
@@ -4159,6 +5224,7 @@ function Inspector({
               {operation.source?.type === "directory" ? (
                 <>
                   <TextField
+                    diagnostics={nodeFieldDiagnostics("operation.source.path")}
                     label="Path"
                     value={operation.source.path ?? ""}
                     onChange={(value) =>
@@ -4197,12 +5263,13 @@ function Inspector({
                 />
               ) : null}
               <NumberField
+                diagnostics={nodeFieldDiagnostics("operation.source.max_concurrency")}
                 label="Max concurrency"
                 min="1"
-                value={operation.source?.max_concurrency ?? 16}
+                value={operation.source?.max_concurrency ?? 1}
                 onChange={(value) =>
                   onOperationChange({
-                    source: { ...operation.source, max_concurrency: value || 16 },
+                    source: { ...operation.source, max_concurrency: value || 1 },
                   })
                 }
               />
@@ -4233,6 +5300,7 @@ function Inspector({
                 onChange={(value) => onOperationChange({ command: value })}
               />
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.working_dir")}
                 label="Working directory"
                 value={operation.working_dir ?? ""}
                 onChange={(value) => onOperationChange({ working_dir: value })}
@@ -4253,6 +5321,7 @@ function Inspector({
               title={operation.type === "python_script" ? "Python script" : "Shell script"}
             >
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.script_path")}
                 label="Script path"
                 value={operation.script_path ?? ""}
                 onChange={(value) => onOperationChange({ script_path: value })}
@@ -4276,6 +5345,7 @@ function Inspector({
           {operation.type === "read_file" ? (
             <InspectorSection title="Read file">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.path")}
                 label="Path"
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
@@ -4303,6 +5373,7 @@ function Inspector({
           {operation.type === "write_file" ? (
             <InspectorSection title="Write file">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.path")}
                 label="Path"
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
@@ -4342,6 +5413,7 @@ function Inspector({
           {operation.type === "copy_file" || operation.type === "move_file" ? (
             <InspectorSection title={operation.type === "copy_file" ? "Copy file" : "Move file"}>
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.source_path")}
                 label="Source path"
                 value={operation.source_path ?? ""}
                 onChange={(value) => onOperationChange({ source_path: value })}
@@ -4349,6 +5421,7 @@ function Inspector({
                 pathBasePath={dataDir}
               />
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.destination_path")}
                 label="Destination path"
                 value={operation.destination_path ?? ""}
                 onChange={(value) => onOperationChange({ destination_path: value })}
@@ -4371,6 +5444,7 @@ function Inspector({
           {operation.type === "delete_file" ? (
             <InspectorSection title="Delete file">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.path")}
                 label="Path"
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
@@ -4398,6 +5472,7 @@ function Inspector({
           {operation.type === "file" ? (
             <InspectorSection title="File path">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.path")}
                 label="Path"
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
@@ -4411,6 +5486,7 @@ function Inspector({
           {operation.type === "folder" ? (
             <InspectorSection title="Folder path">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.path")}
                 label="Path"
                 value={operation.path ?? ""}
                 onChange={(value) => onOperationChange({ path: value })}
@@ -4424,6 +5500,7 @@ function Inspector({
           {operation.type === "open_resource" ? (
             <InspectorSection title="Open app / URL / file">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.target")}
                 label="Target"
                 value={operation.target ?? ""}
                 onChange={(value) => onOperationChange({ target: value })}
@@ -4455,6 +5532,7 @@ function Inspector({
           {operation.type === "prompt_file" ? (
             <InspectorSection title="Prompt file">
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.output_path")}
                 label="Output path"
                 value={operation.output_path ?? ""}
                 onChange={(value) => onOperationChange({ output_path: value })}
@@ -4462,6 +5540,7 @@ function Inspector({
                 pathBasePath={dataDir}
               />
               <TextField
+                diagnostics={nodeFieldDiagnostics("operation.template_path")}
                 label="Template path"
                 value={operation.template_path ?? ""}
                 onChange={(value) => onOperationChange({ template_path: value })}
@@ -4503,6 +5582,7 @@ function Inspector({
             <>
               <InspectorSection title="Common LLM task">
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("agent_id", "operation.agent_id")}
                   label="Agent ID"
                   value={operation.agent_id ?? ""}
                   onChange={(value) => onOperationChange({ agent_id: value })}
@@ -4534,11 +5614,32 @@ function Inspector({
                   onChange={(value) => onOperationChange({ instructions: value })}
                 />
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.working_dir")}
                   label="Working directory"
                   value={operation.working_dir ?? ""}
                   onChange={(value) => onOperationChange({ working_dir: value })}
                   pathPicker
                   pathBasePath={dataDir}
+                />
+                <SelectField
+                  label="Provider profile"
+                  value={operation.profile ?? ""}
+                  options={profileSelectOptions(providerProfiles, agentConfig?.subscription)}
+                  onChange={(value) => onOperationChange({ profile: value })}
+                />
+                <TextField
+                  label="Model override"
+                  value={operation.model ?? ""}
+                  onChange={(value) => onOperationChange({ model: value })}
+                  placeholder="Optional"
+                />
+                <NumberField
+                  label="Timeout override"
+                  min="0"
+                  step="1"
+                  value={operation.timeout ?? ""}
+                  onChange={(value) => onOperationChange({ timeout: value || "" })}
+                  placeholder="Seconds"
                 />
                 <KeyValueField
                   label="Input mapping"
@@ -4551,6 +5652,8 @@ function Inspector({
                 diagnostics={agentDiagnostics}
                 agentId={operation.agent_id}
                 pathBasePath={dataDir}
+                providerProfiles={providerProfiles}
+                onProviderProfilesChange={onProviderProfilesChange}
                 onAgentChange={onAgentChange}
               />
             </>
@@ -4560,6 +5663,7 @@ function Inspector({
             <>
               <InspectorSection title="Local vector index">
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.source_path")}
                   label="Source path"
                   value={operation.source_path ?? ""}
                   onChange={(value) => onOperationChange({ source_path: value })}
@@ -4567,6 +5671,7 @@ function Inspector({
                   pathBasePath={dataDir}
                 />
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.index_path")}
                   label="Index path"
                   value={operation.index_path ?? ""}
                   onChange={(value) => onOperationChange({ index_path: value })}
@@ -4615,6 +5720,7 @@ function Inspector({
             <>
               <InspectorSection title="Local search">
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.index_path")}
                   label="Index path"
                   value={operation.index_path ?? ""}
                   onChange={(value) => onOperationChange({ index_path: value })}
@@ -4859,11 +5965,13 @@ function Inspector({
             <>
               <InspectorSection title="Agent node">
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("agent_id", "operation.agent_id")}
                   label="Agent ID"
                   value={operation.agent_id ?? ""}
                   onChange={(value) => onOperationChange({ agent_id: value })}
                 />
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.prompt_path")}
                   label="Prompt path"
                   value={operation.prompt_path ?? ""}
                   onChange={(value) => onOperationChange({ prompt_path: value })}
@@ -4878,11 +5986,32 @@ function Inspector({
                   placeholder="gofer-flow-workflow-builder"
                 />
                 <TextField
+                  diagnostics={nodeFieldDiagnostics("operation.working_dir")}
                   label="Working directory"
                   value={operation.working_dir ?? ""}
                   onChange={(value) => onOperationChange({ working_dir: value })}
                   pathPicker
                   pathBasePath={dataDir}
+                />
+                <SelectField
+                  label="Provider profile"
+                  value={operation.profile ?? ""}
+                  options={profileSelectOptions(providerProfiles, agentConfig?.subscription)}
+                  onChange={(value) => onOperationChange({ profile: value })}
+                />
+                <TextField
+                  label="Model override"
+                  value={operation.model ?? ""}
+                  onChange={(value) => onOperationChange({ model: value })}
+                  placeholder="Optional"
+                />
+                <NumberField
+                  label="Timeout override"
+                  min="0"
+                  step="1"
+                  value={operation.timeout ?? ""}
+                  onChange={(value) => onOperationChange({ timeout: value || "" })}
+                  placeholder="Seconds"
                 />
                 <SelectField
                   label="Memory"
@@ -4907,6 +6036,8 @@ function Inspector({
                   diagnostics={agentDiagnostics}
                   agentId={operation.agent_id}
                   pathBasePath={dataDir}
+                  providerProfiles={providerProfiles}
+                  onProviderProfilesChange={onProviderProfilesChange}
                   onAgentChange={onAgentChange}
                 />
               </InspectorSection>
@@ -4926,6 +6057,7 @@ function Inspector({
                   {connectedEdges.map((edge) => (
                     <ConnectedEdgeEditor
                       key={edge.id}
+                      diagnostics={diagnosticsForEdge(workflowDiagnostics, edge)}
                       edge={edge}
                       node={node}
                       nodes={nodes}
@@ -4978,6 +6110,10 @@ function Inspector({
               ) : null}
             </div>
           </InspectorSection>
+
+          {nodeRun ? (
+            <RunNodeInspector nodeRun={nodeRun} />
+          ) : null}
             </div>
           </InspectorPanel>
         ) : null}
@@ -4989,28 +6125,29 @@ function Inspector({
 export function defaultFanSource(type) {
   switch (type) {
     case "count":
-      return { type, count: 1, max_concurrency: 16, fail_fast: false };
+      return { type, count: 1, max_concurrency: 1, fail_fast: false };
     case "tabular":
-      return { type, path: "data/input.csv", max_concurrency: 16, fail_fast: false };
+      return { type, path: "data/input.csv", max_concurrency: 1, fail_fast: false };
     case "directory":
       return {
         type,
         path: "data",
         glob: "*",
         include_content: false,
-        max_concurrency: 16,
+        max_concurrency: 1,
         fail_fast: false,
       };
     case "trigger_events":
-      return { type, include_content: false, max_concurrency: 16, fail_fast: false };
+      return { type, include_content: false, max_concurrency: 1, fail_fast: false };
     case "infinite":
-      return { type, max_concurrency: 16, fail_fast: false };
+      return { type, max_concurrency: 1, fail_fast: false };
     default:
       return null;
   }
 }
 
 function ConnectedEdgeEditor({
+  diagnostics = [],
   draft = false,
   edge,
   node,
@@ -5022,6 +6159,7 @@ function ConnectedEdgeEditor({
 }) {
   const blankOption = [["", "Select"]];
   const typeValue = edge.condition || (draft ? "" : "always");
+  const edgeFieldDiagnostics = (...fields) => diagnosticsForField(diagnostics, ...fields);
 
   function updateDraft(patch) {
     onUpdate({ ...edge, ...patch });
@@ -5090,11 +6228,13 @@ function ConnectedEdgeEditor({
     >
       <div className="grid grid-cols-[1.1fr_1fr_1fr_auto] gap-2">
         <EdgeSelect
+          diagnostics={edgeFieldDiagnostics("condition")}
           value={typeValue}
           options={draft ? [["", "Select"], ...compactEdgeConditionOptions] : compactEdgeConditionOptions}
           onChange={handleTypeChange}
         />
         <EdgeSelect
+          diagnostics={edgeFieldDiagnostics("to")}
           value={edge.to}
           options={
             draft ? [...blankOption, ...nodesForTo(nodes)] : endpointOptions(nodes)
@@ -5102,6 +6242,7 @@ function ConnectedEdgeEditor({
           onChange={handleToChange}
         />
         <EdgeSelect
+          diagnostics={edgeFieldDiagnostics("from")}
           value={edge.from}
           options={
             draft
@@ -5125,6 +6266,7 @@ function ConnectedEdgeEditor({
       </div>
       {typeValue === "output_matches" ? (
         <InlineTextField
+          diagnostics={edgeFieldDiagnostics("outputPattern")}
           value={edge.outputPattern ?? ""}
           onChange={(value) =>
             draft ? updateDraft({ outputPattern: value }) : onUpdate({ outputPattern: value })
@@ -5148,7 +6290,15 @@ function nodesForFrom(nodes) {
   return nodes.map((candidate) => [candidate.id, candidate.label || candidate.id]);
 }
 
-function AgentConfigSection({ agentConfig, diagnostics = [], agentId, onAgentChange, pathBasePath }) {
+function AgentConfigSection({
+  agentConfig,
+  diagnostics = [],
+  agentId,
+  onAgentChange,
+  onProviderProfilesChange,
+  pathBasePath,
+  providerProfiles = [],
+}) {
   if (!agentConfig) return null;
   return (
     <InspectorSection title="Agent config">
@@ -5157,13 +6307,24 @@ function AgentConfigSection({ agentConfig, diagnostics = [], agentId, onAgentCha
         diagnostics={diagnostics}
         agentId={agentId}
         onAgentChange={onAgentChange}
+        onProviderProfilesChange={onProviderProfilesChange}
         pathBasePath={pathBasePath}
+        providerProfiles={providerProfiles}
       />
     </InspectorSection>
   );
 }
 
-function AgentConfigFields({ agentConfig, diagnostics = [], agentId, onAgentChange, pathBasePath }) {
+function AgentConfigFields({
+  agentConfig,
+  diagnostics = [],
+  agentId,
+  onAgentChange,
+  onProviderProfilesChange,
+  pathBasePath,
+  providerProfiles = [],
+}) {
+  const agentFieldDiagnostics = (...fields) => diagnosticsForField(diagnostics, ...fields);
   return (
     <>
       <SelectField
@@ -5175,8 +6336,28 @@ function AgentConfigFields({ agentConfig, diagnostics = [], agentId, onAgentChan
         ]}
         onChange={(value) => onAgentChange(agentId, { subscription: value })}
       />
+      <SelectField
+        label="Provider profile"
+        value={agentConfig.profile ?? ""}
+        options={profileSelectOptions(providerProfiles, agentConfig.subscription)}
+        onChange={(value) => onAgentChange(agentId, { profile: value })}
+      />
+      <ProviderProfileEditor
+        agentSubscription={agentConfig.subscription}
+        providerProfiles={providerProfiles}
+        selectedProfileName={agentConfig.profile ?? ""}
+        onAgentChange={(patch) => onAgentChange(agentId, patch)}
+        onProviderProfilesChange={onProviderProfilesChange}
+      />
+      <TextField
+        label="Model override"
+        value={agentConfig.model ?? ""}
+        onChange={(value) => onAgentChange(agentId, { model: value })}
+        placeholder="Optional"
+      />
       <HealthDiagnosticList diagnostics={diagnostics} />
       <TextField
+        diagnostics={agentFieldDiagnostics("prompt_path")}
         label="Prompt path"
         value={agentConfig.prompt_path ?? ""}
         onChange={(value) => onAgentChange(agentId, { prompt_path: value })}
@@ -5184,6 +6365,7 @@ function AgentConfigFields({ agentConfig, diagnostics = [], agentId, onAgentChan
         pathBasePath={pathBasePath}
       />
       <TextField
+        diagnostics={agentFieldDiagnostics("working_dir")}
         label="Working directory"
         value={agentConfig.working_dir ?? ""}
         onChange={(value) => onAgentChange(agentId, { working_dir: value })}
@@ -5211,11 +6393,304 @@ function AgentConfigFields({ agentConfig, diagnostics = [], agentId, onAgentChan
   );
 }
 
+function ProviderProfileEditor({
+  agentSubscription,
+  providerProfiles = [],
+  selectedProfileName = "",
+  onAgentChange,
+  onProviderProfilesChange,
+}) {
+  const selectedProfile =
+    providerProfiles.find((profile) => profile.name === selectedProfileName) ?? null;
+  const [open, setOpen] = useState(false);
+  const [draft, setDraft] = useState(() =>
+    profileEditorDraft(selectedProfile, agentSubscription),
+  );
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (!open) {
+      setDraft(profileEditorDraft(selectedProfile, agentSubscription));
+      setError("");
+    }
+  }, [agentSubscription, open, selectedProfile]);
+
+  async function saveProfile() {
+    setSaving(true);
+    setError("");
+    try {
+      const payload = profilePayloadFromDraft(draft);
+      const response = await fetch(apiUrl("/provider/profiles"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.error || "Could not save provider profile");
+      }
+      const profile = body.profile ?? payload;
+      onProviderProfilesChange?.([
+        ...providerProfiles.filter((candidate) => candidate.name !== profile.name),
+        profile,
+      ].sort((left, right) => left.name.localeCompare(right.name)));
+      onAgentChange({ profile: profile.name });
+      setOpen(false);
+    } catch (saveError) {
+      setError(saveError instanceof Error ? saveError.message : "Could not save provider profile");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function removeProfile() {
+    if (!selectedProfile) return;
+    setSaving(true);
+    setError("");
+    try {
+      const response = await fetch(
+        apiUrl(`/provider/profiles/${encodeURIComponent(selectedProfile.name)}`),
+        { method: "DELETE" },
+      );
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        throw new Error(body.error || "Could not remove provider profile");
+      }
+      onProviderProfilesChange?.(
+        providerProfiles.filter((candidate) => candidate.name !== selectedProfile.name),
+      );
+      onAgentChange({ profile: "" });
+      setOpen(false);
+    } catch (removeError) {
+      setError(removeError instanceof Error ? removeError.message : "Could not remove provider profile");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="rounded-lg border border-line p-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-xs font-medium text-muted">
+          {selectedProfile ? `Editing ${selectedProfile.name}` : "Provider profile editor"}
+        </span>
+        <button
+          className="btn-ghost h-8 px-2 text-xs"
+          type="button"
+          onClick={() => setOpen((current) => !current)}
+        >
+          {open ? "Close" : selectedProfile ? "Edit" : "Create"}
+        </button>
+      </div>
+      {open ? (
+        <div className="mt-3 space-y-3">
+          <TextField
+            label="Profile name"
+            value={draft.name}
+            onChange={(value) => setDraft({ ...draft, name: value })}
+            placeholder="fast-review"
+          />
+          <SelectField
+            label="Subscription"
+            value={draft.subscription}
+            options={[
+              ["codex", "Codex"],
+              ["claude_code", "Claude Code"],
+            ]}
+            onChange={(value) => setDraft({ ...draft, subscription: value })}
+          />
+          <TextField
+            label="Model"
+            value={draft.model}
+            onChange={(value) => setDraft({ ...draft, model: value })}
+            placeholder="Optional"
+          />
+          <NumberField
+            label="Timeout"
+            min="0"
+            step="1"
+            value={draft.timeout}
+            onChange={(value) => setDraft({ ...draft, timeout: value })}
+            placeholder="Seconds"
+          />
+          <TextField
+            label="Reasoning"
+            value={draft.reasoning}
+            onChange={(value) => setDraft({ ...draft, reasoning: value })}
+            placeholder="Codex only"
+          />
+          <SelectField
+            label="Approval mode"
+            value={draft.approval_mode}
+            options={[
+              ["", "Default"],
+              ["auto", "Auto"],
+              ["manual", "Manual"],
+              ["never", "Never"],
+              ["on-request", "On request"],
+              ["on-failure", "On failure"],
+            ]}
+            onChange={(value) => setDraft({ ...draft, approval_mode: value })}
+          />
+          <SelectField
+            label="Sandbox mode"
+            value={draft.sandbox_mode}
+            options={[
+              ["", "Default"],
+              ["read-only", "Read only"],
+              ["workspace-write", "Workspace write"],
+              ["danger-full-access", "Danger full access"],
+            ]}
+            onChange={(value) => setDraft({ ...draft, sandbox_mode: value })}
+          />
+          <ListField
+            label="Extra args"
+            value={draft.extra_args}
+            onChange={(value) => setDraft({ ...draft, extra_args: value })}
+            placeholder="--flag, value"
+          />
+          <ListField
+            label="Default tools"
+            value={draft.tools}
+            onChange={(value) => setDraft({ ...draft, tools: value })}
+            placeholder="Read, Write"
+          />
+          <ListField
+            label="MCP servers"
+            value={draft.mcp_servers}
+            onChange={(value) => setDraft({ ...draft, mcp_servers: value })}
+            placeholder="docs, repo"
+          />
+          <KeyValueField
+            label="Environment"
+            value={draft.env}
+            onChange={(value) => setDraft({ ...draft, env: value })}
+          />
+          <KeyValueField
+            label="Secret refs"
+            value={draft.secret_refs}
+            onChange={(value) => setDraft({ ...draft, secret_refs: value })}
+          />
+          {error ? <p className="text-xs text-red-600">{error}</p> : null}
+          <div className="flex gap-2">
+            <button
+              className="btn-primary h-9 flex-1 justify-center text-xs"
+              disabled={saving}
+              type="button"
+              onClick={saveProfile}
+            >
+              {saving ? "Saving" : "Save"}
+            </button>
+            {selectedProfile ? (
+              <button
+                className="btn-ghost h-9 px-3 text-xs text-red-700"
+                disabled={saving}
+                type="button"
+                onClick={removeProfile}
+              >
+                Remove
+              </button>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function profileEditorDraft(profile, subscription) {
+  return {
+    name: profile?.name ?? "",
+    subscription: profile?.subscription ?? subscription ?? "codex",
+    model: profile?.model ?? "",
+    timeout: profile?.timeout ?? "",
+    reasoning: profile?.reasoning ?? "",
+    approval_mode: profile?.approval_mode ?? "",
+    sandbox_mode: profile?.sandbox_mode ?? "",
+    extra_args: profile?.extra_args ?? [],
+    tools: profile?.tools ?? [],
+    mcp_servers: profile?.mcp_servers ?? [],
+    env: profile?.env ?? {},
+    secret_refs: profile?.secret_refs ?? {},
+  };
+}
+
+function profilePayloadFromDraft(draft) {
+  const payload = {
+    name: draft.name.trim(),
+    subscription: draft.subscription,
+  };
+  for (const key of ["model", "reasoning", "approval_mode", "sandbox_mode"]) {
+    if (draft[key]) payload[key] = draft[key];
+  }
+  if (draft.timeout) payload.timeout = Number(draft.timeout);
+  for (const key of ["extra_args", "tools", "mcp_servers"]) {
+    if (draft[key]?.length) payload[key] = draft[key];
+  }
+  for (const key of ["env", "secret_refs"]) {
+    if (Object.keys(draft[key] ?? {}).length) payload[key] = draft[key];
+  }
+  return payload;
+}
+
+function profileSelectOptions(providerProfiles = [], subscription) {
+  const options = [["", "None"]];
+  providerProfiles
+    .filter((profile) => !subscription || profile.subscription === subscription)
+    .forEach((profile) => {
+      const suffix = profile.model ? ` (${profile.model})` : "";
+      options.push([profile.name, `${profile.name}${suffix}`]);
+    });
+  return options;
+}
+
 function workflowDiagnosticsForDisplay(workflow) {
   return [
+    ...(workflow?.validationDiagnostics ?? []),
+    ...(workflow?.validationErrors ?? []),
+    ...(workflow?.validationWarnings ?? []),
     ...(workflow?.healthErrors ?? []),
     ...(workflow?.healthWarnings ?? []),
-  ];
+  ].filter(
+    (diagnostic, index, all) =>
+      index ===
+      all.findIndex(
+        (candidate) =>
+          candidate.id === diagnostic.id &&
+          candidate.subject === diagnostic.subject &&
+          candidate.field === diagnostic.field &&
+          candidate.message === diagnostic.message,
+      ),
+  );
+}
+
+function workflowValidationDiagnostics(workflow) {
+  return [
+    ...(workflow?.validationDiagnostics ?? []),
+    ...(workflow?.validationErrors ?? []),
+    ...(workflow?.validationWarnings ?? []),
+  ].filter(
+    (diagnostic, index, all) =>
+      index ===
+      all.findIndex(
+        (candidate) =>
+          candidate.id === diagnostic.id &&
+          candidate.subject === diagnostic.subject &&
+          candidate.field === diagnostic.field &&
+          candidate.message === diagnostic.message,
+      ),
+  );
+}
+
+function diagnosticsByTarget(diagnostics, targetType) {
+  return diagnostics.reduce((grouped, diagnostic) => {
+    if (diagnostic.targetType !== targetType || !diagnostic.targetId) return grouped;
+    return {
+      ...grouped,
+      [diagnostic.targetId]: [...(grouped[diagnostic.targetId] ?? []), diagnostic],
+    };
+  }, {});
 }
 
 function diagnosticsForNode(diagnostics, node, agentConfig) {
@@ -5238,6 +6713,62 @@ function diagnosticsForAgent(diagnostics, agentId, agentConfig) {
   });
 }
 
+function diagnosticsForEdge(diagnostics, edge) {
+  if (!edge) return [];
+  const subjects = new Set([`edge:${edge.id}`]);
+  return diagnostics.filter((diagnostic) => {
+    if (subjects.has(diagnostic.subject)) return true;
+    if (diagnostic.targetType !== "edge") return false;
+    const detail = diagnostic.detail ?? {};
+    return (
+      diagnostic.targetId === edge.id ||
+      (detail.from === edge.from && detail.to === edge.to)
+    );
+  });
+}
+
+function diagnosticsForField(diagnostics, ...fields) {
+  const fieldSet = new Set(fields.filter(Boolean));
+  return diagnostics.filter((diagnostic) => fieldSet.has(diagnostic.field));
+}
+
+function fieldDiagnosticState(diagnostics = []) {
+  const visibleDiagnostics = diagnostics.filter((diagnostic) =>
+    diagnostic?.severity === "error" || diagnostic?.severity === "warning",
+  );
+  if (!visibleDiagnostics.length) {
+    return { diagnostics: [], severity: null };
+  }
+  return {
+    diagnostics: visibleDiagnostics,
+    severity: visibleDiagnostics.some((diagnostic) => diagnostic.severity === "error")
+      ? "error"
+      : "warning",
+  };
+}
+
+function fieldBorderClass(diagnostics = [], base = "border-line focus:border-teal-500") {
+  const { severity } = fieldDiagnosticState(diagnostics);
+  if (severity === "error") return "border-red-300 focus:border-red-500 focus:ring-red-100";
+  if (severity === "warning") return "border-amber-300 focus:border-amber-500 focus:ring-amber-100";
+  return base;
+}
+
+function FieldDiagnosticMessage({ diagnostics = [], id }) {
+  const { diagnostics: visibleDiagnostics, severity } = fieldDiagnosticState(diagnostics);
+  if (!visibleDiagnostics.length) return null;
+  return (
+    <p
+      id={id}
+      className={`mt-1 text-xs leading-5 ${
+        severity === "error" ? "text-red-700" : "text-amber-800"
+      }`}
+    >
+      {visibleDiagnostics[0].message}
+    </p>
+  );
+}
+
 function isProviderDiagnosticForAgent(diagnostic, agentConfig) {
   if (!agentConfig?.subscription) return false;
   return (
@@ -5246,7 +6777,7 @@ function isProviderDiagnosticForAgent(diagnostic, agentConfig) {
   );
 }
 
-function HealthDiagnosticList({ diagnostics = [] }) {
+function HealthDiagnosticList({ diagnostics = [], onApplyFix }) {
   const visibleDiagnostics = diagnostics.filter((diagnostic) =>
     diagnostic?.severity === "error" || diagnostic?.severity === "warning",
   );
@@ -5268,6 +6799,20 @@ function HealthDiagnosticList({ diagnostics = [] }) {
               <AlertCircle className="mt-0.5 shrink-0" size={14} />
               <span>{diagnostic.message}</span>
             </div>
+            {diagnostic.fixes?.length ? (
+              <div className="mt-2 flex flex-wrap gap-2">
+                {diagnostic.fixes.map((fix) => (
+                  <button
+                    key={`${fix.action}-${fix.label}`}
+                    className="rounded border border-current/20 bg-white/70 px-2 py-1 text-[11px] font-semibold transition hover:bg-white"
+                    type="button"
+                    onClick={() => onApplyFix?.(fix)}
+                  >
+                    {fix.label}
+                  </button>
+                ))}
+              </div>
+            ) : null}
           </div>
         );
       })}
@@ -5319,6 +6864,48 @@ export function addDefaultNodeToWorkflow(workflow, options = {}) {
     ...workflow,
     agents,
     nodes: [...(workflow.nodes ?? []), node],
+  };
+}
+
+export function duplicateWorkflowNode(workflow, nodeId, { usedAgentIds = [], offset = 28 } = {}) {
+  const nodes = workflow.nodes ?? [];
+  const node = nodes.find((candidate) => candidate.id === nodeId);
+  if (!node) return workflow;
+
+  const nextNumber = nextAvailableNodeNumber(nodes);
+  let operation = structuredCloneCompatible(node.operation ?? defaultOperation(node.type));
+  let agents = workflow.agents ?? {};
+
+  if (operation.agent_id) {
+    const nextAgentNumber = nextAvailableAgentNumber(nodes, agents, usedAgentIds);
+    const nextAgentId = `agent-${nextAgentNumber}`;
+    agents = {
+      ...agents,
+      [nextAgentId]: {
+        ...defaultAgentConfig(nextAgentId),
+        ...(agents[operation.agent_id] ?? {}),
+      },
+    };
+    operation = {
+      ...operation,
+      agent_id: nextAgentId,
+    };
+  }
+
+  const duplicatedNode = {
+    ...structuredCloneCompatible(node),
+    id: `node-${nextNumber}`,
+    label: `${specialNodeLabel(node.type) ?? node.label ?? "Node"} copy`,
+    operation,
+    meta: nodeMetaFromOperation(operation),
+    x: (node.x ?? 0) + offset,
+    y: (node.y ?? 0) + offset,
+  };
+
+  return {
+    ...workflow,
+    agents,
+    nodes: [...nodes, duplicatedNode],
   };
 }
 
@@ -5658,6 +7245,85 @@ function InspectorSection({ children, className = "", title }) {
   );
 }
 
+function ApprovalDecisionOverlay({ approval, node, onDecideApproval }) {
+  const [notes, setNotes] = useState("");
+  const [approver, setApprover] = useState(approval?.approvers?.[0] || "ui");
+  useEffect(() => {
+    setNotes("");
+    setApprover(approval?.approvers?.[0] || "ui");
+  }, [approval?.runId, approval?.nodeId, approval?.approvers]);
+  if (!approval) return null;
+  const nodeLabel = node?.label || node?.id || approval.nodeId;
+  return (
+    <div className="pointer-events-none absolute inset-0 z-[90] flex items-center justify-center px-4">
+      <section
+        className="pointer-events-auto w-full max-w-[560px] rounded-lg border border-amber-300 bg-white shadow-2xl"
+        onPointerDown={(event) => event.stopPropagation()}
+        onPointerMove={(event) => event.stopPropagation()}
+        onPointerUp={(event) => event.stopPropagation()}
+        onWheel={(event) => event.stopPropagation()}
+      >
+        <div className="border-b border-amber-200 bg-amber-50 px-5 py-4">
+          <div className="flex items-center gap-3">
+            <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-amber-600 text-white">
+              <ShieldCheck size={22} />
+            </span>
+            <div className="min-w-0">
+              <h2 className="text-lg font-semibold text-ink">Approval Required</h2>
+              <p className="truncate text-sm text-slate-600">{nodeLabel}</p>
+            </div>
+          </div>
+        </div>
+        <div className="space-y-4 px-5 py-5">
+          <div className="max-h-[180px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-slate-50 px-3 py-3 text-sm leading-6 text-slate-800">
+            {approval.message}
+          </div>
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,180px)_1fr]">
+            <label className="space-y-1 text-xs font-medium text-slate-600">
+              <span>Approver</span>
+              <input
+                className="h-10 w-full rounded-md border border-line bg-white px-3 text-sm text-ink outline-none transition placeholder:text-muted/70 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10"
+                placeholder="Approver identity"
+                value={approver}
+                onChange={(event) => setApprover(event.target.value)}
+              />
+            </label>
+            <label className="space-y-1 text-xs font-medium text-slate-600">
+              <span>Notes</span>
+              <textarea
+                className="min-h-[82px] w-full resize-y rounded-md border border-line bg-white px-3 py-2 text-sm text-ink outline-none transition placeholder:text-muted/70 focus:border-teal-500 focus:ring-2 focus:ring-teal-500/10"
+                placeholder="Decision notes"
+                value={notes}
+                onChange={(event) => setNotes(event.target.value)}
+              />
+            </label>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <button
+              className="flex h-14 items-center justify-center gap-2 rounded-md bg-emerald-600 px-4 text-base font-semibold text-white shadow-sm transition hover:bg-emerald-700"
+              title="Approve pending approval"
+              type="button"
+              onClick={() => onDecideApproval?.(approval, "approved", notes, approver)}
+            >
+              <Check size={22} />
+              Approve
+            </button>
+            <button
+              className="flex h-14 items-center justify-center gap-2 rounded-md border border-red-300 bg-red-50 px-4 text-base font-semibold text-red-700 shadow-sm transition hover:bg-red-100"
+              title="Reject pending approval"
+              type="button"
+              onClick={() => onDecideApproval?.(approval, "rejected", notes, approver)}
+            >
+              <X size={22} />
+              Reject
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function ApprovalRuntimePanel({ approval, onDecideApproval }) {
   const [notes, setNotes] = useState("");
   const [approver, setApprover] = useState(approval?.approvers?.[0] || "ui");
@@ -5886,6 +7552,7 @@ function HttpResponsePreview({ output }) {
 }
 
 function TextField({
+  diagnostics = [],
   label,
   onChange,
   pathBasePath = "",
@@ -5903,6 +7570,8 @@ function TextField({
   const displayValue = isPathField ? resolveDisplayPath(value ?? "", pathBasePath) : value ?? "";
   const canOpenPath = isPathField && displayValue && !isUrlPath(displayValue);
   const canEditTextPath = canOpenPath && pathInfo?.isFile;
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
 
   useEffect(() => {
     let cancelled = false;
@@ -5974,7 +7643,9 @@ function TextField({
         <span className="text-xs font-medium text-muted">{label}</span>
         <span className="relative mt-1 block">
           <input
-            className={`h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500 read-only:bg-slate-50 ${
+            aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+            aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+            className={`h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition read-only:bg-slate-50 ${fieldBorderClass(diagnostics)} ${
               canPickPath && canOpenPath ? "pr-[4.5rem]" : canPickPath || canOpenPath ? "pr-10" : ""
             }`}
             placeholder={placeholder}
@@ -6008,6 +7679,7 @@ function TextField({
             </button>
           ) : null}
         </span>
+        <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
       </label>
       {canEditTextPath ? (
         <div className="mt-1 flex justify-end gap-2">
@@ -6677,18 +8349,26 @@ function defaultCopyName(name = "", index = null) {
   return `${value}${suffix}`;
 }
 
-function InlineTextField({ onChange, placeholder, value }) {
+function InlineTextField({ diagnostics = [], onChange, placeholder, value }) {
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
-    <input
-      className="h-9 w-full rounded-lg border border-line bg-white px-2 text-sm outline-none transition placeholder:text-slate-400 focus:border-teal-500"
-      placeholder={placeholder}
-      value={value ?? ""}
-      onChange={(event) => onChange(event.target.value)}
-    />
+    <div>
+      <input
+        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+        className={`h-9 w-full rounded-lg border bg-white px-2 text-sm outline-none transition placeholder:text-slate-400 ${fieldBorderClass(diagnostics)}`}
+        placeholder={placeholder}
+        value={value ?? ""}
+        onChange={(event) => onChange(event.target.value)}
+      />
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+    </div>
   );
 }
 
 function CronExpressionField({
+  diagnostics = [],
   label,
   onChange,
   onPickerOpenChange,
@@ -6706,12 +8386,16 @@ function CronExpressionField({
   const [time, setTime] = useState(defaultTime);
   const [recurrence, setRecurrence] = useState("weekly");
   const generatedCron = cronFromPicker({ date, recurrence, time });
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
 
   return (
     <div className="relative">
       <span className="text-xs font-medium text-muted">{label}</span>
-      <div className="mt-1 flex h-10 overflow-hidden rounded-lg border border-line bg-white transition focus-within:border-teal-500">
+      <div className={`mt-1 flex h-10 overflow-hidden rounded-lg border bg-white transition focus-within:border-teal-500 ${fieldBorderClass(diagnostics, "border-line")}`}>
         <input
+          aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+          aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
           className="min-w-0 flex-1 bg-transparent px-3 text-sm outline-none"
           placeholder={placeholder}
           value={value ?? ""}
@@ -6726,6 +8410,7 @@ function CronExpressionField({
           <CalendarDays size={17} />
         </button>
       </div>
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
 
       {pickerOpen ? (
         <div className="absolute right-0 top-[68px] z-40 w-[270px] rounded-lg border border-line bg-white p-3 shadow-panel">
@@ -6817,12 +8502,16 @@ function cronFromPicker({ date, recurrence, time }) {
   }
 }
 
-function NumberField({ label, min, onChange, placeholder, step = "1", value }) {
+function NumberField({ diagnostics = [], label, min, onChange, placeholder, step = "1", value }) {
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
     <label className="block">
       <span className="text-xs font-medium text-muted">{label}</span>
       <input
-        className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500"
+        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
         min={min}
         placeholder={placeholder}
         step={step}
@@ -6830,16 +8519,21 @@ function NumberField({ label, min, onChange, placeholder, step = "1", value }) {
         value={value ?? ""}
         onChange={(event) => onChange(event.target.value === "" ? "" : Number(event.target.value))}
       />
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
     </label>
   );
 }
 
-function SelectField({ label, onChange, options, value }) {
+function SelectField({ diagnostics = [], label, onChange, options, value }) {
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
     <label className="block">
       <span className="text-xs font-medium text-muted">{label}</span>
       <select
-        className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500"
+        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
         value={value ?? ""}
         onChange={(event) => onChange(event.target.value)}
       >
@@ -6849,66 +8543,87 @@ function SelectField({ label, onChange, options, value }) {
           </option>
         ))}
       </select>
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
     </label>
   );
 }
 
-function EdgeSelect({ onChange, options, value }) {
+function EdgeSelect({ diagnostics = [], onChange, options, value }) {
   const selectedLabel = options.find(([optionValue]) => optionValue === value)?.[1] ?? "";
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
 
   return (
-    <select
-      className="h-9 min-w-0 rounded-lg border border-line bg-white px-1.5 text-xs outline-none transition focus:border-teal-500"
-      title={selectedLabel}
-      value={value ?? ""}
-      onChange={(event) => onChange(event.target.value)}
-    >
-      {options.map(([optionValue, labelText]) => (
-        <option key={optionValue} value={optionValue}>
-          {labelText}
-        </option>
-      ))}
-    </select>
+    <div>
+      <select
+        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+        className={`h-9 min-w-0 rounded-lg border bg-white px-1.5 text-xs outline-none transition ${fieldBorderClass(diagnostics)}`}
+        title={selectedLabel}
+        value={value ?? ""}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        {options.map(([optionValue, labelText]) => (
+          <option key={optionValue} value={optionValue}>
+            {labelText}
+          </option>
+        ))}
+      </select>
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+    </div>
   );
 }
 
-function TextareaField({ label, onChange, placeholder, rows = 3, value }) {
+function TextareaField({ diagnostics = [], label, onChange, placeholder, rows = 3, value }) {
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
     <label className="block">
       <span className="text-xs font-medium text-muted">{label}</span>
       <textarea
-        className="mt-1 w-full resize-none rounded-lg border border-line px-3 py-2 text-sm outline-none transition focus:border-teal-500"
+        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+        className={`mt-1 w-full resize-none rounded-lg border px-3 py-2 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
         placeholder={placeholder}
         rows={rows}
         value={value ?? ""}
         onChange={(event) => onChange(event.target.value)}
       />
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
     </label>
   );
 }
 
-function ToggleField({ checked, disabled = false, label, onChange }) {
+function ToggleField({ checked, diagnostics = [], disabled = false, label, onChange }) {
+  const diagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
-    <label
-      className={`flex items-center justify-between gap-3 rounded-lg border border-line px-3 py-2 ${
-        disabled ? "cursor-not-allowed bg-slate-50 text-muted dark:bg-[#252526]" : ""
-      }`}
-    >
-      <span className="text-sm font-medium text-slate-700">{label}</span>
-      <input
-        checked={checked}
-        className="h-4 w-4 accent-teal-700"
-        disabled={disabled}
-        type="checkbox"
-        onChange={(event) => onChange(event.target.checked)}
-      />
-    </label>
+    <div>
+      <label
+        className={`flex items-center justify-between gap-3 rounded-lg border px-3 py-2 ${fieldBorderClass(diagnostics, "border-line")} ${
+          disabled ? "cursor-not-allowed bg-slate-50 text-muted dark:bg-[#252526]" : ""
+        }`}
+      >
+        <span className="text-sm font-medium text-slate-700">{label}</span>
+        <input
+          aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+          aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+          checked={checked}
+          className="h-4 w-4 accent-teal-700"
+          disabled={disabled}
+          type="checkbox"
+          onChange={(event) => onChange(event.target.checked)}
+        />
+      </label>
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+    </div>
   );
 }
 
-function ListField({ label, onChange, placeholder, value }) {
+function ListField({ diagnostics = [], label, onChange, placeholder, value }) {
   return (
     <TextareaField
+      diagnostics={diagnostics}
       label={label}
       placeholder={placeholder}
       rows={2}
@@ -6925,9 +8640,10 @@ function ListField({ label, onChange, placeholder, value }) {
   );
 }
 
-function KeyValueField({ label, onChange, value }) {
+function KeyValueField({ diagnostics = [], label, onChange, value }) {
   return (
     <TextareaField
+      diagnostics={diagnostics}
       label={label}
       rows={3}
       value={objectToKeyValueText(value)}

@@ -43,6 +43,11 @@ from gofer.core.operations import (
     TriggerEventsFanSource,
     WriteFileOperation,
 )
+from gofer.core.provider_profiles import (
+    resolve_provider_settings,
+    unresolved_provider_secret_refs,
+    validate_provider_settings,
+)
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
 from gofer.core.usage import LlmUsageBudget, LlmUsageTotals, budget_violations, estimate_tokens
 from gofer.core.workflow import AgenticWorkflow
@@ -68,12 +73,14 @@ def build_execution_plan(
     workflow: AgenticWorkflow,
     *,
     workflow_path: Path | None = None,
+    data_dir: Path | None = None,
     trigger_context: dict[str, Any] | None = None,
     sample_limit: int = SAMPLE_LIMIT,
 ) -> dict[str, Any]:
     """Build a read-only preview of workflow execution impact."""
     limits = workflow.config.resource_limits or DEFAULT_RESOURCE_LIMITS
     path_base = workflow_path.parent if workflow_path is not None else None
+    profile_data_dir = data_dir if data_dir is not None else path_base
     warnings = workflow.resource_warnings(path_base)
     plan: dict[str, Any] = {
         "workflowId": workflow.config.id,
@@ -93,7 +100,10 @@ def build_execution_plan(
         plan["pathResolutionBase"] = str(path_base)
 
     secret_names: set[str] = set()
-    provider_keys: dict[tuple[str, str, str, str | None, bool], set[str]] = {}
+    provider_keys: dict[
+        tuple[str, str, str | None, str | None, float | None, str, str | None, bool],
+        set[str],
+    ] = {}
     dynamic_values: set[str] = set()
     fan_out_multipliers: dict[str, int] = {}
 
@@ -110,6 +120,7 @@ def build_execution_plan(
                 node,
                 limits=limits,
                 path_base=path_base,
+                data_dir=profile_data_dir,
                 trigger_context=trigger_context or {},
                 sample_limit=sample_limit,
                 inherited_fan_out=inherited_fan_out,
@@ -146,6 +157,21 @@ def build_execution_plan(
                 key = (
                     str(requirement["agentId"]),
                     str(requirement["subscription"]),
+                    (
+                        str(requirement["profile"])
+                        if requirement.get("profile") is not None
+                        else None
+                    ),
+                    (
+                        str(requirement["model"])
+                        if requirement.get("model") is not None
+                        else None
+                    ),
+                    (
+                        float(requirement["timeout"])
+                        if requirement.get("timeout") is not None
+                        else None
+                    ),
                     str(requirement["workingDir"]),
                     (
                         str(requirement["binary"])
@@ -173,8 +199,18 @@ def build_execution_plan(
         plan["destructiveActionDetails"]
     )
     plan["requiredSecrets"] = sorted(secret_names)
-    plan["providerRequirements"] = [
-        {
+    plan["providerRequirements"] = []
+    for (
+        agent_id,
+        subscription,
+        profile,
+        model,
+        timeout,
+        working_dir,
+        binary,
+        available,
+    ), extra_paths in sorted(provider_keys.items()):
+        provider_requirement: dict[str, Any] = {
             "agentId": agent_id,
             "subscription": subscription,
             "workingDir": working_dir,
@@ -182,10 +218,13 @@ def build_execution_plan(
             "available": available,
             "extraPaths": sorted(extra_paths),
         }
-        for (agent_id, subscription, working_dir, binary, available), extra_paths in sorted(
-            provider_keys.items()
-        )
-    ]
+        if profile is not None:
+            provider_requirement["profile"] = profile
+        if model is not None:
+            provider_requirement["model"] = model
+        if timeout is not None:
+            provider_requirement["timeout"] = timeout
+        plan["providerRequirements"].append(provider_requirement)
     plan["unresolvedDynamicValues"] = sorted(dynamic_values)
     budget = workflow.config.llm_budget
     usage = plan["projectedLlmUsage"]
@@ -293,6 +332,7 @@ def _node_plan(
     *,
     limits: ResourceLimits,
     path_base: Path | None,
+    data_dir: Path | None,
     trigger_context: dict[str, Any],
     sample_limit: int,
     inherited_fan_out: int = 1,
@@ -310,8 +350,8 @@ def _node_plan(
     fan_out = _fan_out_plan(op, trigger_context, limits, sample_limit, path_base)
     if fan_out is not None:
         warnings.extend(str(warning) for warning in fan_out.get("warnings", []))
-    required_secrets = _required_secrets(op, workflow)
-    provider_requirements = _provider_requirements(op, workflow, path_base)
+    required_secrets = _required_secrets(op, workflow, path_base, data_dir)
+    provider_requirements = _provider_requirements(op, workflow, path_base, data_dir)
     projected_llm_usage = _projected_llm_usage(
         op,
         workflow,
@@ -332,6 +372,8 @@ def _node_plan(
             )
         )
     for requirement in provider_requirements:
+        for error in requirement.get("validationErrors", []):
+            warnings.append(str(error))
         if not requirement.get("available"):
             binary = requirement.get("binary") or requirement["subscription"]
             warnings.append(
@@ -1346,22 +1388,48 @@ def _preview_trigger_events(
     return count, sample, warnings
 
 
-def _required_secrets(op: object, workflow: AgenticWorkflow) -> list[str]:
+def _required_secrets(
+    op: object,
+    workflow: AgenticWorkflow,
+    path_base: Path | None,
+    data_dir: Path | None,
+) -> list[str]:
     values: dict[str, str] = {}
+    profile_secrets: set[str] = set()
     if isinstance(op, (BashCommandOperation, PythonScriptOperation, ShellScriptOperation)):
         values.update(op.env)
     elif isinstance(op, AgentOperation):
         agent = workflow.agents.get(op.agent_id)
         if agent is not None:
             values.update(agent.env)
+            settings = resolve_provider_settings(
+                agent_subscription=agent.subscription,
+                profile_name=agent.profile,
+                agent_model=agent.model,
+                operation_profile=op.profile,
+                operation_model=op.model,
+                operation_timeout=op.timeout,
+                data_dir=data_dir,
+            )
+            profile_secrets.update(unresolved_provider_secret_refs(settings))
     elif isinstance(op, CommonLlmTaskOperation):
         agent = workflow.agents.get(op.agent_id)
         if agent is not None:
             values.update(agent.env)
+            settings = resolve_provider_settings(
+                agent_subscription=agent.subscription,
+                profile_name=agent.profile,
+                agent_model=agent.model,
+                operation_profile=op.profile,
+                operation_model=op.model,
+                operation_timeout=op.timeout,
+                data_dir=data_dir,
+            )
+            profile_secrets.update(unresolved_provider_secret_refs(settings))
     elif isinstance(op, HttpRequestOperation):
         for field, value in _iter_strings(op.model_dump(by_alias=True)):
             values[field] = value
-    return sorted({
+    return sorted(profile_secrets | {
         secret
         for value in values.values()
         for secret in _secret_reference_names(str(value))
@@ -1379,22 +1447,43 @@ def _provider_requirements(
     op: object,
     workflow: AgenticWorkflow,
     path_base: Path | None,
+    data_dir: Path | None,
 ) -> list[dict[str, Any]]:
     if isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
         agent = workflow.agents.get(op.agent_id)
         if agent is None:
             return []
+        settings = resolve_provider_settings(
+            agent_subscription=agent.subscription,
+            profile_name=agent.profile,
+            agent_model=agent.model,
+            operation_profile=op.profile,
+            operation_model=op.model,
+            operation_timeout=op.timeout,
+            data_dir=data_dir,
+        )
+        validation_errors: list[str] = []
+        try:
+            validate_provider_settings(settings)
+        except ValueError as exc:
+            validation_errors.append(str(exc))
         extra_paths = _configured_extra_paths(agent, path_base)
-        binary = _provider_binary(agent.subscription)
+        binary = _provider_binary(settings.subscription)
         available = shutil.which(binary) is not None if binary is not None else False
-        return [{
+        requirement = {
             "agentId": agent.agent_id,
-            "subscription": agent.subscription,
+            "subscription": settings.subscription,
+            "profile": settings.profile_name,
+            "model": settings.model,
+            "timeout": settings.timeout,
             "workingDir": str(_resolve_path(op.working_dir, path_base)),
             "binary": binary,
             "available": available,
             "extraPaths": extra_paths,
-        }]
+        }
+        if validation_errors:
+            requirement["validationErrors"] = validation_errors
+        return [requirement]
     return []
 
 
@@ -1486,7 +1575,7 @@ def _is_dynamic_reference(value: str, node_ids: set[str]) -> bool:
     if "." not in expression:
         return False
     root = expression.split(".", 1)[0]
-    return root in {"trigger", "loop", "previous", *node_ids}
+    return root in {"trigger", "params", "loop", "previous", *node_ids}
 
 
 def _iter_strings(value: Any, prefix: str = "") -> list[tuple[str, str]]:

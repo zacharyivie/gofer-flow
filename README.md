@@ -138,6 +138,12 @@ Use the version bump script before tagging a release:
 node scripts/bump-version.cjs 0.1.1
 ```
 
+Release and packaging script behavior is covered by focused regression tests:
+
+```bash
+python -m pytest tests/unit/test_release_scripts.py
+```
+
 After building the release AppImage, update the Arch package checksum with:
 
 ```bash
@@ -272,6 +278,59 @@ gof schedule stop
 ```
 
 The default scheduler database is `schedules.db` in the Gofer data directory. You can override it with `--db`.
+
+## Webhook and API Triggers
+
+Workflows can opt in to local webhook/API triggers. Triggers are disabled unless a workflow declares an enabled entry under `workflow.webhooks`:
+
+```toml
+[workflow.webhooks.github]
+enabled = true
+source = "github"
+token_env = "GOFER_GITHUB_WEBHOOK_TOKEN"
+fanout_path = "payload.items"
+concurrency_policy = "reject_if_running"
+```
+
+The trigger ID is the table key (`github` above). `token` can be set directly for local testing, but `token_env` is preferred. If a token is configured, HTTP requests must send it with `X-Gofer-Webhook-Token` or `Authorization: Bearer <token>`.
+
+Trigger payloads are available to nodes through the `trigger` namespace:
+
+```toml
+[[nodes]]
+id = "triage"
+type = "bash_command"
+command = 'printf "%s\n" "$ISSUE_NUMBER"'
+
+[nodes.inputs]
+"env.ISSUE_NUMBER" = "{{trigger.payload.issue.number}}"
+"env.EVENT" = "{{trigger.headers.x_github_event}}"
+"env.SOURCE" = "{{trigger.source}}"
+```
+
+Start the UI/API server, then post JSON to the trigger endpoint:
+
+```bash
+curl -X POST "http://127.0.0.1:8765/api/workflows/incident-response/webhooks/github/trigger" \
+  -H "Content-Type: application/json" \
+  -H "X-Gofer-Webhook-Token: $GOFER_GITHUB_WEBHOOK_TOKEN" \
+  -H "X-GitHub-Event: issues" \
+  -d '{"issue":{"number":42},"items":[{"title":"first"}]}'
+```
+
+The request payload, normalized headers, source, received timestamp, request ID, and fan-out events are recorded with the run. Runs created from webhook triggers can be replayed from the CLI or UI run history:
+
+```bash
+gof workflow trigger incident-response \
+  --trigger-id github \
+  --payload-file event.json \
+  --header "X-GitHub-Event: issues" \
+  --token "$GOFER_GITHUB_WEBHOOK_TOKEN"
+
+gof workflow trigger incident-response --trigger-id github --replay-run-id run-20260626.log
+```
+
+For `trigger_events` fan-out nodes, `fanout_path` can point at a JSON array such as `payload.items`. Each array object becomes one trigger event.
 
 ## Workflow TOML
 
@@ -609,7 +668,12 @@ pipe_output = true
 
 - `retry_count`: number of retries after the first failed attempt.
 - `retry_delay_seconds`: delay between retry attempts.
-- `timeout_seconds`: subprocess timeout.
+- `timeout_seconds`: subprocess timeout. When a subprocess node is stopped or
+  times out, Gofer Flow terminates the subprocess tree: POSIX platforms signal
+  the started process group, and Windows uses `taskkill /T` with a forced
+  fallback. Descendants that deliberately detach into a separate session,
+  process group, service, or job may outlive the workflow and should clean up
+  their own background work.
 - `pipe_output`: makes the node output available as stdin or prepended prompt text for downstream nodes.
 
 ## Conditional Edges

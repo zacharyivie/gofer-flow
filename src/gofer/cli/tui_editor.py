@@ -9,7 +9,7 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import questionary
 from prompt_toolkit import Application
@@ -27,25 +27,50 @@ from gofer.core.agent import AgentConfig
 from gofer.core.graph import GraphNode
 from gofer.core.operations import (
     AgentOperation,
+    ApprovalGateOperation,
     BashCommandOperation,
+    BreakOperation,
+    CommonLlmTaskOperation,
     CopyFileOperation,
+    CountFanSource,
     DeleteFileOperation,
+    DirectoryFanSource,
+    FailOperation,
+    FanSource,
+    FileOperation,
+    FolderOperation,
     HttpRequestOperation,
     HttpRetryPolicy,
+    InfiniteFanSource,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
+    LoopOperation,
     MoveFileOperation,
+    NotificationOperation,
     OpenResourceOperation,
+    PassOperation,
+    PromptFileOperation,
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
+    StartOperation,
+    TabularFanSource,
+    TriggerEventsFanSource,
     WriteFileOperation,
 )
+from gofer.core.usage import LlmUsageBudget
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig
 
 # ── Field descriptor types ───────────────────────────────────────────────────
 
 
 _AnyOp = (
-    BashCommandOperation
+    StartOperation
+    | PassOperation
+    | FailOperation
+    | BreakOperation
+    | LoopOperation
+    | BashCommandOperation
     | PythonScriptOperation
     | ShellScriptOperation
     | ReadFileOperation
@@ -53,8 +78,16 @@ _AnyOp = (
     | CopyFileOperation
     | MoveFileOperation
     | DeleteFileOperation
+    | FileOperation
+    | FolderOperation
     | OpenResourceOperation
+    | PromptFileOperation
+    | CommonLlmTaskOperation
+    | LocalVectorizeOperation
+    | LocalSearchOperation
     | HttpRequestOperation
+    | ApprovalGateOperation
+    | NotificationOperation
     | AgentOperation
 )
 
@@ -497,7 +530,7 @@ def workflow_to_sections(wf: AgenticWorkflow) -> list[Section]:
 
 def _node_to_section(node: GraphNode) -> Section:
     op = node.operation
-    op_fields = _operation_fields(node.node_id, cast(_AnyOp, op))
+    op_fields = _operation_fields(node.node_id, op)
     shared: list[FieldDescriptor] = [
         FieldDescriptor(
             f"nodes.{node.node_id}.retry_count",
@@ -539,6 +572,18 @@ def _operation_fields(
     node_id_fd = FieldDescriptor(
         f"{prefix}.node_id", "Node ID", FieldKind.STRING, node_id, read_only=True
     )
+
+    if isinstance(op, StartOperation):
+        return [node_id_fd]
+
+    if isinstance(op, (PassOperation, FailOperation, BreakOperation)):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.message", "Message", FieldKind.STRING, op.message),
+        ]
+
+    if isinstance(op, LoopOperation):
+        return [node_id_fd, *_fan_source_fields(prefix, op.source)]
 
     if isinstance(op, BashCommandOperation):
         return [
@@ -646,6 +691,12 @@ def _operation_fields(
             ),
         ]
 
+    if isinstance(op, (FileOperation, FolderOperation)):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.path", "Path", FieldKind.PATH, op.path),
+        ]
+
     if isinstance(op, OpenResourceOperation):
         return [
             node_id_fd,
@@ -659,6 +710,151 @@ def _operation_fields(
             ),
             FieldDescriptor(
                 f"{prefix}.args", "Arguments", FieldKind.LIST_STR, list(op.args)
+            ),
+        ]
+
+    if isinstance(op, PromptFileOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.output_path", "Output Path", FieldKind.PATH, op.output_path
+            ),
+            FieldDescriptor(
+                f"{prefix}.template", "Template", FieldKind.STRING, op.template
+            ),
+            FieldDescriptor(
+                f"{prefix}.template_path",
+                "Template Path",
+                FieldKind.PATH,
+                op.template_path,
+                optional=True,
+            ),
+            FieldDescriptor(
+                f"{prefix}.variables",
+                "Variables",
+                FieldKind.DICT_STR_STR,
+                dict(op.variables),
+            ),
+            FieldDescriptor(
+                f"{prefix}.encoding", "Encoding", FieldKind.STRING, op.encoding
+            ),
+            FieldDescriptor(
+                f"{prefix}.create_dirs", "Create Dirs", FieldKind.BOOL, op.create_dirs
+            ),
+            FieldDescriptor(
+                f"{prefix}.overwrite", "Overwrite", FieldKind.BOOL, op.overwrite
+            ),
+        ]
+
+    if isinstance(op, CommonLlmTaskOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.agent_id", "Agent ID", FieldKind.STRING, op.agent_id
+            ),
+            FieldDescriptor(
+                f"{prefix}.task",
+                "Task",
+                FieldKind.CHOICE,
+                op.task,
+                choices=["review", "summarize", "explain", "extract", "rewrite", "classify"],
+            ),
+            FieldDescriptor(f"{prefix}.target", "Target", FieldKind.STRING, op.target),
+            FieldDescriptor(
+                f"{prefix}.instructions",
+                "Instructions",
+                FieldKind.STRING,
+                op.instructions,
+            ),
+            FieldDescriptor(
+                f"{prefix}.working_dir", "Working Dir", FieldKind.PATH, op.working_dir
+            ),
+            *_llm_common_fields(prefix, op),
+        ]
+
+    if isinstance(op, LocalVectorizeOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.source_path", "Source Path", FieldKind.PATH, op.source_path
+            ),
+            FieldDescriptor(
+                f"{prefix}.index_path", "Index Path", FieldKind.PATH, op.index_path
+            ),
+            FieldDescriptor(f"{prefix}.glob", "Glob", FieldKind.STRING, op.glob),
+            FieldDescriptor(
+                f"{prefix}.recursive", "Recursive", FieldKind.BOOL, op.recursive
+            ),
+            FieldDescriptor(
+                f"{prefix}.chunk_size", "Chunk Size", FieldKind.INT, op.chunk_size
+            ),
+            FieldDescriptor(
+                f"{prefix}.chunk_overlap",
+                "Chunk Overlap",
+                FieldKind.INT,
+                op.chunk_overlap,
+            ),
+            FieldDescriptor(
+                f"{prefix}.encoding", "Encoding", FieldKind.STRING, op.encoding
+            ),
+            FieldDescriptor(
+                f"{prefix}.mode",
+                "Mode",
+                FieldKind.CHOICE,
+                op.mode,
+                choices=["incremental", "full", "validate", "compact"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.embedding_strategy",
+                "Embedding Strategy",
+                FieldKind.STRING,
+                op.embedding_strategy,
+            ),
+            FieldDescriptor(
+                f"{prefix}.search_strategy",
+                "Search Strategy",
+                FieldKind.STRING,
+                op.search_strategy,
+            ),
+        ]
+
+    if isinstance(op, LocalSearchOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.index_path", "Index Path", FieldKind.PATH, op.index_path
+            ),
+            FieldDescriptor(f"{prefix}.query", "Query", FieldKind.STRING, op.query),
+            FieldDescriptor(f"{prefix}.top_k", "Top K", FieldKind.INT, op.top_k),
+            FieldDescriptor(
+                f"{prefix}.score_threshold",
+                "Score Threshold",
+                FieldKind.FLOAT,
+                op.score_threshold,
+            ),
+            FieldDescriptor(
+                f"{prefix}.include_snippets",
+                "Include Snippets",
+                FieldKind.BOOL,
+                op.include_snippets,
+            ),
+            FieldDescriptor(
+                f"{prefix}.include_file_metadata",
+                "Include Metadata",
+                FieldKind.BOOL,
+                op.include_file_metadata,
+            ),
+            FieldDescriptor(
+                f"{prefix}.embedding_strategy",
+                "Embedding Strategy",
+                FieldKind.STRING,
+                op.embedding_strategy,
+            ),
+            FieldDescriptor(
+                f"{prefix}.search_strategy",
+                "Search Strategy",
+                FieldKind.STRING,
+                op.search_strategy,
             ),
         ]
 
@@ -687,7 +883,7 @@ def _operation_fields(
             ),
             FieldDescriptor(f"{prefix}.body", "Raw Body", FieldKind.STRING, op.body or ""),
             FieldDescriptor(
-                f"{prefix}.timeout_seconds",
+                f"{prefix}.http_timeout_seconds",
                 "HTTP Timeout (s)",
                 FieldKind.FLOAT,
                 op.timeout_seconds,
@@ -737,7 +933,63 @@ def _operation_fields(
             ),
         ]
 
-    # AgentOperation
+    if isinstance(op, ApprovalGateOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.message", "Message", FieldKind.STRING, op.message),
+            FieldDescriptor(
+                f"{prefix}.approval_timeout_seconds",
+                "Approval Timeout (s)",
+                FieldKind.FLOAT,
+                op.timeout_seconds,
+                optional=True,
+            ),
+            FieldDescriptor(
+                f"{prefix}.timeout_decision",
+                "Timeout Decision",
+                FieldKind.CHOICE,
+                op.timeout_decision,
+                choices=["reject", "timeout"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.approvers",
+                "Approvers",
+                FieldKind.LIST_STR,
+                list(op.approvers),
+            ),
+            FieldDescriptor(f"{prefix}.notify", "Notify", FieldKind.BOOL, op.notify),
+            FieldDescriptor(
+                f"{prefix}.notification_title",
+                "Notification Title",
+                FieldKind.STRING,
+                op.notification_title,
+            ),
+        ]
+
+    if isinstance(op, NotificationOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(f"{prefix}.title", "Title", FieldKind.STRING, op.title),
+            FieldDescriptor(f"{prefix}.body", "Body", FieldKind.STRING, op.body),
+            FieldDescriptor(
+                f"{prefix}.channel",
+                "Channel",
+                FieldKind.CHOICE,
+                op.channel,
+                choices=["desktop"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.urgency",
+                "Urgency",
+                FieldKind.CHOICE,
+                op.urgency,
+                choices=["low", "normal", "critical"],
+            ),
+        ]
+
+    if not isinstance(op, AgentOperation):
+        return [node_id_fd]
+
     return [
         node_id_fd,
         FieldDescriptor(
@@ -749,11 +1001,40 @@ def _operation_fields(
         FieldDescriptor(
             f"{prefix}.working_dir", "Working Dir", FieldKind.PATH, op.working_dir
         ),
+        *_llm_common_fields(prefix, op),
+        FieldDescriptor(
+            f"{prefix}.skill_name",
+            "Skill Name",
+            FieldKind.STRING,
+            op.skill_name,
+            optional=True,
+        ),
         FieldDescriptor(
             f"{prefix}.dynamic_count",
             "Dynamic Count",
             FieldKind.STRING,
             str(op.dynamic_count),
+        ),
+    ]
+
+
+def _llm_common_fields(
+    prefix: str,
+    op: AgentOperation | CommonLlmTaskOperation,
+) -> list[FieldDescriptor]:
+    return [
+        FieldDescriptor(
+            f"{prefix}.profile", "Profile", FieldKind.STRING, op.profile, optional=True
+        ),
+        FieldDescriptor(
+            f"{prefix}.model", "Model", FieldKind.STRING, op.model, optional=True
+        ),
+        FieldDescriptor(
+            f"{prefix}.timeout",
+            "Agent Timeout (s)",
+            FieldKind.FLOAT,
+            op.timeout,
+            optional=True,
         ),
         FieldDescriptor(
             f"{prefix}.memory",
@@ -768,7 +1049,96 @@ def _operation_fields(
             FieldKind.DICT_STR_STR,
             dict(op.input_mapping),
         ),
+        FieldDescriptor(
+            f"{prefix}.llm_budget.max_agent_calls",
+            "Max Agent Calls",
+            FieldKind.INT,
+            op.llm_budget.max_agent_calls,
+            optional=True,
+        ),
+        FieldDescriptor(
+            f"{prefix}.llm_budget.max_estimated_tokens",
+            "Max Tokens",
+            FieldKind.INT,
+            op.llm_budget.max_estimated_tokens,
+            optional=True,
+        ),
+        FieldDescriptor(
+            f"{prefix}.llm_budget.max_estimated_cost",
+            "Max Cost",
+            FieldKind.FLOAT,
+            op.llm_budget.max_estimated_cost,
+            optional=True,
+        ),
+        FieldDescriptor(
+            f"{prefix}.llm_budget.max_agent_time_seconds",
+            "Max Agent Time",
+            FieldKind.FLOAT,
+            op.llm_budget.max_agent_time_seconds,
+            optional=True,
+        ),
     ]
+
+
+def _fan_source_fields(prefix: str, source: object) -> list[FieldDescriptor]:
+    fields = [
+        FieldDescriptor(
+            f"{prefix}.source.type",
+            "Source Type",
+            FieldKind.CHOICE,
+            getattr(source, "type", "count"),
+            choices=["count", "tabular", "directory", "trigger_events", "infinite"],
+        ),
+        FieldDescriptor(
+            f"{prefix}.source.max_concurrency",
+            "Max Concurrency",
+            FieldKind.INT,
+            getattr(source, "max_concurrency", 1),
+        ),
+        FieldDescriptor(
+            f"{prefix}.source.fail_fast",
+            "Fail Fast",
+            FieldKind.BOOL,
+            getattr(source, "fail_fast", False),
+        ),
+    ]
+    if isinstance(source, CountFanSource):
+        fields.append(
+            FieldDescriptor(
+                f"{prefix}.source.count", "Count", FieldKind.STRING, source.count
+            )
+        )
+    elif isinstance(source, TabularFanSource):
+        fields.append(
+            FieldDescriptor(f"{prefix}.source.path", "Path", FieldKind.PATH, source.path)
+        )
+    elif isinstance(source, DirectoryFanSource):
+        fields.extend(
+            [
+                FieldDescriptor(
+                    f"{prefix}.source.path", "Path", FieldKind.PATH, source.path
+                ),
+                FieldDescriptor(
+                    f"{prefix}.source.glob", "Glob", FieldKind.STRING, source.glob
+                ),
+                FieldDescriptor(
+                    f"{prefix}.source.include_content",
+                    "Include Content",
+                    FieldKind.BOOL,
+                    source.include_content,
+                ),
+            ]
+        )
+    elif isinstance(source, TriggerEventsFanSource):
+        fields.append(
+            FieldDescriptor(
+                f"{prefix}.source.include_content",
+                "Include Content",
+                FieldKind.BOOL,
+                source.include_content,
+            )
+        )
+    return fields
 
 
 def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
@@ -804,9 +1174,31 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
             p = f"nodes.{nid}"
             op = node.operation
 
-            if isinstance(op, BashCommandOperation):
+            if isinstance(op, StartOperation):
+                new_op: _AnyOp = StartOperation(type=op.type)
+            elif isinstance(op, PassOperation):
+                new_op = PassOperation(
+                    type=op.type,
+                    message=fm.get(f"{p}.message") or "",
+                )
+            elif isinstance(op, FailOperation):
+                new_op = FailOperation(
+                    type=op.type,
+                    message=fm.get(f"{p}.message") or "",
+                )
+            elif isinstance(op, BreakOperation):
+                new_op = BreakOperation(
+                    type=op.type,
+                    message=fm.get(f"{p}.message") or "",
+                )
+            elif isinstance(op, LoopOperation):
+                new_op = LoopOperation(
+                    type=op.type,
+                    source=_build_fan_source(fm, p, op.source),
+                )
+            elif isinstance(op, BashCommandOperation):
                 wd_raw = fm.get(f"{p}.working_dir")
-                new_op: _AnyOp = BashCommandOperation(
+                new_op = BashCommandOperation(
                     type=op.type,
                     command=fm.get(f"{p}.command") or op.command,
                     working_dir=_as_path_or_none(wd_raw),
@@ -871,12 +1263,89 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     recursive=bool(fm.get(f"{p}.recursive")),
                     missing_ok=bool(fm.get(f"{p}.missing_ok")),
                 )
+            elif isinstance(op, FileOperation):
+                new_op = FileOperation(
+                    type=op.type,
+                    path=_as_path(fm.get(f"{p}.path"), op.path),
+                )
+            elif isinstance(op, FolderOperation):
+                new_op = FolderOperation(
+                    type=op.type,
+                    path=_as_path(fm.get(f"{p}.path"), op.path),
+                )
             elif isinstance(op, OpenResourceOperation):
                 new_op = OpenResourceOperation(
                     type=op.type,
                     target=fm.get(f"{p}.target") or op.target,
                     resource_type=fm.get(f"{p}.resource_type") or op.resource_type,
                     args=fm.get(f"{p}.args") or [],
+                )
+            elif isinstance(op, PromptFileOperation):
+                template_path_raw = fm.get(f"{p}.template_path")
+                new_op = PromptFileOperation(
+                    type=op.type,
+                    output_path=_as_path(fm.get(f"{p}.output_path"), op.output_path),
+                    template=fm.get(f"{p}.template") or "",
+                    template_path=(
+                        _as_path_or_none(template_path_raw)
+                        if f"{p}.template_path" in fm
+                        else _as_path_or_none(template_path_raw)
+                    ),
+                    variables=fm.get(f"{p}.variables") or {},
+                    encoding=fm.get(f"{p}.encoding") or op.encoding,
+                    create_dirs=bool(fm.get(f"{p}.create_dirs")),
+                    overwrite=bool(fm.get(f"{p}.overwrite")),
+                )
+            elif isinstance(op, CommonLlmTaskOperation):
+                new_op = CommonLlmTaskOperation(
+                    type=op.type,
+                    agent_id=fm.get(f"{p}.agent_id") or op.agent_id,
+                    task=fm.get(f"{p}.task") or op.task,
+                    target=fm.get(f"{p}.target") or "",
+                    instructions=fm.get(f"{p}.instructions") or "",
+                    working_dir=_as_path(fm.get(f"{p}.working_dir"), op.working_dir),
+                    profile=_empty_to_none(fm.get(f"{p}.profile")),
+                    model=_empty_to_none(fm.get(f"{p}.model")),
+                    timeout=_optional_float(fm.get(f"{p}.timeout")),
+                    memory=fm.get(f"{p}.memory") or op.memory,
+                    input_mapping=fm.get(f"{p}.input_mapping") or {},
+                    llm_budget=_llm_budget_from_fields(fm, p),
+                )
+            elif isinstance(op, LocalVectorizeOperation):
+                new_op = LocalVectorizeOperation(
+                    type=op.type,
+                    source_path=_as_path(fm.get(f"{p}.source_path"), op.source_path),
+                    index_path=_as_path(fm.get(f"{p}.index_path"), op.index_path),
+                    glob=fm.get(f"{p}.glob") or op.glob,
+                    recursive=bool(fm.get(f"{p}.recursive")),
+                    chunk_size=int(fm.get(f"{p}.chunk_size") or op.chunk_size),
+                    chunk_overlap=int(
+                        fm.get(f"{p}.chunk_overlap") or op.chunk_overlap
+                    ),
+                    encoding=fm.get(f"{p}.encoding") or op.encoding,
+                    mode=fm.get(f"{p}.mode") or op.mode,
+                    embedding_strategy=(
+                        fm.get(f"{p}.embedding_strategy") or op.embedding_strategy
+                    ),
+                    search_strategy=fm.get(f"{p}.search_strategy") or op.search_strategy,
+                )
+            elif isinstance(op, LocalSearchOperation):
+                new_op = LocalSearchOperation(
+                    type=op.type,
+                    index_path=_as_path(fm.get(f"{p}.index_path"), op.index_path),
+                    query=fm.get(f"{p}.query") or op.query,
+                    top_k=int(fm.get(f"{p}.top_k") or op.top_k),
+                    score_threshold=float(
+                        fm.get(f"{p}.score_threshold") or op.score_threshold
+                    ),
+                    include_snippets=bool(fm.get(f"{p}.include_snippets")),
+                    include_file_metadata=bool(
+                        fm.get(f"{p}.include_file_metadata")
+                    ),
+                    embedding_strategy=(
+                        fm.get(f"{p}.embedding_strategy") or op.embedding_strategy
+                    ),
+                    search_strategy=fm.get(f"{p}.search_strategy") or op.search_strategy,
                 )
             elif isinstance(op, HttpRequestOperation):
                 retry_statuses = [
@@ -893,7 +1362,7 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     json=_parse_json_field(fm.get(f"{p}.json_payload")),
                     body=fm.get(f"{p}.body") or None,
                     timeout_seconds=float(
-                        fm.get(f"{p}.timeout_seconds") or op.timeout_seconds
+                        fm.get(f"{p}.http_timeout_seconds") or op.timeout_seconds
                     ),
                     retry=HttpRetryPolicy(
                         attempts=int(
@@ -914,6 +1383,30 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     output_mapping=fm.get(f"{p}.output_mapping") or {},
                     secret_fields=fm.get(f"{p}.secret_fields") or [],
                 )
+            elif isinstance(op, ApprovalGateOperation):
+                new_op = ApprovalGateOperation(
+                    type=op.type,
+                    message=fm.get(f"{p}.message") or op.message,
+                    timeout_seconds=_optional_float(
+                        fm.get(f"{p}.approval_timeout_seconds")
+                    ),
+                    timeout_decision=(
+                        fm.get(f"{p}.timeout_decision") or op.timeout_decision
+                    ),
+                    approvers=fm.get(f"{p}.approvers") or [],
+                    notify=bool(fm.get(f"{p}.notify")),
+                    notification_title=(
+                        fm.get(f"{p}.notification_title") or op.notification_title
+                    ),
+                )
+            elif isinstance(op, NotificationOperation):
+                new_op = NotificationOperation(
+                    type=op.type,
+                    title=fm.get(f"{p}.title") or op.title,
+                    body=fm.get(f"{p}.body") or "",
+                    channel=fm.get(f"{p}.channel") or op.channel,
+                    urgency=fm.get(f"{p}.urgency") or op.urgency,
+                )
             elif isinstance(op, AgentOperation):
                 dc_raw = fm.get(f"{p}.dynamic_count", "1")
                 dc: int | str
@@ -926,14 +1419,19 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     type=op.type,
                     agent_id=fm.get(f"{p}.agent_id") or op.agent_id,
                     prompt_path=(
-                        op.prompt_path
-                        if prompt_path_raw is None
+                        _as_path_or_none(prompt_path_raw)
+                        if f"{p}.prompt_path" in fm
                         else _as_path_or_none(prompt_path_raw)
                     ),
                     working_dir=_as_path(fm.get(f"{p}.working_dir"), op.working_dir),
+                    profile=_empty_to_none(fm.get(f"{p}.profile")),
+                    model=_empty_to_none(fm.get(f"{p}.model")),
+                    timeout=_optional_float(fm.get(f"{p}.timeout")),
+                    skill_name=_empty_to_none(fm.get(f"{p}.skill_name")),
                     dynamic_count=dc,
                     memory=fm.get(f"{p}.memory") or op.memory,
                     input_mapping=fm.get(f"{p}.input_mapping") or {},
+                    llm_budget=_llm_budget_from_fields(fm, p),
                     fan_source=op.fan_source,
                 )
             else:
@@ -1015,6 +1513,114 @@ def sections_to_agent(sections: list[Section], cfg: AgentConfig) -> AgentConfig:
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
+
+def _build_fan_source(fm: dict[str, Any], prefix: str, fallback: FanSource) -> FanSource:
+    source_type = str(fm.get(f"{prefix}.source.type") or fallback.type)
+    max_concurrency = _required_int(
+        fm.get(f"{prefix}.source.max_concurrency", fallback.max_concurrency)
+    )
+    fail_fast = bool(fm.get(f"{prefix}.source.fail_fast"))
+
+    if source_type == "tabular":
+        path = _as_path(
+            fm.get(f"{prefix}.source.path"),
+            fallback.path if isinstance(fallback, TabularFanSource) else Path("."),
+        )
+        return TabularFanSource(
+            type="tabular",
+            path=path,
+            max_concurrency=max_concurrency,
+            fail_fast=fail_fast,
+        )
+    if source_type == "directory":
+        path = _as_path(
+            fm.get(f"{prefix}.source.path"),
+            fallback.path if isinstance(fallback, DirectoryFanSource) else Path("."),
+        )
+        glob = (
+            fallback.glob
+            if isinstance(fallback, DirectoryFanSource)
+            else "*"
+        )
+        return DirectoryFanSource(
+            type="directory",
+            path=path,
+            glob=str(fm.get(f"{prefix}.source.glob") or glob),
+            include_content=bool(fm.get(f"{prefix}.source.include_content")),
+            max_concurrency=max_concurrency,
+            fail_fast=fail_fast,
+        )
+    if source_type == "trigger_events":
+        return TriggerEventsFanSource(
+            type="trigger_events",
+            include_content=bool(fm.get(f"{prefix}.source.include_content")),
+            max_concurrency=max_concurrency,
+            fail_fast=fail_fast,
+        )
+    if source_type == "infinite":
+        return InfiniteFanSource(
+            type="infinite",
+            max_concurrency=max_concurrency,
+            fail_fast=fail_fast,
+        )
+
+    fallback_count: int | str | None = (
+        fallback.count if isinstance(fallback, CountFanSource) else 1
+    )
+    count_raw = fm.get(f"{prefix}.source.count", fallback_count)
+    try:
+        count: int | str | None = int(str(count_raw))
+    except (TypeError, ValueError):
+        count = str(count_raw) if count_raw is not None else None
+    return CountFanSource(
+        type="count",
+        count=count,
+        max_concurrency=max_concurrency,
+        fail_fast=fail_fast,
+    )
+
+
+def _llm_budget_from_fields(fm: dict[str, Any], prefix: str) -> LlmUsageBudget:
+    return LlmUsageBudget(
+        max_agent_calls=_optional_int(fm.get(f"{prefix}.llm_budget.max_agent_calls")),
+        max_estimated_tokens=_optional_int(
+            fm.get(f"{prefix}.llm_budget.max_estimated_tokens")
+        ),
+        max_estimated_cost=_optional_float(
+            fm.get(f"{prefix}.llm_budget.max_estimated_cost")
+        ),
+        max_agent_time_seconds=_optional_float(
+            fm.get(f"{prefix}.llm_budget.max_agent_time_seconds")
+        ),
+    )
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    return _required_int(value)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return _required_float(value)
+
+
+def _required_int(value: object) -> int:
+    return int(str(value))
+
+
+def _required_float(value: object) -> float:
+    return float(str(value))
+
+
+def _empty_to_none(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _as_path(raw: Any, fallback: Path) -> Path:  # noqa: ANN401

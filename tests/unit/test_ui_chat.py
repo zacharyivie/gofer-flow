@@ -434,6 +434,48 @@ def test_build_chat_command_uses_resolved_binary_paths() -> None:
 
 
 @pytest.mark.asyncio
+async def test_run_workflow_chat_adds_trusted_workflow_paths_to_provider_sandbox(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    captured_command = None
+    data_dir = tmp_path / "gofer-data"
+    trusted_dir = tmp_path / "trusted"
+    trusted_dir.mkdir()
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def capture_subprocess(command, **_kwargs):
+        nonlocal captured_command
+        captured_command = command
+        return 0, "done", ""
+
+    monkeypatch.setattr(chat, "run_subprocess", capture_subprocess)
+
+    await run_workflow_chat(
+        provider="codex",
+        model="cli-default",
+        messages=[{"role": "user", "body": "hello"}],
+        workflow={
+            "id": "trusted",
+            "filesystemAccess": [
+                {"path": str(trusted_dir), "read": True, "write": True},
+                {"path": str(tmp_path / "read-only"), "read": True, "write": False},
+            ],
+        },
+        working_dir=tmp_path,
+        data_dir=data_dir,
+    )
+
+    assert captured_command is not None
+    assert str(data_dir.resolve()) in option_values(captured_command, "--add-dir")
+    assert str(trusted_dir.resolve()) in option_values(captured_command, "--add-dir")
+    assert str((tmp_path / "read-only").resolve()) not in option_values(
+        captured_command,
+        "--add-dir",
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_workflow_chat_reports_process_launch_errors(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(chat.shutil, "which", lambda _binary: r"C:\missing\codex.cmd")
 
@@ -746,3 +788,7 @@ async def test_stream_workflow_chat_yields_error_on_nonzero_exit(monkeypatch, tm
 
 def option_value(command: list[str], option: str) -> str:
     return command[command.index(option) + 1]
+
+
+def option_values(command: list[str], option: str) -> list[str]:
+    return [command[index + 1] for index, value in enumerate(command[:-1]) if value == option]

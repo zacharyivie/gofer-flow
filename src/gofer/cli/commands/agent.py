@@ -36,6 +36,8 @@ def create(
     subscription: str | None = typer.Option(
         None, "--subscription", help=f"Subscription ({', '.join(_SUBSCRIPTION_CHOICES)})"
     ),
+    profile: str | None = typer.Option(None, "--profile", help="Provider profile name"),
+    model: str | None = typer.Option(None, "--model", help="Provider model override"),
     working_dir: Path | None = typer.Option(None, "--working-dir", help="Agent working directory"),
     prompt: str | None = typer.Option(
         None, "--prompt", help="Prompt text or path to a prompt file"
@@ -109,6 +111,8 @@ def create(
         agent_id=agent_id,
         subscription=subscription,  # type: ignore[arg-type]
         working_dir=working_dir,
+        profile=profile,
+        model=model,
         prompt_path=prompt_path,
         tools=tools_list,
         mcp_servers=mcp_list,
@@ -128,6 +132,8 @@ def edit(
     subscription: str | None = typer.Option(
         None, "--subscription", help=f"Subscription ({', '.join(_SUBSCRIPTION_CHOICES)})"
     ),
+    profile: str | None = typer.Option(None, "--profile", help="Provider profile name"),
+    model: str | None = typer.Option(None, "--model", help="Provider model override"),
     working_dir: Path | None = typer.Option(None, "--working-dir", help="Agent working directory"),
     prompt: str | None = typer.Option(
         None, "--prompt", help="Prompt text or path to a prompt file"
@@ -157,7 +163,17 @@ def edit(
     # No flags → interactive TUI editor
     _any_flag = any(
         v is not None
-        for v in [subscription, working_dir, prompt, tools, mcp_servers, extra_path, env]
+        for v in [
+            subscription,
+            profile,
+            model,
+            working_dir,
+            prompt,
+            tools,
+            mcp_servers,
+            extra_path,
+            env,
+        ]
     )
     if not _any_flag:
         from gofer.cli.tui_editor import (
@@ -187,6 +203,12 @@ def edit(
 
     if working_dir is not None:
         cfg = cfg.model_copy(update={"working_dir": working_dir.expanduser().resolve()})
+
+    if profile is not None:
+        cfg = cfg.model_copy(update={"profile": profile.strip() or None})
+
+    if model is not None:
+        cfg = cfg.model_copy(update={"model": model.strip() or None})
 
     if prompt is not None:
         prompt_path = resolve_prompt(prompt.strip(), base, agent_id)
@@ -334,12 +356,21 @@ def list_agents(
         console.print(f"No agents found in [bold]{base}[/bold].")
         return
 
-    table = Table("Agent ID", "Workflow", "Subscription", "Working Dir", "Prompt")
+    table = Table()
+    table.add_column("Agent ID", no_wrap=True)
+    table.add_column("Workflow", no_wrap=True)
+    table.add_column("Subscription", no_wrap=True)
+    table.add_column("Profile", overflow="fold")
+    table.add_column("Model", overflow="fold")
+    table.add_column("Working Dir", overflow="fold")
+    table.add_column("Prompt", overflow="fold")
     for wf, cfg in pairs:
         table.add_row(
             cfg.agent_id,
             wf.config.id,
             cfg.subscription,
+            cfg.profile or "",
+            cfg.model or "",
             str(cfg.working_dir),
             str(cfg.prompt_path),
         )

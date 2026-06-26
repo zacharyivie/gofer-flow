@@ -18,6 +18,7 @@ def write_run_node_outputs_payload(result: Any, limits: Any) -> None:
             node_id: run_sidecar_node_output_contract(output)
             for node_id, output in result.node_outputs.items()
         },
+        "parameters": getattr(result, "parameters", {}),
         "usageSummary": result.usage_summary,
         "nodeOutputsTruncated": False,
         "nodeOutputsMaxBytes": limits.max_api_log_response_bytes,

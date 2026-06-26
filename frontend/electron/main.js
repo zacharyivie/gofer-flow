@@ -508,6 +508,7 @@ function setupIpcHandlers() {
     deletePath,
     downloadAndInstallUpdate,
     getGoferDataDir,
+    grantPath,
     getUpdateState,
     installDownloadedUpdate,
     listDirectory,
@@ -834,6 +835,13 @@ async function pathInfo(_event, options = {}) {
   });
   const stat = await fs.promises.stat(targetPath);
   return pathInfoFromStat(targetPath, stat);
+}
+
+async function grantPath(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+  return pathHandle(path.resolve(options.targetPath));
 }
 
 async function copyPath(_event, options = {}) {

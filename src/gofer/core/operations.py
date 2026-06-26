@@ -39,14 +39,14 @@ class OperationType(StrEnum):
 class CountFanSource(BaseModel):
     type: Literal["count"]
     count: int | str | None = 1
-    max_concurrency: int = 16
+    max_concurrency: int = 1
     fail_fast: bool = False
 
 
 class TabularFanSource(BaseModel):
     type: Literal["tabular"]
     path: Path
-    max_concurrency: int = 16
+    max_concurrency: int = 1
     fail_fast: bool = False
 
 
@@ -55,20 +55,20 @@ class DirectoryFanSource(BaseModel):
     path: Path
     glob: str = "*"
     include_content: bool = False
-    max_concurrency: int = 16
+    max_concurrency: int = 1
     fail_fast: bool = False
 
 
 class TriggerEventsFanSource(BaseModel):
     type: Literal["trigger_events"]
     include_content: bool = False
-    max_concurrency: int = 16
+    max_concurrency: int = 1
     fail_fast: bool = False
 
 
 class InfiniteFanSource(BaseModel):
     type: Literal["infinite"]
-    max_concurrency: int = 16
+    max_concurrency: int = 1
     fail_fast: bool = False
 
 
@@ -203,6 +203,9 @@ class CommonLlmTaskOperation(BaseModel):
     target: str = ""
     instructions: str = ""
     working_dir: Path
+    profile: str | None = None
+    model: str | None = None
+    timeout: float | None = None
     memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
     llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
@@ -281,6 +284,9 @@ class AgentOperation(BaseModel):
     agent_id: str
     prompt_path: Path | None = None
     working_dir: Path
+    profile: str | None = None
+    model: str | None = None
+    timeout: float | None = None
     skill_name: str | None = None
     dynamic_count: int | str = 1
     memory: Literal["none", "run", "all"] = "none"

@@ -2,6 +2,7 @@ const desktopIpcHandlers = [
   ["gofer:restart-backend", "restartBackend"],
   ["gofer:open-logs", "openLogsFolder"],
   ["gofer:get-data-dir", "getGoferDataDir"],
+  ["gofer:grant-path", "grantPath"],
   ["gofer:list-directory", "listDirectory"],
   ["gofer:open-path", "openPath"],
   ["gofer:reveal-path", "revealPath"],

@@ -26,6 +26,7 @@ from gofer.core.agent import (
     Agent,
     AgentConfig,
     AgentResult,
+    _accepts_execute_kwarg,
     configured_extra_paths,
     format_agent_memory,
 )
@@ -74,6 +75,12 @@ from gofer.core.operations import (
     TriggerEventsFanSource,
     WriteFileOperation,
 )
+from gofer.core.provider_profiles import (
+    ResolvedProviderSettings,
+    resolve_provider_settings,
+    resolved_provider_env,
+    validate_provider_settings,
+)
 from gofer.core.resources import (
     DEFAULT_RESOURCE_LIMITS,
     ResourceLimitError,
@@ -91,7 +98,12 @@ from gofer.core.usage import (
     summarize_node_outputs,
     usage_from_metadata,
 )
-from gofer.core.workflow import AgenticWorkflow
+from gofer.core.workflow import (
+    AgenticWorkflow,
+    FilesystemAccessEntry,
+    masked_workflow_parameters,
+    resolve_workflow_parameters,
+)
 from gofer.prompts.manager import PromptManager
 from gofer.subscriptions.base import Subscription
 from gofer.utils.logging import get_logger
@@ -504,6 +516,13 @@ def _resolve_workflow_path(path: Path, path_base: Path | None) -> Path:
     if expanded.is_absolute() or path_base is None:
         return expanded
     return path_base / expanded
+
+
+def _resolved_for_access(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
 
 
 def _folder_path_data(path: Path) -> dict[str, object]:
@@ -1025,7 +1044,7 @@ class QueuedNode:
     loop_index: int | None = None
     loop_items: list[dict[str, object]] | None = None
     loop_infinite: bool = False
-    loop_max_concurrency: int = 16
+    loop_max_concurrency: int = 1
     loop_fail_fast: bool = False
 
     @property
@@ -1045,7 +1064,7 @@ class NodeOutput:
     terminal_status: str | None = None
     loop_items: list[dict[str, object]] | None = None
     loop_infinite: bool = False
-    loop_max_concurrency: int = 16
+    loop_max_concurrency: int = 1
     loop_fail_fast: bool = False
     type: str = ""
     text: str | None = None
@@ -1095,6 +1114,7 @@ class ExecutionContext:
     node_outputs: dict[str, NodeOutput] = field(default_factory=dict)
     node_runs: dict[str, list[NodeOutput]] = field(default_factory=dict)
     trigger: dict[str, Any] = field(default_factory=dict)
+    params: dict[str, Any] = field(default_factory=dict)
 
     def record(self, output: NodeOutput) -> None:
         self.node_outputs[output.node_id] = output
@@ -1110,7 +1130,11 @@ class ExecutionContext:
         if str(value).strip().isdigit():
             return int(str(value).strip())
         parts = value.strip("{}").split(".")
-        obj: Any = {k: v.contract() for k, v in self.node_outputs.items()}
+        if parts and parts[0] == "params":
+            obj: Any = self.params
+            parts = parts[1:]
+        else:
+            obj = {k: v.contract() for k, v in self.node_outputs.items()}
         for part in parts:
             if not isinstance(obj, dict):
                 raise ValueError(f"Cannot resolve dynamic_count path: {value!r}")
@@ -1134,6 +1158,9 @@ class ExecutionContext:
         parts = value.strip("{}").split(".")
         if parts and parts[0] == "trigger":
             obj: Any = self.trigger
+            parts = parts[1:]
+        elif parts and parts[0] == "params":
+            obj = self.params
             parts = parts[1:]
         elif parts and parts[0] == "loop":
             obj = {"current": loop_item or {}, **(loop_item or {})}
@@ -1177,6 +1204,16 @@ class ExecutionResult:
     node_runs: dict[str, list[NodeOutput]] = field(default_factory=dict)
     log_path: Path | None = None
     usage_summary: dict[str, object] = field(default_factory=dict)
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ResumeOptions:
+    run_id: str | None = None
+    from_node: str | None = None
+    only_node: str | None = None
+    skip_cache: bool = False
+    force: bool = False
 
 
 @dataclass(frozen=True)
@@ -1185,6 +1222,11 @@ class LlmUsageReservation:
 
 
 class WorkflowRunLog:
+    _MAX_EVENT_STRING_BYTES = 2000
+    _MAX_EVENT_LIST_ITEMS = 20
+    _MAX_EVENT_DICT_ITEMS = 80
+    _MAX_LIVE_AGENT_THOUGHTS = 20
+
     def __init__(
         self,
         workflow_id: str,
@@ -1205,6 +1247,9 @@ class WorkflowRunLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             if self.path.exists():
                 self._run_log_bytes = byte_len(self.path.read_text(encoding="utf-8"))
+            else:
+                self._append(f"{self._now()} - {self.workflow_id} started successfully\n")
+                self._write_events_payload({"events": [], "nodes": {}})
             return
         timestamp = self.started_at.strftime("%Y-%m-%dT%H-%M-%S%f%z")
         root = base_dir or get_data_dir() / "logs"
@@ -1226,17 +1271,25 @@ class WorkflowRunLog:
     def begin_node_attempt(self, node_id: str, run_number: int, attempt: int) -> None:
         self._active_node_runs[node_id] = (run_number, attempt)
 
-    def node_output(self, node_id: str, label: str, value: str) -> None:
+    def node_output(
+        self,
+        node_id: str,
+        label: str,
+        value: str,
+        *,
+        uncapped: bool = False,
+    ) -> None:
         if not value:
             return
-        self._write_node_event(node_id, label, value)
+        self._write_node_event(node_id, label, value, uncapped=uncapped)
 
     def node_agent_event(self, node_id: str, label: str, value: str) -> None:
         if not value:
             return
         if not value.rstrip("\n").splitlines():
             return
-        self._write_node_event(node_id, label, value)
+        self._write_node_event(node_id, label, value, uncapped=label == "AGENT_MESSAGE")
+        self._update_node_agent_event_data(node_id, label, value)
 
     def complete(
         self,
@@ -1282,6 +1335,12 @@ class WorkflowRunLog:
         events_list = cast(list[dict[str, object]], events)
         nodes_by_id = cast(dict[str, object], nodes)
         occurred_at = self._now()
+        event_fan_out_item = self._compact_event_value(fan_out_item)
+        if event_fan_out_item is not None and not isinstance(event_fan_out_item, dict):
+            event_fan_out_item = {"value": event_fan_out_item}
+        event_data = self._compact_event_value(data or {})
+        if not isinstance(event_data, dict):
+            event_data = {}
         event = {
             "nodeId": node_id,
             "status": status,
@@ -1293,8 +1352,8 @@ class WorkflowRunLog:
             "exitCode": exit_code,
             "success": success,
             "skipped": skipped,
-            "fanOutItem": fan_out_item,
-            "data": data or {},
+            "fanOutItem": event_fan_out_item,
+            "data": event_data,
         }
         events_list.append({key: value for key, value in event.items() if value is not None})
         if node_id != "workflow":
@@ -1321,8 +1380,8 @@ class WorkflowRunLog:
                                 "attempt": attempt,
                                 "runNumber": run_number,
                                 "startedAt": occurred_at,
-                                "fanOutItem": fan_out_item,
-                                "inputs": (data or {}).get("inputs", {}),
+                                "fanOutItem": event_fan_out_item,
+                                "inputs": event_data.get("inputs", {}),
                             }
                         )
                 if status in {"completed", "failed", "stopped"}:
@@ -1332,7 +1391,7 @@ class WorkflowRunLog:
                             attempts,
                             attempt=attempt,
                             run_number=run_number,
-                            fan_out_item=fan_out_item,
+                            fan_out_item=event_fan_out_item,
                         )
                         matching_attempt.update(
                             {
@@ -1340,28 +1399,28 @@ class WorkflowRunLog:
                                 "durationSeconds": duration_seconds,
                                 "exitCode": exit_code,
                                 "success": success,
-                                "output": (data or {}).get("output", ""),
-                                "error": (data or {}).get("error", ""),
+                                "output": event_data.get("output", ""),
+                                "error": event_data.get("error", ""),
                             }
                         )
                         for detail_key in ("inputs", "stdout", "stderr", "message", "prompt"):
-                            if data and detail_key in data:
-                                matching_attempt[detail_key] = data[detail_key]
-                        if fan_out_item is not None:
+                            if detail_key in event_data:
+                                matching_attempt[detail_key] = event_data[detail_key]
+                        if event_fan_out_item is not None:
                             aggregate_status, aggregate_success = self._fan_out_attempt_status(
                                 attempts,
                                 fallback_status=status,
                             )
                             node_state["status"] = aggregate_status
                             node_state["success"] = aggregate_success
-                if data:
+                if event_data:
                     existing_data = cast(dict[str, object], node_state.get("data", {}))
                     if status == "edge_decision":
                         decisions = existing_data.setdefault("edgeDecisions", [])
                         if isinstance(decisions, list):
-                            decisions.append(data)
+                            decisions.append(event_data)
                     else:
-                        existing_data.update(data)
+                        existing_data.update(event_data)
                     node_state["data"] = existing_data
         self._write_events_payload(payload)
 
@@ -1378,6 +1437,102 @@ class WorkflowRunLog:
         node_state["data"] = existing_data
         node_state["updatedAt"] = self._now()
         self._write_events_payload(payload)
+
+    def _update_node_agent_event_data(self, node_id: str, label: str, value: str) -> None:
+        payload = self._read_events_payload()
+        nodes = payload.setdefault("nodes", {})
+        if not isinstance(nodes, dict):
+            return
+        node_state = nodes.setdefault(node_id, {"nodeId": node_id, "attempts": []})
+        if not isinstance(node_state, dict):
+            return
+        existing_data = cast(dict[str, object], node_state.get("data", {}))
+        value_preview = self._compact_event_value(value)
+        if not isinstance(value_preview, str):
+            value_preview = str(value_preview)
+        if label == "AGENT_THOUGHT":
+            thoughts = existing_data.setdefault("thoughts", [])
+            if isinstance(thoughts, list):
+                thoughts.append(value_preview)
+                del thoughts[: -self._MAX_LIVE_AGENT_THOUGHTS]
+            existing_data["latestThought"] = value_preview
+            node_state["status"] = "started"
+            node_state["message"] = value_preview
+            run_number, attempt = self._active_node_runs.get(node_id, (None, None))
+            self._update_active_attempt_preview(
+                node_state,
+                run_number=run_number,
+                attempt=attempt,
+                patch={"latestThought": value_preview},
+            )
+        elif label == "AGENT_MESSAGE":
+            existing_data["message"] = value_preview
+            node_state["message"] = value_preview
+            run_number, attempt = self._active_node_runs.get(node_id, (None, None))
+            self._update_active_attempt_preview(
+                node_state,
+                run_number=run_number,
+                attempt=attempt,
+                patch={"message": value_preview},
+            )
+        else:
+            return
+        node_state["data"] = existing_data
+        node_state["updatedAt"] = self._now()
+        self._write_events_payload(payload)
+
+    @classmethod
+    def _compact_event_value(cls, value: object) -> object:
+        if isinstance(value, str):
+            return truncate_text_bytes(
+                value,
+                cls._MAX_EVENT_STRING_BYTES,
+                "event payload",
+            )
+        if isinstance(value, dict):
+            compacted: dict[str, object] = {}
+            for index, (key, item) in enumerate(value.items()):
+                if index >= cls._MAX_EVENT_DICT_ITEMS:
+                    compacted["__truncated__"] = (
+                        f"{len(value) - cls._MAX_EVENT_DICT_ITEMS} additional keys omitted"
+                    )
+                    break
+                compacted[str(key)] = cls._compact_event_value(item)
+            return compacted
+        if isinstance(value, list):
+            items = [
+                cls._compact_event_value(item)
+                for item in value[: cls._MAX_EVENT_LIST_ITEMS]
+            ]
+            if len(value) > cls._MAX_EVENT_LIST_ITEMS:
+                items.append(
+                    f"{len(value) - cls._MAX_EVENT_LIST_ITEMS} additional items omitted"
+                )
+            return items
+        return value
+
+    @staticmethod
+    def _update_active_attempt_preview(
+        node_state: dict[str, object],
+        *,
+        run_number: int | None,
+        attempt: int | None,
+        patch: dict[str, object],
+    ) -> None:
+        attempts = node_state.get("attempts")
+        if not isinstance(attempts, list):
+            return
+        for candidate in reversed(attempts):
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("finishedAt") is not None:
+                continue
+            if run_number is not None and candidate.get("runNumber") != run_number:
+                continue
+            if attempt is not None and candidate.get("attempt") != attempt:
+                continue
+            candidate.update(patch)
+            return
 
     @staticmethod
     def _matching_attempt(
@@ -1429,11 +1584,21 @@ class WorkflowRunLog:
     def _write(self, level: str, message: str) -> None:
         self._append(f"{self._now()} - {level} - {message}\n")
 
+    def _write_uncapped(self, level: str, message: str) -> None:
+        self._append_uncapped(f"{self._now()} - {level} - {message}\n")
+
     def _node_log_key(self, node_id: str) -> tuple[str, int | None, int | None]:
         run_number, attempt = self._active_node_runs.get(node_id, (None, None))
         return (node_id, run_number, attempt)
 
-    def _write_node_event(self, node_id: str, label: str, value: str) -> None:
+    def _write_node_event(
+        self,
+        node_id: str,
+        label: str,
+        value: str,
+        *,
+        uncapped: bool = False,
+    ) -> None:
         body = "".join(f"{line}\n" for line in value.rstrip("\n").splitlines())
         if not body:
             return
@@ -1443,11 +1608,18 @@ class WorkflowRunLog:
                 self._limits.max_log_message_bytes,
                 f"{node_id} {label}",
             )
-        body = self._fit_node_body(node_id, body, label)
+        if not uncapped:
+            body = self._fit_node_body(node_id, body, label)
         if not body:
             return
-        self._write("NODE", f"{node_id} - {label}:")
-        self._append_node_body(node_id, body)
+        if uncapped:
+            self._write_uncapped("NODE", f"{node_id} - {label}:")
+        else:
+            self._write("NODE", f"{node_id} - {label}:")
+        if uncapped:
+            self._append_node_body_uncapped(node_id, body)
+        else:
+            self._append_node_body(node_id, body)
 
     def _fit_node_body(self, node_id: str, body: str, label: str) -> str:
         key = self._node_log_key(node_id)
@@ -1485,6 +1657,11 @@ class WorkflowRunLog:
         written = self._append(body)
         self._node_log_bytes[key] = self._node_log_bytes.get(key, 0) + written
 
+    def _append_node_body_uncapped(self, node_id: str, body: str) -> None:
+        key = self._node_log_key(node_id)
+        written = self._append_uncapped(body)
+        self._node_log_bytes[key] = self._node_log_bytes.get(key, 0) + written
+
     def _write_node_omission_line(self, node_id: str, label: str) -> None:
         key = (self._node_log_key(node_id), label)
         if key in self._node_log_omissions:
@@ -1502,6 +1679,9 @@ class WorkflowRunLog:
         if remaining_run <= 0:
             return 0
         text = truncate_text_bytes(text, remaining_run, "run log")
+        return self._append_uncapped(text)
+
+    def _append_uncapped(self, text: str) -> int:
         with self.path.open("a", encoding="utf-8") as fh:
             fh.write(text)
         written = byte_len(text)
@@ -1537,16 +1717,20 @@ class WorkflowRunLog:
 
 
 class WorkflowExecutor:
+    _SNAPSHOT_ARTIFACT_KEY = "__gofer_artifact__"
+
     def __init__(
         self,
         workflow: AgenticWorkflow,
         subscriptions: dict[str, Subscription],
         dry_run: bool = False,
         log_base_dir: Path | None = None,
+        run_log_path: Path | None = None,
         workflow_path: Path | None = None,
         max_total_node_runs: int | None = None,
         cancel_event: threading.Event | None = None,
         stop_file: Path | None = None,
+        data_dir: Path | None = None,
         http_client: HttpClient | None = None,
         approval_store: ApprovalStore | None = None,
         notification_adapter: NotificationAdapter | None = None,
@@ -1555,6 +1739,7 @@ class WorkflowExecutor:
         self._subscriptions = subscriptions
         self._dry_run = dry_run
         self._log_base_dir = log_base_dir
+        self._run_log_path = run_log_path
         self._workflow_path = workflow_path
         self._path_base = workflow_path.parent if workflow_path is not None else None
         self._max_total_node_runs = max_total_node_runs or workflow.config.max_total_node_runs
@@ -1564,6 +1749,7 @@ class WorkflowExecutor:
         self._run_stop_file: Path | None = None
         self._stop_monitor_done = threading.Event()
         self._trigger_context: dict[str, Any] = {}
+        self._run_parameters: dict[str, Any] = {}
         self._run_log: WorkflowRunLog | None = None
         self._agent_run_memory: dict[str, list[dict[str, str]]] = {}
         self._llm_usage_lock = anyio.Lock()
@@ -1571,12 +1757,26 @@ class WorkflowExecutor:
         self._node_llm_usage_totals: dict[str, LlmUsageTotals] = {}
         self._limits = workflow.config.resource_limits
         self._http_client = http_client or UrllibHttpClient()
-        data_dir = log_base_dir.parent if log_base_dir is not None else None
-        self._approval_store = approval_store or ApprovalStore(data_dir)
+        store_data_dir = data_dir or (log_base_dir.parent if log_base_dir is not None else None)
+        self._data_dir = store_data_dir
+        self._approval_store = approval_store or ApprovalStore(store_data_dir)
         self._notification_adapter = notification_adapter or DesktopNotificationAdapter()
+        self._resume_options: ResumeOptions | None = None
+        self._resume_task_entries: dict[str, dict[str, object]] = {}
+        self._resume_seed_outputs: dict[str, NodeOutput] = {}
+        self._resume_only_dependencies: set[str] = set()
+        self._resume_cache_bypass_nodes: set[str] = set()
+
+    def with_resume_options(self, options: ResumeOptions) -> WorkflowExecutor:
+        self._resume_options = options
+        return self
 
     def with_trigger_context(self, trigger_context: dict[str, Any]) -> WorkflowExecutor:
         self._trigger_context = trigger_context
+        return self
+
+    def with_parameters(self, parameters: dict[str, Any] | None) -> WorkflowExecutor:
+        self._run_parameters = parameters or {}
         return self
 
     def _log(self) -> WorkflowRunLog:
@@ -1589,8 +1789,9 @@ class WorkflowExecutor:
         node_id: str,
         result: AgentResult,
         prefix: str = "",
+        streamed_thought_count: int = 0,
     ) -> None:
-        for thought in result.thoughts:
+        for thought in result.thoughts[streamed_thought_count:]:
             value = f"{prefix}{thought}" if prefix else thought
             self._log().node_agent_event(
                 node_id,
@@ -1892,18 +2093,37 @@ class WorkflowExecutor:
         metadata: dict[str, object] = {}
         try:
             timeout = await self._remaining_agent_time_timeout(node_id, op)
-            effective_timeout = min(180.0, timeout) if timeout is not None else 180.0
-            result = await subscription.execute(
-                prompt=compaction_prompt,
-                working_dir=agent_config.working_dir,
-                tools=agent_config.tools,
-                mcp_servers=agent_config.mcp_servers,
-                env=agent_config.env,
-                timeout=effective_timeout,
-                cancel_event=self._cancel_event if self._pass_cancel_event else None,
-                extra_paths=configured_extra_paths(agent_config),
-                max_output_bytes=self._limits.max_subprocess_output_bytes,
+            provider_settings = self._provider_settings_for_operation(agent_config, op)
+            profile_timeout = self._effective_agent_timeout(timeout, provider_settings)
+            effective_timeout = (
+                min(180.0, profile_timeout) if profile_timeout is not None else 180.0
             )
+            effective_env = {**resolved_provider_env(provider_settings), **agent_config.env}
+            if _accepts_execute_kwarg(subscription, "provider_settings"):
+                result = await subscription.execute(
+                    prompt=compaction_prompt,
+                    working_dir=agent_config.working_dir,
+                    tools=agent_config.tools,
+                    mcp_servers=agent_config.mcp_servers,
+                    env=effective_env,
+                    timeout=effective_timeout,
+                    cancel_event=self._cancel_event if self._pass_cancel_event else None,
+                    extra_paths=configured_extra_paths(agent_config),
+                    max_output_bytes=self._limits.max_subprocess_output_bytes,
+                    provider_settings=provider_settings,
+                )
+            else:
+                result = await subscription.execute(
+                    prompt=compaction_prompt,
+                    working_dir=agent_config.working_dir,
+                    tools=agent_config.tools,
+                    mcp_servers=agent_config.mcp_servers,
+                    env=effective_env,
+                    timeout=effective_timeout,
+                    cancel_event=self._cancel_event if self._pass_cancel_event else None,
+                    extra_paths=configured_extra_paths(agent_config),
+                    max_output_bytes=self._limits.max_subprocess_output_bytes,
+                )
             output_for_usage = result.output
             metadata = result.usage_metadata
             summary = (
@@ -1960,15 +2180,118 @@ class WorkflowExecutor:
         working_dir: Path | None,
     ) -> AgentConfig:
         updates: dict[str, Path | list[Path]] = {}
-        if self._path_base is not None and agent_config.extra_paths:
-            updates["extra_paths"] = [
-                _resolve_workflow_path(path, self._path_base) for path in agent_config.extra_paths
-            ]
+        extra_paths = [
+            *agent_config.extra_paths,
+            *[
+                entry.path
+                for entry in self._workflow.config.filesystem_access
+                if entry.read and entry.write
+            ],
+        ]
+        if extra_paths:
+            updates["extra_paths"] = self._provider_extra_paths(extra_paths)
         if prompt_path is not None:
             updates["prompt_path"] = _resolve_workflow_path(prompt_path, self._path_base)
         if working_dir is not None:
             updates["working_dir"] = _resolve_workflow_path(working_dir, self._path_base)
         return agent_config.model_copy(update=updates) if updates else agent_config
+
+    def _provider_extra_paths(self, paths: list[Path]) -> list[Path]:
+        resolved_paths: list[Path] = []
+        seen: set[Path] = set()
+        for configured_path in paths:
+            resolved = _resolve_workflow_path(configured_path, self._path_base)
+            provider_path = resolved
+            if resolved.exists() and resolved.is_file():
+                provider_path = resolved.parent
+            elif not resolved.exists() and resolved.suffix:
+                provider_path = resolved.parent
+            provider_path = provider_path.resolve()
+            if provider_path in seen:
+                continue
+            seen.add(provider_path)
+            resolved_paths.append(provider_path)
+        return resolved_paths
+
+    def _path_has_workflow_access(
+        self,
+        path: Path,
+        permission: Literal["read", "write", "execute"],
+    ) -> bool:
+        if self._path_base is None:
+            return True
+        resolved_path = _resolved_for_access(path)
+        trusted_root = _resolved_for_access(self._path_base)
+        if resolved_path == trusted_root or trusted_root in resolved_path.parents:
+            root_entry = self._project_root_access_entry(trusted_root)
+            return getattr(root_entry, permission) if root_entry is not None else True
+        for entry in self._workflow.config.filesystem_access:
+            if not getattr(entry, permission):
+                continue
+            if self._access_entry_covers_path(entry, resolved_path):
+                return True
+        return False
+
+    def _access_entry_covers_path(
+        self,
+        entry: FilesystemAccessEntry,
+        resolved_path: Path,
+    ) -> bool:
+        entry_path = _resolve_workflow_path(entry.path, self._path_base)
+        resolved_entry = _resolved_for_access(entry_path)
+        return resolved_path == resolved_entry or resolved_entry in resolved_path.parents
+
+    def _project_root_access_entry(
+        self,
+        trusted_root: Path,
+    ) -> FilesystemAccessEntry | None:
+        for entry in self._workflow.config.filesystem_access:
+            entry_path = _resolve_workflow_path(entry.path, self._path_base)
+            if _resolved_for_access(entry_path) == trusted_root:
+                return entry
+        return None
+
+    def _require_workflow_path_access(
+        self,
+        path: Path,
+        permission: Literal["read", "write", "execute"],
+    ) -> None:
+        if self._path_has_workflow_access(path, permission):
+            return
+        raise PermissionError(
+            f"Workflow filesystem access denied for {permission} on {path}. "
+            "Add the path to workflow filesystem access or move it into the "
+            "trusted project folder."
+        )
+
+    def _provider_settings_for_operation(
+        self,
+        agent_config: AgentConfig,
+        op: AgentOperation | CommonLlmTaskOperation,
+    ) -> ResolvedProviderSettings:
+        settings = resolve_provider_settings(
+            agent_subscription=agent_config.subscription,
+            profile_name=agent_config.profile,
+            agent_model=agent_config.model,
+            operation_profile=op.profile,
+            operation_model=op.model,
+            operation_timeout=op.timeout,
+            data_dir=self._data_dir,
+        )
+        validate_provider_settings(settings)
+        return settings
+
+    @staticmethod
+    def _effective_agent_timeout(
+        budget_timeout: float | None,
+        provider_settings: ResolvedProviderSettings,
+    ) -> float | None:
+        timeouts = [
+            value
+            for value in (budget_timeout, provider_settings.timeout)
+            if value is not None
+        ]
+        return min(timeouts) if timeouts else None
 
     def _trigger_secret_values(self, ctx: ExecutionContext, graph: WorkflowGraph) -> set[str]:
         secret_values: set[str] = set()
@@ -2074,6 +2397,64 @@ class WorkflowExecutor:
             node_id,
         ).with_suffix(".checkpoint.json")
 
+    @staticmethod
+    def _artifact_root(snapshot_path: Path) -> Path:
+        return snapshot_path.parent / f"{snapshot_path.stem}.artifacts"
+
+    @staticmethod
+    def _safe_artifact_name(value: object) -> str:
+        text = re.sub(r"[^a-zA-Z0-9_.-]+", "-", str(value)).strip("-._")
+        if not text:
+            text = "artifact"
+        if len(text) > 80:
+            digest = hashlib.sha256(str(value).encode()).hexdigest()[:12]
+            text = f"{text[:64]}-{digest}"
+        return text
+
+    def _write_snapshot_artifact(
+        self,
+        snapshot_path: Path,
+        category: str,
+        name: object,
+        payload: object,
+    ) -> dict[str, str]:
+        root = self._artifact_root(snapshot_path)
+        safe_category = self._safe_artifact_name(category)
+        safe_name = self._safe_artifact_name(name)
+        artifact_path = root / safe_category / f"{safe_name}.json"
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        artifact_path.write_text(json.dumps(payload, default=str), encoding="utf-8")
+        return {self._SNAPSHOT_ARTIFACT_KEY: str(artifact_path.relative_to(root))}
+
+    def _snapshot_ref(
+        self,
+        snapshot_path: Path,
+        category: str,
+        name: object,
+        payload: object,
+    ) -> dict[str, str]:
+        return self._write_snapshot_artifact(snapshot_path, category, name, payload)
+
+    def _hydrate_snapshot_artifacts(self, snapshot_path: Path, payload: object) -> object:
+        if isinstance(payload, dict):
+            artifact_ref = payload.get(self._SNAPSHOT_ARTIFACT_KEY)
+            if isinstance(artifact_ref, str):
+                root = self._artifact_root(snapshot_path)
+                artifact_path = (root / artifact_ref).resolve()
+                try:
+                    artifact_path.relative_to(root.resolve())
+                    artifact_payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError, json.JSONDecodeError):
+                    return {}
+                return self._hydrate_snapshot_artifacts(snapshot_path, artifact_payload)
+            return {
+                str(key): self._hydrate_snapshot_artifacts(snapshot_path, value)
+                for key, value in payload.items()
+            }
+        if isinstance(payload, list):
+            return [self._hydrate_snapshot_artifacts(snapshot_path, item) for item in payload]
+        return payload
+
     def _write_approval_checkpoint(
         self,
         path: Path,
@@ -2083,16 +2464,23 @@ class WorkflowExecutor:
         trigger_context: dict[str, object],
     ) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        node_outputs = {
+            output_id: self._snapshot_ref(
+                path,
+                "approval-node-outputs",
+                output_id,
+                output.contract(),
+            )
+            for output_id, output in ctx.node_outputs.items()
+        }
         path.write_text(
             json.dumps(
                 {
                     "workflowId": self._workflow.config.id,
                     "nodeId": node_id,
                     "trigger": trigger_context,
-                    "nodeOutputs": {
-                        output_id: output.contract()
-                        for output_id, output in ctx.node_outputs.items()
-                    },
+                    "params": ctx.params,
+                    "nodeOutputs": node_outputs,
                 },
                 default=str,
             ),
@@ -2385,7 +2773,7 @@ class WorkflowExecutor:
             ),
             loop_items=loop_items if isinstance(loop_items, list) else None,
             loop_infinite=bool(data.get("loop_infinite", False)),
-            loop_max_concurrency=int(data.get("loop_max_concurrency") or 16),
+            loop_max_concurrency=int(data.get("loop_max_concurrency") or 1),
             loop_fail_fast=bool(data.get("loop_fail_fast", False)),
             type=str(data.get("type") or ""),
             text=str(data.get("text") or data.get("output") or ""),
@@ -2394,6 +2782,398 @@ class WorkflowExecutor:
             items=output_items if isinstance(output_items, list) else [],
             error=str(data.get("error")) if data.get("error") is not None else None,
         )
+
+    def _run_resume_path(self) -> Path | None:
+        if self._run_log is None:
+            return None
+        return self._run_log.path.with_suffix(".resume.json")
+
+    def _cache_root(self) -> Path | None:
+        base = self._data_dir or (self._log_base_dir.parent if self._log_base_dir else None)
+        if base is None:
+            return None
+        return base / "node-cache" / self._workflow.config.id
+
+    def _global_cache_path(self) -> Path | None:
+        root = self._cache_root()
+        if root is None:
+            return None
+        return root / "cache.json"
+
+    def _run_checkpoint_path(self, run_id: str) -> Path | None:
+        base = self._log_base_dir or (self._data_dir / "logs" if self._data_dir else None)
+        if base is None:
+            return None
+        safe_run_id = run_id.replace("/", "").replace("\\", "")
+        return base / self._workflow.config.id / safe_run_id
+
+    @staticmethod
+    def _task_cache_key(node_id: str, loop_item: dict[str, object] | None) -> str:
+        if loop_item is None:
+            return node_id
+        index = loop_item.get("index")
+        if index is not None:
+            return f"{node_id}::{index}"
+        item_hash = hashlib.sha256(
+            json.dumps(loop_item, sort_keys=True, default=str).encode()
+        ).hexdigest()
+        return f"{node_id}::{item_hash}"
+
+    def _read_resume_payload(self, run_id: str) -> dict[str, object]:
+        log_path = self._run_checkpoint_path(run_id)
+        if log_path is None:
+            return {}
+        candidates = [
+            log_path.with_suffix(".resume.json"),
+            log_path.with_suffix(".outputs.json"),
+        ]
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(payload, dict):
+                return cast(dict[str, object], self._hydrate_snapshot_artifacts(candidate, payload))
+        return {}
+
+    def _read_global_cache(self) -> dict[str, dict[str, object]]:
+        path = self._global_cache_path()
+        if path is None:
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        payload = self._hydrate_snapshot_artifacts(path, payload)
+        entries = payload.get("entries") if isinstance(payload, dict) else None
+        return entries if isinstance(entries, dict) else {}
+
+    def _write_global_cache_entry(self, entry: dict[str, object]) -> None:
+        path = self._global_cache_path()
+        if path is None:
+            return
+        entries = self._read_global_cache()
+        key = str(entry.get("cacheKey") or "")
+        if not key:
+            return
+        entries[key] = entry
+        stored_entries = {
+            entry_key: self._snapshot_ref(path, "entries", entry_key, entry_value)
+            for entry_key, entry_value in entries.items()
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "workflowId": self._workflow.config.id,
+                    "updatedAt": datetime.now().astimezone().isoformat(),
+                    "entries": stored_entries,
+                },
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+    def _write_resume_checkpoint(self, ctx: ExecutionContext) -> None:
+        path = self._run_resume_path()
+        if path is None:
+            return
+        node_outputs = {
+            node_id: self._snapshot_ref(path, "node-outputs", node_id, output.contract())
+            for node_id, output in ctx.node_outputs.items()
+        }
+        node_runs = {
+            node_id: [
+                self._snapshot_ref(path, "node-runs", f"{node_id}-{index}", output.contract())
+                for index, output in enumerate(runs)
+            ]
+            for node_id, runs in ctx.node_runs.items()
+        }
+        task_entries = {
+            key: self._snapshot_ref(path, "task-entries", key, entry)
+            for key, entry in self._resume_task_entries.items()
+        }
+        path.write_text(
+            json.dumps(
+                {
+                    "workflowId": self._workflow.config.id,
+                    "runId": self._log().path.name,
+                    "trigger": ctx.trigger,
+                    "params": ctx.params,
+                    "nodeOutputs": node_outputs,
+                    "nodeRuns": node_runs,
+                    "taskEntries": task_entries,
+                    "updatedAt": datetime.now().astimezone().isoformat(),
+                },
+                default=str,
+            ),
+            encoding="utf-8",
+        )
+
+    def _operation_fingerprint(self, node: GraphNode) -> dict[str, object]:
+        return cast(
+            dict[str, object],
+            node.operation.model_dump(mode="json", exclude_none=True),
+        )
+
+    def _referenced_file_fingerprints(self, node: GraphNode) -> dict[str, object]:
+        op = node.operation
+        paths: list[Path] = []
+        for attr in (
+            "path",
+            "source_path",
+            "script_path",
+            "template_path",
+            "source_path",
+            "index_path",
+        ):
+            value = getattr(op, attr, None)
+            if isinstance(value, Path):
+                paths.append(value)
+        source = getattr(op, "source", None)
+        source_path = getattr(source, "path", None)
+        if isinstance(source_path, Path):
+            paths.append(source_path)
+        result: dict[str, object] = {}
+        for raw_path in paths:
+            path = (
+                raw_path
+                if raw_path.is_absolute()
+                else (self._path_base or Path.cwd()) / raw_path
+            )
+            try:
+                stat = path.stat()
+            except OSError:
+                result[str(raw_path)] = {"exists": False}
+                continue
+            result[str(raw_path)] = {
+                "exists": True,
+                "size": stat.st_size,
+                "mtimeNs": stat.st_mtime_ns,
+            }
+        return result
+
+    def _cache_key_for(
+        self,
+        node: GraphNode,
+        inputs: dict[str, object],
+        loop_item: dict[str, object] | None,
+    ) -> str:
+        payload = {
+            "nodeId": node.node_id,
+            "operation": self._operation_fingerprint(node),
+            "inputs": inputs,
+            "loopItem": loop_item,
+            "files": self._referenced_file_fingerprints(node),
+        }
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+    def _cacheable_by_default(self, node: GraphNode) -> bool:
+        return node.operation.type not in {
+            OperationType.AGENT,
+            OperationType.COMMON_LLM_TASK,
+            OperationType.APPROVAL_GATE,
+            OperationType.HTTP_REQUEST,
+            OperationType.NOTIFICATION,
+        }
+
+    def _entry_output(self, entry: dict[str, object]) -> NodeOutput | None:
+        output = entry.get("output")
+        if not isinstance(output, dict):
+            return None
+        return self._node_output_from_contract(str(output.get("node_id") or ""), output)
+
+    def _load_resume_state(self, graph: WorkflowGraph) -> ExecutionContext:
+        options = self._resume_options
+        ctx = ExecutionContext(
+            trigger=self._trigger_context,
+            params=resolve_workflow_parameters(
+                self._workflow.config,
+                self._run_parameters,
+            ),
+        )
+        self._resume_task_entries = {}
+        self._resume_seed_outputs = {}
+        self._resume_only_dependencies = set()
+        self._resume_cache_bypass_nodes = set()
+        if options is None or options.force:
+            return ctx
+
+        payload = self._read_resume_payload(options.run_id or "")
+        trigger = payload.get("trigger")
+        if isinstance(trigger, dict) and not self._trigger_context:
+            ctx.trigger = trigger
+        saved_params = payload.get("params")
+        if isinstance(saved_params, dict) and not self._run_parameters:
+            ctx.params = resolve_workflow_parameters(self._workflow.config, saved_params)
+        task_entries = payload.get("taskEntries")
+        if isinstance(task_entries, dict):
+            self._resume_task_entries = {
+                str(key): cast(dict[str, object], value)
+                for key, value in task_entries.items()
+                if isinstance(value, dict)
+            }
+        if not options.skip_cache:
+            for key, entry in self._read_global_cache().items():
+                if isinstance(entry, dict):
+                    self._resume_task_entries.setdefault(str(key), entry)
+
+        invalidated = self._invalidated_nodes(graph, options)
+        if options.from_node or options.only_node:
+            self._resume_cache_bypass_nodes = set(invalidated)
+        if options.only_node:
+            self._resume_only_dependencies = self._ancestor_nodes(graph, options.only_node)
+        saved_outputs = payload.get("nodeOutputs")
+        if isinstance(saved_outputs, dict):
+            for node in (
+                node
+                for generation in graph.topological_generations()
+                for node in generation
+            ):
+                node_id = node.node_id
+                output_data = saved_outputs.get(node_id)
+                if output_data is None:
+                    continue
+                if node_id in invalidated:
+                    continue
+                output = self._node_output_from_contract(node_id, output_data)
+                if not output.success:
+                    continue
+                if options.only_node and node_id == options.only_node:
+                    continue
+                if not self._saved_output_matches_current_cache_key(node, ctx, graph):
+                    invalidated.update({node_id, *self._descendant_nodes(graph, node_id)})
+                    continue
+                output.data = {**output.data, "reused": True}
+                ctx.record(output)
+                self._resume_seed_outputs[node_id] = output
+        return ctx
+
+    def _saved_output_matches_current_cache_key(
+        self,
+        node: GraphNode,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+    ) -> bool:
+        entry = self._resume_task_entries.get(self._task_cache_key(node.node_id, None))
+        if not isinstance(entry, dict):
+            return True
+        inputs = self._resolve_node_inputs(node, ctx, graph, None)
+        return entry.get("cacheKey") == self._cache_key_for(node, inputs, None)
+
+    def _invalidated_nodes(self, graph: WorkflowGraph, options: ResumeOptions) -> set[str]:
+        if options.only_node:
+            return {options.only_node}
+        if options.from_node:
+            return {options.from_node, *self._descendant_nodes(graph, options.from_node)}
+        return {
+            entry_node
+            for entry_node, entry in (
+                (str(key).split("::", 1)[0], value)
+                for key, value in self._resume_task_entries.items()
+            )
+            if not bool(entry.get("success"))
+        }
+
+    def _descendant_nodes(self, graph: WorkflowGraph, node_id: str) -> set[str]:
+        seen: set[str] = set()
+        stack = list(graph._graph.successors(node_id)) if node_id in graph._nodes else []
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(graph._graph.successors(current))
+        return seen
+
+    def _ancestor_nodes(self, graph: WorkflowGraph, node_id: str) -> set[str]:
+        seen: set[str] = set()
+        stack = list(graph._graph.predecessors(node_id)) if node_id in graph._nodes else []
+        while stack:
+            current = stack.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            stack.extend(graph._graph.predecessors(current))
+        return seen
+
+    def _record_reused_seed_outputs(self) -> None:
+        for node_id, output in self._resume_seed_outputs.items():
+            self._log().event(
+                node_id,
+                "reused",
+                message="reused output from resumed run",
+                exit_code=output.exit_code,
+                success=output.success,
+                skipped=True,
+                data={**self._node_event_data(output), "reused": True},
+            )
+
+    def _should_run_task(self, task: QueuedNode) -> bool:
+        options = self._resume_options
+        if options is None or options.only_node is None:
+            return True
+        return task.node_id == options.only_node or task.node_id in self._resume_only_dependencies
+
+    def _cached_output_for_task(
+        self,
+        node: GraphNode,
+        inputs: dict[str, object],
+        loop_item: dict[str, object] | None,
+    ) -> NodeOutput | None:
+        options = self._resume_options
+        if options is None or options.force or options.skip_cache:
+            return None
+        if node.node_id in self._resume_cache_bypass_nodes:
+            return None
+        task_key = self._task_cache_key(node.node_id, loop_item)
+        entry = self._resume_task_entries.get(task_key)
+        if entry is None and not self._cacheable_by_default(node):
+            return None
+        cache_key = self._cache_key_for(node, inputs, loop_item)
+        if entry is None:
+            entry = self._read_global_cache().get(cache_key)
+        if not isinstance(entry, dict):
+            return None
+        if not bool(entry.get("success")):
+            return None
+        if entry.get("cacheKey") != cache_key:
+            return None
+        output = self._entry_output(entry)
+        if output is None:
+            return None
+        output.data = {**output.data, "reused": True, "cacheKey": cache_key}
+        return output
+
+    def _persist_node_result(
+        self,
+        task: QueuedNode,
+        output: NodeOutput,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+    ) -> None:
+        node = graph._nodes.get(task.node_id)
+        if node is None:
+            return
+        inputs = self._resolve_node_inputs(node, ctx, graph, task.loop_item)
+        cache_key = self._cache_key_for(node, inputs, task.loop_item)
+        entry: dict[str, object] = {
+            "nodeId": task.node_id,
+            "taskKey": self._task_cache_key(task.node_id, task.loop_item),
+            "loopItem": task.loop_item,
+            "success": output.success,
+            "exitCode": output.exit_code,
+            "cacheKey": cache_key,
+            "cacheable": self._cacheable_by_default(node),
+            "inputs": inputs,
+            "operation": self._operation_fingerprint(node),
+            "output": output.contract(),
+            "finishedAt": datetime.now().astimezone().isoformat(),
+        }
+        self._resume_task_entries[str(entry["taskKey"])] = entry
+        self._write_resume_checkpoint(ctx)
+        if output.success and bool(entry["cacheable"]):
+            self._write_global_cache_entry(entry)
 
     async def run(self) -> ExecutionResult:
         if self._stop_file is not None:
@@ -2406,6 +3186,7 @@ class WorkflowExecutor:
             self._workflow.config.id,
             self._log_base_dir,
             self._limits,
+            existing_path=self._run_log_path,
         )
         run_log = self._log()
         if self._stop_file is not None:
@@ -2416,8 +3197,8 @@ class WorkflowExecutor:
                 data_dir,
             )
             self._run_stop_file.unlink(missing_ok=True)
-        ctx = ExecutionContext(trigger=self._trigger_context)
         graph = self._workflow.graph
+        ctx = self._load_resume_state(graph)
         start = time.monotonic()
         halted = False
         halt_reason: str | None = None
@@ -2433,6 +3214,20 @@ class WorkflowExecutor:
         try:
             run_log.info(f"dry_run={self._dry_run}")
             run_log.info(f"max_total_node_runs={self._max_total_node_runs}")
+            if self._resume_options is not None:
+                run_log.info(
+                    "resume="
+                    + json.dumps(
+                        {
+                            "run_id": self._resume_options.run_id,
+                            "from_node": self._resume_options.from_node,
+                            "only_node": self._resume_options.only_node,
+                            "skip_cache": self._resume_options.skip_cache,
+                            "force": self._resume_options.force,
+                        },
+                        default=str,
+                    )
+                )
             if ctx.trigger:
                 trigger_text = json.dumps(ctx.trigger, default=str)
                 trigger_text = _replace_known_secrets(
@@ -2440,14 +3235,26 @@ class WorkflowExecutor:
                     self._trigger_secret_values(ctx, graph),
                 )
                 run_log.info(f"trigger={trigger_text}")
+            if ctx.params:
+                run_log.info(
+                    "params="
+                    + json.dumps(
+                        masked_workflow_parameters(self._workflow.config, ctx.params),
+                        default=str,
+                    )
+                )
 
-            queue: deque[QueuedNode] = deque(
-                QueuedNode(node_id) for node_id in self._initial_node_ids(graph)
-            )
+            self._record_reused_seed_outputs()
+            queue: deque[QueuedNode] = deque()
+            queued_tasks: set[tuple[str, str | None, int | None]] = set()
+            running_tasks: set[tuple[str, str | None, int | None]] = set()
+            if ctx.node_outputs:
+                self._queue_resume_frontier(graph, ctx, queue, queued_tasks, running_tasks)
+            else:
+                queue.extend(QueuedNode(node_id) for node_id in self._initial_node_ids(graph))
+                queued_tasks.update(task.key for task in queue)
             for task in queue:
                 run_log.event(task.node_id, "queued", message="start node queued")
-            queued_tasks = {task.key for task in queue}
-            running_tasks: set[tuple[str, str | None, int | None]] = set()
             run_log.info(f"start_nodes={[task.node_id for task in queue]}")
 
             send, receive = anyio.create_memory_object_stream[tuple[QueuedNode, NodeOutput, bool]](
@@ -2491,6 +3298,14 @@ class WorkflowExecutor:
 
                             task = queue.popleft()
                             queued_tasks.discard(task.key)
+                            if not self._should_run_task(task):
+                                continue
+                            if (
+                                task.node_id in self._resume_seed_outputs
+                                and task.loop_origin is None
+                                and task.after_loop_origin is None
+                            ):
+                                continue
                             if task.loop_origin is not None:
                                 active_loop_tasks = sum(
                                     1 for key in running_tasks if key[1] == task.loop_origin
@@ -2536,6 +3351,7 @@ class WorkflowExecutor:
                         node_id = task.node_id
                         running_tasks.discard(task.key)
                         ctx.record(output)
+                        self._persist_node_result(task, output, ctx, graph)
                         self._refresh_pending_approval_checkpoints(ctx)
                         if output.terminal_status is not None:
                             self._record_loop_item_output(
@@ -2719,6 +3535,7 @@ class WorkflowExecutor:
                 duration_seconds=total,
                 log_path=run_log.path,
                 usage_summary=summarize_node_outputs(ctx.node_outputs, ctx.node_runs),
+                parameters=masked_workflow_parameters(self._workflow.config, ctx.params),
             )
         except BaseException as exc:
             run_log.complete(False, str(exc))
@@ -2767,6 +3584,7 @@ class WorkflowExecutor:
             checkpoint = json.loads(checkpoint_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
+        checkpoint = self._hydrate_snapshot_artifacts(checkpoint_path, checkpoint)
         if not isinstance(checkpoint, dict):
             return None
 
@@ -2779,8 +3597,13 @@ class WorkflowExecutor:
         )
         run_log = self._log()
         checkpoint_trigger = checkpoint.get("trigger")
+        checkpoint_params = checkpoint.get("params")
         ctx = ExecutionContext(
-            trigger=checkpoint_trigger if isinstance(checkpoint_trigger, dict) else {}
+            trigger=checkpoint_trigger if isinstance(checkpoint_trigger, dict) else {},
+            params=resolve_workflow_parameters(
+                self._workflow.config,
+                checkpoint_params if isinstance(checkpoint_params, dict) else self._run_parameters,
+            ),
         )
         saved_outputs = checkpoint.get("nodeOutputs")
         if isinstance(saved_outputs, dict):
@@ -3039,6 +3862,7 @@ class WorkflowExecutor:
             duration_seconds=time.monotonic() - start,
             log_path=run_log.path,
             usage_summary=summarize_node_outputs(ctx.node_outputs, ctx.node_runs),
+            parameters=masked_workflow_parameters(self._workflow.config, ctx.params),
         )
 
     def _start_stop_monitor(self) -> threading.Thread | None:
@@ -3315,9 +4139,30 @@ class WorkflowExecutor:
         attempt = 0
         output: NodeOutput | None = None
         while True:
+            inputs = self._resolve_node_inputs(node, ctx, graph, loop_item)
+            cached_output = self._cached_output_for_task(node, inputs, loop_item)
+            if cached_output is not None:
+                results[node.node_id] = cached_output
+                self._log().node(
+                    node.node_id,
+                    self._run_log_message(run_number, "reused cached output"),
+                )
+                self._log().event(
+                    node.node_id,
+                    "reused",
+                    attempt=attempt + 1,
+                    run_number=run_number,
+                    fan_out_item=loop_item,
+                    message="reused cached output",
+                    duration_seconds=0,
+                    exit_code=cached_output.exit_code,
+                    success=cached_output.success,
+                    skipped=True,
+                    data={**self._node_event_data(cached_output), "reused": True},
+                )
+                return
             self._log().begin_node_attempt(node.node_id, run_number, attempt + 1)
             attempt_started = time.monotonic()
-            inputs = self._resolve_node_inputs(node, ctx, graph, loop_item)
             self._log().event(
                 node.node_id,
                 "started",
@@ -3352,7 +4197,13 @@ class WorkflowExecutor:
                         logged_output = preview_body
                 elif isinstance(output.data.get("error"), str):
                     logged_output = str(output.data["error"])
-            self._log().node_output(node.node_id, "node output", logged_output)
+            self._log().node_output(
+                node.node_id,
+                "node output",
+                logged_output,
+                uncapped=output.type
+                in {str(OperationType.AGENT), str(OperationType.COMMON_LLM_TASK)},
+            )
             self._log().node(
                 node.node_id,
                 self._run_log_message(
@@ -3455,7 +4306,7 @@ class WorkflowExecutor:
     ) -> object:
         parts = value.strip("{}").split(".")
         root = parts[0] if parts else ""
-        known_roots = {"trigger", "loop", "previous", *ctx.node_outputs.keys()}
+        known_roots = {"trigger", "params", "loop", "previous", *ctx.node_outputs.keys()}
         if root not in known_roots:
             return value
         try:
@@ -3505,7 +4356,11 @@ class WorkflowExecutor:
         base_env: dict[str, str],
         loop_item: dict[str, object] | None = None,
     ) -> dict[str, str] | None:
-        env = dict(base_env)
+        template_context = self._template_context(node, ctx, graph, loop_item)
+        env = {
+            key: PromptManager._interpolate(value, template_context)
+            for key, value in base_env.items()
+        }
         if loop_item:
             for key, value in loop_item.items():
                 if key.lower() == "path":
@@ -3516,6 +4371,19 @@ class WorkflowExecutor:
             if key.startswith("env.") and len(key) > 4:
                 env[key[4:]] = self._input_text(value)
         return env or None
+
+    def _render_runtime_string(
+        self,
+        value: str,
+        node: GraphNode,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        loop_item: dict[str, object] | None = None,
+    ) -> str:
+        return PromptManager._interpolate(
+            value,
+            self._template_context(node, ctx, graph, loop_item),
+        )
 
     def _input_context(
         self,
@@ -3561,6 +4429,7 @@ class WorkflowExecutor:
                     getattr(node.operation, "approvers", []),
                 ),
             },
+            "params": ctx.params,
             "trigger": ctx.trigger,
             "loop": {"current": loop_item or {}, **(loop_item or {})},
             "previous": (
@@ -3725,21 +4594,27 @@ class WorkflowExecutor:
             )
             self._log().node_output(node.node_id, "approval message", message)
             if op.notify:
-                await self._notification_adapter.send(
-                    Notification(
-                        title=str(
-                            self._render_http_value(
-                                op.notification_title,
-                                template_context,
-                            )
-                        ),
-                        body=(
-                            f"{message}\n\n"
-                            f"Approve with: {approve_command}\n"
-                            f"Reject with: {reject_command}"
-                        ),
+                try:
+                    await self._notification_adapter.send(
+                        Notification(
+                            title=str(
+                                self._render_http_value(
+                                    op.notification_title,
+                                    template_context,
+                                )
+                            ),
+                            body=(
+                                f"{message}\n\n"
+                                f"Approve with: {approve_command}\n"
+                                f"Reject with: {reject_command}"
+                            ),
+                        )
                     )
-                )
+                except Exception as exc:
+                    self._log().node(
+                        node.node_id,
+                        f"approval notification failed: {exc}",
+                    )
             decision = await wait_for_decision(
                 self._approval_store,
                 self._workflow.config.id,
@@ -3855,13 +4730,31 @@ class WorkflowExecutor:
         if op.type == OperationType.BASH_COMMAND:
             assert isinstance(op, BashCommandOperation)
             stdin = self._resolve_pipe_stdin(node, ctx, graph, loop_item)
-            cmd = command_shell_args(op.command)
+            rendered_command = self._render_runtime_string(
+                op.command,
+                node,
+                ctx,
+                graph,
+                loop_item,
+            )
+            cmd = command_shell_args(rendered_command)
             working_dir = (
-                _resolve_workflow_path(op.working_dir, self._path_base)
+                _resolve_workflow_path(
+                    Path(
+                        self._render_runtime_string(
+                            str(op.working_dir),
+                            node,
+                            ctx,
+                            graph,
+                            loop_item,
+                        )
+                    ),
+                    self._path_base,
+                )
                 if op.working_dir is not None
                 else None
             )
-            self._log().node(node.node_id, f"command: {op.command}")
+            self._log().node(node.node_id, f"command: {rendered_command}")
             self._log().node(node.node_id, f"command shell: {cmd[0]}")
             rc, stdout, stderr = await run_subprocess(
                 cmd,
@@ -3881,7 +4774,7 @@ class WorkflowExecutor:
                 exit_code=rc,
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
-                data={"stdout": stdout, "stderr": stderr, "command": op.command},
+                data={"stdout": stdout, "stderr": stderr, "command": rendered_command},
                 error=stderr if rc != 0 else None,
             )
 
@@ -3889,7 +4782,12 @@ class WorkflowExecutor:
             assert isinstance(op, (PythonScriptOperation, ShellScriptOperation))
             interpreter = "python" if op.type == OperationType.PYTHON_SCRIPT else "bash"
             script_path = _resolve_workflow_path(op.script_path, self._path_base)
-            cmd = [interpreter, str(script_path)] + list(op.args)
+            self._require_workflow_path_access(script_path, "execute")
+            rendered_args = [
+                self._render_runtime_string(arg, node, ctx, graph, loop_item)
+                for arg in op.args
+            ]
+            cmd = [interpreter, str(script_path)] + rendered_args
             stdin = self._resolve_pipe_stdin(node, ctx, graph, loop_item)
             self._log().node(node.node_id, f"command: {' '.join(cmd)}")
             rc, stdout, stderr = await run_subprocess(
@@ -3920,6 +4818,7 @@ class WorkflowExecutor:
         elif op.type == OperationType.READ_FILE:
             assert isinstance(op, ReadFileOperation)
             path = _resolve_workflow_path(op.path, self._path_base)
+            self._require_workflow_path_access(path, "read")
             self._log().node(node.node_id, f"read file: {path}")
             content = read_text_limited(
                 path,
@@ -3945,6 +4844,7 @@ class WorkflowExecutor:
             assert isinstance(op, WriteFileOperation)
             stdin = self._resolve_pipe_stdin(node, ctx, graph, loop_item)
             path = _resolve_workflow_path(op.path, self._path_base)
+            self._require_workflow_path_access(path, "write")
             content = op.content
             if content == "" and stdin is not None:
                 content = stdin.decode(op.encoding)
@@ -3978,6 +4878,8 @@ class WorkflowExecutor:
                 op.destination_path,
                 self._path_base,
             )
+            self._require_workflow_path_access(source_path, "read")
+            self._require_workflow_path_access(destination_path, "write")
             _copy_path(source_path, destination_path, op.create_dirs, op.overwrite)
             output = f"copied {source_path} to {destination_path}"
             self._log().node(node.node_id, output)
@@ -4004,6 +4906,8 @@ class WorkflowExecutor:
                 op.destination_path,
                 self._path_base,
             )
+            self._require_workflow_path_access(source_path, "write")
+            self._require_workflow_path_access(destination_path, "write")
             _move_path(source_path, destination_path, op.create_dirs, op.overwrite)
             output = f"moved {source_path} to {destination_path}"
             self._log().node(node.node_id, output)
@@ -4026,6 +4930,7 @@ class WorkflowExecutor:
         elif op.type == OperationType.DELETE_FILE:
             assert isinstance(op, DeleteFileOperation)
             path = _resolve_workflow_path(op.path, self._path_base)
+            self._require_workflow_path_access(path, "write")
             if not path.exists():
                 if op.missing_ok:
                     output = f"{path} did not exist"
@@ -4065,6 +4970,7 @@ class WorkflowExecutor:
         elif op.type == OperationType.FILE:
             assert isinstance(op, FileOperation)
             path = _resolve_workflow_path(op.path, self._path_base)
+            self._require_workflow_path_access(path, "read")
             output = str(path)
             self._log().node(node.node_id, f"file path: {output}")
             return NodeOutput(
@@ -4080,6 +4986,7 @@ class WorkflowExecutor:
         elif op.type == OperationType.FOLDER:
             assert isinstance(op, FolderOperation)
             path = _resolve_workflow_path(op.path, self._path_base)
+            self._require_workflow_path_access(path, "read")
             output = str(path)
             self._log().node(node.node_id, f"folder path: {output}")
             return NodeOutput(
@@ -4141,6 +5048,7 @@ class WorkflowExecutor:
             assert isinstance(op, PromptFileOperation)
             if op.template_path is not None:
                 template_path = _resolve_workflow_path(op.template_path, self._path_base)
+                self._require_workflow_path_access(template_path, "read")
                 template = read_text_limited(
                     template_path,
                     encoding=op.encoding,
@@ -4155,6 +5063,7 @@ class WorkflowExecutor:
                     "." not in value
                     and value not in ctx.node_outputs
                     and not value.startswith("trigger")
+                    and not value.startswith("params")
                 ):
                     variables[key] = value
                     continue
@@ -4286,7 +5195,15 @@ class WorkflowExecutor:
                     },
                     error=message,
                 )
-            agent_timeout = await self._remaining_agent_time_timeout(node.node_id, op)
+            budget_timeout = await self._remaining_agent_time_timeout(node.node_id, op)
+            provider_settings = self._provider_settings_for_operation(agent_config, op)
+            agent_timeout = self._effective_agent_timeout(budget_timeout, provider_settings)
+            common_streamed_thoughts: list[str] = []
+
+            def on_common_agent_thought(thought: str) -> None:
+                common_streamed_thoughts.append(thought)
+                self._log().node_agent_event(node.node_id, "AGENT_THOUGHT", thought)
+
             result = await Agent(agent_config, sub).run(
                 input_ctx,
                 cancel_event=self._cancel_event if self._pass_cancel_event else None,
@@ -4294,8 +5211,14 @@ class WorkflowExecutor:
                 memory=memory,
                 max_output_bytes=self._limits.max_subprocess_output_bytes,
                 timeout=agent_timeout,
+                on_thought=on_common_agent_thought,
+                provider_settings=provider_settings,
             )
-            self._log_agent_result(node.node_id, result)
+            self._log_agent_result(
+                node.node_id,
+                result,
+                streamed_thought_count=len(common_streamed_thoughts),
+            )
             self._remember_agent_result(node.node_id, op.memory, result)
             usage = usage_from_metadata(
                 provider=result.provider or agent_config.subscription,
@@ -4323,7 +5246,6 @@ class WorkflowExecutor:
             success = result.success and not budget_violations_after_call
             if budget_violations_after_call:
                 result_output = "; ".join(budget_violations_after_call)
-                result_message = result_output
             return NodeOutput(
                 node_id=node.node_id,
                 success=success,
@@ -5211,7 +6133,15 @@ class WorkflowExecutor:
                     },
                     error=message,
                 )
-            agent_timeout = await self._remaining_agent_time_timeout(node.node_id, op)
+            budget_timeout = await self._remaining_agent_time_timeout(node.node_id, op)
+            provider_settings = self._provider_settings_for_operation(agent_config, op)
+            agent_timeout = self._effective_agent_timeout(budget_timeout, provider_settings)
+            agent_streamed_thoughts: list[str] = []
+
+            def on_agent_thought(thought: str) -> None:
+                agent_streamed_thoughts.append(thought)
+                self._log().node_agent_event(node.node_id, "AGENT_THOUGHT", thought)
+
             result = await Agent(agent_config, sub).run(
                 agent_input_ctx,
                 cancel_event=self._cancel_event if self._pass_cancel_event else None,
@@ -5219,8 +6149,14 @@ class WorkflowExecutor:
                 memory=memory,
                 max_output_bytes=self._limits.max_subprocess_output_bytes,
                 timeout=agent_timeout,
+                on_thought=on_agent_thought,
+                provider_settings=provider_settings,
             )
-            self._log_agent_result(node.node_id, result)
+            self._log_agent_result(
+                node.node_id,
+                result,
+                streamed_thought_count=len(agent_streamed_thoughts),
+            )
             self._remember_agent_result(node.node_id, op.memory, result)
             usage = usage_from_metadata(
                 provider=result.provider or agent_config.subscription,
@@ -5248,7 +6184,6 @@ class WorkflowExecutor:
             success = result.success and not budget_violations_after_call
             if budget_violations_after_call:
                 result_output = "; ".join(budget_violations_after_call)
-                result_message = result_output
             return NodeOutput(
                 node_id=node.node_id,
                 success=success,

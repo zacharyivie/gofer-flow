@@ -5,10 +5,12 @@ import tempfile
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from gofer.core.agent import AgentResult
+from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS
 from gofer.utils.process import stream_subprocess
 
@@ -25,6 +27,8 @@ class Subscription(ABC):
         cancel_event: threading.Event | None = None,
         extra_paths: list[Path] | None = None,
         max_output_bytes: int | None = None,
+        on_thought: Callable[[str], None] | None = None,
+        provider_settings: ResolvedProviderSettings | None = None,
     ) -> AgentResult:
         start = time.monotonic()
         stdout_chunks: list[str] = []
@@ -35,7 +39,13 @@ class Subscription(ABC):
             prompt_path = Path(prompt_dir) / "prompt.md"
             prompt_path.write_text(prompt, encoding="utf-8")
             prompt_arg = self._prompt_file_instruction(prompt_path)
-            cmd = self._build_command(prompt_arg, tools, mcp_servers, extra_paths or [])
+            cmd = self._build_command(
+                prompt_arg,
+                tools,
+                mcp_servers,
+                extra_paths or [],
+                provider_settings,
+            )
             async for event in stream_subprocess(
                 cmd,
                 cancel_event=cancel_event,
@@ -52,7 +62,16 @@ class Subscription(ABC):
                     text = event["text"]
                     if not text:
                         continue
-                    thought_chunks.append(text)
+                    payloads = _json_payloads(text)
+                    if payloads:
+                        for thought in _live_thoughts_from_payloads(payloads):
+                            thought_chunks.append(thought)
+                            if on_thought is not None:
+                                on_thought(thought)
+                    else:
+                        thought_chunks.append(text)
+                        if on_thought is not None:
+                            on_thought(text)
                     if event["stream"] == "stdout":
                         stdout_chunks.append(text)
                     else:
@@ -64,14 +83,13 @@ class Subscription(ABC):
         stdout = "".join(stdout_chunks)
         stderr = "".join(stderr_chunks)
         message, usage_metadata = self._parse_provider_output(stdout, stderr)
-        thoughts = _non_json_thoughts(thought_chunks)
         return AgentResult(
             agent_id="",
             success=returncode == 0,
             output=message,
             exit_code=returncode,
             duration_seconds=duration,
-            thoughts=thoughts,
+            thoughts=thought_chunks,
             message=message,
             usage_metadata=usage_metadata,
         )
@@ -97,6 +115,7 @@ class Subscription(ABC):
         tools: list[str],
         mcp_servers: list[str],
         extra_paths: list[Path] | None = None,
+        provider_settings: ResolvedProviderSettings | None = None,
     ) -> list[str]: ...
 
     @abstractmethod
@@ -127,6 +146,49 @@ def _json_payloads(text: str) -> list[dict[str, Any]]:
 
 def _non_json_thoughts(chunks: list[str]) -> list[str]:
     return [chunk for chunk in chunks if not _json_payloads(chunk)]
+
+
+def _live_thoughts_from_payloads(payloads: list[dict[str, Any]]) -> list[str]:
+    thoughts: list[str] = []
+    for payload in payloads:
+        thought = _live_thought_from_payload(payload)
+        if thought:
+            thoughts.append(thought)
+    return thoughts
+
+
+def _live_thought_from_payload(payload: dict[str, Any]) -> str | None:
+    message = payload.get("message")
+    if isinstance(message, dict):
+        text = _text_from_message_content(message.get("content"))
+        if text:
+            return text
+
+    item = payload.get("item")
+    if isinstance(item, dict):
+        item_type = item.get("type")
+        text = item.get("text")
+        if item_type == "agent_message" and isinstance(text, str) and text:
+            return text
+        if item_type == "agent_reasoning":
+            text = item.get("text") or item.get("summary")
+            if isinstance(text, str) and text:
+                return text
+        if item_type == "command_execution":
+            output = item.get("aggregated_output")
+            if isinstance(output, str) and output:
+                return output
+            command = item.get("command")
+            if isinstance(command, str) and command:
+                return command
+
+    data = payload.get("data")
+    if isinstance(data, dict):
+        message = data.get("message")
+        if isinstance(message, str) and message:
+            return message
+
+    return None
 
 
 def _usage_metadata_from_payloads(payloads: list[dict[str, Any]]) -> dict[str, object]:
@@ -231,10 +293,35 @@ def _message_from_payloads(payloads: list[dict[str, Any]]) -> str | None:
                 return value
         message = payload.get("message")
         if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str) and content:
+            content = _text_from_message_content(message.get("content"))
+            if content:
                 return content
+        item = payload.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str) and text:
+                return text
+        data = payload.get("data")
+        if isinstance(data, dict):
+            message = data.get("message")
+            if isinstance(message, str) and message:
+                return message
     return None
+
+
+def _text_from_message_content(content: Any) -> str | None:
+    if isinstance(content, str) and content:
+        return content
+    if not isinstance(content, list):
+        return None
+    texts: list[str] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return "\n".join(texts) if texts else None
 
 
 def _copy_number(

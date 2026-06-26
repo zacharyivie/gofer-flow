@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
 from gofer.core.agent import AgentResult
+from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions.base import Subscription
 from gofer.utils.paths import get_data_dir
 
@@ -53,6 +55,7 @@ class FakeSubscription(Subscription):
         tools: list[str],
         mcp_servers: list[str],
         extra_paths: list[Path] | None = None,
+        provider_settings: ResolvedProviderSettings | None = None,
     ) -> list[str]:
         return ["fake"]
 
@@ -70,12 +73,18 @@ class FakeSubscription(Subscription):
         cancel_event: threading.Event | None = None,
         extra_paths: list[Path] | None = None,
         max_output_bytes: int | None = None,
+        on_thought: Callable[[str], None] | None = None,
+        provider_settings: ResolvedProviderSettings | None = None,
     ) -> AgentResult:
         self.calls.append({
             "prompt": prompt,
             "working_dir": working_dir,
+            "tools": tools,
+            "mcp_servers": mcp_servers,
+            "env": env,
             "extra_paths": extra_paths or [],
             "max_output_bytes": max_output_bytes,
+            "provider_settings": provider_settings,
         })
         return AgentResult(
             agent_id="",

@@ -73,7 +73,7 @@ jobs:
           cache-dependency-glob: uv.lock
 
       - name: Install Python dependencies
-        run: uv sync --extra dev --group dev
+        run: uv sync --extra dev --extra xlsx --group dev
 
       - name: Set up Node
         uses: actions/setup-node@v4

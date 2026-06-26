@@ -4,7 +4,7 @@ import json
 import sys
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -16,6 +16,7 @@ from gofer.core import executor as executor_module
 from gofer.core.agent import AgentConfig, AgentResult
 from gofer.core.approvals import ApprovalStore, RecordingNotificationAdapter
 from gofer.core.executor import (
+    ResumeOptions,
     WorkflowExecutor,
     WorkflowRunLog,
     command_shell_args,
@@ -54,9 +55,14 @@ from gofer.core.operations import (
     WriteFileOperation,
 )
 from gofer.core.planner import build_execution_plan
+from gofer.core.provider_profiles import (
+    ProviderProfile,
+    ResolvedProviderSettings,
+    save_provider_profiles,
+)
 from gofer.core.resources import ResourceLimits, byte_len
 from gofer.core.usage import LlmPricing, LlmUsageBudget
-from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
+from gofer.core.workflow import AgenticWorkflow, FilesystemAccessEntry, WorkflowConfig
 from gofer.utils.run_state import (
     request_workflow_run_stop,
     request_workflow_stop,
@@ -149,6 +155,72 @@ async def test_agent_usage_fallback_records_estimated_tokens_and_cost(tmp_path: 
     assert usage["input_tokens"] == 3
     assert usage["output_tokens"] == 2
     assert usage["estimated_cost"] == pytest.approx(0.007)
+
+
+@pytest.mark.anyio
+async def test_agent_run_applies_profile_and_node_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    save_provider_profiles(
+        {
+            "fast": ProviderProfile(
+                name="fast",
+                subscription="claude_code",
+                model="sonnet",
+                timeout=60,
+                tools=["Read"],
+                env={"PROFILE_ENV": "1"},
+                secret_refs={"PROFILE_SECRET": "PROFILE_TOKEN"},
+            )
+        },
+        tmp_path,
+    )
+    monkeypatch.setenv("GOFER_SECRET_PROFILE_TOKEN", "secret-value")
+    wf = AgenticWorkflow(WorkflowConfig(id="profiles", name="Profiles"))
+    wf.register_agent(
+        AgentConfig(
+            agent_id="agent",
+            subscription="claude_code",
+            working_dir=tmp_path,
+            profile="fast",
+            env={"AGENT_ENV": "1"},
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="ask",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="agent",
+                working_dir=tmp_path,
+                skill_name="summarize",
+                model="opus",
+                timeout=30,
+            ),
+        )
+    )
+    sub = FakeSubscription(output="done")
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    call = sub.calls[0]
+    settings = cast(Any, call["provider_settings"])
+    assert result.success is True
+    assert settings.profile_name == "fast"
+    assert settings.model == "opus"
+    assert settings.tools == ["Read"]
+    assert call["tools"] == []
+    assert call["env"] == {
+        "PROFILE_ENV": "1",
+        "PROFILE_SECRET": "secret-value",
+        "AGENT_ENV": "1",
+    }
+    assert settings.timeout == 30
     totals = cast(dict[str, Any], result.usage_summary["totals"])
     assert totals["agent_calls"] == 1
 
@@ -266,6 +338,7 @@ async def test_node_llm_token_budget_fails_after_estimated_usage(tmp_path: Path)
     assert "max_estimated_tokens exceeded" in output.output
     usage = cast(dict[str, Any], output.data["usage"])
     budget = cast(dict[str, Any], output.data["budget"])
+    assert output.data["message"] == "abcdefgh"
     assert usage["total_tokens"] > 1
     assert budget["violations"]
 
@@ -309,6 +382,8 @@ async def test_node_llm_agent_time_budget_sets_provider_timeout(
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             self.calls.append({"prompt": prompt, "timeout": timeout})
             return AgentResult(
@@ -480,6 +555,15 @@ async def test_usage_summary_counts_each_fan_out_agent_run(tmp_path: Path) -> No
     prompt = tmp_path / "p.md"
     prompt.write_text("Process item {{index}}.", encoding="utf-8")
     sub = FakeSubscription(output="done")
+    save_provider_profiles(
+        {
+            "usage-profile": ProviderProfile(
+                name="usage-profile",
+                subscription="claude_code",
+            )
+        },
+        tmp_path,
+    )
 
     wf = _make_workflow()
     wf.register_agent(
@@ -925,6 +1009,541 @@ async def test_loop_structured_events_include_fan_out_item_counts(tmp_path: Path
     assert [item["index"] for item in failed_items] == [1]
     assert failed_items[0]["exitCode"] == 3
     assert "bad-1" in failed_items[0]["output"]
+
+
+@pytest.mark.anyio
+async def test_resume_from_failure_reuses_successful_upstream_node(tmp_path: Path) -> None:
+    calls = tmp_path / "calls.txt"
+    marker = tmp_path / "marker"
+    wf = _make_workflow("resume-failure")
+    wf.add_operation(_bash_node("first", f"echo first >> {calls}; echo first"))
+    wf.add_operation(
+        _bash_node(
+            "second",
+            (
+                f"echo second >> {calls}; "
+                f"if [ ! -f {marker} ]; then touch {marker}; echo failed; exit 7; fi; "
+                "echo second-ok"
+            ),
+        )
+    )
+    wf.then("first", "second")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert not first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == ["first", "second", "second"]
+    assert resumed.node_outputs["first"].data["reused"] is True
+    assert resumed.node_outputs["second"].output.strip() == "second-ok"
+
+
+@pytest.mark.anyio
+async def test_resume_checkpoint_moves_large_outputs_to_artifacts(tmp_path: Path) -> None:
+    calls = tmp_path / "artifact-calls.txt"
+    marker = tmp_path / "artifact-marker"
+    large_output = "x" * 75_000
+    large_file = tmp_path / "large.txt"
+    large_file.write_text(large_output, encoding="utf-8")
+    wf = _make_workflow("resume-artifacts")
+    wf.add_operation(
+        GraphNode(
+            node_id="first",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=large_file),
+        )
+    )
+    wf.add_operation(
+        _bash_node(
+            "second",
+            (
+                f"echo second >> {calls}; "
+                f"if [ ! -f {marker} ]; then touch {marker}; echo failed; exit 7; fi; "
+                "echo second-ok"
+            ),
+        )
+    )
+    wf.then("first", "second")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+
+    assert not first.success
+    assert first.log_path is not None
+    resume_path = first.log_path.with_suffix(".resume.json")
+    resume_text = resume_path.read_text(encoding="utf-8")
+    assert len(resume_text) < 20_000
+    assert large_output not in resume_text
+    artifacts = list((resume_path.parent / f"{resume_path.stem}.artifacts").rglob("*.json"))
+    assert artifacts
+    assert any(large_output in artifact.read_text(encoding="utf-8") for artifact in artifacts)
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == ["second", "second"]
+    assert resumed.node_outputs["first"].data["reused"] is True
+    assert resumed.node_outputs["first"].output == large_output
+    assert resumed.node_outputs["second"].output.strip() == "second-ok"
+
+
+@pytest.mark.anyio
+async def test_global_cache_moves_large_outputs_to_artifacts(tmp_path: Path) -> None:
+    large_output = "x" * 75_000
+    large_file = tmp_path / "global-cache-large.txt"
+    large_file.write_text(large_output, encoding="utf-8")
+    wf = _make_workflow("global-cache-artifacts")
+    wf.add_operation(
+        GraphNode(
+            node_id="read",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=large_file),
+        )
+    )
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+
+    assert first.success
+    cache_path = tmp_path / "node-cache" / wf.config.id / "cache.json"
+    cache_text = cache_path.read_text(encoding="utf-8")
+    assert len(cache_text) < 20_000
+    assert large_output not in cache_text
+    artifacts = list((cache_path.parent / f"{cache_path.stem}.artifacts").rglob("*.json"))
+    assert artifacts
+    assert any(large_output in artifact.read_text(encoding="utf-8") for artifact in artifacts)
+
+    second = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id="unused")).run()
+
+    assert second.success
+    assert second.node_outputs["read"].data["reused"] is True
+    assert second.node_outputs["read"].output == large_output
+
+
+@pytest.mark.anyio
+async def test_resume_force_reruns_successful_upstream_node(tmp_path: Path) -> None:
+    calls = tmp_path / "force-calls.txt"
+    marker = tmp_path / "force-marker"
+    wf = _make_workflow("resume-force")
+    wf.add_operation(_bash_node("first", f"echo first >> {calls}; echo first"))
+    wf.add_operation(
+        _bash_node(
+            "second",
+            (
+                f"echo second >> {calls}; "
+                f"if [ ! -f {marker} ]; then touch {marker}; exit 9; fi; "
+                "echo ok"
+            ),
+        )
+    )
+    wf.then("first", "second")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name, force=True)).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "first",
+        "second",
+        "first",
+        "second",
+    ]
+
+
+@pytest.mark.anyio
+async def test_resume_from_node_reruns_selected_node_without_reusing_cache(
+    tmp_path: Path,
+) -> None:
+    calls = tmp_path / "from-node-calls.txt"
+    wf = _make_workflow("resume-from-node-cache-bypass")
+    wf.add_operation(_bash_node("first", f"echo first >> {calls}; echo first"))
+    wf.add_operation(_bash_node("second", f"echo second >> {calls}; echo second"))
+    wf.then("first", "second")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(
+        ResumeOptions(run_id=first.log_path.name, from_node="first")
+    ).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "first",
+        "second",
+        "first",
+        "second",
+    ]
+    assert resumed.node_outputs["first"].data.get("reused") is not True
+    assert resumed.node_outputs["second"].data.get("reused") is not True
+
+
+@pytest.mark.anyio
+async def test_resume_only_node_reruns_selected_node_without_reusing_cache(
+    tmp_path: Path,
+) -> None:
+    calls = tmp_path / "only-node-calls.txt"
+    wf = _make_workflow("resume-only-node-cache-bypass")
+    wf.add_operation(_bash_node("first", f"echo first >> {calls}; echo first"))
+    wf.add_operation(_bash_node("second", f"echo second >> {calls}; echo second"))
+    wf.add_operation(_bash_node("third", f"echo third >> {calls}; echo third"))
+    wf.then("first", "second")
+    wf.then("second", "third")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(
+        ResumeOptions(run_id=first.log_path.name, only_node="second")
+    ).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == [
+        "first",
+        "second",
+        "third",
+        "second",
+    ]
+    assert resumed.node_outputs["first"].data["reused"] is True
+    assert resumed.node_outputs["second"].data.get("reused") is not True
+    assert resumed.node_outputs["third"].data["reused"] is True
+
+
+@pytest.mark.anyio
+async def test_resume_changed_file_input_invalidates_cached_output(tmp_path: Path) -> None:
+    source = tmp_path / "input.txt"
+    source.write_text("old", encoding="utf-8")
+    marker = tmp_path / "changed-marker"
+    wf = _make_workflow("resume-cache-invalidates")
+    wf.add_operation(
+        GraphNode(
+            node_id="read",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=source),
+        )
+    )
+    wf.add_operation(
+        _bash_node(
+            "fail-once",
+            f"if [ ! -f {marker} ]; then touch {marker}; exit 1; fi; echo ok",
+        )
+    )
+    wf.then("read", "fail-once")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert first.log_path is not None
+    source.write_text("new", encoding="utf-8")
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert resumed.node_outputs["read"].output == "new"
+    assert resumed.node_outputs["read"].data.get("reused") is not True
+
+
+@pytest.mark.anyio
+async def test_resume_replays_conditional_edges_from_reused_state(tmp_path: Path) -> None:
+    marker = tmp_path / "conditional-marker"
+    wf = _make_workflow("resume-conditional")
+    wf.add_operation(_bash_node("decide", "echo go"))
+    wf.add_operation(
+        _bash_node(
+            "matched",
+            f"if [ ! -f {marker} ]; then touch {marker}; exit 1; fi; echo matched",
+        )
+    )
+    wf.add_operation(_bash_node("unmatched", "echo unmatched"))
+    wf.then(
+        "decide",
+        "matched",
+        EdgeConfig(
+            from_node="decide",
+            to_node="matched",
+            condition=EdgeConditionType.OUTPUT_MATCHES,
+            output_pattern="go",
+        ),
+    )
+    wf.then(
+        "decide",
+        "unmatched",
+        EdgeConfig(
+            from_node="decide",
+            to_node="unmatched",
+            condition=EdgeConditionType.OUTPUT_MATCHES,
+            output_pattern="stop",
+        ),
+    )
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert resumed.node_outputs["decide"].data["reused"] is True
+    assert "matched" in resumed.node_outputs
+    assert "unmatched" not in resumed.node_outputs
+
+
+@pytest.mark.anyio
+async def test_resume_after_stop_continues_from_checkpoint(tmp_path: Path) -> None:
+    calls = tmp_path / "stop-calls.txt"
+    stop_file = tmp_path / "state" / "stop"
+    stop_file.parent.mkdir()
+    wf = _make_workflow("resume-stop")
+    wf.add_operation(_bash_node("first", f"echo first >> {calls}; touch {stop_file}; echo first"))
+    wf.add_operation(_bash_node("second", f"echo second >> {calls}; echo second"))
+    wf.then("first", "second")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+        stop_file=stop_file,
+    ).run()
+    assert not first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == ["first", "second"]
+
+
+@pytest.mark.anyio
+async def test_resume_loop_retries_only_failed_fan_out_items(tmp_path: Path) -> None:
+    calls = tmp_path / "fanout-calls.txt"
+    marker = tmp_path / "fanout-marker"
+    wf = _make_workflow("resume-fanout")
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=2, max_concurrency=2),
+            ),
+        )
+    )
+    wf.add_operation(
+        _bash_node(
+            "child",
+            (
+                f"echo $INDEX >> {calls}; "
+                f"if [ \"$INDEX\" = \"1\" ] && [ ! -f {marker} ]; "
+                f"then touch {marker}; exit 1; fi; "
+                "echo ok-$INDEX"
+            ),
+        )
+    )
+    wf.then("loop", "child")
+
+    first = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert not first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert calls.read_text(encoding="utf-8").splitlines() == ["0", "1", "1"]
+
+
+@pytest.mark.anyio
+async def test_resume_loop_retries_failed_fan_out_agent_item_with_fake_subscription(
+    tmp_path: Path,
+) -> None:
+    class FailsSecondCallOnceSubscription(FakeSubscription):
+        def __init__(self) -> None:
+            super().__init__(output="agent-ok")
+            self.failed = False
+
+        async def execute(
+            self,
+            prompt: str,
+            working_dir: Path,
+            tools: list[str],
+            mcp_servers: list[str],
+            env: dict[str, str],
+            timeout: float | None = None,
+            cancel_event: threading.Event | None = None,
+            extra_paths: list[Path] | None = None,
+            max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
+        ) -> AgentResult:
+            self.calls.append({
+                "prompt": prompt,
+                "working_dir": working_dir,
+                "tools": tools,
+                "mcp_servers": mcp_servers,
+                "env": env,
+                "extra_paths": extra_paths or [],
+                "max_output_bytes": max_output_bytes,
+                "provider_settings": provider_settings,
+            })
+            if len(self.calls) == 2 and not self.failed:
+                self.failed = True
+                return AgentResult(
+                    agent_id="",
+                    success=False,
+                    output="agent-failed",
+                    exit_code=5,
+                    duration_seconds=0.0,
+                )
+            return AgentResult(
+                agent_id="",
+                success=True,
+                output=f"agent-ok-{len(self.calls)}",
+                exit_code=0,
+                duration_seconds=0.0,
+            )
+
+    wf = _make_workflow("resume-fanout-agent")
+    wf.register_agent(
+        AgentConfig(
+            agent_id="agent",
+            subscription="claude_code",
+            working_dir=tmp_path,
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=CountFanSource(type="count", count=2, max_concurrency=1),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent-child",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="agent",
+                working_dir=tmp_path,
+                skill_name="summarize",
+            ),
+        )
+    )
+    wf.then("loop", "agent-child")
+    sub = FailsSecondCallOnceSubscription()
+
+    first = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).run()
+    assert not first.success
+    assert first.log_path is not None
+
+    resumed = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+        data_dir=tmp_path,
+    ).with_resume_options(ResumeOptions(run_id=first.log_path.name)).run()
+
+    assert resumed.success
+    assert len(sub.calls) == 3
 
 
 async def test_start_node_routes_to_next_node(tmp_path: Path) -> None:
@@ -1453,6 +2072,188 @@ async def test_write_file_uses_piped_input_when_content_empty(tmp_path: Path) ->
     assert result.success
     assert destination.read_text() == "piped"
     assert "wrote 5 characters" in result.node_outputs["write"].output
+
+
+async def test_file_node_requires_access_outside_workflow_project(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    project_dir.mkdir()
+    external_dir.mkdir()
+    source = external_dir / "input.txt"
+    source.write_text("outside")
+    wf = _make_workflow()
+    wf.add_operation(
+        GraphNode(
+            node_id="read",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=source),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=project_dir / "flow.toml",
+    ).run()
+
+    assert not result.success
+    assert not result.node_outputs["read"].success
+    assert "filesystem access denied for read" in result.node_outputs["read"].output
+
+
+async def test_file_node_allows_configured_read_access_outside_workflow_project(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    project_dir.mkdir()
+    external_dir.mkdir()
+    source = external_dir / "input.txt"
+    source.write_text("outside")
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="read-access",
+            name="Read Access",
+            filesystem_access=[
+                FilesystemAccessEntry(path=external_dir, read=True, write=False)
+            ],
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="read",
+            operation=ReadFileOperation(type=OperationType.READ_FILE, path=source),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=project_dir / "flow.toml",
+    ).run()
+
+    assert result.success
+    assert result.node_outputs["read"].output == "outside"
+
+
+async def test_write_file_requires_write_access_outside_workflow_project(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    project_dir.mkdir()
+    external_dir.mkdir()
+    destination = external_dir / "out.txt"
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="write-access",
+            name="Write Access",
+            filesystem_access=[
+                FilesystemAccessEntry(path=external_dir, read=True, write=False)
+            ],
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="write",
+            operation=WriteFileOperation(
+                type=OperationType.WRITE_FILE,
+                path=destination,
+                content="blocked",
+            ),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=project_dir / "flow.toml",
+    ).run()
+
+    assert not result.success
+    assert not destination.exists()
+    assert "filesystem access denied for write" in result.node_outputs["write"].output
+
+
+async def test_write_file_allows_configured_write_access_outside_workflow_project(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    project_dir.mkdir()
+    external_dir.mkdir()
+    destination = external_dir / "out.txt"
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="write-access",
+            name="Write Access",
+            filesystem_access=[
+                FilesystemAccessEntry(path=external_dir, read=False, write=True)
+            ],
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="write",
+            operation=WriteFileOperation(
+                type=OperationType.WRITE_FILE,
+                path=destination,
+                content="allowed",
+            ),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=project_dir / "flow.toml",
+    ).run()
+
+    assert result.success
+    assert destination.read_text() == "allowed"
+
+
+async def test_project_root_access_entry_can_restrict_implicit_project_access(
+    tmp_path: Path,
+) -> None:
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    destination = project_dir / "out.txt"
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="project-access",
+            name="Project Access",
+            filesystem_access=[
+                FilesystemAccessEntry(path=project_dir, read=True, write=False)
+            ],
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="write",
+            operation=WriteFileOperation(
+                type=OperationType.WRITE_FILE,
+                path=destination,
+                content="blocked",
+            ),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=project_dir / "flow.toml",
+    ).run()
+
+    assert not result.success
+    assert not destination.exists()
+    assert "filesystem access denied for write" in result.node_outputs["write"].output
 
 
 async def test_relative_workflow_paths_match_plan_and_execution(
@@ -2258,7 +3059,86 @@ async def test_agent_node_logs_thoughts_and_message_separately(tmp_path: Path) -
     assert "choosing answer" in log_text
     assert "agent-step - AGENT_MESSAGE:" in log_text
     assert "hello from agent" in log_text
+    assert "agent-step - node output:" in log_text
+    assert "agent-step - node output:\nhello from agent\n" in log_text
     assert "node output:\nAGENT_MESSAGE" not in log_text
+
+
+async def test_agent_node_streams_thoughts_to_log_before_completion(tmp_path: Path) -> None:
+    class StreamingFakeSubscription(FakeSubscription):
+        async def execute(
+            self,
+            prompt: str,
+            working_dir: Path,
+            tools: list[str],
+            mcp_servers: list[str],
+            env: dict[str, str],
+            timeout: float | None = None,
+            cancel_event: threading.Event | None = None,
+            extra_paths: list[Path] | None = None,
+            max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
+        ) -> AgentResult:
+            self.calls.append({
+                "prompt": prompt,
+                "working_dir": working_dir,
+                "extra_paths": extra_paths or [],
+                "max_output_bytes": max_output_bytes,
+            })
+            if on_thought is not None:
+                on_thought("live thought\n")
+            log_paths = list((tmp_path / "logs" / "agent-live-log").glob("*.log"))
+            assert len(log_paths) == 1
+            assert "live thought" in log_paths[0].read_text(encoding="utf-8")
+            return AgentResult(
+                agent_id="",
+                success=True,
+                output="final answer",
+                exit_code=0,
+                duration_seconds=0.0,
+                thoughts=["live thought\n"],
+                message="final answer",
+            )
+
+    prompt = tmp_path / "p.md"
+    prompt.write_text("Say hello.")
+    sub = StreamingFakeSubscription()
+
+    wf = _make_workflow("agent-live-log")
+    wf.register_agent(
+        AgentConfig(
+            agent_id="bot",
+            subscription="claude_code",
+            working_dir=tmp_path,
+            prompt_path=prompt,
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent-step",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="bot",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
+
+    result = await WorkflowExecutor(
+        wf,
+        {"claude_code": sub},
+        log_base_dir=tmp_path / "logs",
+    ).run()
+
+    assert result.success
+    log_text = result.log_path.read_text(encoding="utf-8")
+    assert log_text.count("live thought") == 1
+    assert "agent-step - AGENT_MESSAGE:" in log_text
+    assert "agent-step - node output:" in log_text
+    assert "agent-step - node output:\nfinal answer\n" in log_text
+    assert "final answer" in log_text
 
 
 async def test_agent_node_uses_node_prompt_path_over_agent_default(tmp_path: Path) -> None:
@@ -2422,6 +3302,8 @@ async def test_agent_node_memory_compaction_logs_info(
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             prompt_text = prompt
             self.calls.append(
@@ -2522,6 +3404,8 @@ async def test_agent_node_memory_compaction_uses_fallback_summary(
             cancel_event: threading.Event | None = None,
             extra_paths: list[Path] | None = None,
             max_output_bytes: int | None = None,
+            on_thought: Callable[[str], None] | None = None,
+            provider_settings: ResolvedProviderSettings | None = None,
         ) -> AgentResult:
             prompt_text = prompt
             self.calls.append({"prompt": prompt_text})
@@ -3318,6 +4202,29 @@ def test_agent_message_and_node_output_are_not_capped_by_message_limit(tmp_path:
     assert "\n2026-" in text
 
 
+def test_agent_message_and_node_output_can_exceed_log_budget(tmp_path: Path) -> None:
+    limits = ResourceLimits(
+        max_log_message_bytes=120,
+        max_log_bytes_per_node=80,
+        max_log_bytes_per_run=220,
+    )
+    run_log = WorkflowRunLog("agent-final-log-limit", base_dir=tmp_path, limits=limits)
+    final_message = "final-" + ("m" * 500)
+    node_output = "output-" + ("o" * 500)
+
+    run_log.node_agent_event("agent", "AGENT_THOUGHT", "x" * 1000)
+    run_log.node_agent_event("agent", "AGENT_MESSAGE", final_message)
+    run_log.node_output("agent", "node output", node_output, uncapped=True)
+
+    text = run_log.path.read_text(encoding="utf-8")
+
+    assert final_message in text
+    assert node_output in text
+    assert "agent - AGENT_MESSAGE:" in text
+    assert "agent - node output:" in text
+    assert byte_len(text) > limits.max_log_bytes_per_run
+
+
 def test_truncated_agent_thought_does_not_run_into_next_log_entry(tmp_path: Path) -> None:
     limits = ResourceLimits(
         max_log_message_bytes=120,
@@ -3334,6 +4241,62 @@ def test_truncated_agent_thought_does_not_run_into_next_log_entry(tmp_path: Path
     assert "truncated at 120 bytes]\n2026-" in text
     assert "bytes]2026-" not in text
     assert "agent - AGENT_MESSAGE:\nfinal message\n" in text
+
+
+def test_agent_events_update_live_node_event_data(tmp_path: Path) -> None:
+    run_log = WorkflowRunLog("agent-event-data", base_dir=tmp_path)
+
+    run_log.begin_node_attempt("node-4", 1, 1)
+    run_log.event("node-4", "started", run_number=1, attempt=1)
+    run_log.node_agent_event("node-4", "AGENT_THOUGHT", "first thought")
+    run_log.node_agent_event("node-4", "AGENT_MESSAGE", "final message")
+
+    payload = json.loads(run_log.events_path.read_text(encoding="utf-8"))
+    node = payload["nodes"]["node-4"]
+    assert node["status"] == "started"
+    assert node["message"] == "final message"
+    assert node["attempts"][0]["latestThought"] == "first thought"
+    assert node["attempts"][0]["message"] == "final message"
+    node_data = payload["nodes"]["node-4"]["data"]
+
+    assert node_data["thoughts"] == ["first thought"]
+    assert node_data["latestThought"] == "first thought"
+    assert node_data["message"] == "final message"
+
+
+def test_live_event_payloads_are_compacted_for_ui_state(tmp_path: Path) -> None:
+    run_log = WorkflowRunLog("compact-event-data", base_dir=tmp_path)
+    large_content = "x" * 20_000
+
+    run_log.event(
+        "agent",
+        "started",
+        attempt=1,
+        run_number=1,
+        fan_out_item={
+            "file_name": "ticket.txt",
+            "file_content": large_content,
+        },
+        data={
+            "inputs": {
+                "content": large_content,
+            },
+            "prompt": large_content,
+        },
+    )
+    for index in range(25):
+        run_log.node_agent_event("agent", "AGENT_THOUGHT", f"thought-{index}")
+
+    payload = json.loads(run_log.events_path.read_text(encoding="utf-8"))
+    node = payload["nodes"]["agent"]
+    attempt = node["attempts"][0]
+
+    assert len(payload["events"][0]["fanOutItem"]["file_content"]) < 2500
+    assert len(attempt["fanOutItem"]["file_content"]) < 2500
+    assert len(attempt["inputs"]["content"]) < 2500
+    assert len(node["data"]["thoughts"]) == 20
+    assert node["data"]["thoughts"][0] == "thought-5"
+    assert node["data"]["latestThought"] == "thought-24"
 
 
 def test_repeated_node_log_events_cannot_exceed_node_log_limit(tmp_path: Path) -> None:
@@ -3577,6 +4540,61 @@ async def test_approval_gate_pauses_and_resumes_after_approval(tmp_path: Path) -
     log_text = result.log_path.read_text()
     assert "approval pending" in log_text
     assert "approval decision: decision=approved by=alice" in log_text
+
+
+async def test_approval_gate_continues_when_notification_fails(
+    tmp_path: Path,
+) -> None:
+    class FailingNotificationAdapter:
+        async def send(self, _notification: object) -> None:
+            raise RuntimeError("toast backend unavailable")
+
+    wf = _make_workflow("approval-notify-failure")
+    wf.add_operation(
+        GraphNode(
+            node_id="approve",
+            operation=ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message="Approve deploy?",
+                notify=True,
+            ),
+        )
+    )
+    store = ApprovalStore(tmp_path)
+    result = None
+
+    async def decide_when_pending() -> None:
+        while True:
+            pending = store.list_pending("approval-notify-failure")
+            if pending:
+                request = pending[0]
+                store.decide(
+                    request.workflow_id,
+                    request.run_id,
+                    request.node_id,
+                    "approved",
+                    decided_by="ui",
+                )
+                return
+            await anyio.sleep(0.05)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(decide_when_pending)
+        result = await WorkflowExecutor(
+            wf,
+            {},
+            log_base_dir=tmp_path / "logs",
+            approval_store=store,
+            notification_adapter=FailingNotificationAdapter(),
+        ).run()
+
+    assert result is not None
+    assert result.success
+    assert result.node_outputs["approve"].data["decision"] == "approved"
+    assert result.log_path is not None
+    log_text = result.log_path.read_text()
+    assert "approval notification failed: toast backend unavailable" in log_text
+    assert "approval decision: decision=approved by=ui" in log_text
 
 
 async def test_approval_gate_rejection_routes_on_failure(tmp_path: Path) -> None:

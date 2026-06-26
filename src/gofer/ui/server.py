@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import signal
 import sys
+import tempfile
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -18,31 +23,59 @@ from gofer.core.usage import summarize_node_outputs
 from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
 from gofer.ui.api import (
+    ProviderProfileError,
+    RunnerQueueError,
     WorkflowAlreadyExistsError,
     WorkflowApprovalError,
+    WorkflowBundleError,
     WorkflowCreateError,
+    WorkflowHistoryError,
     WorkflowLogError,
     WorkflowPlanError,
     WorkflowRunError,
+    WorkflowTriggerError,
     WorkflowUpdateError,
+    apply_workflow_validation_fix_payload,
+    cancel_queued_run_payload,
     create_workflow_payload,
     decide_workflow_approval_payload,
+    delete_provider_profile_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
     duplicate_workflow_payload,
+    export_workflow_bundle_payload,
     health_payload,
+    import_workflow_bundle_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
     list_workflow_approvals_payload,
+    list_workflow_history_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
+    list_workflow_templates_payload,
+    preview_workflow_bundle_payload,
+    provider_profiles_payload,
+    prune_workflow_run_logs_payload,
+    queue_workflow_run_payload,
     rename_workflow_payload,
+    replay_workflow_trigger_payload,
+    restore_workflow_revision_payload,
+    resume_workflow_payload,
+    retention_settings_payload,
     run_workflow_payload,
+    runner_queue_payload,
     stop_workflow_run_payload,
+    trigger_workflow_payload,
+    update_retention_settings_payload,
     update_workflow_payload,
+    upsert_provider_profile_payload,
+    validate_workflow_draft_payload,
+    validate_workflow_payload,
     workflow_plan_payload,
+    workflow_revision_diff_payload,
     workflow_run_events_payload,
     workflow_run_log_payload,
+    workflow_template_payload,
 )
 from gofer.ui.chat import (
     ChatProviderError,
@@ -56,6 +89,35 @@ from gofer.utils.paths import get_data_dir
 
 log = get_logger(__name__)
 CONTINUOUS_RUN_POLL_SECONDS = 1.0
+
+
+def _optional_query(query: dict[str, list[str]], name: str) -> str | None:
+    value = query.get(name, [None])[0]
+    return value if value not in {None, ""} else None
+
+
+def _int_query(query: dict[str, list[str]], name: str, default: int) -> int:
+    value = _optional_query(query, name)
+    if value is None:
+        return default
+    return int(value)
+
+
+def _optional_int_query(query: dict[str, list[str]], name: str) -> int | None:
+    value = _optional_query(query, name)
+    return int(value) if value is not None else None
+
+
+def _optional_datetime_query(query: dict[str, list[str]], name: str) -> datetime | None:
+    value = _optional_query(query, name)
+    return datetime.fromisoformat(value) if value is not None else None
+
+
+def _optional_body_int(body: dict[str, Any], name: str) -> int | None:
+    value = body.get(name)
+    if value in {None, ""}:
+        return None
+    return int(str(value))
 
 
 def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> None:
@@ -261,6 +323,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     workflow_id,
                     run_id,
                     self._request_data_dir(query),
+                    offset=_optional_int_query(query, "offset"),
+                    limit=_optional_int_query(query, "limit"),
+                    tail_bytes=_optional_int_query(query, "tailBytes"),
+                    include_details=query.get("details", ["1"])[0] != "0",
                 )
             except WorkflowLogError as exc:
                 self._send_html(f"<p>{html.escape(str(exc))}</p>", status=404)
@@ -276,14 +342,107 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if parsed.path == "/api/workflow-templates":
+            self._send_json(list_workflow_templates_payload())
+            return
+
+        if parsed.path.startswith("/api/workflow-templates/"):
+            template_name = parsed.path.removeprefix("/api/workflow-templates/")
+            try:
+                self._send_json(workflow_template_payload(template_name))
+            except WorkflowCreateError as exc:
+                self._send_json({"error": str(exc)}, status=404)
+            return
+
         if parsed.path == "/api/chat/providers":
             self._send_json(provider_payload())
+            return
+
+        if parsed.path == "/api/provider/profiles":
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(provider_profiles_payload(self._request_data_dir(query)))
+            except ProviderProfileError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path in {"/api/runners", "/api/queue"}:
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(runner_queue_payload(self._request_data_dir(query)))
+            except RunnerQueueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path == "/api/retention":
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(retention_settings_payload(self._request_data_dir(query)))
+            except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/retention"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/retention")
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(
+                    retention_settings_payload(self._request_data_dir(query), workflow_id)
+                )
+            except WorkflowLogError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/history"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/history")
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(
+                    list_workflow_history_payload(
+                        workflow_id,
+                        self._request_data_dir(query),
+                        limit=_optional_int_query(query, "limit"),
+                    )
+                )
+            except WorkflowHistoryError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/history/" in parsed.path
+            and parsed.path.endswith("/diff")
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/").removesuffix("/diff")
+            workflow_id, revision_id = remainder.split("/history/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(
+                    workflow_revision_diff_payload(
+                        workflow_id,
+                        revision_id,
+                        self._request_data_dir(query),
+                    )
+                )
+            except WorkflowHistoryError as exc:
+                self._send_json({"error": str(exc)}, status=400)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/doctor"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/doctor")
             query = parse_qs(parsed.query)
             self._send_json(health_payload(self._request_data_dir(query), workflow_id))
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/validate"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/validate")
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(
+                    validate_workflow_payload(workflow_id, self._request_data_dir(query))
+                )
+            except WorkflowUpdateError as exc:
+                self._send_json({"error": str(exc)}, status=404)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/logs/latest"):
@@ -294,7 +453,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     workflow_id,
                     self._request_data_dir(query),
                 )
-            except WorkflowLogError as exc:
+            except (WorkflowLogError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
@@ -330,6 +489,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     workflow_id,
                     run_id,
                     self._request_data_dir(query),
+                    offset=_optional_int_query(query, "offset"),
+                    limit=_optional_int_query(query, "limit"),
+                    tail_bytes=_optional_int_query(query, "tailBytes"),
+                    include_details=query.get("details", ["1"])[0] != "0",
                 )
             except WorkflowLogError as exc:
                 self._send_json({"error": str(exc)}, status=404)
@@ -345,8 +508,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 payload = list_workflow_run_logs_payload(
                     workflow_id,
                     self._request_data_dir(query),
+                    offset=_int_query(query, "offset", 0),
+                    limit=_optional_int_query(query, "limit"),
+                    status=_optional_query(query, "status"),
+                    trigger_type=_optional_query(query, "trigger"),
+                    search=_optional_query(query, "q"),
+                    started_after=_optional_datetime_query(query, "startedAfter"),
+                    started_before=_optional_datetime_query(query, "startedBefore"),
                 )
-            except WorkflowLogError as exc:
+            except (WorkflowLogError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
@@ -373,10 +543,54 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if parsed.path == "/api/retention":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = update_retention_settings_payload(
+                    self._request_data_dir(query),
+                    settings=body,
+                )
+            except (WorkflowLogError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/retention"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/retention")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = update_retention_settings_payload(
+                    self._request_data_dir(query),
+                    workflow_id=workflow_id,
+                    settings=body,
+                )
+            except (WorkflowLogError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
         if parsed.path == "/api/workflows/import":
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
+                with _bundle_path_from_body(body) as bundle_path:
+                    if bundle_path:
+                        plan = import_workflow_bundle_payload(
+                            bundle_path,
+                            self._request_data_dir(query),
+                            replace=bool(body.get("replace", False)),
+                            dry_run=bool(body.get("dryRun", False)),
+                        )
+                        self._sync_schedules()
+                        self._send_json(
+                            {"import": plan},
+                            status=200 if body.get("dryRun") else 201,
+                        )
+                        return
                 workflow = import_workflow_payload(
                     str(body.get("content", "")),
                     self._request_data_dir(query),
@@ -384,7 +598,12 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             except WorkflowAlreadyExistsError as exc:
                 self._send_json({"error": str(exc)}, status=409)
                 return
-            except (WorkflowCreateError, json.JSONDecodeError) as exc:
+            except (
+                WorkflowBundleError,
+                WorkflowCreateError,
+                json.JSONDecodeError,
+                ValueError,
+            ) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
@@ -392,14 +611,36 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"workflow": workflow}, status=201)
             return
 
+        if parsed.path == "/api/workflows/import/preview":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                with _bundle_path_from_body(body) as bundle_path:
+                    payload = preview_workflow_bundle_payload(
+                        bundle_path or Path(""),
+                        self._request_data_dir(query),
+                    )
+            except (WorkflowBundleError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"import": payload})
+            return
+
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
-                workflow = create_workflow_payload(
-                    str(body.get("name", "")),
-                    self._request_data_dir(query),
-                )
+                if body.get("template"):
+                    workflow = create_workflow_payload(
+                        str(body.get("name", "")),
+                        self._request_data_dir(query),
+                        template=body.get("template"),
+                    )
+                else:
+                    workflow = create_workflow_payload(
+                        str(body.get("name", "")),
+                        self._request_data_dir(query),
+                    )
             except WorkflowAlreadyExistsError as exc:
                 self._send_json({"error": str(exc)}, status=409)
                 return
@@ -451,6 +692,79 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 return
 
             self._send_json(response)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/validate"):
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                self._send_json(
+                    validate_workflow_draft_payload(
+                        body,
+                        self._request_data_dir(query),
+                    )
+                )
+            except (WorkflowUpdateError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/validate/fix"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/validate/fix")
+            query = parse_qs(parsed.query)
+            try:
+                payload = apply_workflow_validation_fix_payload(
+                    workflow_id,
+                    self._read_json(),
+                    self._request_data_dir(query),
+                )
+            except (WorkflowUpdateError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/provider/profiles":
+            query = parse_qs(parsed.query)
+            try:
+                payload = upsert_provider_profile_payload(
+                    self._read_json(),
+                    self._request_data_dir(query),
+                )
+            except (ProviderProfileError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/runs/" in parsed.path
+            and parsed.path.endswith("/resume")
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/")
+            workflow_id, run_id = remainder.removesuffix("/resume").split("/runs/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                trigger_context = body.get("triggerContext")
+                if trigger_context is not None and not isinstance(trigger_context, dict):
+                    raise WorkflowRunError("triggerContext must be an object")
+                payload = asyncio.run(
+                    resume_workflow_payload(
+                        workflow_id,
+                        self._request_data_dir(query),
+                        run_id=run_id,
+                        from_node=body.get("fromNode"),
+                        only_node=body.get("onlyNode"),
+                        skip_cache=bool(body.get("skipCache", False)),
+                        force=bool(body.get("force", False)),
+                        trigger_context=trigger_context,
+                    )
+                )
+            except (WorkflowRunError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"run": payload})
             return
 
         if (
@@ -507,6 +821,25 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"workflow": workflow})
             return
 
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/logs/prune"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/logs/prune")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = prune_workflow_run_logs_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                    keep_last=_optional_body_int(body, "keepLast"),
+                    keep_days=_optional_body_int(body, "keepDays"),
+                    keep_failed_days=_optional_body_int(body, "keepFailedDays"),
+                    dry_run=bool(body.get("dryRun", True)),
+                )
+            except (WorkflowLogError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/duplicate"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/duplicate")
             query = parse_qs(parsed.query)
@@ -528,6 +861,48 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"workflow": workflow}, status=201)
             return
 
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/history/" in parsed.path
+            and parsed.path.endswith("/restore")
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/").removesuffix("/restore")
+            workflow_id, revision_id = remainder.split("/history/", 1)
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = restore_workflow_revision_payload(
+                    workflow_id,
+                    revision_id,
+                    self._request_data_dir(query),
+                    as_copy=bool(body.get("asCopy", False)),
+                )
+            except (WorkflowHistoryError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._sync_schedules()
+            self._send_json(payload)
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/export"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/export")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                output_path = Path(str(body.get("outputPath", "")))
+                payload = export_workflow_bundle_payload(
+                    workflow_id,
+                    output_path,
+                    self._request_data_dir(query),
+                    notes=body.get("notes"),
+                )
+            except (WorkflowBundleError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload, status=201)
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/plan"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/plan")
             query = parse_qs(parsed.query)
@@ -536,16 +911,58 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 trigger_context = body.get("triggerContext")
                 if trigger_context is not None and not isinstance(trigger_context, dict):
                     raise WorkflowPlanError("triggerContext must be an object")
+                parameters = body.get("parameters")
+                if parameters is not None and not isinstance(parameters, dict):
+                    raise WorkflowPlanError("parameters must be an object")
                 plan = workflow_plan_payload(
                     workflow_id,
                     self._request_data_dir(query),
                     trigger_context=trigger_context,
+                    parameters=parameters,
                 )
             except (WorkflowPlanError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
             self._send_json({"plan": plan})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/queue"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/queue")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                parameters = body.get("parameters")
+                if parameters is not None and not isinstance(parameters, dict):
+                    raise RunnerQueueError("parameters must be an object")
+                target_labels = body.get("targetLabels")
+                if target_labels is not None and not isinstance(target_labels, list):
+                    raise RunnerQueueError("targetLabels must be an array")
+                payload = queue_workflow_run_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
+                    priority=int(body.get("priority") or 0),
+                    trigger=str(body.get("trigger") or "ui"),
+                    parameters=parameters,
+                    target_labels=[str(label) for label in (target_labels or [])],
+                )
+            except (RunnerQueueError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json(payload, status=202)
+            return
+
+        if parsed.path.startswith("/api/queue/") and parsed.path.endswith("/cancel"):
+            run_id = parsed.path.removeprefix("/api/queue/").removesuffix("/cancel")
+            query = parse_qs(parsed.query)
+            try:
+                payload = cancel_queued_run_payload(run_id, self._request_data_dir(query))
+            except RunnerQueueError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+
+            self._send_json(payload)
             return
 
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/run"):
@@ -557,19 +974,91 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 trigger_context = body.get("triggerContext")
                 if trigger_context is not None and not isinstance(trigger_context, dict):
                     raise WorkflowRunError("triggerContext must be an object")
-                result = asyncio.run(
-                    run_workflow_payload(
-                        workflow_id,
-                        self._request_data_dir(query),
-                        dry_run=dry_run,
-                        trigger_context=trigger_context,
+                parameters = body.get("parameters")
+                if parameters is not None and not isinstance(parameters, dict):
+                    raise WorkflowRunError("parameters must be an object")
+                if parameters is None:
+                    result = asyncio.run(
+                        run_workflow_payload(
+                            workflow_id,
+                            self._request_data_dir(query),
+                            dry_run=dry_run,
+                            trigger_context=trigger_context,
+                        )
                     )
-                )
+                else:
+                    result = asyncio.run(
+                        run_workflow_payload(
+                            workflow_id,
+                            self._request_data_dir(query),
+                            dry_run=dry_run,
+                            trigger_context=trigger_context,
+                            parameters=parameters,
+                        )
+                    )
             except (WorkflowRunError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
 
             self._send_json({"plan" if dry_run else "run": result})
+            return
+
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/webhooks/" in parsed.path
+            and parsed.path.endswith("/replay")
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/")
+            workflow_id, trigger_part = remainder.split("/webhooks/", 1)
+            trigger_id = trigger_part.removesuffix("/replay")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                run_id = str(body.get("runId") or "")
+                if not run_id:
+                    raise WorkflowTriggerError("runId is required")
+                payload = asyncio.run(
+                    replay_workflow_trigger_payload(
+                        workflow_id,
+                        run_id,
+                        self._request_data_dir(query),
+                        trigger_id=trigger_id,
+                        token=self._webhook_token(),
+                        require_token=True,
+                    )
+                )
+            except (WorkflowTriggerError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"trigger": payload}, status=202)
+            return
+
+        if (
+            parsed.path.startswith("/api/workflows/")
+            and "/webhooks/" in parsed.path
+            and parsed.path.endswith("/trigger")
+        ):
+            remainder = parsed.path.removeprefix("/api/workflows/")
+            workflow_id, trigger_part = remainder.split("/webhooks/", 1)
+            trigger_id = trigger_part.removesuffix("/trigger")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = asyncio.run(
+                    trigger_workflow_payload(
+                        workflow_id,
+                        trigger_id,
+                        self._request_data_dir(query),
+                        payload=body,
+                        headers={str(key): str(value) for key, value in self.headers.items()},
+                        source=str(self.headers.get("X-Gofer-Webhook-Source") or "http"),
+                        token=self._webhook_token(),
+                    )
+                )
+            except (WorkflowTriggerError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"trigger": payload}, status=202)
             return
 
         if (
@@ -648,6 +1137,20 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 )
             except WorkflowUpdateError as exc:
                 self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path.startswith("/api/provider/profiles/"):
+            profile_name = parsed.path.removeprefix("/api/provider/profiles/")
+            query = parse_qs(parsed.query)
+            try:
+                payload = delete_provider_profile_payload(
+                    profile_name,
+                    self._request_data_dir(query),
+                )
+            except ProviderProfileError as exc:
+                self._send_json({"error": str(exc)}, status=404)
                 return
             self._send_json(payload)
             return
@@ -782,6 +1285,13 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
         self.wfile.write(body)
+
+    def _webhook_token(self) -> str | None:
+        token = self.headers.get("X-Gofer-Webhook-Token")
+        authorization = self.headers.get("Authorization", "")
+        if token is None and authorization.startswith("Bearer "):
+            token = authorization.removeprefix("Bearer ").strip()
+        return token
 
     def _send_html(self, markup: str, status: int = 200) -> None:
         body = markup.encode("utf-8")
@@ -967,6 +1477,21 @@ def create_server(
         data_dir or get_data_dir(),
         resource_limits=resource_limits,
     )
+
+
+@contextmanager
+def _bundle_path_from_body(body: dict[str, Any]) -> Iterator[Path | None]:
+    if body.get("bundleContent"):
+        with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as temp_file:
+            temp_file.write(base64.b64decode(str(body["bundleContent"])))
+            temp_path = Path(temp_file.name)
+        try:
+            yield temp_path
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return
+    bundle_path = body.get("bundlePath")
+    yield Path(str(bundle_path)) if bundle_path else None
 
 
 def _install_shutdown_handlers(server: GoferUiServer) -> None:

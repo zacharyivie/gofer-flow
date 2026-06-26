@@ -4,9 +4,13 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+from apscheduler.jobstores.base import JobLookupError
+from apscheduler.jobstores.memory import MemoryJobStore
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.base import SchedulerNotRunningError
 from apscheduler.triggers.cron import CronTrigger
+from sqlalchemy.pool import NullPool
 
 from gofer.core.run_outputs import write_run_node_outputs_payload
 from gofer.core.workflow import AgenticWorkflow
@@ -38,7 +42,7 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
             log_base_dir=path.parent / "logs",
             workflow_path=path,
             stop_file=workflow_stop_path(workflow_id, path.parent),
-        )
+        ).with_parameters(wf.config.schedule.params if wf.config.schedule else {})
         result = await executor.run()
         write_run_node_outputs_payload(result, wf.config.resource_limits)
         log.info("Workflow %s finished: success=%s", workflow_id, result.success)
@@ -48,14 +52,31 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
 
 class WorkflowScheduler:
     def __init__(self, db_path: Path | None = None) -> None:
-        db_url = f"sqlite:///{db_path}" if db_path else "sqlite:///:memory:"
-        jobstore = SQLAlchemyJobStore(url=db_url)
-        self._scheduler = BackgroundScheduler(jobstores={"default": jobstore})
+        self._db_path = db_path
+        self._persistent = db_path is not None
+        self._jobstore = self._new_jobstore()
+        self._scheduler = BackgroundScheduler(jobstores={"default": self._jobstore})
         self._workflow_paths: dict[str, str] = {}
+        self._closed = False
+
+    def _new_jobstore(self) -> SQLAlchemyJobStore | MemoryJobStore:
+        if self._db_path:
+            db_url = f"sqlite:///{self._db_path}"
+            engine_options: dict[str, Any] = {"poolclass": NullPool}
+            return SQLAlchemyJobStore(
+                url=db_url,
+                engine_options=engine_options,
+            )
+        return MemoryJobStore()
+
+    def _new_scheduler(self) -> BackgroundScheduler:
+        return BackgroundScheduler(jobstores={"default": self._jobstore})
 
     def add_workflow(self, workflow: AgenticWorkflow, workflow_path: Path) -> None:
         if workflow.config.schedule is None:
             raise ValueError(f"Workflow '{workflow.config.id}' has no schedule configured")
+        if not workflow_path.exists():
+            raise FileNotFoundError(f"Workflow file not found: {workflow_path}")
         workflow.validate(workflow_path)
 
         sched = workflow.config.schedule
@@ -65,14 +86,14 @@ class WorkflowScheduler:
 
         # Start transiently so jobs persist to the SQLAlchemy store immediately
         started_here = False
-        if not self._scheduler.running:
+        if self._persistent and not self._scheduler.running:
             self._scheduler.start(paused=True)
             started_here = True
 
         # Remove first so replace works regardless of scheduler running state
         try:
             self._scheduler.remove_job(job_id)
-        except Exception:
+        except JobLookupError:
             pass
 
         self._scheduler.add_job(
@@ -86,32 +107,34 @@ class WorkflowScheduler:
         )
 
         if started_here:
-            self._scheduler.shutdown(wait=False)
+            self._shutdown_scheduler(wait=False)
 
         log.info("Scheduled workflow '%s' cron='%s'", workflow.config.id, sched.cron_expression)
 
     def remove_workflow(self, workflow_id: str) -> None:
         job_id = f"workflow:{workflow_id}"
         started_here = False
-        if not self._scheduler.running:
+        if self._persistent and not self._scheduler.running:
             self._scheduler.start(paused=True)
             started_here = True
         try:
             self._scheduler.remove_job(job_id)
+        except JobLookupError:
+            pass
         finally:
             if started_here:
-                self._scheduler.shutdown(wait=False)
+                self._shutdown_scheduler(wait=False)
 
     def list_workflows(self) -> list[dict[str, str]]:
         started_here = False
-        if not self._scheduler.running:
+        if self._persistent and not self._scheduler.running:
             self._scheduler.start(paused=True)
             started_here = True
         try:
             jobs_raw = list(self._scheduler.get_jobs())
         finally:
             if started_here:
-                self._scheduler.shutdown(wait=False)
+                self._shutdown_scheduler(wait=False)
         jobs = []
         for job in jobs_raw:
             jobs.append(
@@ -126,13 +149,51 @@ class WorkflowScheduler:
         return jobs
 
     def start(self, paused: bool = False) -> None:
+        self._closed = False
         self._scheduler.start(paused=paused)
 
     def resume(self) -> None:
         self._scheduler.resume()
 
     def shutdown(self, wait: bool = True) -> None:
-        self._scheduler.shutdown(wait=wait)
+        self._shutdown_scheduler(wait=wait)
+        try:
+            self._jobstore.shutdown()
+        except Exception:
+            pass
+        self._closed = True
+
+    def _shutdown_scheduler(self, wait: bool = True) -> None:
+        try:
+            self._scheduler.shutdown(wait=wait)
+        except SchedulerNotRunningError:
+            self._dispose_jobstore()
+        else:
+            if self._persistent:
+                try:
+                    self._jobstore.shutdown()
+                except Exception:
+                    pass
+                self._jobstore = self._new_jobstore()
+                self._closed = False
+            else:
+                self._closed = True
+            self._scheduler = self._new_scheduler()
 
     def is_running(self) -> bool:
         return bool(self._scheduler.running)
+
+    def _dispose_jobstore(self) -> None:
+        if self._closed:
+            return
+        self._jobstore.shutdown()
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            if self._scheduler.running:
+                self._shutdown_scheduler(wait=False)
+            else:
+                self._dispose_jobstore()
+        except Exception:
+            pass

@@ -10,6 +10,7 @@ import {
   Download,
   FolderOpen,
   GitBranch,
+  History,
   ListFilter,
   Loader2,
   MessageSquare,
@@ -30,6 +31,124 @@ import {
 import DagCanvas from "../components/DagCanvas.jsx";
 import { apiUrl } from "../lib/api.js";
 
+const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
+const DEFAULT_RETENTION_SETTINGS = {
+  keepDays: 14,
+  keepFailedDays: 30,
+  keepLast: 100,
+};
+const RUN_LOG_TAIL_BYTES = 64 * 1024;
+
+function loadRetentionSettings() {
+  if (typeof window === "undefined") return DEFAULT_RETENTION_SETTINGS;
+  try {
+    const stored = window.localStorage?.getItem(RETENTION_STORAGE_KEY);
+    if (!stored) return DEFAULT_RETENTION_SETTINGS;
+    const parsed = JSON.parse(stored);
+    if (!parsed || typeof parsed !== "object") return DEFAULT_RETENTION_SETTINGS;
+    return {
+      keepDays: Number.isFinite(parsed.keepDays)
+        ? parsed.keepDays
+        : DEFAULT_RETENTION_SETTINGS.keepDays,
+      keepFailedDays: Number.isFinite(parsed.keepFailedDays)
+        ? parsed.keepFailedDays
+        : DEFAULT_RETENTION_SETTINGS.keepFailedDays,
+      keepLast: Number.isFinite(parsed.keepLast)
+        ? parsed.keepLast
+        : DEFAULT_RETENTION_SETTINGS.keepLast,
+    };
+  } catch {
+    return DEFAULT_RETENTION_SETTINGS;
+  }
+}
+
+function isBundleFile(file) {
+  const name = file?.name?.toLowerCase?.() ?? "";
+  return name.endsWith(".zip") || name.endsWith(".gof");
+}
+
+async function fileToBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+  }
+  return window.btoa(binary);
+}
+
+function formatBundleImportPreview(plan) {
+  const manifest = plan.manifest ?? {};
+  const promptPaths = (manifest.includedPaths ?? [])
+    .filter((item) => item.kind === "prompt" || item.kind === "prompt_template")
+    .map((item) => `${item.path}${item.kind === "prompt_template" ? " (template)" : ""}`);
+  const lines = [
+    `Import bundle "${plan.workflowName}" as ${plan.workflowId}?`,
+    "",
+    "Files to create:",
+    ...previewLines(plan.filesToCreate),
+    "",
+    "Files to overwrite:",
+    ...previewLines(plan.filesToOverwrite),
+    "",
+    "Agents and providers:",
+    ...previewProviderLines(manifest.providerAssumptions),
+    "",
+    "Prompts:",
+    ...previewLines(promptPaths),
+    "",
+    "Triggers:",
+    ...previewTriggerLines(manifest.triggers),
+  ];
+  if (plan.conflicts?.length) {
+    lines.push("", "Conflicts:", ...plan.conflicts.map((item) => `- ${item.path}: ${item.action}`));
+  }
+  if (plan.requiredSecrets?.length) {
+    lines.push("", "Required secrets:", ...plan.requiredSecrets.map((item) => `- ${item.name}`));
+  }
+  if (plan.externalRequirements?.length) {
+    lines.push(
+      "",
+      "External requirements:",
+      ...plan.externalRequirements.map((item) => `- ${item.path}: ${item.reason}`),
+    );
+  }
+  return lines.join("\n");
+}
+
+function previewLines(items = []) {
+  return items.length ? items.map((item) => `- ${item}`) : ["- None"];
+}
+
+function previewProviderLines(items = []) {
+  if (!items.length) return ["- None"];
+  return items.map((item) => {
+    const details = [item.subscription, item.profile && `profile ${item.profile}`, item.model].filter(
+      Boolean,
+    );
+    return `- ${item.agentId}: ${details.join(", ")}`;
+  });
+}
+
+function previewTriggerLines(items = []) {
+  if (!items.length) return ["- None"];
+  return items.map((item) => {
+    if (item.type === "schedule") {
+      return `- schedule: ${item.cron} (${item.timezone})`;
+    }
+    if (item.type === "watch") {
+      return `- watch: ${item.path} ${item.glob} (${item.mode})`;
+    }
+    if (item.type === "webhook") {
+      const details = [item.source, item.enabled === "true" ? "enabled" : "disabled"];
+      if (item.tokenEnv) details.push(`secret ${item.tokenEnv}`);
+      if (item.fanoutPath) details.push(`fanout ${item.fanoutPath}`);
+      return `- webhook ${item.id}: ${details.join(", ")}`;
+    }
+    return `- ${item.type ?? "trigger"}`;
+  });
+}
+
 export default function App() {
   const [workflows, setWorkflows] = useState([]);
   const [promptAgentIds, setPromptAgentIds] = useState([]);
@@ -45,10 +164,27 @@ export default function App() {
   });
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createState, setCreateState] = useState({ saving: false, error: "" });
+  const [exportDialog, setExportDialog] = useState({
+    error: "",
+    outputPath: "",
+    saving: false,
+    workflow: null,
+  });
+  const [workflowTemplates, setWorkflowTemplates] = useState([]);
+  const [historyState, setHistoryState] = useState({
+    diff: null,
+    error: "",
+    loading: false,
+    open: false,
+    revisions: [],
+  });
   const [dirtyWorkflow, setDirtyWorkflow] = useState();
   const [, setSaveState] = useState({ saving: false, error: "" });
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
   const [runPreview, setRunPreview] = useState(null);
+  const [executionMode, setExecutionMode] = useState("local");
+  const [queueState, setQueueState] = useState({ runners: [], runs: [], error: "" });
+  const [retentionSettings, setRetentionSettings] = useState(loadRetentionSettings);
   const [updateState, setUpdateState] = useState({
     available: false,
     checking: false,
@@ -137,6 +273,19 @@ export default function App() {
     }
   }, []);
 
+  const loadWorkflowTemplates = useCallback(async () => {
+    try {
+      const response = await fetch(apiUrl("/workflow-templates"));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setWorkflowTemplates(payload.templates ?? []);
+    } catch {
+      setWorkflowTemplates([]);
+    }
+  }, []);
+
   const loadDoctor = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
       setDoctorState((current) => ({ ...current, loading: true, error: "" }));
@@ -165,26 +314,103 @@ export default function App() {
     }
   }, []);
 
+  const loadQueue = useCallback(async ({ silent = false } = {}) => {
+    try {
+      const response = await fetch(apiUrl("/queue"));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Queue API returned ${response.status}`);
+      }
+      setQueueState({
+        runners: payload.runners ?? [],
+        runs: payload.runs ?? [],
+        error: "",
+      });
+    } catch (error) {
+      if (!silent) {
+        setQueueState((current) => ({
+          ...current,
+          error: error instanceof Error ? error.message : "Unable to load runners",
+        }));
+      }
+    }
+  }, []);
+
   useEffect(() => {
     loadWorkflows();
   }, [loadWorkflows]);
 
   useEffect(() => {
+    loadWorkflowTemplates();
+  }, [loadWorkflowTemplates]);
+
+  useEffect(() => {
     loadDoctor();
-  }, [loadDoctor]);
+    loadQueue();
+  }, [loadDoctor, loadQueue]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       loadWorkflows({ silent: true });
       loadDoctor({ silent: true });
+      loadQueue({ silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [loadDoctor, loadWorkflows]);
+  }, [loadDoctor, loadQueue, loadWorkflows]);
 
   useEffect(() => {
     window.localStorage.setItem("gofer-ui-theme", theme);
   }, [theme]);
+
+  const loadRetentionSettingsForWorkflow = useCallback(async (workflowId) => {
+    if (!workflowId) return;
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/retention`),
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      if (payload.settings) {
+        setRetentionSettings(payload.settings);
+        window.localStorage?.setItem(RETENTION_STORAGE_KEY, JSON.stringify(payload.settings));
+      }
+    } catch {
+      setRetentionSettings(loadRetentionSettings());
+    }
+  }, []);
+
+  const saveRetentionSettingsForWorkflow = useCallback(async (workflowId, nextSettings) => {
+    setRetentionSettings(nextSettings);
+    window.localStorage?.setItem(RETENTION_STORAGE_KEY, JSON.stringify(nextSettings));
+    if (!workflowId) return;
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/retention`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(nextSettings),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      if (payload.settings) {
+        setRetentionSettings(payload.settings);
+        window.localStorage?.setItem(RETENTION_STORAGE_KEY, JSON.stringify(payload.settings));
+      }
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message:
+          error instanceof Error ? error.message : "Unable to save retention settings",
+      });
+    }
+  }, []);
 
   const checkForUpdates = useCallback(async ({ silent = false } = {}) => {
     if (!window.goferUpdates?.check) return;
@@ -329,7 +555,9 @@ export default function App() {
 
   const loadRunLogs = useCallback(async (workflowId, { silent = false } = {}) => {
     try {
-      const response = await fetch(apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs`));
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs?limit=100`),
+      );
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
@@ -363,8 +591,14 @@ export default function App() {
       }));
     }
     try {
+      const params = new URLSearchParams({
+        tailBytes: String(RUN_LOG_TAIL_BYTES),
+        details: silent ? "0" : "1",
+      });
       const response = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs/${encodeURIComponent(runId)}`),
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflowId)}/logs/${encodeURIComponent(runId)}?${params}`,
+        ),
       );
       const payload = await response.json();
       if (!response.ok) {
@@ -377,12 +611,16 @@ export default function App() {
         error: "",
         text: payload.log?.logText ?? "",
         path: payload.log?.logPath ?? null,
-        nodeOutputs: payload.log?.nodeOutputs ?? null,
-        nodeOutputsTruncated: Boolean(payload.log?.nodeOutputsTruncated),
-        nodeOutputsMaxBytes: payload.log?.nodeOutputsMaxBytes ?? null,
-        usageSummary: payload.log?.usageSummary ?? null,
-        runEvents: payload.log?.runEvents ?? [],
-        runNodes: payload.log?.runNodes ?? {},
+        nodeOutputs: silent ? current.nodeOutputs : (payload.log?.nodeOutputs ?? null),
+        nodeOutputsTruncated: silent
+          ? current.nodeOutputsTruncated
+          : Boolean(payload.log?.nodeOutputsTruncated),
+        nodeOutputsMaxBytes: silent
+          ? current.nodeOutputsMaxBytes
+          : (payload.log?.nodeOutputsMaxBytes ?? null),
+        usageSummary: silent ? current.usageSummary : (payload.log?.usageSummary ?? null),
+        runEvents: silent ? current.runEvents : (payload.log?.runEvents ?? []),
+        runNodes: silent ? current.runNodes : (payload.log?.runNodes ?? {}),
         selectedRunId: runId,
       }));
     } catch (error) {
@@ -445,10 +683,17 @@ export default function App() {
       return;
     }
 
-    loadLatestLog(activeWorkflow.id);
+    loadLatestLog(activeWorkflow.id, { silent: true });
     loadRunLogs(activeWorkflow.id);
     loadApprovals(activeWorkflow.id);
-  }, [activeWorkflow?.id, loadApprovals, loadLatestLog, loadRunLogs]);
+    loadRetentionSettingsForWorkflow(activeWorkflow.id);
+  }, [
+    activeWorkflow?.id,
+    loadApprovals,
+    loadLatestLog,
+    loadRetentionSettingsForWorkflow,
+    loadRunLogs,
+  ]);
 
   useEffect(() => {
     if (!activeWorkflow?.id) {
@@ -618,7 +863,8 @@ export default function App() {
       }
 
       const triggerContext = buildRunPreviewTriggerContext(savedWorkflow);
-      const previewRequest = workflowPlanRequest(savedWorkflow.id, triggerContext);
+      const initialParameters = initialWorkflowParameters(savedWorkflow);
+      const previewRequest = workflowPlanRequest(savedWorkflow.id, triggerContext, initialParameters);
       const previewResponse = await fetch(previewRequest.url, previewRequest.options);
       const previewPayload = await previewResponse.json();
       if (!previewResponse.ok) {
@@ -626,7 +872,12 @@ export default function App() {
       }
       setRunState({ running: false, workflowId: savedWorkflow.id, error: "", result: null });
       setLogState((current) => ({ ...current, loading: false }));
-      setRunPreview({ workflow: savedWorkflow, plan: previewPayload.plan, triggerContext });
+      setRunPreview({
+        workflow: savedWorkflow,
+        plan: previewPayload.plan,
+        triggerContext,
+        parameters: initialParameters,
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
       setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
@@ -636,7 +887,7 @@ export default function App() {
     }
   }
 
-  async function executeWorkflowRun(workflow, triggerContext = {}) {
+  async function executeWorkflowRun(workflow, triggerContext = {}, parameters = {}) {
     setRunPreview(null);
     setRunState({ running: true, workflowId: workflow.id, error: "", result: null });
     setLogState((current) => ({
@@ -646,9 +897,37 @@ export default function App() {
       selectedRunId: null,
     }));
     try {
+      if (executionMode === "remote") {
+        const response = await fetch(apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/queue`), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            trigger: "ui",
+            parameters:
+              Object.keys(parameters ?? {}).length > 0
+                ? { triggerContext, workflowParams: parameters }
+                : { triggerContext },
+          }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || `Queue API returned ${response.status}`);
+        }
+        setRunState({ running: false, workflowId: workflow.id, error: "", result: payload.run });
+        setLogState((current) => ({ ...current, loading: false }));
+        setTopBarNotice({
+          type: "success",
+          message: `Queued ${workflow.name} for remote execution`,
+        });
+        loadQueue({ silent: true });
+        return;
+      }
       const runRequest = workflowRunRequest(workflow.id, {
         dryRun: false,
         triggerContext,
+        parameters,
       });
       const response = await fetch(runRequest.url, runRequest.options);
       const payload = await response.json();
@@ -720,6 +999,18 @@ export default function App() {
         type: "success",
         message: decision === "approved" ? "Approval recorded" : "Rejection recorded",
       });
+      setApprovalState((current) => ({
+        ...current,
+        approvals: current.approvals.map((candidate) =>
+          candidate.runId === approval.runId && candidate.nodeId === approval.nodeId
+            ? (payload.approval ?? {
+                ...candidate,
+                status: "decided",
+                decision: { decision, decidedBy: by, notes },
+              })
+            : candidate,
+        ),
+      }));
       loadApprovals(workflow.id, { silent: true });
       loadLatestLog(workflow.id, { silent: true });
       loadRunLogs(workflow.id, { silent: true });
@@ -790,7 +1081,122 @@ export default function App() {
     }
   }
 
-  async function createWorkflow(name) {
+  async function resumeWorkflowRunLog(workflowId, runId, options = {}) {
+    if (!workflowId || !runId) return;
+
+    setRunState({ running: true, workflowId, error: "", result: null, resumingRunId: runId });
+    setLogState((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const request = workflowResumeRequest(workflowId, runId, options);
+      const response = await fetch(request.url, request.options);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setRunState({ running: false, workflowId, error: "", result: payload.run });
+      setLogState({
+        loading: false,
+        error: "",
+        text: payload.run?.logText ?? "",
+        path: payload.run?.logPath ?? null,
+        nodeOutputs: payload.run?.nodeOutputs ?? null,
+        nodeOutputsTruncated: Boolean(payload.run?.nodeOutputsTruncated),
+        nodeOutputsMaxBytes: payload.run?.nodeOutputsMaxBytes ?? null,
+        usageSummary: payload.run?.usageSummary ?? null,
+        runEvents: payload.run?.runEvents ?? [],
+        runNodes: payload.run?.runNodes ?? {},
+        runs: logState.runs,
+        selectedRunId: null,
+      });
+      setTopBarNotice({ type: "success", message: "Workflow run resumed" });
+      loadWorkflows({ silent: true });
+      loadRunLogs(workflowId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to resume workflow run";
+      setRunState({ running: false, workflowId, error: message, result: null });
+      setLogState((current) => ({ ...current, loading: false, error: message }));
+      loadLatestLog(workflowId, { silent: true });
+      loadRunLogs(workflowId, { silent: true });
+    }
+  }
+
+  async function replayWorkflowTriggerLog(workflowId, runId, triggerId = null) {
+    if (!workflowId || !runId) return;
+
+    setRunState({ running: true, workflowId, error: "", result: null, resumingRunId: runId });
+    setLogState((current) => ({ ...current, loading: true, error: "" }));
+    try {
+      const request = workflowReplayTriggerRequest(workflowId, runId, triggerId);
+      const response = await fetch(request.url, request.options);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      const runPayload = payload.trigger?.run ?? payload.run ?? {};
+      setRunState({ running: false, workflowId, error: "", result: runPayload });
+      setLogState({
+        loading: false,
+        error: "",
+        text: runPayload.logText ?? "",
+        path: runPayload.logPath ?? null,
+        nodeOutputs: runPayload.nodeOutputs ?? null,
+        nodeOutputsTruncated: Boolean(runPayload.nodeOutputsTruncated),
+        nodeOutputsMaxBytes: runPayload.nodeOutputsMaxBytes ?? null,
+        usageSummary: runPayload.usageSummary ?? null,
+        runEvents: runPayload.runEvents ?? [],
+        runNodes: runPayload.runNodes ?? {},
+        runs: logState.runs,
+        selectedRunId: null,
+      });
+      setTopBarNotice({ type: "success", message: "Webhook payload replayed" });
+      loadWorkflows({ silent: true });
+      loadRunLogs(workflowId);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to replay webhook payload";
+      setRunState({ running: false, workflowId, error: message, result: null });
+      setLogState((current) => ({ ...current, loading: false, error: message }));
+      loadRunLogs(workflowId, { silent: true });
+    }
+  }
+
+  async function pruneWorkflowRunLogs(workflowId, options = {}) {
+    if (!workflowId) return;
+    const dryRun = options.dryRun !== false;
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/logs/prune`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            dryRun,
+            keepLast: options.keepLast ?? retentionSettings.keepLast,
+            keepDays: options.keepDays ?? retentionSettings.keepDays,
+            keepFailedDays: options.keepFailedDays ?? retentionSettings.keepFailedDays,
+          }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      const count = payload.runs?.length ?? 0;
+      setTopBarNotice({
+        type: dryRun ? "info" : "success",
+        message: dryRun
+          ? `Retention preview: ${count} run${count === 1 ? "" : "s"} would be removed`
+          : `Retention cleanup removed ${count} run${count === 1 ? "" : "s"}`,
+      });
+      loadRunLogs(workflowId, { silent: true });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to prune workflow runs",
+      });
+    }
+  }
+
+  async function createWorkflow(name, options = {}) {
     setCreateState({ saving: true, error: "" });
     try {
       const response = await fetch(apiUrl("/workflows"), {
@@ -798,7 +1204,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ name, template: options.template || undefined }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -832,9 +1238,142 @@ export default function App() {
     }
   }
 
+  async function loadWorkflowHistory(workflowId) {
+    setHistoryState((current) => ({ ...current, error: "", loading: true }));
+    try {
+      const response = await fetch(apiUrl(`/workflows/${encodeURIComponent(workflowId)}/history`));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setHistoryState((current) => ({
+        ...current,
+        error: "",
+        loading: false,
+        revisions: payload.revisions ?? [],
+      }));
+    } catch (error) {
+      setHistoryState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to load workflow history",
+        loading: false,
+      }));
+    }
+  }
+
+  async function openWorkflowHistory(workflow) {
+    if (!workflow?.id) return;
+    setHistoryState({
+      diff: null,
+      error: "",
+      loading: true,
+      open: true,
+      revisions: [],
+    });
+    await loadWorkflowHistory(workflow.id);
+  }
+
+  async function previewWorkflowRevision(workflowId, revisionId) {
+    setHistoryState((current) => ({ ...current, error: "" }));
+    try {
+      const response = await fetch(
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflowId)}/history/${encodeURIComponent(revisionId)}/diff`,
+        ),
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setHistoryState((current) => ({ ...current, diff: payload }));
+    } catch (error) {
+      setHistoryState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to load revision diff",
+      }));
+    }
+  }
+
+  async function restoreWorkflowRevision(workflowId, revisionId, { asCopy = false } = {}) {
+    const action = asCopy ? "restore this revision as a copy" : "restore this revision";
+    if (!window.confirm(`Are you sure you want to ${action}?`)) return;
+    setHistoryState((current) => ({ ...current, error: "", loading: true }));
+    try {
+      const response = await fetch(
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflowId)}/history/${encodeURIComponent(revisionId)}/restore`,
+        ),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ asCopy }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      const restored = summarizeWorkflow(payload.workflow, dataDir);
+      deletedWorkflowIdsRef.current.delete(restored.id);
+      setWorkflows((current) => {
+        const withoutRestored = current.filter((candidate) => candidate.id !== restored.id);
+        return [...withoutRestored, restored];
+      });
+      setActiveWorkflowId(restored.id);
+      setHistoryState((current) => ({ ...current, loading: false, open: false }));
+      setTopBarNotice({
+        type: "success",
+        message: asCopy ? `Restored ${restored.name} as a copy` : `Restored ${restored.name}`,
+      });
+      loadWorkflows({ silent: true });
+    } catch (error) {
+      setHistoryState((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to restore workflow revision",
+        loading: false,
+      }));
+    }
+  }
+
   async function importWorkflow(file) {
     if (!file) return;
     try {
+      if (isBundleFile(file)) {
+        const bundleContent = await fileToBase64(file);
+        const previewResponse = await fetch(apiUrl("/workflows/import/preview"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ bundleContent, filename: file.name }),
+        });
+        const previewPayload = await previewResponse.json();
+        if (!previewResponse.ok) {
+          throw new Error(previewPayload.error || `Workflow API returned ${previewResponse.status}`);
+        }
+        const plan = previewPayload.import;
+        if (!window.confirm(formatBundleImportPreview(plan))) {
+          return;
+        }
+        const importResponse = await fetch(apiUrl("/workflows/import"), {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ bundleContent, filename: file.name }),
+        });
+        const importPayload = await importResponse.json();
+        if (!importResponse.ok) {
+          throw new Error(importPayload.error || `Workflow API returned ${importResponse.status}`);
+        }
+        const imported = importPayload.import;
+        deletedWorkflowIdsRef.current.delete(imported.workflowId);
+        await loadWorkflows({ silent: true });
+        setActiveWorkflowId(imported.workflowId);
+        setTopBarNotice({ type: "success", message: `Imported ${imported.workflowName}` });
+        return;
+      }
+
       const content = await file.text();
       const response = await fetch(apiUrl("/workflows/import"), {
         method: "POST",
@@ -861,11 +1400,53 @@ export default function App() {
     }
   }
 
+  async function exportWorkflow(workflow) {
+    if (!workflow) return;
+    const defaultPath = `${dataDir ? `${dataDir.replace(/\/$/, "")}/` : ""}${workflow.id}.gof.zip`;
+    setExportDialog({
+      error: "",
+      outputPath: defaultPath,
+      saving: false,
+      workflow,
+    });
+  }
+
+  async function confirmExportWorkflow(outputPath) {
+    const workflow = exportDialog.workflow;
+    if (!workflow || !outputPath.trim()) return;
+    setExportDialog((current) => ({ ...current, error: "", saving: true }));
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/export`),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ outputPath: outputPath.trim() }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Workflow API returned ${response.status}`);
+      }
+      setExportDialog({ error: "", outputPath: "", saving: false, workflow: null });
+      setTopBarNotice({ type: "success", message: `Exported bundle to ${payload.bundlePath}` });
+    } catch (error) {
+      setExportDialog((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to export workflow bundle",
+        saving: false,
+      }));
+    }
+  }
+
   async function deleteWorkflow(workflow) {
     if (!workflow) return;
     if (!window.confirm(`Delete workflow "${workflow.name}"?`)) return;
 
     try {
+      setCreateState({ saving: false, error: "" });
       deletedWorkflowIdsRef.current.add(workflow.id);
       saveRevisionRef.current += 1;
       if (dirtyWorkflowRef.current?.id === workflow.id) {
@@ -1043,7 +1624,10 @@ export default function App() {
         workflows={filteredWorkflows}
         width={workflowPaneWidth}
         onQueryChange={setQuery}
-        onCreate={() => setCreateDialogOpen(true)}
+        onCreate={() => {
+          setCreateState({ saving: false, error: "" });
+          setCreateDialogOpen(true);
+        }}
         onDataDirPick={changeDataDir}
         onDeleteWorkflow={deleteWorkflow}
         onDuplicateWorkflow={duplicateWorkflow}
@@ -1071,6 +1655,7 @@ export default function App() {
               workflow={activeWorkflow}
               onCheckForUpdates={() => checkForUpdates()}
               onApplyUpdate={() => applyUpdate(updateState)}
+              onOpenHistory={() => openWorkflowHistory(activeWorkflow)}
               onToggleTheme={() =>
                 setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
               }
@@ -1081,13 +1666,25 @@ export default function App() {
               logState={logState}
               approvalState={approvalState}
               notice={topBarNotice}
+              retentionSettings={retentionSettings}
               runState={runState}
               workflow={activeWorkflow}
               usedAgentIds={usedAgentIds}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
               onStopRunLog={(runId) => stopWorkflowRunLog(activeWorkflow.id, runId)}
+              onResumeRunLog={(runId, options) =>
+                resumeWorkflowRunLog(activeWorkflow.id, runId, options)
+              }
+              onReplayRunLog={(runId, triggerId) =>
+                replayWorkflowTriggerLog(activeWorkflow.id, runId, triggerId)
+              }
+              onPruneRunLogs={(options) => pruneWorkflowRunLogs(activeWorkflow.id, options)}
+              onRetentionSettingsChange={(nextSettings) =>
+                saveRetentionSettingsForWorkflow(activeWorkflow.id, nextSettings)
+              }
               onImportWorkflow={importWorkflow}
+              onExportWorkflow={() => exportWorkflow(activeWorkflow)}
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
               onStopWorkflow={stopWorkflowRun}
@@ -1122,13 +1719,20 @@ export default function App() {
           plan={runPreview.plan}
           workflow={runPreview.workflow}
           onCancel={() => setRunPreview(null)}
-          onRun={() => executeWorkflowRun(runPreview.workflow, runPreview.triggerContext)}
+          initialParameters={runPreview.parameters}
+          onRun={(parameters) =>
+            executeWorkflowRun(runPreview.workflow, runPreview.triggerContext, parameters)
+          }
+          executionMode={executionMode}
+          onExecutionModeChange={setExecutionMode}
+          queueState={queueState}
         />
       ) : null}
       <CreateWorkflowDialog
         error={createState.error}
         open={createDialogOpen}
         saving={createState.saving}
+        templates={workflowTemplates}
         onClose={() => {
           if (!createState.saving) {
             setCreateDialogOpen(false);
@@ -1137,6 +1741,36 @@ export default function App() {
         }}
         onCreate={createWorkflow}
       />
+
+      <ExportWorkflowDialog
+        error={exportDialog.error}
+        open={Boolean(exportDialog.workflow)}
+        outputPath={exportDialog.outputPath}
+        saving={exportDialog.saving}
+        workflow={exportDialog.workflow}
+        onClose={() => {
+          if (!exportDialog.saving) {
+            setExportDialog({ error: "", outputPath: "", saving: false, workflow: null });
+          }
+        }}
+        onExport={confirmExportWorkflow}
+      />
+
+      {historyState.open && activeWorkflow ? (
+        <WorkflowHistoryDialog
+          diff={historyState.diff}
+          error={historyState.error}
+          loading={historyState.loading}
+          revisions={historyState.revisions}
+          workflow={activeWorkflow}
+          onClose={() => setHistoryState((current) => ({ ...current, open: false }))}
+          onRefresh={() => loadWorkflowHistory(activeWorkflow.id)}
+          onPreview={(revisionId) => previewWorkflowRevision(activeWorkflow.id, revisionId)}
+          onRestore={(revisionId, options) =>
+            restoreWorkflowRevision(activeWorkflow.id, revisionId, options)
+          }
+        />
+      ) : null}
     </main>
   );
 }
@@ -1206,6 +1840,7 @@ export function summarizeWorkflow(workflow, dataDir = "") {
     description: `${workflow.nodes.length} nodes, ${workflow.edges.length} edges, ${agentCount} agents.${
       workflow.schedule ? ` Scheduled with ${workflow.schedule.cron_expression}.` : ""
     }${workflow.watch ? ` Watching ${watchPath}.` : ""
+    }${Object.values(workflow.webhooks ?? {}).some((config) => config?.enabled) ? " API trigger enabled." : ""
     }`,
     status,
     tags: [status.toLowerCase(), ...operationTypes.slice(0, 2)],
@@ -1259,6 +1894,7 @@ export function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = 
 export function workflowPayloadForSave(workflow) {
   return {
     ...workflow,
+    filesystemAccess: normalizeWorkflowFilesystemAccess(workflow.filesystemAccess),
     nodes: (workflow.nodes ?? []).map((node) => ({
       ...node,
       x: node.x ?? 0,
@@ -1269,7 +1905,28 @@ export function workflowPayloadForSave(workflow) {
   };
 }
 
-export function workflowPlanRequest(workflowId, triggerContext = {}) {
+export function normalizeWorkflowFilesystemAccess(entries = []) {
+  const seen = new Set();
+  return (entries ?? [])
+    .map((entry) => ({
+      path: String(entry?.path ?? "").trim(),
+      read: true,
+      write: true,
+      execute: false,
+    }))
+    .filter((entry) => {
+      const key = entry.path.replace(/\\/g, "/").replace(/\/+$/, "");
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+}
+
+export function workflowPlanRequest(workflowId, triggerContext = {}, parameters = {}) {
+  const body = { triggerContext };
+  if (Object.keys(parameters ?? {}).length > 0) {
+    body.parameters = parameters;
+  }
   return {
     url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/plan`),
     options: {
@@ -1277,15 +1934,19 @@ export function workflowPlanRequest(workflowId, triggerContext = {}) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ triggerContext }),
+      body: JSON.stringify(body),
     },
   };
 }
 
 export function workflowRunRequest(
   workflowId,
-  { dryRun = false, triggerContext = {} } = {},
+  { dryRun = false, triggerContext = {}, parameters = {} } = {},
 ) {
+  const body = { dryRun, triggerContext };
+  if (Object.keys(parameters ?? {}).length > 0) {
+    body.parameters = parameters;
+  }
   return {
     url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/run`),
     options: {
@@ -1293,18 +1954,60 @@ export function workflowRunRequest(
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ dryRun, triggerContext }),
+      body: JSON.stringify(body),
+    },
+  };
+}
+
+export function workflowResumeRequest(
+  workflowId,
+  runId,
+  { force = false, fromNode = null, onlyNode = null, skipCache = false, triggerContext = {} } = {},
+) {
+  return {
+    url: apiUrl(
+      `/workflows/${encodeURIComponent(workflowId)}/runs/${encodeURIComponent(runId)}/resume`,
+    ),
+    options: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ force, fromNode, onlyNode, skipCache, triggerContext }),
+    },
+  };
+}
+
+export function workflowReplayTriggerRequest(workflowId, runId, triggerId = null) {
+  const encodedWorkflowId = encodeURIComponent(workflowId);
+  const encodedTriggerId = encodeURIComponent(triggerId || "default");
+  return {
+    url: apiUrl(
+      `/workflows/${encodedWorkflowId}/webhooks/${encodedTriggerId}/replay`,
+    ),
+    options: {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ runId }),
     },
   };
 }
 
 export function workflowLogUrls(workflowId, runId = null) {
   const encodedWorkflowId = encodeURIComponent(workflowId);
+  const selectedParams = new URLSearchParams({
+    tailBytes: String(RUN_LOG_TAIL_BYTES),
+    details: "0",
+  });
   return {
     latest: apiUrl(`/workflows/${encodedWorkflowId}/logs/latest`),
     runs: apiUrl(`/workflows/${encodedWorkflowId}/logs`),
     selected: runId
-      ? apiUrl(`/workflows/${encodedWorkflowId}/logs/${encodeURIComponent(runId)}`)
+      ? `${apiUrl(
+          `/workflows/${encodedWorkflowId}/logs/${encodeURIComponent(runId)}`,
+        )}?${selectedParams}`
       : null,
   };
 }
@@ -1693,6 +2396,7 @@ function TopBar({
   workflow,
   onApplyUpdate,
   onCheckForUpdates,
+  onOpenHistory,
   onToggleTheme,
 }) {
   const nodeCount = workflow.nodes?.length ?? 0;
@@ -1754,6 +2458,14 @@ function TopBar({
         ) : null}
         <button
           className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+          title="Workflow history"
+          type="button"
+          onClick={onOpenHistory}
+        >
+          <History size={16} />
+        </button>
+        <button
+          className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
           title={theme === "dark" ? "Light mode" : "Dark mode"}
           type="button"
           onClick={onToggleTheme}
@@ -1778,6 +2490,134 @@ function updateButtonTitle(updateState) {
   if (updateState?.downloaded) return "Restart Gofer Flow and apply the downloaded update";
   if (updateState?.downloading) return "Downloading update";
   return "Download, install, and restart Gofer Flow";
+}
+
+function WorkflowHistoryDialog({
+  diff,
+  error,
+  loading,
+  revisions,
+  workflow,
+  onClose,
+  onPreview,
+  onRefresh,
+  onRestore,
+}) {
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
+      <div className="flex max-h-[86vh] w-full max-w-[920px] flex-col rounded-lg border border-line bg-white shadow-panel">
+        <div className="flex items-center justify-between border-b border-line px-5 py-4">
+          <div className="min-w-0">
+            <h2 className="truncate text-base font-semibold">Workflow history</h2>
+            <p className="truncate text-xs text-muted">
+              {workflow.name} · {workflow.id}
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line text-muted transition hover:bg-slate-50 hover:text-ink"
+              title="Refresh history"
+              type="button"
+              onClick={onRefresh}
+            >
+              <RefreshCw size={16} className={loading ? "animate-spin" : ""} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+              title="Close"
+              type="button"
+              onClick={onClose}
+            >
+              <X size={17} />
+            </button>
+          </div>
+        </div>
+
+        <div className="grid min-h-0 flex-1 grid-cols-[340px_minmax(0,1fr)] overflow-hidden">
+          <div className="workflow-scrollbar min-h-0 overflow-y-auto border-r border-line">
+            {error ? (
+              <div className="border-b border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+                {error}
+              </div>
+            ) : null}
+            {loading && !revisions.length ? (
+              <div className="px-4 py-6 text-sm text-muted">Loading history...</div>
+            ) : null}
+            {!loading && !revisions.length ? (
+              <div className="px-4 py-6 text-sm text-muted">No revisions found.</div>
+            ) : null}
+            {revisions.map((revision) => (
+              <div key={revision.revisionId} className="border-b border-line px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-semibold text-ink">
+                      {formatRevisionDate(revision.createdAt)}
+                    </p>
+                    <p className="mt-0.5 text-xs text-muted">
+                      {revision.source} · {revision.author}
+                    </p>
+                  </div>
+                  <button
+                    className="shrink-0 rounded-md border border-line px-2 py-1 text-[11px] font-medium text-muted transition hover:bg-slate-50 hover:text-ink"
+                    type="button"
+                    onClick={() => onPreview(revision.revisionId)}
+                  >
+                    Diff
+                  </button>
+                </div>
+                <ul className="mt-2 space-y-1 text-xs text-slate-600">
+                  {(revision.summary ?? []).slice(0, 4).map((item) => (
+                    <li key={item}>{item}</li>
+                  ))}
+                </ul>
+                <div className="mt-3 flex gap-2">
+                  <button
+                    className="rounded-md border border-line px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                    type="button"
+                    onClick={() => onRestore(revision.revisionId)}
+                  >
+                    Restore
+                  </button>
+                  <button
+                    className="rounded-md border border-line px-2.5 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+                    type="button"
+                    onClick={() => onRestore(revision.revisionId, { asCopy: true })}
+                  >
+                    Restore as copy
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="min-h-0 overflow-hidden">
+            {diff ? (
+              <div className="flex h-full flex-col">
+                <div className="border-b border-line px-4 py-3">
+                  <p className="text-sm font-semibold">Revision diff</p>
+                  <p className="mt-1 text-xs text-muted">
+                    {(diff.summary ?? []).join("; ") || "No material changes"}
+                  </p>
+                </div>
+                <pre className="workflow-scrollbar min-h-0 flex-1 overflow-auto bg-[#0f172a] p-4 text-xs leading-5 text-slate-100">
+                  {diff.tomlDiff || "No TOML diff."}
+                </pre>
+              </div>
+            ) : (
+              <div className="grid h-full place-items-center px-8 text-center text-sm text-muted">
+                Select a revision diff to inspect TOML and graph-level changes.
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatRevisionDate(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString();
 }
 
 function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows }) {
@@ -2754,7 +3594,55 @@ function buildRunPreviewTriggerContext(workflow) {
   return triggerContext;
 }
 
-export function RunPreviewDialog({ plan, workflow, onCancel, onRun }) {
+function initialWorkflowParameters(workflow) {
+  const values = {};
+  for (const [name, spec] of Object.entries(workflow.parameters ?? {})) {
+    if (spec.default !== undefined && spec.default !== null) {
+      values[name] = spec.default;
+    } else if (spec.type === "boolean") {
+      values[name] = false;
+    } else {
+      values[name] = "";
+    }
+  }
+  return values;
+}
+
+function validateWorkflowParameters(workflow, values) {
+  const errors = {};
+  for (const [name, spec] of Object.entries(workflow.parameters ?? {})) {
+    const value = values[name];
+    if (spec.required && (value === undefined || value === null || value === "")) {
+      errors[name] = "Required";
+      continue;
+    }
+    if (value === undefined || value === null || value === "") continue;
+    if (spec.type === "number" && Number.isNaN(Number(value))) {
+      errors[name] = "Enter a number";
+    }
+    if (spec.type === "enum" && Array.isArray(spec.choices) && !spec.choices.includes(value)) {
+      errors[name] = "Choose a valid option";
+    }
+  }
+  return errors;
+}
+
+export function RunPreviewDialog({
+  plan,
+  workflow,
+  onCancel,
+  onRun,
+  initialParameters = {},
+  executionMode = "local",
+  onExecutionModeChange = () => {},
+  queueState = { runners: [] },
+}) {
+  const parameterSchema = workflow.parameters ?? {};
+  const [parameters, setParameters] = useState(() => ({
+    ...initialWorkflowParameters(workflow),
+    ...initialParameters,
+  }));
+  const [parameterErrors, setParameterErrors] = useState({});
   const warnings = plan?.warnings ?? [];
   const destructiveActions = plan?.destructiveActions ?? [];
   const providers = plan?.providerRequirements ?? [];
@@ -2794,16 +3682,43 @@ export function RunPreviewDialog({ plan, workflow, onCancel, onRun }) {
           {triggerItems.length > 0 ? (
             <PreviewSection title="Trigger context" items={triggerItems} />
           ) : null}
+          {Object.keys(parameterSchema).length > 0 ? (
+            <section>
+              <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
+                Run parameters
+              </h3>
+              <div className="space-y-3 rounded-lg border border-line bg-slate-50 p-3">
+                {Object.entries(parameterSchema).map(([name, spec]) => (
+                  <RunParameterField
+                    key={name}
+                    name={name}
+                    spec={spec}
+                    value={parameters[name]}
+                    error={parameterErrors[name]}
+                    onChange={(value) =>
+                      setParameters((current) => ({ ...current, [name]: value }))
+                    }
+                  />
+                ))}
+              </div>
+            </section>
+          ) : null}
           {providers.length > 0 ? (
             <PreviewSection
               title="Provider CLI requirements"
               items={providers.map((provider) => {
+                const profile = provider.profile ? ` profile=${provider.profile}` : "";
+                const model = provider.model ? ` model=${provider.model}` : "";
+                const timeout =
+                  provider.timeout !== undefined && provider.timeout !== null
+                    ? ` timeout=${provider.timeout}s`
+                    : "";
                 const extraPaths = provider.extraPaths?.length
                   ? ` extra_paths=${provider.extraPaths.join(", ")}`
                   : "";
                 const binary = provider.binary ?? "unknown";
                 const availability = provider.available ? "available" : "missing";
-                return `${provider.agentId}: ${provider.subscription} binary=${binary} (${availability}) cwd=${provider.workingDir}${extraPaths}`;
+                return `${provider.agentId}: ${provider.subscription} binary=${binary} (${availability}) cwd=${provider.workingDir}${profile}${model}${timeout}${extraPaths}`;
               })}
             />
           ) : null}
@@ -2814,6 +3729,39 @@ export function RunPreviewDialog({ plan, workflow, onCancel, onRun }) {
               items={unresolvedValues}
             />
           ) : null}
+
+          <section>
+            <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
+              Execution target
+            </h3>
+            <div className="inline-flex rounded-lg border border-line bg-slate-50 p-1">
+              <button
+                className={`rounded-md px-3 py-1.5 text-sm ${
+                  executionMode === "local" ? "bg-white font-semibold shadow-sm" : "text-muted"
+                }`}
+                type="button"
+                onClick={() => onExecutionModeChange("local")}
+              >
+                Local
+              </button>
+              <button
+                className={`rounded-md px-3 py-1.5 text-sm ${
+                  executionMode === "remote" ? "bg-white font-semibold shadow-sm" : "text-muted"
+                }`}
+                type="button"
+                onClick={() => onExecutionModeChange("remote")}
+              >
+                Remote
+              </button>
+            </div>
+            {executionMode === "remote" ? (
+              <p className="mt-2 text-xs text-muted">
+                {(queueState.runners ?? []).length
+                  ? `${queueState.runners.length} runner${queueState.runners.length === 1 ? "" : "s"} registered`
+                  : "No runners registered yet"}
+              </p>
+            ) : null}
+          </section>
 
           <section>
             <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
@@ -2901,14 +3849,99 @@ export function RunPreviewDialog({ plan, workflow, onCancel, onRun }) {
           <button
             className="btn-primary inline-flex items-center justify-center gap-2 whitespace-nowrap"
             type="button"
-            onClick={onRun}
+            onClick={() => {
+              const errors = validateWorkflowParameters(workflow, parameters);
+              setParameterErrors(errors);
+              if (Object.keys(errors).length === 0) {
+                onRun(parameters);
+              }
+            }}
           >
-            <Play size={15} />
             Run workflow
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+function RunParameterField({ error, name, onChange, spec, value }) {
+  const id = `run-param-${name}`;
+  const label = spec.label || name;
+  const commonClass =
+    "mt-1 w-full rounded-md border border-line bg-white px-3 py-2 text-sm outline-none focus:border-teal-500";
+  const inputType =
+    spec.type === "number"
+      ? "number"
+      : spec.type === "date"
+        ? "date"
+        : spec.type === "time"
+          ? "time"
+          : spec.type === "datetime"
+            ? "datetime-local"
+            : spec.type === "secret"
+              ? "password"
+              : "text";
+  return (
+    <label className="block text-sm" htmlFor={id}>
+      <span className="font-medium">
+        {label}
+        {spec.required ? <span className="text-rose-600"> *</span> : null}
+      </span>
+      {spec.description ? (
+        <span className="mt-0.5 block text-xs text-muted">{spec.description}</span>
+      ) : null}
+      {spec.type === "boolean" ? (
+        <input
+          id={id}
+          className="mt-2 h-4 w-4 rounded border-line"
+          type="checkbox"
+          checked={Boolean(value)}
+          onChange={(event) => onChange(event.target.checked)}
+        />
+      ) : spec.type === "enum" ? (
+        <select
+          id={id}
+          className={commonClass}
+          value={value ?? ""}
+          onChange={(event) => onChange(event.target.value)}
+        >
+          <option value="">Select...</option>
+          {(spec.choices ?? []).map((choice) => (
+            <option key={String(choice)} value={choice}>
+              {String(choice)}
+            </option>
+          ))}
+        </select>
+      ) : spec.type === "text" || spec.type === "multiline" ? (
+        <textarea
+          id={id}
+          className={`${commonClass} min-h-24 resize-y`}
+          value={value ?? ""}
+          onChange={(event) => onChange(event.target.value)}
+        />
+      ) : (
+        <input
+          id={id}
+          className={commonClass}
+          type={inputType}
+          value={value ?? ""}
+          min={spec.min}
+          max={spec.max}
+          pattern={spec.pattern}
+          onChange={(event) => {
+            const nextValue = spec.type === "number" ? event.target.value : event.target.value;
+            onChange(nextValue);
+          }}
+        />
+      )}
+      {spec.type === "file" || spec.type === "folder" ? (
+        <span className="mt-1 block text-xs text-muted">
+          Enter a path accessible to the runner.
+        </span>
+      ) : null}
+      {error ? <span className="mt-1 block text-xs text-rose-700">{error}</span> : null}
+    </label>
   );
 }
 
@@ -2932,12 +3965,18 @@ function PreviewSection({ title, items, tone = "default" }) {
   );
 }
 
-function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
+function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreate }) {
   const [name, setName] = useState("");
+  const [mode, setMode] = useState("blank");
+  const [templateName, setTemplateName] = useState("");
+
+  const selectedTemplate = templates.find((item) => item.name === templateName) ?? null;
 
   useEffect(() => {
     if (open) {
       setName("");
+      setMode("blank");
+      setTemplateName("");
     }
   }, [open]);
 
@@ -2945,13 +3984,13 @@ function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
 
   function handleSubmit(event) {
     event.preventDefault();
-    onCreate(name);
+    onCreate(name, { template: mode === "template" ? templateName : "" });
   }
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
       <form
-        className="w-full max-w-[420px] rounded-lg border border-line bg-white shadow-panel"
+        className="w-full max-w-[560px] rounded-lg border border-line bg-white shadow-panel"
         onSubmit={handleSubmit}
       >
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
@@ -2970,7 +4009,32 @@ function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
           </button>
         </div>
 
-        <div className="space-y-3 px-5 py-5">
+        <div className="space-y-4 px-5 py-5">
+          <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1">
+            <button
+              className={`h-9 rounded-md text-sm font-medium transition ${
+                mode === "blank" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
+              }`}
+              disabled={saving}
+              type="button"
+              onClick={() => setMode("blank")}
+            >
+              Blank
+            </button>
+            <button
+              className={`h-9 rounded-md text-sm font-medium transition ${
+                mode === "template" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
+              }`}
+              disabled={saving}
+              type="button"
+              onClick={() => {
+                setMode("template");
+                setTemplateName((current) => current || templates[0]?.name || "");
+              }}
+            >
+              Template
+            </button>
+          </div>
           <label className="block">
             <span className="text-xs font-medium text-muted">Name</span>
             <input
@@ -2980,6 +4044,151 @@ function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
               placeholder="Daily Analysis"
               value={name}
               onChange={(event) => setName(event.target.value)}
+            />
+          </label>
+          {mode === "template" ? (
+            <>
+              <label className="block">
+                <span className="text-xs font-medium text-muted">Template</span>
+                <select
+                  className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500"
+                  disabled={saving}
+                  value={templateName}
+                  onChange={(event) => setTemplateName(event.target.value)}
+                >
+                  <option value="" disabled>
+                    Select a template
+                  </option>
+                  {templates.map((template) => (
+                    <option key={template.name} value={template.name}>
+                      {template.title}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedTemplate ? (
+                <div className="rounded-lg border border-line bg-slate-50 px-3 py-3 text-sm">
+                  <div className="font-medium text-ink">{selectedTemplate.purpose}</div>
+                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                    <TemplatePreviewList
+                      title="Inputs"
+                      items={(selectedTemplate.required_inputs ?? []).map(
+                        (item) => `${item.name} (${item.type ?? "string"})`,
+                      )}
+                    />
+                    <TemplatePreviewList
+                      title="Providers"
+                      items={(selectedTemplate.provider_assumptions ?? []).map(
+                        (item) => `${item.agentId}: ${item.subscription}`,
+                      )}
+                    />
+                    <TemplatePreviewList
+                      title="Nodes"
+                      items={(selectedTemplate.generated_nodes ?? []).map(
+                        (item) => `${item.id} (${item.type})`,
+                      )}
+                    />
+                    <TemplatePreviewList
+                      title="Assets"
+                      items={(selectedTemplate.assets ?? []).map((item) => item.path)}
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                  Template previews are unavailable.
+                </div>
+              )}
+            </>
+          ) : null}
+          {error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
+              {error}
+            </div>
+          ) : null}
+        </div>
+
+        <div className="flex items-center justify-end gap-2 border-t border-line px-5 py-4">
+          <button
+            className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={saving}
+            type="button"
+            onClick={onClose}
+          >
+            Cancel
+          </button>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
+            disabled={saving || (mode === "blank" && !name.trim()) || (mode === "template" && !templateName)}
+            type="submit"
+          >
+            {saving ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
+            Create
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+function ExportWorkflowDialog({
+  error,
+  open,
+  outputPath,
+  saving,
+  workflow,
+  onClose,
+  onExport,
+}) {
+  const [draftPath, setDraftPath] = useState(outputPath || "");
+
+  useEffect(() => {
+    if (open) {
+      setDraftPath(outputPath || "");
+    }
+  }, [open, outputPath]);
+
+  if (!open) return null;
+
+  function handleSubmit(event) {
+    event.preventDefault();
+    onExport(draftPath);
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
+      <form
+        className="w-full max-w-[600px] rounded-lg border border-line bg-white shadow-panel"
+        onSubmit={handleSubmit}
+      >
+        <div className="flex items-center justify-between border-b border-line px-5 py-4">
+          <div>
+            <h2 className="text-base font-semibold">Export workflow bundle</h2>
+            <p className="text-xs text-muted">
+              {workflow?.name ? `Create a portable bundle for ${workflow.name}` : "Create a portable workflow bundle"}
+            </p>
+          </div>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            disabled={saving}
+            title="Close"
+            type="button"
+            onClick={onClose}
+          >
+            <X size={17} />
+          </button>
+        </div>
+
+        <div className="space-y-4 px-5 py-5">
+          <label className="block">
+            <span className="text-xs font-medium text-muted">Output path</span>
+            <input
+              autoFocus
+              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
+              disabled={saving}
+              placeholder="/path/to/workflow.gof.zip"
+              value={draftPath}
+              onChange={(event) => setDraftPath(event.target.value)}
             />
           </label>
           {error ? (
@@ -3000,14 +4209,29 @@ function CreateWorkflowDialog({ error, open, saving, onClose, onCreate }) {
           </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={saving || !name.trim()}
+            disabled={saving || !draftPath.trim()}
+            title="Confirm workflow export"
             type="submit"
           >
-            {saving ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-            Create
+            {saving ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+            Export
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+function TemplatePreviewList({ title, items }) {
+  const visibleItems = items?.length ? items.slice(0, 4) : ["None"];
+  return (
+    <div>
+      <div className="text-xs font-semibold text-muted">{title}</div>
+      <ul className="mt-1 space-y-1 text-xs leading-5 text-slate-700">
+        {visibleItems.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
     </div>
   );
 }
@@ -3043,11 +4267,25 @@ function WorkflowHealthPanel({ doctorState, workflow }) {
   const globalWarnings = doctorState?.warnings ?? [];
   const workflowErrors = workflow?.healthErrors ?? [];
   const workflowWarnings = workflow?.healthWarnings ?? [];
-  const errors = [...globalErrors, ...workflowErrors];
-  const warnings = [...globalWarnings, ...workflowWarnings];
+  const validationErrors = workflow?.validationErrors ?? [];
+  const validationWarnings = workflow?.validationWarnings ?? [];
+  const errors = [...globalErrors, ...workflowErrors, ...validationErrors];
+  const warnings = [...globalWarnings, ...workflowWarnings, ...validationWarnings];
   const diagnostics = [...errors, ...warnings].filter((diagnostic) =>
     diagnostic?.severity === "error" || diagnostic?.severity === "warning",
   );
+  const diagnosticKey = diagnostics
+    .map((diagnostic) =>
+      [
+        diagnostic.id,
+        diagnostic.subject ?? "",
+        diagnostic.severity,
+        diagnostic.message,
+      ].join(":"),
+    )
+    .join("|");
+  const [dismissedDiagnosticKey, setDismissedDiagnosticKey] = useState("");
+  const [dismissedDoctorError, setDismissedDoctorError] = useState("");
   if (doctorState?.loading && !diagnostics.length) {
     return (
       <section className="border-b border-line bg-white px-5 py-2">
@@ -3059,24 +4297,32 @@ function WorkflowHealthPanel({ doctorState, workflow }) {
     );
   }
   if (doctorState?.error && !diagnostics.length) {
+    if (dismissedDoctorError === doctorState.error) {
+      return null;
+    }
     return (
       <section className="border-b border-amber-200 bg-amber-50 px-5 py-2">
         <div className="flex items-center gap-2 text-sm text-amber-800">
-          <AlertCircle size={15} />
-          <span>{doctorState.error}</span>
+          <AlertCircle size={15} className="shrink-0" />
+          <span className="min-w-0 flex-1">{doctorState.error}</span>
+          <button
+            type="button"
+            className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-amber-800 transition hover:bg-amber-100 hover:text-amber-950"
+            title="Hide environment warning"
+            aria-label="Hide environment warning"
+            onClick={() => setDismissedDoctorError(doctorState.error)}
+          >
+            <X size={16} />
+          </button>
         </div>
       </section>
     );
   }
   if (!diagnostics.length) {
-    return (
-      <section className="border-b border-line bg-white px-5 py-2">
-        <div className="flex items-center gap-2 text-sm text-emerald-700">
-          <Check size={15} />
-          <span>Environment health checks passed.</span>
-        </div>
-      </section>
-    );
+    return null;
+  }
+  if (diagnostics.length && dismissedDiagnosticKey === diagnosticKey) {
+    return null;
   }
 
   const errorCount = errors.length;
@@ -3108,6 +4354,19 @@ function WorkflowHealthPanel({ doctorState, workflow }) {
             </p>
           ) : null}
         </div>
+        <button
+          type="button"
+          className={`grid h-7 w-7 shrink-0 place-items-center rounded-md transition ${
+            errorCount
+              ? "text-red-700 hover:bg-red-100 hover:text-red-900"
+              : "text-amber-800 hover:bg-amber-100 hover:text-amber-950"
+          }`}
+          title="Hide environment warning"
+          aria-label="Hide environment warning"
+          onClick={() => setDismissedDiagnosticKey(diagnosticKey)}
+        >
+          <X size={16} />
+        </button>
       </div>
     </section>
   );

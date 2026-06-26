@@ -452,6 +452,41 @@ body = "Workflow complete"
     assert "D-Bus" in warnings[0]["message"]
 
 
+def test_desktop_notification_health_passes_on_windows_with_powershell(monkeypatch) -> None:
+    def fake_which(binary: str) -> str | None:
+        if binary == "powershell.exe":
+            return "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+        return f"/bin/{binary}"
+
+    monkeypatch.setattr("gofer.core.health.sys.platform", "win32")
+    monkeypatch.setattr("gofer.core.health.shutil.which", fake_which)
+
+    payload = run_health_checks().to_dict()
+
+    assert any(
+        item["id"] == "desktop.notifications"
+        and item["severity"] == "ok"
+        and item["subject"] == "Windows"
+        and "PowerShell" in item["message"]
+        for item in payload["diagnostics"]
+    )
+    assert not any(item["id"] == "desktop.notifications" for item in payload["warnings"])
+
+
+def test_desktop_notification_health_warns_on_windows_without_powershell(monkeypatch) -> None:
+    monkeypatch.setattr("gofer.core.health.sys.platform", "win32")
+    monkeypatch.setattr("gofer.core.health.shutil.which", lambda _binary: None)
+
+    payload = run_health_checks().to_dict()
+
+    assert any(
+        item["id"] == "desktop.notifications"
+        and item["severity"] == "warning"
+        and "PowerShell" in item["message"]
+        for item in payload["warnings"]
+    )
+
+
 def test_workflow_health_catches_open_resource_auto_local_paths(
     monkeypatch,
     tmp_path: Path,
