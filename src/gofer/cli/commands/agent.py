@@ -16,6 +16,7 @@ from gofer.core.agent import (
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
+from gofer.subscriptions.direct_api import AnthropicApiSubscription, OpenAiApiSubscription
 from gofer.utils.agent_helpers import resolve_prompt, unique_agent_id
 from gofer.utils.paths import get_data_dir
 from gofer.utils.registry import find_agent, find_workflow, list_all_agents
@@ -26,6 +27,8 @@ console = Console()
 _SUBSCRIPTIONS = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
+    "openai_api": OpenAiApiSubscription(),
+    "anthropic_api": AnthropicApiSubscription(),
 }
 _SUBSCRIPTION_CHOICES = list(_SUBSCRIPTIONS)
 

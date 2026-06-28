@@ -17,6 +17,7 @@ from gofer.core.operations import (
     FileOperation,
     FolderOperation,
     HttpRequestOperation,
+    HttpRetryPolicy,
     LocalSearchOperation,
     LocalVectorizeOperation,
     LoopOperation,
@@ -54,9 +55,7 @@ def test_python_script_roundtrip() -> None:
 
 
 def test_shell_script_roundtrip() -> None:
-    op = ShellScriptOperation(
-        type=OperationType.SHELL_SCRIPT, script_path=Path("/tmp/bar.sh")
-    )
+    op = ShellScriptOperation(type=OperationType.SHELL_SCRIPT, script_path=Path("/tmp/bar.sh"))
     parsed = adapter.validate_python(op.model_dump())
     assert isinstance(parsed, ShellScriptOperation)
 
@@ -159,6 +158,22 @@ def test_file_io_operations_roundtrip() -> None:
             type=OperationType.NOTIFICATION,
             title="Deploy",
             body="Workflow finished",
+            channel="slack",
+            webhook_url="{{secret.SLACK_WEBHOOK_URL}}",
+            headers={"Authorization": "{{secret.API_TOKEN}}"},
+            payload={"text": "Deploy finished"},
+            retry=HttpRetryPolicy(attempts=2, backoff_seconds=0.1),
+        ),
+        NotificationOperation(
+            type=OperationType.NOTIFICATION,
+            title="Email",
+            body="Workflow finished",
+            channel="email",
+            email_from="gofer@example.test",
+            email_to=["ops@example.test"],
+            smtp_host="smtp.example.test",
+            smtp_username="{{secret.SMTP_USERNAME}}",
+            smtp_password="{{secret.SMTP_PASSWORD}}",
         ),
     ]
 

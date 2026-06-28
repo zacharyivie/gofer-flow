@@ -48,6 +48,7 @@ If the surrounding assistant prompt provides a "Gofer Flow CLI" executable path,
 - Use `prompt_file` nodes when a workflow should generate or refresh reusable prompt files from templates and variables.
 - Use `common_llm_task` nodes for standard review/summarize/explain/extract/rewrite/classify work instead of creating a bespoke prompt file.
 - Use `local_vectorize` followed by `local_search` when a workflow needs offline local search over files before an agent step.
+- Use dashboard CLI commands and `dashboard_item` nodes when workflows need durable, human-editable structured state. Do not manually edit dashboard JSON files unless there is no CLI/API alternative.
 - Use `skill_name` on an `agent` node when the user wants to invoke a Codex/Claude Code skill directly. The agent prompt becomes `/skill_name`, so `prompt_path` can be omitted on that node.
 - Use `--memory run` when an agent node should keep a continuous conversation only within one workflow run. Use `--memory all` when it should remember prior executions across future workflow runs. Leave the default `--memory none` for independent calls.
 - Never require real LLM provider CLIs in tests; validate with `--dry-run`.
@@ -168,6 +169,76 @@ Watcher mode guidance:
 - `batch`: one workflow run receives all changed files in `trigger.events`.
 - `queue`: one workflow run per changed file; each run gets one event in `trigger.event` and `trigger.events[0]`.
 - `fanout`: one workflow run receives all changed files and should usually use a `loop` node with `source = { type = "trigger_events" }` before the agent node.
+
+## Dashboards
+
+Dashboards are durable local JSON artifacts under the Gofer data directory and are meant to be changed through `gof dashboard` commands or the UI. They contain sections, components, schemas, views, and JSON-backed items. Component IDs are the stable references workflows should use.
+
+Useful commands:
+
+```bash
+gof dashboard list
+gof dashboard create "Dev Dashboard"
+gof dashboard section add "Dev Dashboard" "Ticket Board"
+gof dashboard component add-board "Dev Dashboard" "Ticket Board" "Tickets"
+gof dashboard component schema set "Dev Dashboard" tickets '{"title":"string","status":{"type":"enum","values":["backlog","todo","in_progress","completed"]}}'
+gof dashboard component views set "Dev Dashboard" tickets '[{"title":"Backlog","filter":{"field":"status","operator":"equals","value":"backlog"}}]'
+gof dashboard item add "Dev Dashboard" tickets '{"title":"Review ticket","status":"backlog"}'
+gof dashboard item list "Dev Dashboard" tickets --filter 'status=backlog' --json
+gof dashboard item update "Dev Dashboard" tickets <item-id> '{"status":"in_progress"}'
+gof dashboard item move "Dev Dashboard" tickets <item-id> completed
+gof dashboard item delete "Dev Dashboard" tickets <item-id>
+```
+
+Use the workflow CLI when adding dashboard nodes for users:
+
+```bash
+gof workflow add-node review.toml --id read-backlog --type dashboard_item --dashboard "Dev Dashboard" --component tickets --dashboard-action read --filter 'status=backlog'
+gof workflow add-node review.toml --id complete-ticket --type dashboard_item --dashboard "Dev Dashboard" --component tickets --dashboard-action move --item-id '{{read-backlog.items.0.id}}' --field status --value-json '"completed"'
+```
+
+Workflow nodes can read and mutate dashboard component items:
+
+```toml
+[[nodes]]
+id = "read-backlog"
+type = "dashboard_item"
+action = "read"
+dashboard = "Dev Dashboard"
+component = "tickets"
+filter = "status=backlog"
+
+[[nodes]]
+id = "complete-ticket"
+type = "dashboard_item"
+action = "move"
+dashboard = "Dev Dashboard"
+component = "tickets"
+item_id = "{{read-backlog.items.0.id}}"
+field = "status"
+value = "completed"
+```
+
+`read` returns matching JSON items in `items`, `value`, and `data.items`. `add`, `update`, `delete`, and `move` return the affected item in `value` and `data.item`.
+
+Agent nodes can also write structured dashboard updates when the workflow declares the allowed target:
+
+```toml
+[[nodes]]
+id = "review-ticket"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+prompt_path = "prompts/review.md"
+
+[[nodes.dashboard_updates]]
+action = "add"
+dashboard = "Dev Dashboard"
+component = "tickets"
+source = "data.dashboard_update"
+```
+
+The agent should emit JSON such as `{"dashboard_update":{"item":{"title":"Reviewed","status":"completed"}}}`. Keep dashboard/component targets in workflow config so agent output cannot freely choose arbitrary local dashboard state.
 
 Recursive safety:
 

@@ -12,7 +12,8 @@ from typing import Any, cast
 
 import tomli_w
 
-from gofer.core.workflow import AgenticWorkflow, validate_workflow_id
+from gofer.core.resources import ResourceLimits, bundle_resource_limits_from_env
+from gofer.core.workflow import AgenticWorkflow, WebhookTriggerConfig, validate_workflow_id
 
 BUNDLE_FORMAT_VERSION = 1
 MANIFEST_PATH = "manifest.json"
@@ -145,6 +146,7 @@ class BundleImportPlan:
     external_requirements: list[dict[str, str]]
     required_secrets: list[dict[str, str]]
     path_rewrites: dict[str, str] = field(default_factory=dict)
+    risk_warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -158,7 +160,14 @@ class BundleImportPlan:
             "externalRequirements": self.external_requirements,
             "requiredSecrets": self.required_secrets,
             "pathRewrites": self.path_rewrites,
+            "riskWarnings": self.risk_warnings,
         }
+
+
+@dataclass(frozen=True)
+class _ValidatedBundleArchive:
+    names: tuple[str, ...]
+    info_by_name: dict[str, zipfile.ZipInfo]
 
 
 def export_workflow_bundle(
@@ -209,8 +218,18 @@ def export_workflow_bundle(
     return manifest
 
 
-def preview_workflow_bundle(bundle_path: Path, *, data_dir: Path | None = None) -> BundleImportPlan:
-    return _build_import_plan(bundle_path, _data_dir(data_dir), replace=False)
+def preview_workflow_bundle(
+    bundle_path: Path,
+    *,
+    data_dir: Path | None = None,
+    limits: ResourceLimits | None = None,
+) -> BundleImportPlan:
+    return _build_import_plan(
+        bundle_path,
+        _data_dir(data_dir),
+        replace=False,
+        limits=limits or bundle_resource_limits_from_env(),
+    )
 
 
 def import_workflow_bundle(
@@ -219,20 +238,23 @@ def import_workflow_bundle(
     data_dir: Path | None = None,
     replace: bool = False,
     dry_run: bool = False,
+    limits: ResourceLimits | None = None,
 ) -> BundleImportPlan:
     base = _data_dir(data_dir)
-    plan = _build_import_plan(bundle_path, base, replace=replace)
+    active_limits = limits or bundle_resource_limits_from_env()
+    plan = _build_import_plan(bundle_path, base, replace=replace, limits=active_limits)
     if dry_run:
         return plan
     base.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(bundle_path) as archive:
-        _validate_archive_entries(archive)
-        workflow_data = _workflow_data_for_import(archive, plan)
+        validated = _validate_archive_entries(archive, active_limits)
+        workflow_data = _workflow_data_for_import(archive, plan, validated, active_limits)
+        archived_names = validated.names
         for item in plan.manifest.included_paths:
             archive_path = item["archivePath"]
             original_path = item["path"]
             target_rel = plan.path_rewrites.get(original_path, original_path)
-            for name in archive.namelist():
+            for name in archived_names:
                 if name == archive_path or name.startswith(f"{archive_path.rstrip('/')}/"):
                     if name.endswith("/"):
                         continue
@@ -252,16 +274,24 @@ def import_workflow_bundle(
     return plan
 
 
-def _build_import_plan(bundle_path: Path, base: Path, *, replace: bool) -> BundleImportPlan:
+def _build_import_plan(
+    bundle_path: Path,
+    base: Path,
+    *,
+    replace: bool,
+    limits: ResourceLimits,
+) -> BundleImportPlan:
     if not bundle_path.exists():
         raise BundleError(f"{bundle_path} not found")
     with zipfile.ZipFile(bundle_path) as archive:
-        _validate_archive_entries(archive)
-        manifest = BundleManifest.from_dict(json.loads(archive.read(MANIFEST_PATH)))
+        validated = _validate_archive_entries(archive, limits)
+        manifest = BundleManifest.from_dict(
+            json.loads(_read_archive_text(archive, MANIFEST_PATH, validated, limits))
+        )
         if manifest.format_version != BUNDLE_FORMAT_VERSION:
             raise BundleError(f"Unsupported bundle format version {manifest.format_version}")
-        raw = tomllib.loads(archive.read(WORKFLOW_PATH).decode("utf-8"))
-        archived_asset_files = _archived_asset_files(archive, manifest)
+        raw = tomllib.loads(_read_archive_text(archive, WORKFLOW_PATH, validated, limits))
+        archived_asset_files = _archived_asset_files(validated, manifest)
     workflow = AgenticWorkflow.from_dict(raw)
     requested_id = workflow.config.id
     workflow_id = requested_id if replace else _available_workflow_id(requested_id, base)
@@ -318,19 +348,19 @@ def _build_import_plan(bundle_path: Path, base: Path, *, replace: bool) -> Bundl
         external_requirements=manifest.external_requirements,
         required_secrets=manifest.required_secrets,
         path_rewrites=path_rewrites,
+        risk_warnings=_import_risk_warnings(workflow),
     )
 
 
 def _archived_asset_files(
-    archive: zipfile.ZipFile,
+    archive: _ValidatedBundleArchive,
     manifest: BundleManifest,
 ) -> list[tuple[dict[str, str], str | None]]:
-    archived_names = archive.namelist()
     files: list[tuple[dict[str, str], str | None]] = []
     for item in manifest.included_paths:
         archive_path = _safe_relative_path(item["archivePath"])
         matched = False
-        for name in archived_names:
+        for name in archive.names:
             if name.endswith("/"):
                 continue
             if name == archive_path:
@@ -349,8 +379,10 @@ def _archived_asset_files(
 def _workflow_data_for_import(
     archive: zipfile.ZipFile,
     plan: BundleImportPlan,
+    validated: _ValidatedBundleArchive,
+    limits: ResourceLimits,
 ) -> dict[str, Any]:
-    raw = tomllib.loads(archive.read(WORKFLOW_PATH).decode("utf-8"))
+    raw = tomllib.loads(_read_archive_text(archive, WORKFLOW_PATH, validated, limits))
     raw.setdefault("workflow", {})["id"] = plan.workflow_id
     raw["workflow"]["name"] = plan.workflow_name
     if plan.path_rewrites:
@@ -469,9 +501,13 @@ def _required_secrets(
     workflow: AgenticWorkflow,
     included: list[BundlePath],
 ) -> list[dict[str, str]]:
-    names: set[str] = set()
+    sources: dict[str, set[str]] = {}
+
+    def add(name: str, source: str) -> None:
+        sources.setdefault(name, set()).add(source)
+
     for match in SECRET_TOKEN_PATTERN.finditer(json.dumps(data, sort_keys=True)):
-        names.add(match.group(1) or match.group(2))
+        add(match.group(1) or match.group(2), "workflow.toml")
     for item in included:
         if item.source.is_dir():
             paths = [path for path in item.source.rglob("*") if path.is_file()]
@@ -483,13 +519,19 @@ def _required_secrets(
             except UnicodeDecodeError:
                 continue
             for match in SECRET_TOKEN_PATTERN.finditer(text):
-                names.add(match.group(1) or match.group(2))
+                add(match.group(1) or match.group(2), item.workflow_path)
     for trigger in workflow.config.webhooks.values():
         if trigger.token_env:
-            names.add(trigger.token_env)
+            add(trigger.token_env, f"trigger:{trigger.id}.token_env")
     for name in _required_env_secret_names(data):
-        names.add(name)
-    return [{"name": name, "description": "Required by bundled workflow"} for name in sorted(names)]
+        add(name, "workflow.toml")
+    return [
+        {
+            "name": name,
+            "description": "Required by " + ", ".join(sorted(secret_sources)),
+        }
+        for name, secret_sources in sorted(sources.items())
+    ]
 
 
 def _provider_assumptions(workflow: AgenticWorkflow) -> list[dict[str, str]]:
@@ -533,13 +575,55 @@ def _triggers(workflow: AgenticWorkflow) -> list[dict[str, str]]:
             "source": trigger.source,
             "enabled": str(trigger.enabled).lower(),
             "concurrencyPolicy": trigger.concurrency_policy,
+            "tokenConfigured": str(trigger.has_authentication).lower(),
+            "allowUnauthenticated": str(trigger.allow_unauthenticated).lower(),
+            "risk": "high"
+            if trigger.store_raw_payload
+            or trigger.missing_authentication
+            or trigger.requires_unauthenticated_warning
+            else "normal",
         }
+        risk_reasons = _webhook_risk_reasons(trigger)
+        if risk_reasons:
+            item["riskReasons"] = ",".join(risk_reasons)
         if trigger.token_env:
             item["tokenEnv"] = trigger.token_env
         if trigger.fanout_path:
             item["fanoutPath"] = trigger.fanout_path
         triggers.append(item)
     return triggers
+
+
+def _import_risk_warnings(workflow: AgenticWorkflow) -> list[str]:
+    warnings: list[str] = []
+    for trigger_id, trigger in sorted(workflow.config.webhooks.items()):
+        if trigger.missing_authentication:
+            warnings.append(
+                f"Enabled webhook trigger '{trigger_id}' has no authentication configured; "
+                "importing it enabled will fail validation and runtime requests will be rejected."
+            )
+        if trigger.requires_unauthenticated_warning:
+            warnings.append(
+                f"Webhook trigger '{trigger_id}' explicitly allows unauthenticated requests; "
+                "this is high risk and intended only for local testing."
+            )
+        if trigger.store_raw_payload:
+            warnings.append(
+                f"Webhook trigger '{trigger_id}' stores raw replay payloads; "
+                "incoming secrets may be persisted."
+            )
+    return warnings
+
+
+def _webhook_risk_reasons(trigger: WebhookTriggerConfig) -> list[str]:
+    reasons: list[str] = []
+    if trigger.missing_authentication:
+        reasons.append("missing_authentication")
+    if trigger.requires_unauthenticated_warning:
+        reasons.append("unauthenticated_allowed")
+    if trigger.store_raw_payload:
+        reasons.append("raw_payload_retention")
+    return reasons
 
 
 def _vector_index_entries_path(
@@ -599,6 +683,7 @@ def _sanitized_workflow_data(data: dict[str, Any]) -> dict[str, Any]:
             if isinstance(trigger, dict) and trigger.get("token"):
                 trigger.pop("token", None)
     _sanitize_http_request_nodes(copied)
+    _sanitize_notification_nodes(copied)
     _sanitize_env_maps(copied)
     return cast(dict[str, Any], copied)
 
@@ -663,6 +748,54 @@ def _sanitize_http_request_nodes(data: dict[str, Any]) -> None:
         body = node.get("body")
         if isinstance(body, str):
             node["body"] = _sanitize_http_body(body, configured, secret_values)
+
+
+def _sanitize_notification_nodes(data: dict[str, Any]) -> None:
+    nodes = data.get("nodes")
+    if not isinstance(nodes, list):
+        return
+    configured: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("type") != "notification":
+            continue
+        secret_values = _collect_notification_secret_values(node)
+        webhook_url = node.get("webhook_url")
+        if isinstance(webhook_url, str):
+            node["webhook_url"] = (
+                webhook_url if _is_secret_reference_only(webhook_url) else MASKED_SECRET_VALUE
+            )
+        for key in ("headers", "payload", "email_to"):
+            if key in node:
+                node[key] = _sanitize_http_value(
+                    node[key],
+                    configured,
+                    key,
+                    secret_values,
+                )
+        for key in ("email_from", "smtp_host", "smtp_username", "smtp_password"):
+            value = node.get(key)
+            if isinstance(value, str):
+                node[key] = _sanitize_http_string(
+                    value,
+                    secret_values,
+                    force=key in {"smtp_username", "smtp_password"}
+                    or _is_sensitive_http_field(key, configured),
+                )
+
+
+def _collect_notification_secret_values(node: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    webhook_url = node.get("webhook_url")
+    if isinstance(webhook_url, str):
+        parsed = urllib.parse.urlsplit(webhook_url)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if _is_sensitive_http_field(key, set()):
+                values.update(_collect_plain_leaf_strings(value))
+    for key in ("headers", "payload", "email_to"):
+        values.update(_collect_configured_http_values(node.get(key), set(), key))
+    for key in ("email_from", "smtp_host", "smtp_username", "smtp_password"):
+        values.update(_collect_configured_http_values(node.get(key), set(), key))
+    return {value for value in values if value and not _contains_secret_reference(value)}
 
 
 def _collect_http_secret_values(node: dict[str, Any], configured: set[str]) -> set[str]:
@@ -786,10 +919,7 @@ def _sanitize_http_value(
             )
         return sanitized
     if isinstance(value, list):
-        return [
-            _sanitize_http_value(item, configured, path, secret_values)
-            for item in value
-        ]
+        return [_sanitize_http_value(item, configured, path, secret_values) for item in value]
     if isinstance(value, str):
         return _sanitize_http_string(
             value,
@@ -860,7 +990,7 @@ def _is_sensitive_http_field(path: str, configured: set[str]) -> bool:
         normalized in configured
         or name in configured
         or name in SENSITIVE_FIELD_NAMES
-        or any(token in name for token in ("token", "secret"))
+        or any(token in name for token in ("token", "secret", "password"))
     )
 
 
@@ -944,14 +1074,97 @@ def _available_workflow_id(workflow_id: str, base: Path) -> str:
         index += 1
 
 
-def _validate_archive_entries(archive: zipfile.ZipFile) -> None:
-    names = set(archive.namelist())
+def _validate_archive_entries(
+    archive: zipfile.ZipFile,
+    limits: ResourceLimits,
+) -> _ValidatedBundleArchive:
+    infos = archive.infolist()
+    entry_count = len(infos)
+    if entry_count > limits.max_bundle_entries:
+        raise BundleError(
+            "Bundle archive entry count exceeded limit "
+            f"{limits.max_bundle_entries} entries (got {entry_count} entries)"
+        )
+
+    names = [info.filename for info in infos]
+    unique_names = set(names)
+    if len(unique_names) != len(names):
+        raise BundleError("Bundle contains duplicate archive paths")
+
     if MANIFEST_PATH not in names:
         raise BundleError("Bundle is missing manifest.json")
     if WORKFLOW_PATH not in names:
         raise BundleError("Bundle is missing workflow.toml")
-    for info in archive.infolist():
+
+    total_uncompressed = 0
+    total_compressed = 0
+    for info in infos:
         _safe_relative_path(info.filename)
+        if info.is_dir():
+            if info.file_size or info.compress_size:
+                raise BundleError("Bundle directory entry contains file data")
+            continue
+
+        total_uncompressed += info.file_size
+        total_compressed += info.compress_size
+        if info.file_size > limits.max_bundle_entry_bytes:
+            raise BundleError(
+                f"Bundle archive entry size exceeded limit {limits.max_bundle_entry_bytes} bytes"
+            )
+        if total_uncompressed > limits.max_bundle_total_uncompressed_bytes:
+            raise BundleError(
+                "Bundle total uncompressed size exceeded limit "
+                f"{limits.max_bundle_total_uncompressed_bytes} bytes "
+                f"(got {total_uncompressed} bytes)"
+            )
+        if total_compressed > limits.max_bundle_compressed_bytes:
+            raise BundleError(
+                "Bundle compressed size exceeded limit "
+                f"{limits.max_bundle_compressed_bytes} bytes "
+                f"(got {total_compressed} bytes)"
+            )
+        ratio = info.file_size / max(info.compress_size, 1)
+        if ratio > limits.max_bundle_compression_ratio:
+            raise BundleError(
+                f"Bundle compression ratio exceeded limit {limits.max_bundle_compression_ratio:g}:1"
+            )
+
+    for metadata_path in (MANIFEST_PATH, WORKFLOW_PATH):
+        metadata_size = archive.getinfo(metadata_path).file_size
+        if metadata_size > limits.max_bundle_metadata_bytes:
+            raise BundleError(
+                f"Bundle {metadata_path} size exceeded metadata limit "
+                f"{limits.max_bundle_metadata_bytes} bytes "
+                f"(got {metadata_size} bytes)"
+            )
+
+    return _ValidatedBundleArchive(
+        names=tuple(names),
+        info_by_name={info.filename: info for info in infos},
+    )
+
+
+def _read_archive_text(
+    archive: zipfile.ZipFile,
+    path: str,
+    validated: _ValidatedBundleArchive,
+    limits: ResourceLimits,
+) -> str:
+    info = validated.info_by_name[path]
+    if info.file_size > limits.max_bundle_metadata_bytes:
+        raise BundleError(
+            f"Bundle {path} size exceeded metadata limit "
+            f"{limits.max_bundle_metadata_bytes} bytes "
+            f"(got {info.file_size} bytes)"
+        )
+    data = archive.read(path)
+    if len(data) > limits.max_bundle_metadata_bytes:
+        raise BundleError(
+            f"Bundle {path} size exceeded metadata limit "
+            f"{limits.max_bundle_metadata_bytes} bytes "
+            f"(got {len(data)} bytes)"
+        )
+    return data.decode("utf-8")
 
 
 def _safe_relative_path(path: str) -> str:

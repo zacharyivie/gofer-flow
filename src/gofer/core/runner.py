@@ -20,6 +20,7 @@ from gofer.core.operations import AgentOperation, CommonLlmTaskOperation
 from gofer.core.workflow import AgenticWorkflow
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
+from gofer.subscriptions.direct_api import AnthropicApiSubscription, OpenAiApiSubscription
 from gofer.utils.paths import get_data_dir
 from gofer.utils.run_state import workflow_run_stop_path
 
@@ -38,6 +39,8 @@ RUNNER_STALE_AFTER_SECONDS = 60
 _SUBSCRIPTIONS = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
+    "openai_api": OpenAiApiSubscription(),
+    "anthropic_api": AnthropicApiSubscription(),
 }
 
 
@@ -104,7 +107,7 @@ class RunnerRecord:
 
 
 def default_runner_capabilities(workspace_roots: list[str] | None = None) -> dict[str, Any]:
-    providers = [
+    provider_clis = [
         name
         for name, executable in (("codex", "codex"), ("claude_code", "claude"))
         if shutil.which(executable)
@@ -112,21 +115,29 @@ def default_runner_capabilities(workspace_roots: list[str] | None = None) -> dic
     return {
         "os": platform.system().lower(),
         "hostname": socket.gethostname(),
-        "provider_clis": providers,
+        "provider_clis": provider_clis,
+        "direct_providers": ["anthropic_api", "openai_api"],
         "workspace_roots": workspace_roots or [os.getcwd()],
     }
 
 
 def workflow_required_capabilities(workflow: AgenticWorkflow) -> dict[str, Any]:
-    providers: set[str] = set()
+    provider_clis: set[str] = set()
+    direct_providers: set[str] = set()
     for node in workflow.graph.nodes_in_order():
         op = node.operation
         if not isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
             continue
         agent = workflow.agents.get(op.agent_id)
         if agent is not None:
-            providers.add(agent.subscription)
-    return {"provider_clis": sorted(providers)}
+            if agent.subscription in {"openai_api", "anthropic_api"}:
+                direct_providers.add(agent.subscription)
+            else:
+                provider_clis.add(agent.subscription)
+    return {
+        "provider_clis": sorted(provider_clis),
+        "direct_providers": sorted(direct_providers),
+    }
 
 
 def capabilities_match(
@@ -143,6 +154,11 @@ def capabilities_match(
     missing_providers = sorted(required_providers - available_providers)
     if missing_providers:
         return False, f"Runner missing provider CLI(s): {', '.join(missing_providers)}"
+    required_direct = set(required_capabilities.get("direct_providers") or [])
+    available_direct = set(runner_capabilities.get("direct_providers") or [])
+    missing_direct = sorted(required_direct - available_direct)
+    if missing_direct:
+        return False, f"Runner missing direct provider support: {', '.join(missing_direct)}"
     return True, None
 
 

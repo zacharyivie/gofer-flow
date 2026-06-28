@@ -33,6 +33,8 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
+    DashboardItemOperation,
+    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FailOperation,
@@ -88,6 +90,7 @@ _AnyOp = (
     | HttpRequestOperation
     | ApprovalGateOperation
     | NotificationOperation
+    | DashboardItemOperation
     | AgentOperation
 )
 
@@ -976,7 +979,7 @@ def _operation_fields(
                 "Channel",
                 FieldKind.CHOICE,
                 op.channel,
-                choices=["desktop"],
+                choices=["desktop", "slack", "teams", "webhook", "email"],
             ),
             FieldDescriptor(
                 f"{prefix}.urgency",
@@ -984,6 +987,129 @@ def _operation_fields(
                 FieldKind.CHOICE,
                 op.urgency,
                 choices=["low", "normal", "critical"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.webhook_url",
+                "Webhook URL",
+                FieldKind.STRING,
+                op.webhook_url or "",
+            ),
+            FieldDescriptor(
+                f"{prefix}.headers", "Headers", FieldKind.DICT_STR_STR, dict(op.headers)
+            ),
+            FieldDescriptor(
+                f"{prefix}.payload",
+                "Payload JSON",
+                FieldKind.STRING,
+                _format_json_field(op.payload),
+            ),
+            FieldDescriptor(
+                f"{prefix}.email_from",
+                "Email From",
+                FieldKind.STRING,
+                op.email_from or "",
+            ),
+            FieldDescriptor(
+                f"{prefix}.email_to",
+                "Email To",
+                FieldKind.LIST_STR,
+                list(op.email_to),
+            ),
+            FieldDescriptor(
+                f"{prefix}.smtp_host",
+                "SMTP Host",
+                FieldKind.STRING,
+                op.smtp_host or "",
+            ),
+            FieldDescriptor(
+                f"{prefix}.smtp_port",
+                "SMTP Port",
+                FieldKind.INT,
+                op.smtp_port,
+            ),
+            FieldDescriptor(
+                f"{prefix}.smtp_username",
+                "SMTP Username",
+                FieldKind.STRING,
+                op.smtp_username or "",
+            ),
+            FieldDescriptor(
+                f"{prefix}.smtp_password",
+                "SMTP Password",
+                FieldKind.STRING,
+                op.smtp_password or "",
+            ),
+            FieldDescriptor(
+                f"{prefix}.smtp_starttls",
+                "SMTP STARTTLS",
+                FieldKind.BOOL,
+                op.smtp_starttls,
+            ),
+            FieldDescriptor(
+                f"{prefix}.notification_timeout_seconds",
+                "Timeout (s)",
+                FieldKind.FLOAT,
+                op.timeout_seconds,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.attempts",
+                "Retry Attempts",
+                FieldKind.INT,
+                op.retry.attempts,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.backoff_seconds",
+                "Retry Backoff (s)",
+                FieldKind.FLOAT,
+                op.retry.backoff_seconds,
+            ),
+            FieldDescriptor(
+                f"{prefix}.retry.retry_on_statuses",
+                "Retry Statuses",
+                FieldKind.LIST_STR,
+                [str(status) for status in op.retry.retry_on_statuses],
+            ),
+            FieldDescriptor(
+                f"{prefix}.expected_statuses",
+                "Expected Statuses",
+                FieldKind.LIST_STR,
+                [str(status) for status in op.expected_statuses],
+            ),
+            FieldDescriptor(
+                f"{prefix}.network_allowlist",
+                "Network Allowlist",
+                FieldKind.LIST_STR,
+                list(op.network_allowlist),
+            ),
+        ]
+
+    if isinstance(op, DashboardItemOperation):
+        return [
+            node_id_fd,
+            FieldDescriptor(
+                f"{prefix}.action",
+                "Action",
+                FieldKind.CHOICE,
+                op.action,
+                choices=["read", "add", "update", "delete", "move"],
+            ),
+            FieldDescriptor(
+                f"{prefix}.dashboard", "Dashboard", FieldKind.STRING, op.dashboard
+            ),
+            FieldDescriptor(
+                f"{prefix}.component", "Component", FieldKind.STRING, op.component
+            ),
+            FieldDescriptor(
+                f"{prefix}.item_id", "Item ID", FieldKind.STRING, op.item_id, optional=True
+            ),
+            FieldDescriptor(f"{prefix}.item", "Item", FieldKind.DICT_STR_STR, op.item),
+            FieldDescriptor(f"{prefix}.patch", "Patch", FieldKind.DICT_STR_STR, op.patch),
+            FieldDescriptor(
+                f"{prefix}.filter", "Filter", FieldKind.STRING, op.filter, optional=True
+            ),
+            FieldDescriptor(f"{prefix}.field", "Move Field", FieldKind.STRING, op.field),
+            FieldDescriptor(
+                f"{prefix}.value", "Move Value", FieldKind.STRING, op.value, optional=True
             ),
         ]
 
@@ -1087,7 +1213,14 @@ def _fan_source_fields(prefix: str, source: object) -> list[FieldDescriptor]:
             "Source Type",
             FieldKind.CHOICE,
             getattr(source, "type", "count"),
-            choices=["count", "tabular", "directory", "trigger_events", "infinite"],
+            choices=[
+                "count",
+                "tabular",
+                "directory",
+                "trigger_events",
+                "dashboard_items",
+                "infinite",
+            ],
         ),
         FieldDescriptor(
             f"{prefix}.source.max_concurrency",
@@ -1137,6 +1270,29 @@ def _fan_source_fields(prefix: str, source: object) -> list[FieldDescriptor]:
                 FieldKind.BOOL,
                 source.include_content,
             )
+        )
+    elif isinstance(source, DashboardItemsFanSource):
+        fields.extend(
+            [
+                FieldDescriptor(
+                    f"{prefix}.source.dashboard",
+                    "Dashboard",
+                    FieldKind.STRING,
+                    source.dashboard,
+                ),
+                FieldDescriptor(
+                    f"{prefix}.source.component",
+                    "Component",
+                    FieldKind.STRING,
+                    source.component,
+                ),
+                FieldDescriptor(
+                    f"{prefix}.source.filter",
+                    "Filter",
+                    FieldKind.STRING,
+                    source.filter or "",
+                ),
+            ]
         )
     return fields
 
@@ -1400,12 +1556,65 @@ def sections_to_workflow(sections: list[Section], wf: AgenticWorkflow) -> None:
                     ),
                 )
             elif isinstance(op, NotificationOperation):
+                retry_statuses = [
+                    int(status)
+                    for status in (fm.get(f"{p}.retry.retry_on_statuses") or [])
+                    if str(status).strip().isdigit()
+                ]
                 new_op = NotificationOperation(
                     type=op.type,
                     title=fm.get(f"{p}.title") or op.title,
                     body=fm.get(f"{p}.body") or "",
                     channel=fm.get(f"{p}.channel") or op.channel,
                     urgency=fm.get(f"{p}.urgency") or op.urgency,
+                    webhook_url=_empty_to_none(fm.get(f"{p}.webhook_url"))
+                    or op.webhook_url,
+                    headers=fm.get(f"{p}.headers") or {},
+                    payload=_parse_json_field(fm.get(f"{p}.payload")),
+                    email_from=_empty_to_none(fm.get(f"{p}.email_from"))
+                    or op.email_from,
+                    email_to=fm.get(f"{p}.email_to") or [],
+                    smtp_host=_empty_to_none(fm.get(f"{p}.smtp_host")) or op.smtp_host,
+                    smtp_port=int(fm.get(f"{p}.smtp_port") or op.smtp_port),
+                    smtp_username=_empty_to_none(fm.get(f"{p}.smtp_username"))
+                    or op.smtp_username,
+                    smtp_password=_empty_to_none(fm.get(f"{p}.smtp_password"))
+                    or op.smtp_password,
+                    smtp_starttls=bool(fm.get(f"{p}.smtp_starttls", op.smtp_starttls)),
+                    timeout_seconds=float(
+                        fm.get(f"{p}.notification_timeout_seconds")
+                        or op.timeout_seconds
+                    ),
+                    retry=HttpRetryPolicy(
+                        attempts=int(
+                            fm.get(f"{p}.retry.attempts") or op.retry.attempts
+                        ),
+                        backoff_seconds=float(
+                            fm.get(f"{p}.retry.backoff_seconds")
+                            or op.retry.backoff_seconds
+                        ),
+                        retry_on_statuses=retry_statuses,
+                    ),
+                    expected_statuses=[
+                        int(status)
+                        for status in (fm.get(f"{p}.expected_statuses") or [])
+                        if str(status).strip().isdigit()
+                    ]
+                    or op.expected_statuses,
+                    network_allowlist=fm.get(f"{p}.network_allowlist") or [],
+                )
+            elif isinstance(op, DashboardItemOperation):
+                new_op = DashboardItemOperation(
+                    type=op.type,
+                    action=fm.get(f"{p}.action") or op.action,
+                    dashboard=fm.get(f"{p}.dashboard") or op.dashboard,
+                    component=fm.get(f"{p}.component") or op.component,
+                    item_id=fm.get(f"{p}.item_id") or None,
+                    item=fm.get(f"{p}.item") or {},
+                    patch=fm.get(f"{p}.patch") or {},
+                    filter=fm.get(f"{p}.filter") or None,
+                    field=fm.get(f"{p}.field") or op.field,
+                    value=fm.get(f"{p}.value"),
                 )
             elif isinstance(op, AgentOperation):
                 dc_raw = fm.get(f"{p}.dynamic_count", "1")
@@ -1555,6 +1764,24 @@ def _build_fan_source(fm: dict[str, Any], prefix: str, fallback: FanSource) -> F
         return TriggerEventsFanSource(
             type="trigger_events",
             include_content=bool(fm.get(f"{prefix}.source.include_content")),
+            max_concurrency=max_concurrency,
+            fail_fast=fail_fast,
+        )
+    if source_type == "dashboard_items":
+        fallback_dashboard = (
+            fallback.dashboard if isinstance(fallback, DashboardItemsFanSource) else ""
+        )
+        fallback_component = (
+            fallback.component if isinstance(fallback, DashboardItemsFanSource) else ""
+        )
+        fallback_filter = (
+            fallback.filter if isinstance(fallback, DashboardItemsFanSource) else ""
+        )
+        return DashboardItemsFanSource(
+            type="dashboard_items",
+            dashboard=str(fm.get(f"{prefix}.source.dashboard") or fallback_dashboard),
+            component=str(fm.get(f"{prefix}.source.component") or fallback_component),
+            filter=fm.get(f"{prefix}.source.filter") or fallback_filter or None,
             max_concurrency=max_concurrency,
             fail_fast=fail_fast,
         )

@@ -16,8 +16,12 @@ const require = createRequire(import.meta.url);
 
 let viteServer;
 let apiUrl;
+let ensureGoferApiToken;
+let installGoferApiFetchAuth;
+let withGoferApiAuth;
 let appModule;
 let canvasModule;
+let patchModule;
 
 before(async () => {
   viteServer = await createServer({
@@ -34,9 +38,11 @@ before(async () => {
     root: frontendRoot,
     server: { hmr: false, middlewareMode: true, watch: null },
   });
-  ({ apiUrl } = await viteServer.ssrLoadModule("/src/lib/api.js"));
+  ({ apiUrl, ensureGoferApiToken, installGoferApiFetchAuth, withGoferApiAuth } =
+    await viteServer.ssrLoadModule("/src/lib/api.js"));
   appModule = await viteServer.ssrLoadModule("/src/pages/App.jsx");
   canvasModule = await viteServer.ssrLoadModule("/src/components/DagCanvas.jsx");
+  patchModule = await viteServer.ssrLoadModule("/src/lib/workflowPatch.js");
 });
 
 after(async () => {
@@ -46,6 +52,10 @@ after(async () => {
 beforeEach(() => {
   globalThis.window = {
     goferApiBaseUrl: undefined,
+    goferApiToken: undefined,
+    __goferApiFetchAuthInstalled: undefined,
+    __goferApiTokenPromise: undefined,
+    location: { href: "http://127.0.0.1:5173/" },
     localStorage: {
       getItem: () => null,
       setItem: () => {},
@@ -70,6 +80,89 @@ test("apiUrl normalizes relative paths, HTTP origins, trailing slashes, and pref
 
   globalThis.window.goferApiBaseUrl = "/custom-api/";
   assert.equal(apiUrl("/workflows"), "/custom-api/workflows");
+});
+
+test("withGoferApiAuth attaches bearer tokens only to Gofer API requests", () => {
+  globalThis.window.goferApiBaseUrl = "http://127.0.0.1:8765";
+  globalThis.window.goferApiToken = "ui-token";
+
+  const [, init] = withGoferApiAuth("http://127.0.0.1:8765/api/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+  assert.equal(init.headers.get("Authorization"), "Bearer ui-token");
+  assert.equal(init.headers.get("Content-Type"), "application/json");
+
+  const [, externalInit] = withGoferApiAuth("https://example.com/api/workflows", {
+    method: "POST",
+  });
+  assert.equal(externalInit.headers, undefined);
+});
+
+test("ensureGoferApiToken loads the UI session token without changing API base URL", async () => {
+  const requests = [];
+  const fetchImpl = async (url) => {
+    requests.push(url);
+    return {
+      ok: true,
+      json: async () => ({
+        apiBaseUrl: "http://127.0.0.1:8765/api",
+        apiToken: "boot-token",
+      }),
+    };
+  };
+
+  const token = await ensureGoferApiToken(fetchImpl);
+
+  assert.equal(token, "boot-token");
+  assert.equal(globalThis.window.goferApiToken, "boot-token");
+  assert.equal(globalThis.window.goferApiBaseUrl, undefined);
+  assert.deepEqual(requests, ["/api/session"]);
+});
+
+test("installGoferApiFetchAuth bootstraps token before mutating Gofer API requests", async () => {
+  const calls = [];
+  globalThis.window.fetch = async (url, init = {}) => {
+    calls.push({ url, init });
+    if (url === "/api/session") {
+      return {
+        ok: true,
+        json: async () => ({ apiToken: "boot-token" }),
+      };
+    }
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+
+  installGoferApiFetchAuth();
+  await globalThis.window.fetch("/api/workflows", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].url, "/api/session");
+  assert.equal(calls[1].url, "/api/workflows");
+  assert.equal(calls[1].init.headers.get("Authorization"), "Bearer boot-token");
+  assert.equal(calls[1].init.headers.get("Content-Type"), "application/json");
+});
+
+test("installGoferApiFetchAuth does not bootstrap for webhook requests", async () => {
+  const calls = [];
+  globalThis.window.fetch = async (url, init = {}) => {
+    calls.push({ url, init });
+    return { ok: true, json: async () => ({ ok: true }) };
+  };
+
+  installGoferApiFetchAuth();
+  await globalThis.window.fetch("/api/workflows/demo/webhooks/main/trigger", {
+    method: "POST",
+  });
+
+  assert.deepEqual(
+    calls.map((call) => call.url),
+    ["/api/workflows/demo/webhooks/main/trigger"],
+  );
+  assert.equal(calls[0].init.headers, undefined);
 });
 
 test("workflow refresh helpers preserve local edits during silent refresh", () => {
@@ -98,33 +191,93 @@ test("workflow refresh helpers preserve local edits during silent refresh", () =
   assert.equal(preserved.nodes[0].x, 99);
 });
 
-test("workflow save payload keeps graph positions and serializes defaults", () => {
-  const payload = appModule.workflowPayloadForSave({
-    id: "demo",
-    name: "Demo",
-    filesystemAccess: [
-      { path: "/outside/shared", read: false, write: false, execute: true },
-      { path: "/outside/shared/", read: true, write: true, execute: true },
-      { path: "" },
-    ],
+test("workflow refresh helpers preserve pending dashboard item loop sources", () => {
+  const remote = [
+    {
+      id: "demo",
+      name: "Remote",
+      nodes: [
+        {
+          id: "loop",
+          type: "loop",
+          label: "Loop",
+          operation: {
+            type: "loop",
+            source: { type: "count", count: 1, max_concurrency: 1, fail_fast: false },
+          },
+        },
+      ],
+      edges: [],
+      agents: {},
+      sourcePath: "/tmp/demo.toml",
+      status: "Ready",
+    },
+  ];
+  const local = {
+    ...remote[0],
     nodes: [
       {
-        id: "step",
-        type: "bash_command",
-        label: "Run",
-        operation: { type: "bash_command", command: "echo hi" },
+        ...remote[0].nodes[0],
+        operation: {
+          type: "loop",
+          source: {
+            type: "dashboard_items",
+            dashboard: "development-dashboard",
+            component: "tickets",
+            filter: "status=todo",
+            max_concurrency: 1,
+            fail_fast: false,
+          },
+        },
       },
     ],
-  });
+  };
+
+  const preserved = appModule.preserveLocalWorkflows(remote, [local], "/data")[0];
+
+  assert.equal(preserved.nodes[0].operation.source.type, "dashboard_items");
+  assert.equal(preserved.nodes[0].operation.source.dashboard, "development-dashboard");
+  assert.equal(preserved.sourcePath, "/tmp/demo.toml");
+});
+
+test("workflow save payload keeps graph positions and serializes defaults", () => {
+  const payload = appModule.workflowPayloadForSave(
+    {
+      id: "demo",
+      name: "Demo",
+      filesystemAccess: [
+        { path: "/project", read: false, write: false, execute: true },
+        { path: "/outside/shared", read: false, write: false, execute: true },
+        { path: "/outside/shared/", read: true, write: true, execute: true },
+        { path: "" },
+      ],
+      metadata: {
+        canvas: {
+          groups: [{ id: "group-1", label: "Phase", nodeIds: ["step"] }],
+        },
+      },
+      nodes: [
+        {
+          id: "step",
+          type: "bash_command",
+          label: "Run",
+          operation: { type: "bash_command", command: "echo hi" },
+        },
+      ],
+    },
+    "/project",
+  );
 
   assert.deepEqual(payload.edges, []);
   assert.deepEqual(payload.agents, {});
   assert.deepEqual(payload.filesystemAccess, [
+    { path: "/project", read: true, write: true, execute: false },
     { path: "/outside/shared", read: true, write: true, execute: false },
   ]);
   assert.equal(payload.nodes[0].x, 0);
   assert.equal(payload.nodes[0].y, 0);
   assert.equal(payload.nodes[0].operation.command, "echo hi");
+  assert.deepEqual(payload.metadata.canvas.groups[0].nodeIds, ["step"]);
 });
 
 test("workflow deletion helpers remove the selected workflow and choose the next active ID", () => {
@@ -263,13 +416,211 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
   });
 });
 
+test("workflow patch helpers parse, validate, apply selected hunks, and reject unsafe actions", () => {
+  const workflow = workflowFixture({ id: "demo", name: "Demo" });
+  const body = [
+    "Proposed patch:",
+    "```gofer-workflow-patch",
+    JSON.stringify({
+      type: "gofer.workflow.patch",
+      version: 1,
+      title: "Add review step",
+      operations: [
+        {
+          id: "add-review",
+          op: "add_node",
+          node: {
+            id: "review",
+            type: "agent",
+            label: "Review output",
+            operation: { type: "agent", agent_id: "reviewer", prompt: "Review {{step.output}}" },
+          },
+        },
+        {
+          id: "connect-review",
+          op: "add_edge",
+          edge: {
+            from: "step",
+            to: "review",
+            condition: "output_matches",
+            outputPattern: "ok",
+          },
+        },
+      ],
+    }),
+    "```",
+  ].join("\n");
+
+  const parsed = patchModule.extractWorkflowPatch(body);
+  assert.equal(parsed.ok, true);
+  const review = patchModule.buildPatchReview(parsed.patch, workflow);
+  assert.equal(review.ok, true);
+  assert.deepEqual(review.hunks.map((hunk) => hunk.risk), ["graph", "graph"]);
+
+  const selected = patchModule.selectedPatchOperations(parsed.patch, ["add-review"]);
+  const nextWorkflow = patchModule.applyWorkflowPatch(workflow, selected);
+  assert.equal(nextWorkflow.nodes.some((node) => node.id === "review"), true);
+  assert.equal(nextWorkflow.edges.length, 0);
+  assert.equal(nextWorkflow.agents.reviewer.subscription, "codex");
+
+  const unsafe = patchModule.buildPatchReview(
+    { type: "gofer.workflow.patch", version: 1, operations: [{ op: "run_workflow" }] },
+    workflow,
+  );
+  assert.equal(unsafe.ok, false);
+  assert.match(unsafe.errors.join("\n"), /Unsupported patch operation/);
+});
+
+test("App reviews and applies selected chat workflow patch hunks with validation and audit metadata", async () => {
+  const patch = {
+    type: "gofer.workflow.patch",
+    version: 1,
+    title: "Add notify step",
+    summary: "Add a notification node and connect it conditionally.",
+    operations: [
+      {
+        id: "add-notify",
+        op: "add_node",
+        node: {
+          id: "notify",
+          type: "notification",
+          label: "Notify owner",
+          x: 240,
+          y: 80,
+          operation: { type: "notification", title: "Done", body: "Workflow finished" },
+        },
+      },
+      {
+        id: "connect-notify",
+        op: "add_edge",
+        edge: {
+          from: "step",
+          to: "notify",
+          condition: "output_matches",
+          outputPattern: "done",
+        },
+      },
+    ],
+  };
+  const chatStream = streamResponse([
+    `{"type":"final","message":{"body":${JSON.stringify(`Here is the patch:\n\`\`\`gofer-workflow-patch\n${JSON.stringify(patch)}\n\`\`\``)}}}\n`,
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture({ id: "demo", name: "Demo" })])),
+    jsonResponse("/api/chat/providers", {
+      providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+    }),
+    jsonResponse("/api/workflows/demo/logs/latest", { log: null }),
+    jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
+    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
+    jsonResponse("/api/workflows/demo/validate", { ok: true, diagnostics: [] }, { method: "POST" }),
+    (url, options = {}) => {
+      if (url !== "/api/workflows/demo" || options.method !== "PUT") return null;
+      const saved = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ workflow: { ...saved, status: "Ready", tags: ["ready"] } }),
+      };
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.click(dom.byText("New thread"));
+  await dom.change(dom.first("textarea"), "Add a notification");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  await dom.click(dom.byText("Review patch"));
+  await dom.flush();
+
+  assert.match(dom.text(), /Review workflow patch/);
+  assert.match(dom.text(), /Add a notification node and connect it conditionally/);
+  assert.match(dom.text(), /Connect nodes/);
+
+  const connectCheckbox = dom.controlAfterLabel("Connect nodes");
+  await dom.change(connectCheckbox, false);
+  await dom.click(dom.byText("Apply selected"));
+  await dom.flush();
+
+  const saveCall = fetchMock.calls.find((call) => call.url === "/api/workflows/demo" && call.options.method === "PUT");
+  const saved = JSON.parse(saveCall.options.body);
+  assert.equal(saved.nodes.some((node) => node.id === "notify"), true);
+  assert.equal(saved.edges.length, 0);
+  assert.deepEqual(saved.auditMetadata.appliedHunkIds, ["add-notify"]);
+  assert.equal(saved.auditMetadata.prompt, "Add a notification");
+  assert.match(saved.auditMetadata.response, /gofer-workflow-patch/);
+
+  await dom.unmount();
+});
+
+test("App rejects invalid chat workflow patches before changing the workflow", async () => {
+  const patch = {
+    type: "gofer.workflow.patch",
+    version: 1,
+    title: "Broken edge",
+    operations: [
+      {
+        id: "bad-edge",
+        op: "add_edge",
+        edge: { from: "missing", to: "step" },
+      },
+    ],
+  };
+  const chatStream = streamResponse([
+    `{"type":"final","message":{"body":${JSON.stringify(`\`\`\`json\n${JSON.stringify(patch)}\n\`\`\``)}}}\n`,
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture({ id: "demo", name: "Demo" })])),
+    jsonResponse("/api/chat/providers", {
+      providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+    }),
+    jsonResponse("/api/workflows/demo/logs/latest", { log: null }),
+    jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
+    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.click(dom.byText("New thread"));
+  await dom.change(dom.first("textarea"), "Connect missing node");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  await dom.click(dom.byText("Review patch"));
+  await dom.flush();
+
+  assert.match(dom.text(), /Patch rejected/);
+  assert.match(dom.text(), /Edge source 'missing' does not exist/);
+  assert.equal(
+    fetchMock.calls.some((call) => call.url === "/api/workflows/demo" && call.options.method === "PUT"),
+    false,
+  );
+
+  await dom.unmount();
+});
+
 test("RunPreviewDialog renders grouped warnings, destructive actions, providers, fan-out samples, and node details", () => {
   const plan = {
     workflowId: "preview-demo",
     workflowName: "Preview Demo",
+    startNodes: ["scan"],
+    validation: {
+      ok: true,
+      diagnostics: [
+        { severity: "warning", message: "Provider CLI missing", subject: "agent:reviewer" },
+      ],
+    },
     warnings: ["Missing read target: /workspace/missing.txt"],
     destructiveActions: ["overwrite file: /workspace/out.txt"],
     requiredSecrets: ["OPENAI_API_KEY"],
+    secretReadiness: [
+      {
+        name: "OPENAI_API_KEY",
+        status: "missing",
+        present: false,
+        sources: ["node:review.provider.api_key"],
+      },
+    ],
     providerRequirements: [
       {
         agentId: "reviewer",
@@ -287,6 +638,21 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
     triggerContext: {
       watch: { path: "/workspace/inbox", glob: "*.md", mode: "fanout" },
     },
+    conditionalBranches: [{ from: "scan", to: "review", label: "output_matches:ready" }],
+    resourceLimits: {
+      max_fanout_items: 10,
+      max_fanout_concurrency: 2,
+      max_files_scanned: 100,
+      max_file_read_bytes: 1024,
+    },
+    executionLimits: { maxTotalNodeRuns: 25 },
+    usageBudget: { enabled: true, max_agent_calls: 3 },
+    projectedLlmUsage: {
+      agent_calls: 2,
+      total_tokens: 1200,
+      estimated_cost: 0.03,
+      agent_time_seconds: 4.5,
+    },
     generations: [
       {
         index: 0,
@@ -297,6 +663,15 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
             detail: "echo scan",
             workingDir: "/workspace/jobs",
             sideEffects: ["shell command: echo scan"],
+            sideEffectDetails: [
+              {
+                kind: "network",
+                action: "http_request",
+                method: "GET",
+                host: "internal.service",
+                networkAllowlist: ["10.0.0.0/8", "internal.service"],
+              },
+            ],
             fanOut: {
               sourceType: "directory",
               count: 2,
@@ -308,6 +683,10 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
               ],
             },
             unresolvedDynamicValues: ["scan.inputs={{trigger.file}}"],
+            retryCount: 1,
+            retryDelaySeconds: 2,
+            timeoutSeconds: 30,
+            allowFailure: true,
           },
         ],
       },
@@ -324,10 +703,16 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
   );
 
   assert.match(html, /Destructive actions/);
+  assert.match(html, /Start nodes/);
+  assert.match(html, /scan/);
+  assert.match(html, /Validation diagnostics/);
+  assert.match(html, /warning: Provider CLI missing \(agent:reviewer\)/);
   assert.match(html, /overwrite file: \/workspace\/out\.txt/);
   assert.match(html, /Warnings/);
   assert.match(html, /Required secrets/);
   assert.match(html, /OPENAI_API_KEY/);
+  assert.match(html, /Secret readiness/);
+  assert.match(html, /OPENAI_API_KEY: missing/);
   assert.match(html, /Provider CLI requirements/);
   assert.match(
     html,
@@ -335,13 +720,54 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
   );
   assert.match(html, /Trigger context/);
   assert.match(html, /Watch: \/workspace\/inbox glob=\*\.md mode=fanout/);
+  assert.match(html, /Conditional branches/);
+  assert.match(html, /scan -&gt; review when output_matches:ready/);
+  assert.match(html, /Projected LLM usage/);
+  assert.match(html, /Agent calls: 2/);
+  assert.match(html, /Usage budget/);
+  assert.match(html, /max_agent_calls: 3/);
+  assert.match(html, /Resource limits/);
+  assert.match(html, /Fan-out concurrency: 2/);
   assert.match(html, /<details/);
   assert.match(html, /Generation 0/);
   assert.match(html, /Working directory: \/workspace\/jobs/);
+  assert.match(html, /Network allowlist internal\.service: 10\.0\.0\.0\/8, internal\.service/);
   assert.match(html, /Fan-out directory:/);
   assert.match(html, /at least 2 items/);
   assert.match(html, /Sample: \/workspace\/inbox\/a\.md/);
   assert.match(html, /Unresolved values/);
+  assert.match(html, /Timeout: 30s/);
+  assert.match(html, /Retries: 1 delay=2s/);
+  assert.match(html, /Allow failure/);
+});
+
+test("RunPreviewDialog blocks execution while validation has errors", () => {
+  const html = renderToStaticMarkup(
+    React.createElement(appModule.RunPreviewDialog, {
+      plan: {
+        workflowId: "broken",
+        workflowName: "Broken",
+        validation: {
+          ok: false,
+          diagnostics: [
+            {
+              severity: "error",
+              message: "Edge target 'missing' does not exist",
+              subject: "edge:start->missing",
+            },
+          ],
+        },
+        generations: [],
+      },
+      workflow: { id: "broken", name: "Broken" },
+      onCancel: () => {},
+      onRun: () => {},
+    }),
+  );
+
+  assert.match(html, /error: Edge target &#x27;missing&#x27; does not exist/);
+  assert.match(html, /Resolve validation errors before running\./);
+  assert.match(html, /disabled=""/);
 });
 
 test("UsageSummaryStrip renders run cost, expensive nodes, slow nodes, and budget failures", () => {
@@ -368,6 +794,38 @@ test("UsageSummaryStrip renders run cost, expensive nodes, slow nodes, and budge
   assert.match(html, /Most expensive: review/);
   assert.match(html, /Slowest: draft/);
   assert.match(html, /Budget failures: review/);
+});
+
+test("bundle import preview surfaces high-risk webhook trigger warnings", () => {
+  const preview = appModule.formatBundleImportPreview({
+    workflowId: "local-hook",
+    workflowName: "Local Hook",
+    filesToCreate: [],
+    filesToOverwrite: [],
+    manifest: {
+      includedPaths: [],
+      providerAssumptions: [],
+      triggers: [
+        {
+          type: "webhook",
+          id: "github",
+          source: "github",
+          enabled: "true",
+          tokenConfigured: "false",
+          allowUnauthenticated: "true",
+          risk: "high",
+          riskReasons: "unauthenticated_allowed",
+        },
+      ],
+    },
+    riskWarnings: [
+      "Webhook trigger 'github' explicitly allows unauthenticated requests; only use this for local testing.",
+    ],
+  });
+
+  assert.match(preview, /webhook github: github, enabled, allows unauthenticated requests, high risk/);
+  assert.match(preview, /High-risk configuration:/);
+  assert.match(preview, /explicitly allows unauthenticated requests/);
 });
 
 test("App loads workflows, preserves local edits on silent refreshes, saves errors, deletes workflows, and loads logs", async () => {
@@ -695,8 +1153,17 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
     { button: 2, clientX: 90, clientY: 100 },
   );
   await dom.click(dom.byText("Rename node"));
+  await dom.click(dom.byText("Cancel"));
+  assert(!dom.text().includes("Node label"));
+
+  await dom.pointer(
+    dom.ancestor(dom.byText("Initial command copy"), "ARTICLE"),
+    "onContextMenu",
+    { button: 2, clientX: 90, clientY: 100 },
+  );
+  await dom.click(dom.byText("Rename node"));
   await dom.change(dom.controlAfterLabel("Node label"), "Renamed command");
-  await dom.pointer(dom.ancestor(dom.byTitle("Confirm node rename"), "FORM"), "onSubmit");
+  await dom.click(dom.byTitle("Confirm node rename"));
   assert.equal(changes.at(-1).nodes.at(-1).label, "Renamed command");
 
   await dom.pointer(
@@ -1012,6 +1479,48 @@ test("DagCanvas run history exposes resume and rerun controls", async () => {
   await dom.unmount();
 });
 
+test("DagCanvas notification inspector exposes retry controls for network channels", async () => {
+  const workflow = workflowFixture({ id: "notify-canvas", name: "Notify Canvas" });
+  workflow.nodes = [
+    {
+      id: "notify",
+      type: "notification",
+      label: "Notify ops",
+      x: 0,
+      y: 0,
+      operation: {
+        type: "notification",
+        channel: "email",
+        title: "Deploy",
+        body: "Done",
+        email_from: "gofer@example.test",
+        email_to: ["ops@example.test"],
+        smtp_host: "smtp.example.test",
+        smtp_username: "***",
+        smtp_password: "***",
+        retry: { attempts: 2, backoff_seconds: 0.5, retry_on_statuses: [429, 503] },
+      },
+    },
+  ];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  await dom.pointer(dom.ancestor(dom.byText("Notify ops"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  assert.ok(dom.controlAfterLabel("Retry attempts"));
+  assert.ok(dom.controlAfterLabel("Retry backoff seconds"));
+  assert.ok(dom.controlAfterLabel("Retry statuses"));
+
+  await dom.unmount();
+});
+
 test("DagCanvas surfaces webhook trigger state and replay controls", async () => {
   const replayCalls = [];
   const workflow = {
@@ -1064,6 +1573,45 @@ test("DagCanvas surfaces webhook trigger state and replay controls", async () =>
   await dom.click(dom.byTitle("Select workflow run"));
   await dom.click(dom.ancestor(dom.byText("Replay webhook payload"), "BUTTON"));
   assert.deepEqual(replayCalls, [{ runId: "run-1.log", triggerId: "github" }]);
+
+  await dom.unmount();
+});
+
+test("DagCanvas marks enabled unauthenticated webhook triggers as high risk", async () => {
+  const workflowChanges = [];
+  const workflow = {
+    ...workflowFixture({ id: "hook-risk", name: "Hook Risk" }),
+    webhooks: {
+      github: {
+        id: "github",
+        enabled: true,
+        source: "github",
+        concurrency_policy: "allow",
+      },
+    },
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(patch) {
+        workflowChanges.push(patch);
+      },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  assert.match(dom.text(), /API trigger: github \(github\) - high risk/);
+  assert.match(dom.text(), /High risk/);
+  assert.match(dom.text(), /No token configured/);
+  assert.match(dom.text(), /Missing authentication/);
+
+  await dom.change(dom.controlAfterLabel("Allow unauthenticated local testing"), true);
+  assert.equal(
+    workflowChanges.at(-1).webhooks.github.allow_unauthenticated,
+    true,
+  );
 
   await dom.unmount();
 });
@@ -1565,6 +2113,174 @@ test("DagCanvas exposes HTTP response fields as selectable outputs", () => {
   assert(paths.has("data.selected"));
 });
 
+test("DagCanvas exposes dashboard item fields as selectable outputs", () => {
+  const fields = canvasModule.nodeOutputFields({
+    id: "tickets",
+    type: "dashboard_item",
+    operation: { type: "dashboard_item" },
+  });
+  const paths = new Set(fields.map(([pathValue]) => pathValue));
+
+  assert(paths.has("items"));
+  assert(paths.has("data.message"));
+  assert(paths.has("data.items"));
+  assert(paths.has("data.item"));
+  assert(paths.has("data.selected"));
+});
+
+test("DagCanvas creates dashboard item loop sources and exposes dashboard loop fields", () => {
+  assert.deepEqual(canvasModule.defaultFanSource("dashboard_items"), {
+    type: "dashboard_items",
+    dashboard: "",
+    component: "",
+    filter: "",
+    max_concurrency: 1,
+    fail_fast: false,
+  });
+
+  const sourceOptions = canvasModule.buildInputSourceOptions(
+    { id: "agent", type: "agent" },
+    [
+      {
+        id: "loop",
+        label: "Loop tickets",
+        type: "loop",
+        operation: {
+          type: "loop",
+          source: {
+            type: "dashboard_items",
+            dashboard: "development-dashboard",
+            component: "tickets",
+          },
+        },
+      },
+      { id: "agent", type: "agent" },
+    ],
+    [{ from: "loop", to: "agent" }],
+    [
+      {
+        id: "development-dashboard",
+        name: "Development Dashboard",
+        sections: [
+          {
+            id: "kanban",
+            title: "Kanban",
+            components: [
+              {
+                id: "tickets",
+                title: "Tickets",
+                schema: {
+                  title: { type: "string" },
+                  status: { type: "enum", values: ["backlog", "todo"] },
+                },
+                items: [
+                  {
+                    id: "ticket-1",
+                    title: "Write docs",
+                    owner: "Dana",
+                    status: "todo",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  );
+  const paths = new Set(sourceOptions.map(([pathValue]) => pathValue));
+
+  assert(paths.has("loop.current.item_id"));
+  assert(paths.has("loop.current.item_json"));
+  assert(paths.has("loop.current.item.title"));
+  assert(paths.has("loop.current.item.status"));
+  assert(paths.has("loop.current.item.owner"));
+  assert(!paths.has("loop.current.file_path"));
+});
+
+test("DagCanvas only exposes loop inputs that match the parent loop source", () => {
+  const countOptions = canvasModule.buildInputSourceOptions(
+    { id: "child", type: "bash_command" },
+    [
+      {
+        id: "loop",
+        label: "Repeat",
+        type: "loop",
+        operation: {
+          type: "loop",
+          source: { type: "count", count: 3 },
+        },
+      },
+      { id: "child", type: "bash_command" },
+    ],
+    [{ from: "loop", to: "child" }],
+  );
+  const countPaths = new Set(countOptions.map(([pathValue]) => pathValue));
+  assert(countPaths.has("loop.current.index"));
+  assert(!countPaths.has("loop.current.file_path"));
+  assert(!countPaths.has("loop.current.item_id"));
+
+  const directoryOptions = canvasModule.buildInputSourceOptions(
+    { id: "child", type: "bash_command" },
+    [
+      {
+        id: "loop",
+        label: "Files",
+        type: "loop",
+        operation: {
+          type: "loop",
+          source: { type: "directory", path: "docs", include_content: false },
+        },
+      },
+      { id: "child", type: "bash_command" },
+    ],
+    [{ from: "loop", to: "child" }],
+  );
+  const directoryPaths = new Set(directoryOptions.map(([pathValue]) => pathValue));
+  assert(directoryPaths.has("loop.current.file_path"));
+  assert(!directoryPaths.has("loop.current.file_content"));
+});
+
+test("DagCanvas exposes loop inputs to downstream iteration nodes", () => {
+  const nodes = [
+    {
+      id: "loop",
+      label: "Files",
+      type: "loop",
+      operation: {
+        type: "loop",
+        source: { type: "directory", path: "docs", include_content: true },
+      },
+    },
+    { id: "first", type: "bash_command" },
+    { id: "second", type: "bash_command" },
+    { id: "after", type: "bash_command" },
+  ];
+  const edges = [
+    { from: "loop", to: "first", condition: "always" },
+    { from: "first", to: "second", condition: "always" },
+    { from: "loop", to: "after", condition: "after_loop" },
+  ];
+
+  const downstreamOptions = canvasModule.buildInputSourceOptions(
+    { id: "second", type: "bash_command" },
+    nodes,
+    edges,
+  );
+  const downstreamPaths = new Set(downstreamOptions.map(([pathValue]) => pathValue));
+  assert(downstreamPaths.has("loop.current.file_path"));
+  assert(downstreamPaths.has("loop.current.file_content"));
+
+  const afterLoopOptions = canvasModule.buildInputSourceOptions(
+    { id: "after", type: "bash_command" },
+    nodes,
+    edges,
+  );
+  const afterLoopPaths = new Set(afterLoopOptions.map(([pathValue]) => pathValue));
+  assert(!afterLoopPaths.has("loop.current.file_path"));
+  assert(!afterLoopPaths.has("loop.current.file_content"));
+});
+
 test("DagCanvas exposes approval and notification fields as selectable outputs", () => {
   const approvalFields = canvasModule.nodeOutputFields({
     id: "approval",
@@ -1653,6 +2369,111 @@ test("DagCanvas helpers persist graph positions and create/remove edges", () => 
   workflow = canvasModule.removeWorkflowNode(workflow, "a");
   assert.deepEqual(workflow.nodes.map((node) => node.id), ["b"]);
   assert.deepEqual(workflow.edges, []);
+});
+
+test("DagCanvas canvas group helpers preserve metadata without changing graph semantics", () => {
+  let workflow = {
+    id: "wf",
+    agents: {},
+    nodes: [
+      { id: "scan", type: "bash_command", label: "Scan", operation: { type: "bash_command" }, x: 10, y: 20 },
+      { id: "review", type: "agent", label: "Review", operation: { type: "agent" }, x: 330, y: 20 },
+      { id: "ship", type: "pass", label: "Ship", operation: { type: "pass" }, x: 660, y: 20 },
+    ],
+    edges: [{ id: "scan-review", from: "scan", to: "review" }],
+  };
+
+  workflow = canvasModule.createCanvasGroup(workflow, ["scan", "review"]);
+  let group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.label, "Group 1");
+  assert.deepEqual(group.nodeIds, ["scan", "review"]);
+  assert.deepEqual(workflow.edges, [{ id: "scan-review", from: "scan", to: "review" }]);
+
+  workflow = canvasModule.updateCanvasGroup(workflow, group.id, {
+    label: "Research",
+    color: "#9333ea",
+    collapsed: true,
+  });
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.label, "Research");
+  assert.equal(group.color, "#9333ea");
+  assert.deepEqual(
+    canvasModule.visibleNodesForGroups(workflow.nodes, [group]).map((node) => node.id),
+    ["ship"],
+  );
+  assert.deepEqual(canvasModule.visibleEdgesForGroups(workflow.edges, [workflow.nodes[2]]), []);
+
+  workflow = canvasModule.moveCanvasGroup(workflow, group.id, { x: 40, y: 10 });
+  assert.equal(workflow.nodes[0].x, 50);
+  assert.equal(workflow.nodes[1].x, 370);
+  assert.equal(canvasModule.normalizeCanvasGroups(workflow)[0].x, group.x + 40);
+
+  workflow = canvasModule.duplicateCanvasGroup(workflow, group.id);
+  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 2);
+
+  workflow = canvasModule.deleteCanvasGroup(workflow, group.id);
+  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 1);
+  assert.equal(workflow.nodes.length, 3);
+  assert.equal(workflow.edges.length, 1);
+});
+
+test("DagCanvas auto-layout, search visibility, and run overlays understand groups", () => {
+  const workflow = {
+    id: "wf",
+    agents: {},
+    metadata: {
+      canvas: {
+        groups: [
+          {
+            id: "group-1",
+            label: "Phase",
+            color: "#0f766e",
+            nodeIds: ["scan", "review"],
+            x: 0,
+            y: 0,
+            width: 260,
+            height: 160,
+            collapsed: false,
+          },
+        ],
+      },
+    },
+    nodes: [
+      { id: "review", type: "agent", label: "Review", operation: { type: "agent" }, x: 400, y: 300 },
+      { id: "scan", type: "bash_command", label: "Scan", operation: { type: "bash_command" }, x: 20, y: 20 },
+      { id: "publish", type: "pass", label: "Publish", operation: { type: "pass" }, x: 760, y: 20 },
+    ],
+    edges: [
+      { id: "scan-review", from: "scan", to: "review" },
+      { id: "review-publish", from: "review", to: "publish" },
+    ],
+  };
+
+  const laidOut = canvasModule.autoLayoutWorkflow(workflow, {
+    columnGap: 280,
+    rowGap: 120,
+    startX: 40,
+    startY: 60,
+  });
+  const group = canvasModule.normalizeCanvasGroups(laidOut)[0];
+  const byId = Object.fromEntries(laidOut.nodes.map((node) => [node.id, node]));
+  assert.equal(byId.scan.x, 40);
+  assert.equal(byId.review.x, 320);
+  assert.ok(group.width >= 500);
+  assert.ok(group.height >= 160);
+  assert.deepEqual(canvasModule.matchingNodeIds(laidOut.nodes, "review"), ["review"]);
+  assert.equal(
+    canvasModule.canvasGroupStatus(group, { scan: "success", review: "started" }, []),
+    "running",
+  );
+  assert.equal(
+    canvasModule.canvasGroupStatus(group, { scan: "success", review: "success" }, []),
+    "success",
+  );
+  assert.equal(
+    canvasModule.canvasGroupStatus(group, {}, [{ nodeId: "review", status: "pending" }]),
+    "approval",
+  );
 });
 
 test("DagCanvas layout, search, and fit helpers handle large directed graphs deterministically", () => {
@@ -1848,6 +2669,65 @@ test("DagCanvas rendered navigation controls auto-layout, fit, zoom, and search 
   await dom.unmount();
 });
 
+test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and deleted", async () => {
+  let workflow = {
+    ...workflowFixture({ id: "groups", name: "Groups", label: "Scan" }),
+    nodes: [
+      {
+        id: "scan",
+        type: "bash_command",
+        label: "Scan",
+        x: 40,
+        y: 80,
+        operation: { type: "bash_command", command: "find docs", working_dir: "" },
+      },
+      {
+        id: "review",
+        type: "agent",
+        label: "Review",
+        x: 340,
+        y: 80,
+        operation: { type: "agent", agent_id: "reviewer", prompt: "Review" },
+      },
+    ],
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        workflow = nextWorkflow;
+      },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.click(dom.byTitle("Create canvas group"));
+  let group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.deepEqual(group.nodeIds, ["scan", "review"]);
+
+  await dom.change(dom.byLabel("Rename Group 1"), "Research phase");
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.label, "Research phase");
+
+  await dom.change(dom.byLabel("Color Research phase"), "#dc2626");
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.color, "#dc2626");
+
+  await dom.click(dom.byTitle("Collapse group"));
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.collapsed, true);
+  assert.doesNotMatch(dom.text(), /Review/);
+
+  await dom.click(dom.byTitle("Duplicate group"));
+  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 2);
+
+  await dom.click(dom.byTitle("Delete group"));
+  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 1);
+  assert.equal(workflow.nodes.length, 2);
+
+  await dom.unmount();
+});
+
 test("DagCanvas minimap sits top left, handles translucent dark mode styling, and traps navigation events", async () => {
   const workflow = {
     ...workflowFixture({ id: "minimap", name: "Minimap", label: "Scan" }),
@@ -1932,10 +2812,16 @@ test("DagCanvas minimap sits top left, handles translucent dark mode styling, an
 
 test("Electron preload exposes stable desktop and update bridge contracts", async () => {
   const exposed = runPreload({
-    argv: ["electron", "preload", "--gofer-api-base-url=http://localhost:9000"],
+    argv: [
+      "electron",
+      "preload",
+      "--gofer-api-base-url=http://localhost:9000",
+      "--gofer-api-token=ui-token",
+    ],
   });
 
   assert.equal(exposed.goferApiBaseUrl, "http://localhost:9000");
+  assert.equal(exposed.goferApiToken, "ui-token");
   assert.deepEqual(Object.keys(exposed.goferDesktop).sort(), [
     "dataDirectory",
     "getDataDir",
@@ -1950,9 +2836,9 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "createFolder",
     "deletePath",
     "getPathInfo",
-    "grantPath",
     "listDirectory",
     "openPath",
+    "pathGrantForApi",
     "renamePath",
     "revealPath",
     "selectPath",
@@ -1995,7 +2881,7 @@ test("Electron preload keeps file grants private while attaching them to later c
         return { basename: "workflow.toml", grantId: "grant-1", isFile: true, path: payload.targetPath };
       }
       if (channel === "gofer:grant-path") {
-        return { grantId: "grant-dir", path: payload.targetPath };
+        return { grantId: "grant-drop", path: payload.targetPath };
       }
       return { channel, payload };
     },
@@ -2014,13 +2900,23 @@ test("Electron preload keeps file grants private while attaching them to later c
       targetPath: "/outside/workflow.toml",
     },
   });
-  assert.equal(await exposed.goferDesktop.workspace.grantPath("/outside/shared"), "/outside/shared");
-  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/shared" })), {
+  assert.equal(await exposed.goferDesktop.workspace.selectPath({ currentPath: "/outside" }), "/outside/workflow.toml");
+  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/workflow.toml"), "grant-1");
+  assert.equal(await exposed.goferDesktop.grantDroppedPath({ path: "/outside/dropped.gof.zip" }), "/outside/dropped.gof.zip");
+  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/dropped.gof.zip"), "grant-drop");
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/workflow.toml" })), {
     channel: "gofer:list-directory",
     payload: {
       create: true,
-      currentPath: "/outside/shared",
-      grantId: "grant-dir",
+      currentPath: "/outside/workflow.toml",
+      grantId: "grant-1",
+    },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.textFiles.read("/outside/workflow.toml")), {
+    channel: "gofer:read-text-file",
+    payload: {
+      grantId: "grant-1",
+      targetPath: "/outside/workflow.toml",
     },
   });
 });

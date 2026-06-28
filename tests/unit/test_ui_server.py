@@ -17,14 +17,17 @@ from gofer.core.watcher import WorkflowWatcher
 from gofer.ui import server as server_module
 from gofer.ui.chat import workflow_chat_prompt_path
 from gofer.ui.server import (
+    DesktopPathGrantStore,
     GoferUiRequestHandler,
     GoferUiServer,
+    WorkflowBundleError,
     create_server,
     ready_payload,
     render_usage_summary_html,
     render_workflow_usage_html,
     sync_workflow_schedules,
     sync_workflow_watchers,
+    ui_session_payload,
     workflow_usage_page_payload,
 )
 from gofer.utils.run_state import workflow_run_stop_path
@@ -65,6 +68,10 @@ def _fake_server(
     server = GoferUiServer.__new__(GoferUiServer)
     server.data_dir = tmp_path
     server.resource_limits = resource_limits or DEFAULT_RESOURCE_LIMITS
+    server.api_token = "test-ui-token"
+    server.allowed_origins = {"http://127.0.0.1:5173", "null"}
+    server.path_grant_secret = "test-secret"
+    server.path_grants = DesktopPathGrantStore()
     server.gofer_cli_path = None
     server.server_address = ("127.0.0.1", 8765)
     server.sync_calls = 0
@@ -89,6 +96,7 @@ def _request(
     body: dict[str, object] | bytes | None = None,
     headers: dict[str, str] | None = None,
     resource_limits: ResourceLimits | None = None,
+    authenticated: bool = True,
 ) -> HandlerResult:
     raw_body = b""
     if isinstance(body, bytes):
@@ -101,7 +109,10 @@ def _request(
     handler.server = server
     handler.path = path
     handler.headers = Message()
-    for key, value in (headers or {}).items():
+    request_headers = dict(headers or {})
+    if authenticated and method in {"POST", "PUT", "DELETE"}:
+        request_headers.setdefault("Authorization", "Bearer test-ui-token")
+    for key, value in request_headers.items():
         handler.headers[key] = value
     if body is not None:
         handler.headers["Content-Length"] = str(len(raw_body))
@@ -125,6 +136,12 @@ def _request(
 
     getattr(handler, f"do_{method}")()
     return HandlerResult(status["code"], response_headers, handler.wfile.getvalue(), server)
+
+
+def _fake_handler(server: GoferUiServer) -> GoferUiRequestHandler:
+    handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
+    handler.server = server
+    return handler
 
 
 def _sockets_available() -> bool:
@@ -291,6 +308,9 @@ def test_ui_server_dynamic_port_reports_bound_port(tmp_path) -> None:
         assert payload["dataDir"] == str(tmp_path)
         assert "goferCliPath" not in payload
         assert isinstance(payload["goferCliAvailable"], bool)
+        assert "apiToken" not in payload
+        assert isinstance(server.api_token, str)
+        assert len(server.api_token) >= 32
     finally:
         server.server_close()
 
@@ -302,6 +322,8 @@ def test_ready_payload_exposes_cli_availability_without_helper_path(tmp_path) ->
             server_address=("127.0.0.1", 37655),
             data_dir=tmp_path,
             gofer_cli_path=tmp_path / ".trusted" / "gof",
+            api_token="ready-token",
+            emit_ready_token=True,
         ),
     )
 
@@ -312,6 +334,7 @@ def test_ready_payload_exposes_cli_availability_without_helper_path(tmp_path) ->
         "port": 37655,
         "dataDir": str(tmp_path),
         "goferCliAvailable": True,
+        "apiToken": "ready-token",
     }
     assert "goferCliPath" not in payload
 
@@ -340,7 +363,83 @@ def test_ui_server_health_check_works_on_dynamic_port(tmp_path) -> None:
     assert response.json() == {"ok": True, "dataDir": str(tmp_path)}
     assert response.header("Content-Type") == "application/json"
     assert response.header("Content-Length") == str(len(response.body))
-    assert response.header("Access-Control-Allow-Origin") == "*"
+    assert response.header("Access-Control-Allow-Origin") is None
+
+
+def test_ui_server_session_payload_exposes_token_for_frontend_bootstrap(tmp_path) -> None:
+    response = _request(
+        tmp_path,
+        "GET",
+        "/api/session",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+
+    assert response.status == 200
+    assert response.json() == {
+        "apiBaseUrl": "http://127.0.0.1:8765/api",
+        "apiToken": "test-ui-token",
+    }
+    assert response.header("Access-Control-Allow-Origin") == "http://127.0.0.1:5173"
+
+
+def test_ui_server_session_payload_is_origin_gated(tmp_path) -> None:
+    response = _request(
+        tmp_path,
+        "GET",
+        "/api/session",
+        headers={"Origin": "https://attacker.example"},
+    )
+
+    assert response.status == 403
+    assert response.json() == {"error": "Origin is not allowed"}
+
+
+def test_ui_session_payload_uses_bound_server_address(tmp_path) -> None:
+    fake_server = _fake_server(tmp_path)
+    fake_server.server_address = ("127.0.0.1", 0)
+
+    assert ui_session_payload(fake_server) == {
+        "apiBaseUrl": "http://127.0.0.1:0/api",
+        "apiToken": "test-ui-token",
+    }
+
+
+def test_ui_server_reflects_trusted_origin_without_wildcard_cors(tmp_path) -> None:
+    response = _request(
+        tmp_path,
+        "GET",
+        "/api/health",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
+
+    assert response.status == 200
+    assert response.header("Access-Control-Allow-Origin") == "http://127.0.0.1:5173"
+    assert response.header("Access-Control-Allow-Origin") != "*"
+
+
+def test_ui_server_rejects_disallowed_origin(tmp_path) -> None:
+    response = _request(
+        tmp_path,
+        "GET",
+        "/api/health",
+        headers={"Origin": "https://attacker.example"},
+    )
+
+    assert response.status == 403
+    assert response.json() == {"error": "Origin is not allowed"}
+
+
+def test_ui_server_state_change_requires_ui_api_token(tmp_path) -> None:
+    response = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows",
+        body={"name": "Demo"},
+        authenticated=False,
+    )
+
+    assert response.status == 401
+    assert response.json() == {"error": "UI API authentication required"}
 
 
 def test_ui_server_renders_llm_usage_summary() -> None:
@@ -454,11 +553,13 @@ include_content = true
     server = GoferUiServer.__new__(GoferUiServer)
     server.data_dir = tmp_path
     server.resource_limits = DEFAULT_RESOURCE_LIMITS
+    server.api_token = "test-ui-token"
     handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
     handler.server = server
     handler.path = "/api/workflows/watched-plan/plan"
     handler.headers = Message()
     handler.headers["Content-Length"] = str(len(body))
+    handler.headers["Authorization"] = "Bearer test-ui-token"
     handler.rfile = BytesIO(body)
     handler.wfile = BytesIO()
     status: dict[str, int] = {}
@@ -499,6 +600,7 @@ name = "Hooked"
 
 [workflow.webhooks.default]
 enabled = true
+allow_unauthenticated = true
 
 [[nodes]]
 id = "echo"
@@ -592,6 +694,102 @@ def test_ui_server_ignores_data_dir_query_override(tmp_path) -> None:
     handler.server = server
 
     assert handler._request_data_dir({"data_dir": [str(outside_data_dir)]}) == requested_data_dir
+
+
+def test_ui_bundle_path_allows_data_dir_path_without_grant(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "bundle.gof.zip"
+    bundle_path.write_bytes(b"zip")
+    server = _fake_server(tmp_path)
+    handler = _fake_handler(server)
+
+    handler._assert_bundle_path_allowed(bundle_path, "", must_exist=True)
+
+
+def test_ui_bundle_path_resolves_relative_paths_under_data_dir(tmp_path: Path) -> None:
+    assert server_module._resolve_ui_bundle_path(Path("bundle.gof.zip"), tmp_path) == (
+        tmp_path / "bundle.gof.zip"
+    )
+
+
+def test_ui_bundle_path_rejects_ungranted_outside_path(tmp_path: Path) -> None:
+    outside_dir = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside_dir.mkdir()
+    bundle_path = outside_dir / "bundle.gof.zip"
+    bundle_path.write_bytes(b"zip")
+    server = _fake_server(tmp_path)
+    handler = _fake_handler(server)
+
+    with pytest.raises(WorkflowBundleError, match="outside the approved"):
+        handler._assert_bundle_path_allowed(bundle_path, "", must_exist=True)
+
+
+def test_ui_bundle_path_allows_granted_outside_path(tmp_path: Path) -> None:
+    outside_dir = tmp_path.parent / f"{tmp_path.name}-granted"
+    outside_dir.mkdir()
+    bundle_path = outside_dir / "bundle.gof.zip"
+    bundle_path.write_bytes(b"zip")
+    server = _fake_server(tmp_path)
+    grant_id = server.path_grants.register(outside_dir, "grant-1")
+    handler = _fake_handler(server)
+
+    handler._assert_bundle_path_allowed(bundle_path, grant_id, must_exist=True)
+
+
+def test_ui_bundle_path_rejects_symlink_parent_escape(tmp_path: Path) -> None:
+    outside_dir = tmp_path.parent / f"{tmp_path.name}-symlink-target"
+    outside_dir.mkdir()
+    bundle_path = outside_dir / "bundle.gof.zip"
+    bundle_path.write_bytes(b"zip")
+    symlink_dir = tmp_path / "linked"
+    try:
+        symlink_dir.symlink_to(outside_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"Symlinks are not available: {exc}")
+    server = _fake_server(tmp_path)
+    handler = _fake_handler(server)
+
+    with pytest.raises(WorkflowBundleError, match="outside the approved"):
+        handler._assert_bundle_path_allowed(symlink_dir / "bundle.gof.zip", "", must_exist=True)
+
+
+def test_ui_bundle_path_uses_nearest_existing_parent_for_missing_destination(
+    tmp_path: Path,
+) -> None:
+    outside_dir = tmp_path.parent / f"{tmp_path.name}-export"
+    outside_dir.mkdir()
+    destination = outside_dir / "missing" / "bundle.gof.zip"
+    server = _fake_server(tmp_path)
+    handler = _fake_handler(server)
+
+    with pytest.raises(WorkflowBundleError, match="outside the approved"):
+        handler._assert_bundle_path_allowed(destination, "", must_exist=False)
+
+    grant_id = server.path_grants.register(outside_dir, "grant-1")
+    handler._assert_bundle_path_allowed(destination, grant_id, must_exist=False)
+
+
+def test_ui_desktop_path_grant_registration_requires_secret(tmp_path: Path) -> None:
+    outside_dir = tmp_path.parent / f"{tmp_path.name}-registered"
+    outside_dir.mkdir()
+
+    denied = _request(
+        tmp_path,
+        "POST",
+        "/api/desktop/path-grants",
+        body={"grantId": "grant-1", "path": str(outside_dir)},
+    )
+    assert denied.status == 400
+
+    allowed = _request(
+        tmp_path,
+        "POST",
+        "/api/desktop/path-grants",
+        body={"grantId": "grant-1", "path": str(outside_dir)},
+        headers={"X-Gofer-Desktop-Grant-Secret": "test-secret"},
+    )
+    assert allowed.status == 201
+    payload = cast(dict[str, str], allowed.json())
+    assert payload["grantId"] == "grant-1"
 
 
 def test_ui_server_doctor_endpoint_returns_health_payload(monkeypatch, tmp_path) -> None:
@@ -836,9 +1034,7 @@ def test_ui_server_update_delete_run_and_stop_routes(monkeypatch, tmp_path) -> N
     )
 
     assert updated.status == 200
-    assert updated.json() == {
-        "workflow": {"id": "wf", "name": "Updated", "dataDir": str(tmp_path)}
-    }
+    assert updated.json() == {"workflow": {"id": "wf", "name": "Updated", "dataDir": str(tmp_path)}}
     assert updated.server.sync_calls == 1
     assert deleted.json() == {"workflowId": "wf", "deleted": True}
     assert deleted.server.sync_calls == 1
@@ -1085,9 +1281,7 @@ def test_ui_server_chat_stream_provider_error_is_ndjson(monkeypatch, tmp_path) -
 
     assert response.status == 200
     assert response.header("Content-Type") == "application/x-ndjson; charset=utf-8"
-    assert response.text().splitlines() == [
-        '{"type": "error", "error": "stream unavailable"}'
-    ]
+    assert response.text().splitlines() == ['{"type": "error", "error": "stream unavailable"}']
 
 
 @pytest.mark.parametrize(
@@ -1160,9 +1354,7 @@ def test_ui_server_error_status_mappings(
         raise error
 
     replacement = (
-        async_raise
-        if patch_name in {"run_workflow_payload", "run_workflow_chat"}
-        else sync_raise
+        async_raise if patch_name in {"run_workflow_payload", "run_workflow_chat"} else sync_raise
     )
     monkeypatch.setattr(server_module, patch_name, replacement)
 
@@ -1175,7 +1367,12 @@ def test_ui_server_error_status_mappings(
 def test_ui_server_unknown_invalid_json_and_options(tmp_path) -> None:
     missing = _request(tmp_path, "GET", "/api/not-found")
     invalid = _request(tmp_path, "POST", "/api/workflows", body=b"{")
-    options = _request(tmp_path, "OPTIONS", "/api/workflows")
+    options = _request(
+        tmp_path,
+        "OPTIONS",
+        "/api/workflows",
+        headers={"Origin": "http://127.0.0.1:5173"},
+    )
 
     assert missing.status == 404
     assert missing.json() == {"error": "Not found"}
@@ -1183,8 +1380,9 @@ def test_ui_server_unknown_invalid_json_and_options(tmp_path) -> None:
     assert "Expecting property name" in cast(dict[str, str], invalid.json())["error"]
     assert options.status == 204
     assert options.body == b""
-    assert options.header("Access-Control-Allow-Origin") == "*"
+    assert options.header("Access-Control-Allow-Origin") == "http://127.0.0.1:5173"
     assert options.header("Access-Control-Allow-Methods") == "GET, POST, PUT, DELETE, OPTIONS"
+    assert "Authorization" in (options.header("Access-Control-Allow-Headers") or "")
 
 
 def test_ui_server_continuous_monitor_starts_one_thread_and_cleans_inactive(
@@ -1323,6 +1521,8 @@ def test_ui_server_serve_shutdown_cleans_up(monkeypatch, tmp_path, capsys) -> No
             self.server_address = ("127.0.0.1", 4321)
             self.data_dir = tmp_path
             self.gofer_cli_path = None
+            self.api_token = "ready-token"
+            self.emit_ready_token = False
             self.scheduler = FakeLifecycle()
             self.watcher = FakeLifecycle()
             self.calls: list[str] = []
@@ -1351,6 +1551,7 @@ def test_ui_server_serve_shutdown_cleans_up(monkeypatch, tmp_path, capsys) -> No
 
     output = capsys.readouterr()
     assert "GOFER_UI_READY" in output.out
+    assert "ready-token" not in output.out
     assert "GOFER_UI_STOPPED" in output.err
     assert fake_server.scheduler.calls == [
         ("start", True),

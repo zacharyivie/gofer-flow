@@ -2,27 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import html
 import json
+import os
+import secrets
 import signal
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
+from gofer.core.resources import ResourceLimits, bundle_resource_limits_from_env
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.core.usage import summarize_node_outputs
 from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
 from gofer.ui.api import (
+    DashboardUiError,
     ProviderProfileError,
     RunnerQueueError,
     WorkflowAlreadyExistsError,
@@ -35,10 +41,18 @@ from gofer.ui.api import (
     WorkflowRunError,
     WorkflowTriggerError,
     WorkflowUpdateError,
+    add_dashboard_component_payload,
+    add_dashboard_section_payload,
     apply_workflow_validation_fix_payload,
     cancel_queued_run_payload,
+    create_dashboard_payload,
     create_workflow_payload,
+    dashboard_items_payload,
+    dashboard_payload,
     decide_workflow_approval_payload,
+    delete_dashboard_component_payload,
+    delete_dashboard_payload,
+    delete_dashboard_section_payload,
     delete_provider_profile_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
@@ -53,6 +67,7 @@ from gofer.ui.api import (
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     list_workflow_templates_payload,
+    mutate_dashboard_item_payload,
     preview_workflow_bundle_payload,
     provider_profiles_payload,
     prune_workflow_run_logs_payload,
@@ -66,6 +81,9 @@ from gofer.ui.api import (
     runner_queue_payload,
     stop_workflow_run_payload,
     trigger_workflow_payload,
+    update_dashboard_component_payload,
+    update_dashboard_payload,
+    update_dashboard_section_payload,
     update_retention_settings_payload,
     update_workflow_payload,
     upsert_provider_profile_payload,
@@ -89,6 +107,8 @@ from gofer.utils.paths import get_data_dir
 
 log = get_logger(__name__)
 CONTINUOUS_RUN_POLL_SECONDS = 1.0
+PATH_GRANT_TTL_SECONDS = 15 * 60
+DEFAULT_DEV_FRONTEND_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
 
 
 def _optional_query(query: dict[str, list[str]], name: str) -> str | None:
@@ -166,17 +186,64 @@ def sync_workflow_watchers(data_dir: Path, watcher: WorkflowWatcher) -> None:
             watcher.remove_workflow(watched["id"])
 
 
+@dataclass(frozen=True)
+class DesktopPathGrant:
+    root: Path
+    expires_at: float
+
+
+class DesktopPathGrantStore:
+    def __init__(self) -> None:
+        self._grants: dict[str, DesktopPathGrant] = {}
+        self._lock = threading.Lock()
+
+    def register(self, root: Path, grant_id: str | None = None) -> str:
+        grant_id = grant_id or str(uuid.uuid4())
+        grant = DesktopPathGrant(
+            root=_canonical_path_for_containment(root),
+            expires_at=time.monotonic() + PATH_GRANT_TTL_SECONDS,
+        )
+        with self._lock:
+            self._prune_locked()
+            self._grants[grant_id] = grant
+        return grant_id
+
+    def covers(self, target: Path, grant_id: str | None) -> bool:
+        if not grant_id:
+            return False
+        canonical_target = _canonical_path_for_containment(target)
+        with self._lock:
+            self._prune_locked()
+            grant = self._grants.get(grant_id)
+        if grant is None:
+            return False
+        return _is_path_inside(canonical_target, grant.root)
+
+    def _prune_locked(self) -> None:
+        now = time.monotonic()
+        expired = [grant_id for grant_id, grant in self._grants.items() if grant.expires_at <= now]
+        for grant_id in expired:
+            self._grants.pop(grant_id, None)
+
+
 class GoferUiServer(ThreadingHTTPServer):
     def __init__(
         self,
         server_address: tuple[str, int],
         data_dir: Path,
         resource_limits: ResourceLimits | None = None,
+        api_token: str | None = None,
+        allowed_origins: set[str] | None = None,
     ) -> None:
         data_dir.mkdir(parents=True, exist_ok=True)
         super().__init__(server_address, GoferUiRequestHandler)
         self.data_dir = data_dir
-        self.resource_limits = resource_limits or DEFAULT_RESOURCE_LIMITS
+        self.resource_limits = resource_limits or bundle_resource_limits_from_env()
+        self.api_token = api_token or os.environ.get("GOFER_UI_API_TOKEN") or _new_ui_api_token()
+        self.emit_ready_token = os.environ.get("GOFER_UI_EMIT_READY_TOKEN") == "1"
+        self.allowed_origins = allowed_origins or _default_allowed_origins()
+        self.path_grant_secret = os.environ.get("GOFER_DESKTOP_GRANT_SECRET", "")
+        self.path_grants = DesktopPathGrantStore()
         self.gofer_cli_path = ensure_local_gofer_cli(data_dir)
         self.scheduler = WorkflowScheduler(db_path=data_dir / "schedules.db")
         self.watcher = WorkflowWatcher(resource_limits=self.resource_limits)
@@ -281,6 +348,9 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
+        if not self._allow_origin(parsed.path):
+            self._send_json({"error": "Origin is not allowed"}, status=403)
+            return
         if parsed.path == "/api/health":
             self._send_json(
                 {
@@ -288,6 +358,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     "dataDir": str(self._default_data_dir()),
                 }
             )
+            return
+
+        if parsed.path == "/api/session":
+            self._send_json(ui_session_payload(self.server))
             return
 
         if parsed.path == "/api/doctor":
@@ -340,6 +414,34 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._sync_schedules()
             payload = list_workflow_payloads(self._request_data_dir(query))
             self._send_json(payload)
+            return
+
+        if parsed.path == "/api/dashboards":
+            query = parse_qs(parsed.query)
+            try:
+                self._send_json(dashboard_payload(self._request_data_dir(query)))
+            except DashboardUiError as exc:
+                self._send_json({"error": str(exc)}, status=400)
+            return
+
+        if parsed.path.startswith("/api/dashboards/") and parsed.path.endswith("/items"):
+            query = parse_qs(parsed.query)
+            remainder = parsed.path.removeprefix("/api/dashboards/").removesuffix("/items")
+            parts = [part for part in remainder.split("/") if part]
+            if len(parts) != 3 or parts[1] != "components":
+                self._send_json({"error": "Not found"}, status=404)
+                return
+            try:
+                self._send_json(
+                    dashboard_items_payload(
+                        parts[0],
+                        parts[2],
+                        self._request_data_dir(query),
+                        _optional_query(query, "filter"),
+                    )
+                )
+            except DashboardUiError as exc:
+                self._send_json({"error": str(exc)}, status=404)
             return
 
         if parsed.path == "/api/workflow-templates":
@@ -543,6 +645,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        if not self._allow_origin(parsed.path):
+            self._send_json({"error": "Origin is not allowed"}, status=403)
+            return
+        if not self._authorize_ui_request("POST", parsed.path):
+            return
         if parsed.path == "/api/retention":
             query = parse_qs(parsed.query)
             try:
@@ -578,12 +685,22 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json()
                 with _bundle_path_from_body(body) as bundle_path:
-                    if bundle_path:
+                    if bundle_path and body.get("bundlePath"):
+                        bundle_path = _resolve_ui_bundle_path(
+                            bundle_path,
+                            self._request_data_dir(query),
+                        )
+                        self._assert_bundle_path_allowed(
+                            bundle_path,
+                            body.get("grantId"),
+                            must_exist=True,
+                        )
                         plan = import_workflow_bundle_payload(
                             bundle_path,
                             self._request_data_dir(query),
                             replace=bool(body.get("replace", False)),
                             dry_run=bool(body.get("dryRun", False)),
+                            resource_limits=self._resource_limits(),
                         )
                         self._sync_schedules()
                         self._send_json(
@@ -616,14 +733,105 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             try:
                 body = self._read_json()
                 with _bundle_path_from_body(body) as bundle_path:
+                    if bundle_path and body.get("bundlePath"):
+                        bundle_path = _resolve_ui_bundle_path(
+                            bundle_path,
+                            self._request_data_dir(query),
+                        )
+                        self._assert_bundle_path_allowed(
+                            bundle_path,
+                            body.get("grantId"),
+                            must_exist=True,
+                        )
                     payload = preview_workflow_bundle_payload(
                         bundle_path or Path(""),
                         self._request_data_dir(query),
+                        resource_limits=self._resource_limits(),
                     )
             except (WorkflowBundleError, json.JSONDecodeError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
             self._send_json({"import": payload})
+            return
+
+        if parsed.path == "/api/dashboards":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = create_dashboard_payload(
+                    str(body.get("name") or ""),
+                    self._request_data_dir(query),
+                    dashboard_id=body.get("id"),
+                )
+            except (DashboardUiError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload, status=201)
+            return
+
+        if parsed.path.startswith("/api/dashboards/"):
+            query = parse_qs(parsed.query)
+            remainder = parsed.path.removeprefix("/api/dashboards/")
+            parts = [part for part in remainder.split("/") if part]
+            try:
+                body = self._read_json()
+                if len(parts) == 1:
+                    payload = update_dashboard_payload(
+                        parts[0],
+                        self._request_data_dir(query),
+                        name=body.get("name"),
+                        duplicate=bool(body.get("duplicate", False)),
+                    )
+                elif len(parts) == 2 and parts[1] == "sections":
+                    payload = add_dashboard_section_payload(
+                        parts[0],
+                        str(body.get("title") or ""),
+                        self._request_data_dir(query),
+                        section_id=body.get("id"),
+                    )
+                elif len(parts) == 3 and parts[1] == "sections" and body.get("type"):
+                    payload = add_dashboard_component_payload(
+                        parts[0],
+                        parts[2],
+                        str(body.get("title") or ""),
+                        str(body.get("type") or "table"),  # type: ignore[arg-type]
+                        self._request_data_dir(query),
+                        component_id=body.get("id"),
+                    )
+                elif len(parts) == 3 and parts[1] == "sections":
+                    payload = update_dashboard_section_payload(
+                        parts[0],
+                        parts[2],
+                        self._request_data_dir(query),
+                        title=body.get("title"),
+                        layout=body.get("layout"),
+                    )
+                elif len(parts) == 3 and parts[1] == "components":
+                    payload = update_dashboard_component_payload(
+                        parts[0],
+                        parts[2],
+                        self._request_data_dir(query),
+                        content=body.get("content"),
+                        display=body.get("display"),
+                        schema=body.get("schema"),
+                        title=body.get("title"),
+                        views=body.get("views"),
+                    )
+                elif len(parts) == 4 and parts[1] == "components" and parts[3] == "items":
+                    payload = mutate_dashboard_item_payload(
+                        parts[0],
+                        parts[2],
+                        str(body.get("action") or "add"),
+                        body,
+                        self._request_data_dir(query),
+                    )
+                else:
+                    self._send_json({"error": "Not found"}, status=404)
+                    return
+            except (DashboardUiError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
             return
 
         if parsed.path == "/api/workflows":
@@ -890,7 +1098,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             query = parse_qs(parsed.query)
             try:
                 body = self._read_json()
-                output_path = Path(str(body.get("outputPath", "")))
+                output_path = _resolve_ui_bundle_path(
+                    Path(str(body.get("outputPath", ""))),
+                    self._request_data_dir(query),
+                )
+                self._assert_bundle_path_allowed(
+                    output_path,
+                    body.get("grantId"),
+                    must_exist=False,
+                )
                 payload = export_workflow_bundle_payload(
                     workflow_id,
                     output_path,
@@ -898,6 +1114,16 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     notes=body.get("notes"),
                 )
             except (WorkflowBundleError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload, status=201)
+            return
+
+        if parsed.path == "/api/desktop/path-grants":
+            try:
+                body = self._read_json()
+                payload = self._register_desktop_path_grant(body)
+            except (json.JSONDecodeError, ValueError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
             self._send_json(payload, status=201)
@@ -1093,6 +1319,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_PUT(self) -> None:
         parsed = urlparse(self.path)
+        if not self._allow_origin(parsed.path):
+            self._send_json({"error": "Origin is not allowed"}, status=403)
+            return
+        if not self._authorize_ui_request("PUT", parsed.path):
+            return
         if parsed.path.startswith("/api/workflows/"):
             workflow_id = parsed.path.removeprefix("/api/workflows/")
             query = parse_qs(parsed.query)
@@ -1114,6 +1345,11 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         parsed = urlparse(self.path)
+        if not self._allow_origin(parsed.path):
+            self._send_json({"error": "Origin is not allowed"}, status=403)
+            return
+        if not self._authorize_ui_request("DELETE", parsed.path):
+            return
         if parsed.path == "/api/chat":
             query = parse_qs(parsed.query)
             try:
@@ -1155,6 +1391,44 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if parsed.path.startswith("/api/dashboards/"):
+            query = parse_qs(parsed.query)
+            remainder = parsed.path.removeprefix("/api/dashboards/")
+            parts = [part for part in remainder.split("/") if part]
+            if len(parts) == 3 and parts[1] == "sections":
+                try:
+                    payload = delete_dashboard_section_payload(
+                        parts[0],
+                        parts[2],
+                        self._request_data_dir(query),
+                    )
+                except DashboardUiError as exc:
+                    self._send_json({"error": str(exc)}, status=404)
+                    return
+                self._send_json(payload)
+                return
+            if len(parts) == 3 and parts[1] == "components":
+                try:
+                    payload = delete_dashboard_component_payload(
+                        parts[0],
+                        parts[2],
+                        self._request_data_dir(query),
+                    )
+                except DashboardUiError as exc:
+                    self._send_json({"error": str(exc)}, status=404)
+                    return
+                self._send_json(payload)
+                return
+
+            dashboard_id = remainder
+            try:
+                payload = delete_dashboard_payload(dashboard_id, self._request_data_dir(query))
+            except DashboardUiError as exc:
+                self._send_json({"error": str(exc)}, status=404)
+                return
+            self._send_json(payload)
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/chat"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/chat")
             query = parse_qs(parsed.query)
@@ -1188,9 +1462,21 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "Not found"}, status=404)
 
     def do_OPTIONS(self) -> None:
+        parsed = urlparse(self.path)
+        if not self._allow_origin(parsed.path):
+            self.send_response(403)
+            self.end_headers()
+            return
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Gofer-Desktop-Grant-Secret, "
+            "X-Gofer-UI-Token, X-Gofer-Webhook-Token",
+        )
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
         self.end_headers()
 
@@ -1246,10 +1532,57 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         server = getattr(self, "server", None)
         if isinstance(server, GoferUiServer):
             return server.resource_limits
-        return DEFAULT_RESOURCE_LIMITS
+        return bundle_resource_limits_from_env()
 
     def _request_data_dir(self, _query: dict[str, list[str]]) -> Path:
         return self._default_data_dir()
+
+    def _assert_bundle_path_allowed(
+        self,
+        target_path: Path,
+        grant_id: object,
+        *,
+        must_exist: bool,
+    ) -> None:
+        server = self.server
+        grants = (
+            server.path_grants
+            if isinstance(server, GoferUiServer)
+            else DesktopPathGrantStore()
+        )
+        data_dir = self._default_data_dir()
+        try:
+            canonical_target = _canonical_path_for_containment(target_path)
+            canonical_data_dir = _canonical_path_for_containment(data_dir)
+        except OSError as exc:
+            raise WorkflowBundleError(str(exc)) from exc
+        if must_exist and not target_path.exists():
+            raise WorkflowBundleError(f"Bundle path does not exist: {target_path}")
+        if _is_path_inside(canonical_target, canonical_data_dir):
+            return
+        grant_value = str(grant_id or "").strip()
+        if grants.covers(target_path, grant_value):
+            return
+        raise WorkflowBundleError("Bundle path is outside the approved Gofer desktop roots")
+
+    def _register_desktop_path_grant(self, body: dict[str, Any]) -> dict[str, str]:
+        server = self.server
+        if not isinstance(server, GoferUiServer):
+            raise ValueError("Desktop path grants are unavailable")
+        secret = server.path_grant_secret
+        if not secret or self.headers.get("X-Gofer-Desktop-Grant-Secret") != secret:
+            raise ValueError("Desktop path grant registration is unauthorized")
+        target_path = str(body.get("path") or "").strip()
+        grant_id = str(body.get("grantId") or "").strip()
+        if not target_path:
+            raise ValueError("A path is required")
+        if not grant_id:
+            raise ValueError("A grant id is required")
+        registered_id = server.path_grants.register(Path(target_path), grant_id)
+        return {
+            "grantId": registered_id,
+            "path": str(_canonical_path_for_containment(Path(target_path))),
+        }
 
     def _read_json(self) -> dict[str, Any]:
         limit = self._resource_limits().max_api_request_body_bytes
@@ -1281,8 +1614,15 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Gofer-Desktop-Grant-Secret, "
+            "X-Gofer-UI-Token, X-Gofer-Webhook-Token",
+        )
         self.end_headers()
         self.wfile.write(body)
 
@@ -1298,7 +1638,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -1306,22 +1649,90 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self._cors_origin()
+        if origin:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+        self.send_header(
+            "Access-Control-Allow-Headers",
+            "Authorization, Content-Type, X-Gofer-UI-Token",
+        )
         self.end_headers()
 
     def _write_stream_event(self, event: dict[str, Any]) -> None:
         self.wfile.write(json.dumps(event).encode("utf-8") + b"\n")
         self.wfile.flush()
 
+    def _allow_origin(self, path: str) -> bool:
+        if not path.startswith("/api/"):
+            return True
+        origin = getattr(self, "headers", {}).get("Origin")
+        if not origin:
+            return True
+        return self._is_allowed_origin(origin)
+
+    def _cors_origin(self) -> str | None:
+        origin_value = getattr(self, "headers", {}).get("Origin")
+        origin = str(origin_value) if origin_value else None
+        if origin and self._is_allowed_origin(origin):
+            return origin
+        return None
+
+    def _is_allowed_origin(self, origin: str) -> bool:
+        server = self.server
+        allowed = server.allowed_origins if isinstance(server, GoferUiServer) else set()
+        if origin in allowed:
+            return True
+        try:
+            parsed_origin = urlparse(origin)
+        except ValueError:
+            return False
+        if parsed_origin.scheme not in {"http", "https"}:
+            return False
+        server_address = self.server.server_address
+        if not isinstance(server_address, tuple) or len(server_address) < 2:
+            return False
+        host, port = server_address[:2]
+        if parsed_origin.hostname not in {host, "localhost"}:
+            return False
+        expected_port = int(port)
+        origin_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        return origin_port == expected_port
+
+    def _authorize_ui_request(self, method: str, path: str) -> bool:
+        if not _requires_ui_api_auth(method, path):
+            return True
+        server = self.server
+        expected = getattr(server, "api_token", "") if isinstance(server, GoferUiServer) else ""
+        supplied = getattr(self, "headers", {}).get("X-Gofer-UI-Token")
+        authorization = getattr(self, "headers", {}).get("Authorization", "")
+        if supplied is None and authorization.startswith("Bearer "):
+            supplied = authorization.removeprefix("Bearer ").strip()
+        if expected and supplied and hmac.compare_digest(supplied, expected):
+            return True
+        self._send_json({"error": "UI API authentication required"}, status=401)
+        return False
+
 
 def ready_payload(server: GoferUiServer) -> dict[str, Any]:
     host, port = server.server_address[:2]
-    return {
+    payload = {
         "host": host,
         "port": port,
         "dataDir": str(server.data_dir),
         "goferCliAvailable": server.gofer_cli_path is not None,
+    }
+    if getattr(server, "emit_ready_token", False):
+        payload["apiToken"] = server.api_token
+    return payload
+
+
+def ui_session_payload(server: Any) -> dict[str, Any]:
+    host, port = server.server_address[:2]
+    api_token = server.api_token if isinstance(server, GoferUiServer) else ""
+    return {
+        "apiBaseUrl": f"http://{host}:{port}/api",
+        "apiToken": api_token,
     }
 
 
@@ -1471,12 +1882,79 @@ def create_server(
     port: int = 8765,
     data_dir: Path | None = None,
     resource_limits: ResourceLimits | None = None,
+    api_token: str | None = None,
+    allowed_origins: set[str] | None = None,
 ) -> GoferUiServer:
     return GoferUiServer(
         (host, port),
         data_dir or get_data_dir(),
         resource_limits=resource_limits,
+        api_token=api_token,
+        allowed_origins=allowed_origins,
     )
+
+
+def _new_ui_api_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def _default_allowed_origins() -> set[str]:
+    origins = set(DEFAULT_DEV_FRONTEND_ORIGINS)
+    configured = os.environ.get("GOFER_UI_ALLOWED_ORIGINS", "")
+    for origin in configured.split(","):
+        normalized = origin.strip().rstrip("/")
+        if normalized:
+            origins.add(normalized)
+    for env_name in ("GOFER_VITE_DEV_SERVER_URL", "VITE_DEV_SERVER_URL"):
+        value = os.environ.get(env_name)
+        if not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme and parsed.netloc:
+            origins.add(f"{parsed.scheme}://{parsed.netloc}")
+    origins.add("null")
+    return origins
+
+
+def _requires_ui_api_auth(method: str, path: str) -> bool:
+    if method not in {"POST", "PUT", "DELETE"} or not path.startswith("/api/"):
+        return False
+    if "/webhooks/" in path and (path.endswith("/trigger") or path.endswith("/replay")):
+        return False
+    return True
+
+
+def _canonical_path_for_containment(target_path: Path) -> Path:
+    path = target_path.expanduser()
+    if path.exists():
+        return path.resolve(strict=True)
+
+    missing_parts: list[str] = []
+    current = path
+    while not current.exists() and current != current.parent:
+        missing_parts.insert(0, current.name)
+        current = current.parent
+
+    if current.exists():
+        parent = current.resolve(strict=True)
+    else:
+        parent = current.resolve(strict=False)
+    return parent.joinpath(*missing_parts)
+
+
+def _resolve_ui_bundle_path(target_path: Path, data_dir: Path) -> Path:
+    expanded = target_path.expanduser()
+    if expanded.is_absolute():
+        return expanded
+    return data_dir / expanded
+
+
+def _is_path_inside(child: Path, root: Path) -> bool:
+    try:
+        child.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 @contextmanager

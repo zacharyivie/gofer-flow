@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -15,6 +17,12 @@ class ResourceLimits(BaseModel):
     max_file_read_bytes: int = 1_048_576
     max_aggregate_read_bytes: int = 32_000_000
     max_vector_index_bytes: int = 50_000_000
+    max_bundle_entries: int = 1000
+    max_bundle_entry_bytes: int = 10_000_000
+    max_bundle_total_uncompressed_bytes: int = 64_000_000
+    max_bundle_compressed_bytes: int = 64_000_000
+    max_bundle_metadata_bytes: int = 1_048_576
+    max_bundle_compression_ratio: float = 100.0
     max_log_message_bytes: int = 1_000
     max_log_bytes_per_node: int = 1_048_576
     max_log_bytes_per_run: int = 20_000_000
@@ -28,6 +36,32 @@ class ResourceLimits(BaseModel):
 
 
 DEFAULT_RESOURCE_LIMITS = ResourceLimits()
+
+BUNDLE_RESOURCE_LIMIT_ENV: dict[str, str] = {
+    "GOFER_BUNDLE_MAX_ENTRIES": "max_bundle_entries",
+    "GOFER_BUNDLE_MAX_ENTRY_BYTES": "max_bundle_entry_bytes",
+    "GOFER_BUNDLE_MAX_TOTAL_UNCOMPRESSED_BYTES": "max_bundle_total_uncompressed_bytes",
+    "GOFER_BUNDLE_MAX_COMPRESSED_BYTES": "max_bundle_compressed_bytes",
+    "GOFER_BUNDLE_MAX_METADATA_BYTES": "max_bundle_metadata_bytes",
+    "GOFER_BUNDLE_MAX_COMPRESSION_RATIO": "max_bundle_compression_ratio",
+}
+
+
+def bundle_resource_limits_from_env(
+    base: ResourceLimits = DEFAULT_RESOURCE_LIMITS,
+) -> ResourceLimits:
+    overrides: dict[str, Any] = {}
+    for env_name, field_name in BUNDLE_RESOURCE_LIMIT_ENV.items():
+        raw = os.environ.get(env_name)
+        if raw is None or raw == "":
+            continue
+        if field_name == "max_bundle_compression_ratio":
+            overrides[field_name] = float(raw)
+        else:
+            overrides[field_name] = int(raw)
+    if not overrides:
+        return base
+    return base.model_copy(update=overrides)
 
 
 def byte_len(value: str) -> int:

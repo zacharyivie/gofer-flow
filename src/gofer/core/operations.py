@@ -34,6 +34,7 @@ class OperationType(StrEnum):
     HTTP_REQUEST = "http_request"
     APPROVAL_GATE = "approval_gate"
     NOTIFICATION = "notification"
+    DASHBOARD_ITEM = "dashboard_item"
 
 
 class CountFanSource(BaseModel):
@@ -66,6 +67,15 @@ class TriggerEventsFanSource(BaseModel):
     fail_fast: bool = False
 
 
+class DashboardItemsFanSource(BaseModel):
+    type: Literal["dashboard_items"]
+    dashboard: str = ""
+    component: str = ""
+    filter: str | dict[str, object] | None = None
+    max_concurrency: int = 1
+    fail_fast: bool = False
+
+
 class InfiniteFanSource(BaseModel):
     type: Literal["infinite"]
     max_concurrency: int = 1
@@ -77,6 +87,7 @@ FanSource = Annotated[
     | TabularFanSource
     | DirectoryFanSource
     | TriggerEventsFanSource
+    | DashboardItemsFanSource
     | InfiniteFanSource,
     Field(discriminator="type"),
 ]
@@ -259,6 +270,7 @@ class HttpRequestOperation(BaseModel):
     response_mode: Literal["auto", "json", "text", "none"] = "auto"
     output_mapping: dict[str, str] = {}
     secret_fields: list[str] = []
+    network_allowlist: list[str] = []
 
 
 class ApprovalGateOperation(BaseModel):
@@ -275,8 +287,47 @@ class NotificationOperation(BaseModel):
     type: Literal[OperationType.NOTIFICATION]
     title: str = "Gofer Flow notification"
     body: str = ""
-    channel: Literal["desktop"] = "desktop"
+    channel: Literal["desktop", "slack", "teams", "webhook", "email"] = "desktop"
     urgency: Literal["low", "normal", "critical"] = "normal"
+    webhook_url: str | None = None
+    headers: dict[str, str] = {}
+    payload: object | None = None
+    email_from: str | None = None
+    email_to: list[str] = []
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_starttls: bool = True
+    timeout_seconds: float = 30.0
+    retry: HttpRetryPolicy = Field(default_factory=HttpRetryPolicy)
+    expected_statuses: list[int] = [200, 201, 202, 204]
+    network_allowlist: list[str] = []
+
+
+class DashboardItemOperation(BaseModel):
+    type: Literal[OperationType.DASHBOARD_ITEM]
+    action: Literal["read", "add", "update", "delete", "move"] = "read"
+    dashboard: str
+    component: str
+    item_id: str | None = None
+    item: dict[str, object] = {}
+    patch: dict[str, object] = {}
+    filter: str | dict[str, object] | None = None
+    field: str = "status"
+    value: object | None = None
+
+
+class DashboardUpdateInstruction(BaseModel):
+    action: Literal["add", "update", "delete", "move"]
+    dashboard: str
+    component: str
+    item_id: str | None = None
+    item: dict[str, object] = {}
+    patch: dict[str, object] = {}
+    field: str = "status"
+    value: object | None = None
+    source: str = "data.dashboard_update"
 
 
 class AgentOperation(BaseModel):
@@ -291,6 +342,7 @@ class AgentOperation(BaseModel):
     dynamic_count: int | str = 1
     memory: Literal["none", "run", "all"] = "none"
     input_mapping: dict[str, str] = {}
+    dashboard_updates: list[DashboardUpdateInstruction] = []
     llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
     # Deprecated: fan-out belongs on LoopOperation. Kept for old TOML compatibility.
     fan_source: FanSource | None = None
@@ -320,6 +372,7 @@ Operation = Annotated[
     | HttpRequestOperation
     | ApprovalGateOperation
     | NotificationOperation
+    | DashboardItemOperation
     | AgentOperation,
     Field(discriminator="type"),
 ]

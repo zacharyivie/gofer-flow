@@ -14,7 +14,7 @@ import time
 import urllib.parse
 import webbrowser
 from collections import deque
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,14 +34,30 @@ from gofer.core.approvals import (
     ApprovalDecisionValue,
     ApprovalRequest,
     ApprovalStore,
-    DesktopNotificationAdapter,
+    MultiChannelNotificationAdapter,
     Notification,
     NotificationAdapter,
     wait_for_decision,
 )
+from gofer.core.dashboards import (
+    add_item as dashboard_add_item,
+)
+from gofer.core.dashboards import (
+    delete_item as dashboard_delete_item,
+)
+from gofer.core.dashboards import (
+    list_items as dashboard_list_items,
+)
+from gofer.core.dashboards import (
+    move_item as dashboard_move_item,
+)
+from gofer.core.dashboards import (
+    update_item as dashboard_update_item,
+)
 from gofer.core.graph import EdgeConditionType, GraphNode, WorkflowGraph
 from gofer.core.http import HttpClient, HttpRequest, UrllibHttpClient, append_query_params
 from gofer.core.llm_prompts import common_llm_task_prompt
+from gofer.core.network_policy import NetworkPolicyViolation, validate_http_request_url
 from gofer.core.operations import (
     AgentOperation,
     ApprovalGateOperation,
@@ -50,6 +66,9 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
+    DashboardItemOperation,
+    DashboardItemsFanSource,
+    DashboardUpdateInstruction,
     DeleteFileOperation,
     DirectoryFanSource,
     FailOperation,
@@ -90,6 +109,7 @@ from gofer.core.resources import (
     require_limit,
     truncate_text_bytes,
 )
+from gofer.core.secrets import missing_workflow_secrets
 from gofer.core.usage import (
     LlmUsageEstimate,
     LlmUsageTotals,
@@ -121,13 +141,28 @@ SECRET_REF_PATTERN = re.compile(
 SECRET_INTERPOLATION_PATTERN = re.compile(r"\{\{\s*secret\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
 TEMPLATE_INTERPOLATION_PATTERN = re.compile(r"\{\{\s*([^}]+)\s*\}\}")
 SENSITIVE_FIELD_NAMES = {
+    "access-key",
+    "access_key",
+    "access_token",
+    "apikey",
+    "auth",
+    "auth_token",
     "authorization",
+    "api_key",
+    "client_secret",
     "cookie",
-    "x-api-key",
+    "credential",
+    "credentials",
+    "id_token",
     "api-key",
-    "token",
+    "passwd",
     "password",
+    "private_key",
+    "refresh_token",
     "secret",
+    "token",
+    "x-api-key",
+    "x_api_key",
 }
 
 
@@ -186,7 +221,11 @@ def _is_sensitive_field(path: str, configured: set[str]) -> bool:
     if normalized in configured:
         return True
     name = normalized.rsplit(".", maxsplit=1)[-1]
-    return name in SENSITIVE_FIELD_NAMES or any(token in name for token in ("token", "secret"))
+    if name in configured:
+        return True
+    return name in SENSITIVE_FIELD_NAMES or any(
+        token in name for token in ("token", "secret", "credential", "password")
+    )
 
 
 def _secret_reference_names(value: object) -> set[str]:
@@ -410,6 +449,109 @@ def _mask_http_text(
         r"(?P<quote>['\"]?)(?P<value>[^,'\"}\s]+)(?P=quote)",
         mask_key_value,
         masked,
+    )
+
+
+def _masked_trigger_context_for_log(trigger_context: dict[str, Any]) -> dict[str, Any]:
+    masked = cast(
+        dict[str, Any],
+        _mask_http_value(trigger_context, _trigger_sensitive_field_config(trigger_context)),
+    )
+    if isinstance(masked.get("events"), list):
+        masked["events_json"] = json.dumps(masked["events"], default=str)
+    if "sanitizedPayload" in masked:
+        masked.pop("sanitizedPayload", None)
+    return masked
+
+
+def _trigger_sensitive_field_config(trigger_context: dict[str, Any]) -> set[str]:
+    configured: set[str] = set()
+    for field_name in trigger_context.get("sensitivePayloadFields", []):
+        value = str(field_name).strip().lower()
+        if not value:
+            continue
+        configured.add(value)
+        if value.startswith("payload."):
+            configured.add(value.removeprefix("payload."))
+        else:
+            configured.add(f"payload.{value}")
+    return configured
+
+
+def _collect_sensitive_field_values(
+    value: object,
+    configured: set[str],
+    path: str = "",
+) -> set[str]:
+    if isinstance(value, dict):
+        values: set[str] = set()
+        for key, item in value.items():
+            key_text = str(key)
+            child_path = f"{path}.{key_text}" if path else key_text
+            if _is_sensitive_field(child_path, configured):
+                values.update(_collect_leaf_strings(item))
+            else:
+                values.update(_collect_sensitive_field_values(item, configured, child_path))
+        return values
+    if isinstance(value, list):
+        list_values: set[str] = set()
+        for item in value:
+            list_values.update(_collect_sensitive_field_values(item, configured, path))
+        return list_values
+    return set()
+
+
+def _trigger_secret_values_for_logs(trigger_context: dict[str, Any]) -> set[str]:
+    configured = _trigger_sensitive_field_config(trigger_context)
+    payload = trigger_context.get("payload")
+    values = _collect_sensitive_field_values(payload, configured)
+    return {value for value in values if value}
+
+
+def _mask_known_secret_values(value: object, secret_values: set[str]) -> object:
+    if not secret_values:
+        return value
+    if isinstance(value, str):
+        return _replace_known_secrets(value, secret_values)
+    if isinstance(value, dict):
+        return {
+            str(key): _mask_known_secret_values(item, secret_values) for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_known_secret_values(item, secret_values) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_mask_known_secret_values(item, secret_values) for item in value)
+    return value
+
+
+def _mask_node_output(output: NodeOutput, secret_values: set[str]) -> NodeOutput:
+    if not secret_values:
+        return output
+    return NodeOutput(
+        node_id=output.node_id,
+        success=output.success,
+        output=str(_mask_known_secret_values(output.output, secret_values)),
+        exit_code=output.exit_code,
+        duration_seconds=output.duration_seconds,
+        skipped=output.skipped,
+        fan_outputs=cast(
+            list[tuple[str, str]],
+            _mask_known_secret_values(output.fan_outputs, secret_values),
+        ),
+        terminal_status=output.terminal_status,
+        loop_items=cast(
+            list[dict[str, object]] | None,
+            _mask_known_secret_values(output.loop_items, secret_values),
+        ),
+        loop_infinite=output.loop_infinite,
+        loop_max_concurrency=output.loop_max_concurrency,
+        loop_fail_fast=output.loop_fail_fast,
+        type=output.type,
+        text=cast(str | None, _mask_known_secret_values(output.text, secret_values)),
+        value=_mask_known_secret_values(output.value, secret_values),
+        data=cast(dict[str, object], _mask_known_secret_values(output.data, secret_values)),
+        items=cast(list[object], _mask_known_secret_values(output.items, secret_values)),
+        error=cast(str | None, _mask_known_secret_values(output.error, secret_values)),
     )
 
 
@@ -802,9 +944,7 @@ def _iter_vector_sidecar_entries(
                         f"Invalid vector index entries JSONL: {entries_path}:{line_number}"
                     ) from exc
                 if not isinstance(entry, dict):
-                    raise ValueError(
-                        f"Invalid vector index entry: {entries_path}:{line_number}"
-                    )
+                    raise ValueError(f"Invalid vector index entry: {entries_path}:{line_number}")
                 yield entry
     except FileNotFoundError as exc:
         raise ValueError(f"Missing vector index entries file: {entries_path}") from exc
@@ -943,6 +1083,8 @@ def _resolve_fan_items(
     ctx: ExecutionContext,
     limits: ResourceLimits = DEFAULT_RESOURCE_LIMITS,
     path_base: Path | None = None,
+    data_dir: Path | None = None,
+    require_path_access: Callable[[Path, Literal["read", "write", "execute"]], None] | None = None,
 ) -> list[dict[str, object]]:
     if isinstance(source, CountFanSource):
         count = ctx.resolve_dynamic_count(source.count)
@@ -953,6 +1095,8 @@ def _resolve_fan_items(
         return [{"index": str(i)} for i in range(count)]
     if isinstance(source, TabularFanSource):
         path = _resolve_workflow_path(source.path, path_base)
+        if require_path_access is not None:
+            require_path_access(path, "read")
         return _load_tabular(
             path,
             max_items=limits.max_fanout_items,
@@ -961,6 +1105,8 @@ def _resolve_fan_items(
         )
     if isinstance(source, DirectoryFanSource):
         source_path = _resolve_workflow_path(source.path, path_base)
+        if require_path_access is not None:
+            require_path_access(source_path, "read")
         items: list[dict[str, object]] = []
         aggregate_bytes = 0
         scanned = 0
@@ -979,6 +1125,8 @@ def _resolve_fan_items(
                     **_file_path_data(p),
                 }
                 if source.include_content:
+                    if require_path_access is not None:
+                        require_path_access(p, "read")
                     size = p.stat().st_size
                     require_limit(size, limits.max_file_read_bytes, f"{p} size")
                     aggregate_bytes += size
@@ -1017,6 +1165,8 @@ def _resolve_fan_items(
                 item.setdefault("directory", str(event_path.parent))
             if source.include_content and event_path_value:
                 file_path = Path(str(event_path_value))
+                if require_path_access is not None:
+                    require_path_access(file_path, "read")
                 if file_path.exists() and file_path.is_file():
                     size = file_path.stat().st_size
                     require_limit(size, limits.max_file_read_bytes, f"{file_path} size")
@@ -1029,6 +1179,38 @@ def _resolve_fan_items(
                         )
                     item["file_content"] = file_path.read_text(errors="replace")
             items.append(item)
+        return items
+    if isinstance(source, DashboardItemsFanSource):
+        dashboard = str(source.dashboard or "").strip()
+        component = str(source.component or "").strip()
+        if not dashboard:
+            raise ValueError("dashboard item loop source requires a dashboard")
+        if not component:
+            raise ValueError("dashboard item loop source requires a component")
+        dashboard_items = dashboard_list_items(
+            dashboard,
+            component,
+            data_dir or get_data_dir(),
+            source.filter,
+        )
+        items = []
+        for idx, item in enumerate(dashboard_items):
+            if len(items) >= limits.max_fanout_items:
+                raise ResourceLimitError(
+                    f"dashboard item fan-out exceeded limit {limits.max_fanout_items} items"
+                )
+            item_payload = cast(dict[str, object], item)
+            item_id = str(item_payload.get("id") or "")
+            items.append(
+                {
+                    "index": str(idx),
+                    "dashboard": dashboard,
+                    "component": component,
+                    "item_id": item_id,
+                    "item": item_payload,
+                    "item_json": json.dumps(item_payload, default=str),
+                }
+            )
         return items
     if isinstance(source, InfiniteFanSource):
         return []
@@ -1291,6 +1473,29 @@ class WorkflowRunLog:
         self._write_node_event(node_id, label, value, uncapped=label == "AGENT_MESSAGE")
         self._update_node_agent_event_data(node_id, label, value)
 
+    def active_attempt_preview(self, node_id: str, data: dict[str, object]) -> None:
+        if not data:
+            return
+        payload = self._read_events_payload()
+        nodes = payload.setdefault("nodes", {})
+        if not isinstance(nodes, dict):
+            return
+        node_state = nodes.setdefault(node_id, {"nodeId": node_id, "attempts": []})
+        if not isinstance(node_state, dict):
+            return
+        run_number, attempt = self._active_node_runs.get(node_id, (None, None))
+        compacted = self._compact_event_value(data)
+        if not isinstance(compacted, dict):
+            return
+        self._update_active_attempt_preview(
+            node_state,
+            run_number=run_number,
+            attempt=attempt,
+            patch=compacted,
+        )
+        node_state["updatedAt"] = self._now()
+        self._write_events_payload(payload)
+
     def complete(
         self,
         success: bool,
@@ -1500,14 +1705,9 @@ class WorkflowRunLog:
                 compacted[str(key)] = cls._compact_event_value(item)
             return compacted
         if isinstance(value, list):
-            items = [
-                cls._compact_event_value(item)
-                for item in value[: cls._MAX_EVENT_LIST_ITEMS]
-            ]
+            items = [cls._compact_event_value(item) for item in value[: cls._MAX_EVENT_LIST_ITEMS]]
             if len(value) > cls._MAX_EVENT_LIST_ITEMS:
-                items.append(
-                    f"{len(value) - cls._MAX_EVENT_LIST_ITEMS} additional items omitted"
-                )
+                items.append(f"{len(value) - cls._MAX_EVENT_LIST_ITEMS} additional items omitted")
             return items
         return value
 
@@ -1760,7 +1960,7 @@ class WorkflowExecutor:
         store_data_dir = data_dir or (log_base_dir.parent if log_base_dir is not None else None)
         self._data_dir = store_data_dir
         self._approval_store = approval_store or ApprovalStore(store_data_dir)
-        self._notification_adapter = notification_adapter or DesktopNotificationAdapter()
+        self._notification_adapter = notification_adapter or MultiChannelNotificationAdapter()
         self._resume_options: ResumeOptions | None = None
         self._resume_task_entries: dict[str, dict[str, object]] = {}
         self._resume_seed_outputs: dict[str, NodeOutput] = {}
@@ -2028,6 +2228,22 @@ class WorkflowExecutor:
         else:
             self._save_agent_memory(node_id, turns)
 
+    def _agent_memory_key(
+        self,
+        node_id: str,
+        loop_item: dict[str, object] | None = None,
+    ) -> str:
+        if not loop_item:
+            return node_id
+        for key in ("item_id", "id", "path", "file_path", "index"):
+            value = loop_item.get(key)
+            if value not in (None, ""):
+                return f"{node_id}--{_safe_path_part(str(value))}"
+        digest = hashlib.sha256(
+            json.dumps(loop_item, sort_keys=True, default=str).encode()
+        ).hexdigest()[:16]
+        return f"{node_id}--{digest}"
+
     def _agent_memory_path(self, node_id: str) -> Path:
         base = self._log_base_dir.parent if self._log_base_dir is not None else get_data_dir()
         workflow_id = _safe_path_part(self._workflow.config.id)
@@ -2287,14 +2503,12 @@ class WorkflowExecutor:
         provider_settings: ResolvedProviderSettings,
     ) -> float | None:
         timeouts = [
-            value
-            for value in (budget_timeout, provider_settings.timeout)
-            if value is not None
+            value for value in (budget_timeout, provider_settings.timeout) if value is not None
         ]
         return min(timeouts) if timeouts else None
 
     def _trigger_secret_values(self, ctx: ExecutionContext, graph: WorkflowGraph) -> set[str]:
-        secret_values: set[str] = set()
+        secret_values = _trigger_secret_values_for_logs(ctx.trigger)
         for node in graph.nodes_in_order():
             op = node.operation
             if op.type != OperationType.HTTP_REQUEST:
@@ -2434,6 +2648,79 @@ class WorkflowExecutor:
         payload: object,
     ) -> dict[str, str]:
         return self._write_snapshot_artifact(snapshot_path, category, name, payload)
+
+    @staticmethod
+    def _snapshot_node_output_contract(output: NodeOutput) -> dict[str, object]:
+        contract = output.contract()
+        if output.type not in {
+            str(OperationType.AGENT),
+            str(OperationType.COMMON_LLM_TASK),
+        }:
+            return contract
+        data = contract.get("data")
+        if not isinstance(data, dict):
+            return contract
+        compact_data: dict[str, object] = {}
+        for key in (
+            "message",
+            "agent_id",
+            "usage",
+            "dashboard_updates",
+            "budget",
+            "cacheKey",
+            "reused",
+        ):
+            if key in data:
+                compact_data[key] = data[key]
+        omitted: list[str] = []
+        for key in ("prompt", "thoughts", "inputs"):
+            if key in data:
+                omitted.append(key)
+        if omitted:
+            compact_data["omittedFromCheckpoint"] = omitted
+        return {**contract, "data": compact_data}
+
+    def _snapshot_task_entry(self, entry: dict[str, object]) -> dict[str, object]:
+        compacted = dict(entry)
+        output = entry.get("output")
+        if isinstance(output, dict):
+            compacted["output"] = self._compact_checkpoint_contract(output)
+            output_type = str(output.get("type") or "")
+            if output_type in {
+                str(OperationType.AGENT),
+                str(OperationType.COMMON_LLM_TASK),
+            }:
+                compacted.pop("inputs", None)
+                compacted["inputsOmittedFromCheckpoint"] = True
+        return compacted
+
+    @staticmethod
+    def _compact_checkpoint_contract(contract: dict[str, object]) -> dict[str, object]:
+        output_type = str(contract.get("type") or "")
+        if output_type not in {
+            str(OperationType.AGENT),
+            str(OperationType.COMMON_LLM_TASK),
+        }:
+            return contract
+        data = contract.get("data")
+        if not isinstance(data, dict):
+            return contract
+        compact_data: dict[str, object] = {}
+        for key in (
+            "message",
+            "agent_id",
+            "usage",
+            "dashboard_updates",
+            "budget",
+            "cacheKey",
+            "reused",
+        ):
+            if key in data:
+                compact_data[key] = data[key]
+        omitted = [key for key in ("prompt", "thoughts", "inputs") if key in data]
+        if omitted:
+            compact_data["omittedFromCheckpoint"] = omitted
+        return {**contract, "data": compact_data}
 
     def _hydrate_snapshot_artifacts(self, snapshot_path: Path, payload: object) -> object:
         if isinstance(payload, dict):
@@ -2577,9 +2864,7 @@ class WorkflowExecutor:
                 )
                 continue
             matched = (
-                False
-                if edge.condition == EdgeConditionType.AFTER_LOOP
-                else edge.evaluate(output)
+                False if edge.condition == EdgeConditionType.AFTER_LOOP else edge.evaluate(output)
             )
             incoming_decisions.append(
                 {
@@ -2788,6 +3073,24 @@ class WorkflowExecutor:
             return None
         return self._run_log.path.with_suffix(".resume.json")
 
+    def _cleanup_resume_checkpoints_for_fresh_run(self) -> None:
+        if self._run_log is None:
+            return
+        if self._resume_options is not None or self._run_log_path is not None:
+            return
+        log_dir = self._run_log.path.parent
+        current_resume = self._run_log.path.with_suffix(".resume.json")
+        current_artifacts = self._artifact_root(current_resume)
+        for resume_path in log_dir.glob("*.resume.json"):
+            if resume_path == current_resume:
+                continue
+            resume_path.unlink(missing_ok=True)
+            shutil.rmtree(self._artifact_root(resume_path), ignore_errors=True)
+        for artifact_root in log_dir.glob("*.resume.artifacts"):
+            if artifact_root == current_artifacts:
+                continue
+            shutil.rmtree(artifact_root, ignore_errors=True)
+
     def _cache_root(self) -> Path | None:
         base = self._data_dir or (self._log_base_dir.parent if self._log_base_dir else None)
         if base is None:
@@ -2878,19 +3181,30 @@ class WorkflowExecutor:
         path = self._run_resume_path()
         if path is None:
             return
+        shutil.rmtree(self._artifact_root(path), ignore_errors=True)
         node_outputs = {
-            node_id: self._snapshot_ref(path, "node-outputs", node_id, output.contract())
+            node_id: self._snapshot_ref(
+                path,
+                "node-outputs",
+                node_id,
+                self._snapshot_node_output_contract(output),
+            )
             for node_id, output in ctx.node_outputs.items()
         }
         node_runs = {
             node_id: [
-                self._snapshot_ref(path, "node-runs", f"{node_id}-{index}", output.contract())
+                self._snapshot_ref(
+                    path,
+                    "node-runs",
+                    f"{node_id}-{index}",
+                    self._snapshot_node_output_contract(output),
+                )
                 for index, output in enumerate(runs)
             ]
             for node_id, runs in ctx.node_runs.items()
         }
         task_entries = {
-            key: self._snapshot_ref(path, "task-entries", key, entry)
+            key: self._snapshot_ref(path, "task-entries", key, self._snapshot_task_entry(entry))
             for key, entry in self._resume_task_entries.items()
         }
         path.write_text(
@@ -2937,9 +3251,7 @@ class WorkflowExecutor:
         result: dict[str, object] = {}
         for raw_path in paths:
             path = (
-                raw_path
-                if raw_path.is_absolute()
-                else (self._path_base or Path.cwd()) / raw_path
+                raw_path if raw_path.is_absolute() else (self._path_base or Path.cwd()) / raw_path
             )
             try:
                 stat = path.stat()
@@ -2975,6 +3287,8 @@ class WorkflowExecutor:
             OperationType.APPROVAL_GATE,
             OperationType.HTTP_REQUEST,
             OperationType.NOTIFICATION,
+            OperationType.DASHBOARD_ITEM,
+            OperationType.LOOP,
         }
 
     def _entry_output(self, entry: dict[str, object]) -> NodeOutput | None:
@@ -3026,11 +3340,12 @@ class WorkflowExecutor:
         saved_outputs = payload.get("nodeOutputs")
         if isinstance(saved_outputs, dict):
             for node in (
-                node
-                for generation in graph.topological_generations()
-                for node in generation
+                node for generation in graph.topological_generations() for node in generation
             ):
                 node_id = node.node_id
+                if node.operation.type == OperationType.LOOP:
+                    invalidated.update({node_id, *self._descendant_nodes(graph, node_id)})
+                    continue
                 output_data = saved_outputs.get(node_id)
                 if output_data is None:
                     continue
@@ -3124,6 +3439,8 @@ class WorkflowExecutor:
         options = self._resume_options
         if options is None or options.force or options.skip_cache:
             return None
+        if node.operation.type == OperationType.LOOP:
+            return None
         if node.node_id in self._resume_cache_bypass_nodes:
             return None
         task_key = self._task_cache_key(node.node_id, loop_item)
@@ -3167,15 +3484,28 @@ class WorkflowExecutor:
             "cacheable": self._cacheable_by_default(node),
             "inputs": inputs,
             "operation": self._operation_fingerprint(node),
-            "output": output.contract(),
+            "output": self._snapshot_node_output_contract(output),
             "finishedAt": datetime.now().astimezone().isoformat(),
         }
-        self._resume_task_entries[str(entry["taskKey"])] = entry
+        stored_entry = self._snapshot_task_entry(entry)
+        self._resume_task_entries[str(entry["taskKey"])] = stored_entry
         self._write_resume_checkpoint(ctx)
         if output.success and bool(entry["cacheable"]):
-            self._write_global_cache_entry(entry)
+            self._write_global_cache_entry(stored_entry)
 
     async def run(self) -> ExecutionResult:
+        if not self._dry_run:
+            missing_secrets = missing_workflow_secrets(
+                self._workflow,
+                workflow_path=self._workflow_path,
+                data_dir=self._data_dir,
+            )
+            if missing_secrets:
+                raise ValueError(
+                    "Missing required secret(s): "
+                    + ", ".join(missing_secrets)
+                    + ". Set GOFER_SECRET_<NAME> or <NAME> before running."
+                )
         if self._stop_file is not None:
             self._stop_file.unlink(missing_ok=True)
         else:
@@ -3188,6 +3518,7 @@ class WorkflowExecutor:
             self._limits,
             existing_path=self._run_log_path,
         )
+        self._cleanup_resume_checkpoints_for_fresh_run()
         run_log = self._log()
         if self._stop_file is not None:
             data_dir = self._stop_file.parent.parent
@@ -3229,7 +3560,10 @@ class WorkflowExecutor:
                     )
                 )
             if ctx.trigger:
-                trigger_text = json.dumps(ctx.trigger, default=str)
+                trigger_text = json.dumps(
+                    _masked_trigger_context_for_log(ctx.trigger),
+                    default=str,
+                )
                 trigger_text = _replace_known_secrets(
                     trigger_text,
                     self._trigger_secret_values(ctx, graph),
@@ -4012,6 +4346,19 @@ class WorkflowExecutor:
             )
         ]
 
+    def _successor_await_all_inputs_ready(
+        self,
+        successor: GraphNode,
+        output: NodeOutput,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+    ) -> bool:
+        if not successor.await_all_inputs:
+            return True
+        if output.loop_items is not None:
+            return True
+        return self._all_inputs_ready(successor.node_id, ctx, graph)
+
     def _queue_successor_tasks(
         self,
         output: NodeOutput,
@@ -4047,11 +4394,7 @@ class WorkflowExecutor:
             if not matched:
                 continue
             successor = graph._nodes[successor_id]
-            if successor.await_all_inputs and not self._all_inputs_ready(
-                successor_id,
-                ctx,
-                graph,
-            ):
+            if not self._successor_await_all_inputs_ready(successor, output, ctx, graph):
                 continue
             for successor_task in self._successor_tasks(successor_id, output, current_task):
                 if successor_task.key in queued_tasks or successor_task.key in running_tasks:
@@ -4187,6 +4530,7 @@ class WorkflowExecutor:
                     exit_code=1,
                     duration_seconds=0.0,
                 )
+            output = _mask_node_output(output, self._trigger_secret_values(ctx, graph))
             results[node.node_id] = output
             logged_output = output.output
             if output.type == str(OperationType.HTTP_REQUEST):
@@ -4225,8 +4569,7 @@ class WorkflowExecutor:
                     f"attempt {attempt + 1} finished "
                     f"success={output.success} exit_code={output.exit_code}"
                 ),
-                duration_seconds=output.duration_seconds
-                or (time.monotonic() - attempt_started),
+                duration_seconds=output.duration_seconds or (time.monotonic() - attempt_started),
                 exit_code=output.exit_code,
                 success=output.success,
                 data=self._node_event_data(output),
@@ -4348,6 +4691,43 @@ class WorkflowExecutor:
             return None
         return self._input_text(inputs["stdin"]).encode()
 
+    def _positional_input_args(
+        self,
+        node: GraphNode,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        loop_item: dict[str, object] | None = None,
+    ) -> list[str]:
+        inputs = self._resolve_node_inputs(node, ctx, graph, loop_item)
+        indexed: list[tuple[int, str]] = []
+        for key, value in inputs.items():
+            if key == "stdin":
+                indexed.append((1, self._input_text(value)))
+            elif key.startswith("stdin") and key[5:].isdigit():
+                indexed.append((int(key[5:]), self._input_text(value)))
+        return [value for _, value in sorted(indexed)]
+
+    def _positional_input_env(self, positional_args: list[str]) -> dict[str, str]:
+        return {
+            f"GOFER_INPUT_ARG_{index}": value
+            for index, value in enumerate(positional_args, start=1)
+        }
+
+    def _bash_command_with_positional_env(
+        self,
+        command: str,
+        positional_arg_count: int,
+    ) -> str:
+        if positional_arg_count <= 0 or sys.platform == "win32":
+            return command
+        args = " ".join(
+            f'"${{GOFER_INPUT_ARG_{index}:-}}"' for index in range(1, positional_arg_count + 1)
+        )
+        return f"set -- {args}; {command}"
+
+    def _is_stdin_input_key(self, key: str) -> bool:
+        return key == "stdin" or (key.startswith("stdin") and key[5:].isdigit())
+
     def _resolved_env(
         self,
         node: GraphNode,
@@ -4368,8 +4748,12 @@ class WorkflowExecutor:
                 if isinstance(value, (str, int, float, bool)):
                     env.setdefault(key.upper(), self._input_text(value))
         for key, value in self._resolve_node_inputs(node, ctx, graph, loop_item).items():
+            if self._is_stdin_input_key(key):
+                continue
             if key.startswith("env.") and len(key) > 4:
                 env[key[4:]] = self._input_text(value)
+            else:
+                env[key] = self._input_text(value)
         return env or None
 
     def _render_runtime_string(
@@ -4555,6 +4939,8 @@ class WorkflowExecutor:
             assert isinstance(op, ApprovalGateOperation)
             template_context = self._template_context(node, ctx, graph, loop_item)
             message = str(self._render_http_value(op.message, template_context))
+            secret_values = _collect_secret_values(op.message)
+            masked_message = _replace_known_secrets(message, secret_values)
             run_id = self._log().path.name
             checkpoint_path = self._approval_checkpoint_path(run_id, node.node_id)
             self._write_approval_checkpoint(
@@ -4567,7 +4953,7 @@ class WorkflowExecutor:
                 workflow_id=self._workflow.config.id,
                 run_id=run_id,
                 node_id=node.node_id,
-                message=message,
+                message=masked_message,
                 approvers=list(op.approvers),
                 timeout_seconds=op.timeout_seconds,
                 timeout_decision=op.timeout_decision,
@@ -4592,7 +4978,7 @@ class WorkflowExecutor:
                 node.node_id,
                 f"approval pending: run_id={run_id} request={request_path}",
             )
-            self._log().node_output(node.node_id, "approval message", message)
+            self._log().node_output(node.node_id, "approval message", masked_message)
             if op.notify:
                 try:
                     await self._notification_adapter.send(
@@ -4604,7 +4990,7 @@ class WorkflowExecutor:
                                 )
                             ),
                             body=(
-                                f"{message}\n\n"
+                                f"{masked_message}\n\n"
                                 f"Approve with: {approve_command}\n"
                                 f"Reject with: {reject_command}"
                             ),
@@ -4664,7 +5050,7 @@ class WorkflowExecutor:
                     "approved": approved,
                     "decidedBy": decided_by,
                     "notes": notes,
-                    "message": message,
+                    "message": masked_message,
                     "runId": run_id,
                     "requestPath": str(request_path),
                     "approvers": list(op.approvers),
@@ -4692,7 +5078,14 @@ class WorkflowExecutor:
                     type=str(op.type),
                     text="infinite loop started",
                 )
-            items = _resolve_fan_items(op.source, ctx, self._limits, self._path_base)
+            items = _resolve_fan_items(
+                op.source,
+                ctx,
+                self._limits,
+                self._path_base,
+                self._data_dir,
+                self._require_workflow_path_access,
+            )
             output = json.dumps(items, default=str)
             self._log().node(node.node_id, f"loop source: {op.source.type}")
             self._log().node(node.node_id, f"loop items: {len(items)}")
@@ -4720,6 +5113,9 @@ class WorkflowExecutor:
                     "source_type": op.source.type,
                     "count": len(items),
                     "source_path": resolved_source_path,
+                    "dashboard": str(getattr(op.source, "dashboard", "")),
+                    "component": str(getattr(op.source, "component", "")),
+                    "filter": getattr(op.source, "filter", None),
                     "glob": str(getattr(op.source, "glob", "")),
                     "include_content": bool(getattr(op.source, "include_content", False)),
                     "max_concurrency": int(getattr(op.source, "max_concurrency", 1)),
@@ -4730,6 +5126,7 @@ class WorkflowExecutor:
         if op.type == OperationType.BASH_COMMAND:
             assert isinstance(op, BashCommandOperation)
             stdin = self._resolve_pipe_stdin(node, ctx, graph, loop_item)
+            positional_args = self._positional_input_args(node, ctx, graph, loop_item)
             rendered_command = self._render_runtime_string(
                 op.command,
                 node,
@@ -4737,7 +5134,11 @@ class WorkflowExecutor:
                 graph,
                 loop_item,
             )
-            cmd = command_shell_args(rendered_command)
+            rendered_command_for_shell = self._bash_command_with_positional_env(
+                rendered_command,
+                len(positional_args),
+            )
+            cmd = command_shell_args(rendered_command_for_shell)
             working_dir = (
                 _resolve_workflow_path(
                     Path(
@@ -4754,28 +5155,39 @@ class WorkflowExecutor:
                 if op.working_dir is not None
                 else None
             )
-            self._log().node(node.node_id, f"command: {rendered_command}")
+            secret_values = self._trigger_secret_values(ctx, graph)
+            masked_command = _replace_known_secrets(rendered_command, secret_values)
+            self._log().node(node.node_id, f"command: {masked_command}")
             self._log().node(node.node_id, f"command shell: {cmd[0]}")
             rc, stdout, stderr = await run_subprocess(
                 cmd,
                 cancel_event=self._cancel_event,
                 cwd=working_dir,
-                env=self._resolved_env(node, ctx, graph, op.env, loop_item),
+                env={
+                    **(self._resolved_env(node, ctx, graph, op.env, loop_item) or {}),
+                    **self._positional_input_env(positional_args),
+                },
                 timeout=node.timeout_seconds,
                 stdin=stdin,
                 max_output_bytes=self._limits.max_subprocess_output_bytes,
             )
-            self._log().node_output(node.node_id, "stdout", stdout)
-            self._log().node_output(node.node_id, "stderr", stderr)
+            masked_stdout = _replace_known_secrets(stdout, secret_values)
+            masked_stderr = _replace_known_secrets(stderr, secret_values)
+            self._log().node_output(node.node_id, "stdout", masked_stdout)
+            self._log().node_output(node.node_id, "stderr", masked_stderr)
             return NodeOutput(
                 node_id=node.node_id,
                 success=rc == 0,
-                output=stdout or stderr,
+                output=masked_stdout or masked_stderr,
                 exit_code=rc,
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
-                data={"stdout": stdout, "stderr": stderr, "command": rendered_command},
-                error=stderr if rc != 0 else None,
+                data={
+                    "stdout": masked_stdout,
+                    "stderr": masked_stderr,
+                    "command": masked_command,
+                },
+                error=masked_stderr if rc != 0 else None,
             )
 
         elif op.type in (OperationType.PYTHON_SCRIPT, OperationType.SHELL_SCRIPT):
@@ -4784,12 +5196,14 @@ class WorkflowExecutor:
             script_path = _resolve_workflow_path(op.script_path, self._path_base)
             self._require_workflow_path_access(script_path, "execute")
             rendered_args = [
-                self._render_runtime_string(arg, node, ctx, graph, loop_item)
-                for arg in op.args
+                self._render_runtime_string(arg, node, ctx, graph, loop_item) for arg in op.args
             ]
-            cmd = [interpreter, str(script_path)] + rendered_args
+            positional_args = self._positional_input_args(node, ctx, graph, loop_item)
+            cmd = [interpreter, str(script_path)] + rendered_args + positional_args
             stdin = self._resolve_pipe_stdin(node, ctx, graph, loop_item)
-            self._log().node(node.node_id, f"command: {' '.join(cmd)}")
+            secret_values = self._trigger_secret_values(ctx, graph)
+            masked_command = _replace_known_secrets(" ".join(cmd), secret_values)
+            self._log().node(node.node_id, f"command: {masked_command}")
             rc, stdout, stderr = await run_subprocess(
                 cmd,
                 cancel_event=self._cancel_event,
@@ -4798,21 +5212,23 @@ class WorkflowExecutor:
                 stdin=stdin,
                 max_output_bytes=self._limits.max_subprocess_output_bytes,
             )
-            self._log().node_output(node.node_id, "stdout", stdout)
-            self._log().node_output(node.node_id, "stderr", stderr)
+            masked_stdout = _replace_known_secrets(stdout, secret_values)
+            masked_stderr = _replace_known_secrets(stderr, secret_values)
+            self._log().node_output(node.node_id, "stdout", masked_stdout)
+            self._log().node_output(node.node_id, "stderr", masked_stderr)
             return NodeOutput(
                 node_id=node.node_id,
                 success=rc == 0,
-                output=stdout or stderr,
+                output=masked_stdout or masked_stderr,
                 exit_code=rc,
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
                 data={
-                    "stdout": stdout,
-                    "stderr": stderr,
+                    "stdout": masked_stdout,
+                    "stderr": masked_stderr,
                     "script_path": str(script_path),
                 },
-                error=stderr if rc != 0 else None,
+                error=masked_stderr if rc != 0 else None,
             )
 
         elif op.type == OperationType.READ_FILE:
@@ -5010,6 +5426,33 @@ class WorkflowExecutor:
                 opened = webbrowser.open(target)
                 if not opened:
                     raise RuntimeError(f"Could not open URL: {target}")
+            elif resource_type in {"auto", "file", "folder"}:
+                resolved_target = _resolve_workflow_path(Path(target), self._path_base)
+                self._require_workflow_path_access(resolved_target, "read")
+                target = str(resolved_target)
+                if sys.platform == "win32":
+                    os.startfile(target)  # type: ignore[attr-defined]
+                else:
+                    cmd = open_resource_args(target, resource_type, op.args)
+                    rc, stdout, stderr = await run_subprocess(
+                        cmd,
+                        cancel_event=self._cancel_event,
+                        timeout=node.timeout_seconds,
+                        max_output_bytes=self._limits.max_subprocess_output_bytes,
+                    )
+                    self._log().node_output(node.node_id, "stdout", stdout)
+                    self._log().node_output(node.node_id, "stderr", stderr)
+                    if rc != 0:
+                        return NodeOutput(
+                            node_id=node.node_id,
+                            success=False,
+                            output=stderr or stdout,
+                            exit_code=rc,
+                            duration_seconds=time.monotonic() - start,
+                            type=str(op.type),
+                            data={"target": target, "stdout": stdout, "stderr": stderr},
+                            error=stderr or stdout,
+                        )
             elif sys.platform == "win32" and resource_type != "app":
                 os.startfile(target)  # type: ignore[attr-defined]
             else:
@@ -5082,6 +5525,7 @@ class WorkflowExecutor:
                 variables["_piped_input"] = stdin.decode(op.encoding)
             rendered = PromptManager._interpolate(template, variables)
             output_path = _resolve_workflow_path(op.output_path, self._path_base)
+            self._require_workflow_path_access(output_path, "write")
             _prepare_destination(output_path, op.create_dirs, op.overwrite)
             output_path.write_text(rendered, encoding=op.encoding)
             output = f"wrote prompt file {output_path}"
@@ -5124,11 +5568,12 @@ class WorkflowExecutor:
                 input_ctx["_piped_input"] = stdin.decode()
             prompt = common_llm_task_prompt(op.task, op.target, op.instructions)
             try:
+                memory_key = self._agent_memory_key(node.node_id, loop_item)
                 memory = await self._compact_agent_memory_if_needed(
-                    node.node_id,
+                    memory_key,
                     op,
                     op.memory,
-                    self._agent_memory(node.node_id, op.memory),
+                    self._agent_memory(memory_key, op.memory),
                     agent_config,
                     sub,
                 )
@@ -5146,15 +5591,13 @@ class WorkflowExecutor:
                     duration_seconds=time.monotonic() - start,
                     type=str(op.type),
                     data={
-                        "inputs": input_ctx,
                         "message": message,
                         "agent_id": op.agent_id,
-                        "prompt": prompt,
-                        "thoughts": [],
                         "budget": {
                             "blocked": True,
                             "violations": exc.violations,
                         },
+                        "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                     },
                     error=message,
                 )
@@ -5163,6 +5606,13 @@ class WorkflowExecutor:
                 input_ctx,
                 prompt,
                 memory,
+            )
+            self._log().active_attempt_preview(
+                node.node_id,
+                {
+                    "inputs": input_ctx,
+                    "prompt": prompt_for_budget,
+                },
             )
             (
                 budget_violations_before_call,
@@ -5183,15 +5633,13 @@ class WorkflowExecutor:
                     duration_seconds=time.monotonic() - start,
                     type=str(op.type),
                     data={
-                        "inputs": input_ctx,
                         "message": message,
                         "agent_id": op.agent_id,
-                        "prompt": prompt_for_budget,
-                        "thoughts": [],
                         "budget": {
                             "blocked": True,
                             "violations": budget_violations_before_call,
                         },
+                        "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                     },
                     error=message,
                 )
@@ -5219,7 +5667,7 @@ class WorkflowExecutor:
                 result,
                 streamed_thought_count=len(common_streamed_thoughts),
             )
-            self._remember_agent_result(node.node_id, op.memory, result)
+            self._remember_agent_result(memory_key, op.memory, result)
             usage = usage_from_metadata(
                 provider=result.provider or agent_config.subscription,
                 profile=result.profile or agent_config.profile,
@@ -5254,22 +5702,15 @@ class WorkflowExecutor:
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
                 data={
-                    "inputs": input_ctx,
                     "message": result_message,
                     "agent_id": op.agent_id,
-                    "prompt": result.prompt or prompt,
-                    "thoughts": [
-                        self._bounded_agent_thought(node.node_id, thought)
-                        for thought in result.thoughts
-                    ],
                     "usage": usage.model_dump(),
                     "budget": {
                         "violations": budget_violations_after_call,
                         "workflow_totals": self._llm_usage_totals.to_dict(),
-                        "node_totals": self._node_llm_usage_totals[
-                            node.node_id
-                        ].to_dict(),
+                        "node_totals": self._node_llm_usage_totals[node.node_id].to_dict(),
                     },
+                    "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                 },
                 error=result_output if not success else None,
             )
@@ -5278,6 +5719,17 @@ class WorkflowExecutor:
             assert isinstance(op, LocalVectorizeOperation)
             source_path = _resolve_workflow_path(op.source_path, self._path_base)
             index_path = _resolve_workflow_path(op.index_path, self._path_base)
+            entries_path = _default_vector_entries_path(index_path)
+            self._require_workflow_path_access(source_path, "read")
+            self._require_workflow_path_access(index_path, "write")
+            self._require_workflow_path_access(index_path.parent, "write")
+            self._require_workflow_path_access(entries_path, "write")
+            temp_changed_entries_path = index_path.with_name(
+                f".{index_path.name}.{os.getpid()}.changed.jsonl"
+            )
+            temp_entries_path = index_path.with_name(
+                f".{index_path.name}.{os.getpid()}.entries.jsonl"
+            )
             vector_target = source_path
             iterator = (
                 (vector_target.rglob(op.glob) if op.recursive else vector_target.glob(op.glob))
@@ -5290,6 +5742,7 @@ class WorkflowExecutor:
             for file_path in iterator:
                 if not file_path.is_file():
                     continue
+                self._require_workflow_path_access(file_path, "read")
                 if len(files) >= self._limits.max_files_scanned:
                     raise ResourceLimitError(
                         f"local_vectorize scanned files exceeded limit "
@@ -5315,6 +5768,8 @@ class WorkflowExecutor:
 
             metadata = _vector_index_metadata(op, source_path)
             strategy = _local_vector_strategy(op.embedding_strategy, op.search_strategy)
+            if op.mode != "full" and index_path.exists():
+                self._require_workflow_path_access(index_path, "read")
             existing_index = (
                 None
                 if op.mode == "full"
@@ -5324,6 +5779,11 @@ class WorkflowExecutor:
                     include_entries=False,
                 )
             )
+            if existing_index is not None and isinstance(existing_index.get("entries_file"), str):
+                self._require_workflow_path_access(
+                    _vector_entries_path(index_path, existing_index),
+                    "read",
+                )
             compatible = _vector_index_compatible(existing_index, metadata)
             old_files = _vector_index_file_records(existing_index) if compatible else {}
 
@@ -5340,9 +5800,7 @@ class WorkflowExecutor:
                 nonlocal temp_changed_entries
                 if temp_changed_entries is None:
                     index_path.parent.mkdir(parents=True, exist_ok=True)
-                    temp_changed_entries = index_path.with_name(
-                        f".{index_path.name}.{os.getpid()}.changed.jsonl"
-                    )
+                    temp_changed_entries = temp_changed_entries_path
                     temp_changed_entries.write_text("", encoding="utf-8")
                 return temp_changed_entries
 
@@ -5449,8 +5907,7 @@ class WorkflowExecutor:
             last_update_time = (
                 datetime.now().astimezone().isoformat()
                 if should_write
-                else stored_last_update_time
-                or datetime.now().astimezone().isoformat()
+                else stored_last_update_time or datetime.now().astimezone().isoformat()
             )
             index_metadata = {
                 **metadata,
@@ -5493,10 +5950,6 @@ class WorkflowExecutor:
             else:
                 if should_write:
                     index_path.parent.mkdir(parents=True, exist_ok=True)
-                    entries_path = _default_vector_entries_path(index_path)
-                    temp_entries_path = index_path.with_name(
-                        f".{index_path.name}.{os.getpid()}.entries.jsonl"
-                    )
                     written_entry_count = 0
                     sidecar_bytes = 0
                     with temp_entries_path.open("w", encoding="utf-8") as entries_file:
@@ -5590,9 +6043,23 @@ class WorkflowExecutor:
         elif op.type == OperationType.LOCAL_SEARCH:
             assert isinstance(op, LocalSearchOperation)
             index_path = _resolve_workflow_path(op.index_path, self._path_base)
-            index = _load_vector_index(index_path, self._limits.max_vector_index_bytes)
+            self._require_workflow_path_access(index_path, "read")
+            index = _load_vector_index(
+                index_path,
+                self._limits.max_vector_index_bytes,
+                include_entries=False,
+            )
             if index is None:
                 raise FileNotFoundError(index_path)
+            if index.get("entries") is None and isinstance(index.get("entries_file"), str):
+                entries_path = _vector_entries_path(index_path, index)
+                self._require_workflow_path_access(entries_path, "read")
+                index["entries"] = list(
+                    _iter_vector_sidecar_entries(
+                        entries_path,
+                        self._limits.max_vector_index_bytes,
+                    )
+                )
             index_metadata = index.get("metadata", {})
             if not isinstance(index_metadata, dict):
                 index_metadata = {}
@@ -5613,9 +6080,7 @@ class WorkflowExecutor:
                     continue
                 score = strategy.score(query_vector, entry.get("vector", {}))
                 entry_chunk = entry.get("chunk", 0)
-                chunk_index = (
-                    int(entry_chunk) if isinstance(entry_chunk, int | str | float) else 0
-                )
+                chunk_index = int(entry_chunk) if isinstance(entry_chunk, int | str | float) else 0
                 ranked.append((score, chunk_index, entry))
             ranked.sort(
                 key=lambda item: (
@@ -5840,6 +6305,35 @@ class WorkflowExecutor:
                     indent=2,
                 ),
             )
+            try:
+                policy_result = validate_http_request_url(
+                    url,
+                    allowlist=op.network_allowlist,
+                )
+            except NetworkPolicyViolation as exc:
+                error_text = str(exc)
+                self._log().node(node.node_id, error_text)
+                return NodeOutput(
+                    node_id=node.node_id,
+                    success=False,
+                    output=error_text,
+                    exit_code=1,
+                    duration_seconds=time.monotonic() - start,
+                    type=str(op.type),
+                    value=error_text,
+                    data={
+                        "url": masked_url,
+                        "method": method,
+                        "attempts": 0,
+                        "error": error_text,
+                    },
+                    error=error_text,
+                )
+            if policy_result.allowed_by is not None:
+                self._log().node(
+                    node.node_id,
+                    f"http request network allowlist matched: {policy_result.allowed_by}",
+                )
 
             attempts = max(1, op.retry.attempts)
             response = None
@@ -5853,6 +6347,7 @@ class WorkflowExecutor:
                             headers=headers,
                             body=body,
                             timeout_seconds=op.timeout_seconds,
+                            network_allowlist=list(op.network_allowlist),
                         )
                     )
                     last_error = None
@@ -5901,6 +6396,34 @@ class WorkflowExecutor:
                     },
                     error=error_text,
                 )
+            redirect_location = response.headers.get("Location") or response.headers.get("location")
+            if 300 <= response.status < 400 and redirect_location:
+                redirect_url = urllib.parse.urljoin(url, redirect_location)
+                try:
+                    validate_http_request_url(
+                        redirect_url,
+                        allowlist=op.network_allowlist,
+                    )
+                except NetworkPolicyViolation as exc:
+                    error_text = str(exc)
+                    self._log().node(node.node_id, error_text)
+                    return NodeOutput(
+                        node_id=node.node_id,
+                        success=False,
+                        output=error_text,
+                        exit_code=1,
+                        duration_seconds=time.monotonic() - start,
+                        type=str(op.type),
+                        value=error_text,
+                        data={
+                            "url": masked_url,
+                            "method": method,
+                            "attempts": attempts,
+                            "status": response.status,
+                            "error": error_text,
+                        },
+                        error=error_text,
+                    )
             body_text = response.body.decode("utf-8", errors="replace")
             parsed_json: object | None = None
             json_error: json.JSONDecodeError | None = None
@@ -5910,13 +6433,6 @@ class WorkflowExecutor:
                 except json.JSONDecodeError as exc:
                     if op.response_mode == "json":
                         json_error = exc
-            response_data: dict[str, object] = {
-                "status": response.status,
-                "headers": response.headers,
-                "body": body_text,
-                "json": parsed_json,
-            }
-            selected = self._http_output_mapping(response_data, op.output_mapping)
             masked_response_headers = cast(
                 dict[str, object],
                 _mask_http_value(
@@ -5949,14 +6465,14 @@ class WorkflowExecutor:
                 op.output_mapping,
             )
             if op.response_mode == "json" and parsed_json is not None:
-                output = json.dumps(parsed_json, default=str)
-                output_value: object = parsed_json
+                output = json.dumps(masked_json, default=str)
+                output_value: object = masked_json
             elif op.response_mode == "none":
                 output = ""
                 output_value = None
             else:
-                output = body_text
-                output_value = body_text
+                output = masked_body_text
+                output_value = masked_body_text
             success = response.status in set(op.expected_statuses) and json_error is None
             error_text = masked_body_text
             if json_error is not None:
@@ -5979,8 +6495,8 @@ class WorkflowExecutor:
                 type=str(op.type),
                 value=output_value,
                 data={
-                    **response_data,
-                    "selected": selected,
+                    **masked_response_data,
+                    "selected": masked_selected,
                     "responsePreview": {
                         **masked_response_data,
                         "selected": masked_selected,
@@ -5993,33 +6509,199 @@ class WorkflowExecutor:
                 error=error_text if not success else None,
             )
 
+        elif op.type == OperationType.DASHBOARD_ITEM:
+            assert isinstance(op, DashboardItemOperation)
+            template_context = self._template_context(node, ctx, graph, loop_item)
+            dashboard = str(self._render_http_value(op.dashboard, template_context))
+            component = str(self._render_http_value(op.component, template_context))
+            item_id = (
+                str(self._render_http_value(op.item_id, template_context))
+                if op.item_id is not None
+                else None
+            )
+            item = cast(dict[str, object], self._render_http_value(op.item, template_context))
+            patch = cast(dict[str, object], self._render_http_value(op.patch, template_context))
+            filter_rule = self._render_http_value(op.filter, template_context)
+            data_dir = self._data_dir or get_data_dir()
+            if op.action == "read":
+                if not (isinstance(filter_rule, str | dict) or filter_rule is None):
+                    raise ValueError("Dashboard filter must be a string or object")
+                items = dashboard_list_items(dashboard, component, data_dir, filter_rule)
+                output = json.dumps(items, default=str)
+                message = f"dashboard read: {dashboard}/{component} {len(items)} item(s)"
+                self._log().node(
+                    node.node_id,
+                    message,
+                )
+                return NodeOutput(
+                    node_id=node.node_id,
+                    success=True,
+                    output=output,
+                    exit_code=0,
+                    duration_seconds=time.monotonic() - start,
+                    type=str(op.type),
+                    value=items,
+                    items=cast(list[object], list(items)),
+                    data={
+                        "action": op.action,
+                        "dashboard": dashboard,
+                        "component": component,
+                        "count": len(items),
+                        "items": items,
+                        "message": message,
+                        "selected": items[0] if items else None,
+                    },
+                )
+            if op.action == "add":
+                result_item = dashboard_add_item(dashboard, component, item, data_dir)
+            elif op.action == "update":
+                if not item_id:
+                    raise ValueError("Dashboard update requires item_id")
+                result_item = dashboard_update_item(dashboard, component, item_id, patch, data_dir)
+            elif op.action == "delete":
+                if not item_id:
+                    raise ValueError("Dashboard delete requires item_id")
+                result_item = dashboard_delete_item(dashboard, component, item_id, data_dir)
+            elif op.action == "move":
+                if not item_id:
+                    raise ValueError("Dashboard move requires item_id")
+                result_item = dashboard_move_item(
+                    dashboard,
+                    component,
+                    item_id,
+                    op.field,
+                    self._render_http_value(op.value, template_context),
+                    data_dir,
+                )
+            else:
+                raise ValueError(f"Unsupported dashboard action: {op.action}")
+            output = json.dumps(result_item, default=str)
+            message = f"dashboard {op.action}: {dashboard}/{component}"
+            self._log().node(node.node_id, message)
+            return NodeOutput(
+                node_id=node.node_id,
+                success=True,
+                output=output,
+                exit_code=0,
+                duration_seconds=time.monotonic() - start,
+                type=str(op.type),
+                value=result_item,
+                data={
+                    "action": op.action,
+                    "dashboard": dashboard,
+                    "component": component,
+                    "item": result_item,
+                    "message": message,
+                    "selected": result_item,
+                },
+            )
+
         elif op.type == OperationType.NOTIFICATION:
             assert isinstance(op, NotificationOperation)
             template_context = self._template_context(node, ctx, graph, loop_item)
+            op_data = op.model_dump()
+            secret_values = _collect_secret_values(op_data)
             title = str(self._render_http_value(op.title, template_context))
             notification_body = str(self._render_http_value(op.body, template_context))
+            webhook_url = (
+                str(self._render_http_value(op.webhook_url, template_context))
+                if op.webhook_url is not None
+                else None
+            )
+            headers = cast(
+                dict[str, str],
+                self._render_http_value(op.headers, template_context),
+            )
+            payload = self._render_http_value(op.payload, template_context)
+            email_from = (
+                str(self._render_http_value(op.email_from, template_context))
+                if op.email_from is not None
+                else None
+            )
+            email_to = cast(list[str], self._render_http_value(op.email_to, template_context))
+            smtp_host = (
+                str(self._render_http_value(op.smtp_host, template_context))
+                if op.smtp_host is not None
+                else None
+            )
+            smtp_username = (
+                str(self._render_http_value(op.smtp_username, template_context))
+                if op.smtp_username is not None
+                else None
+            )
+            smtp_password = (
+                str(self._render_http_value(op.smtp_password, template_context))
+                if op.smtp_password is not None
+                else None
+            )
+            masked_title = _replace_known_secrets(title, secret_values)
+            masked_body = _replace_known_secrets(notification_body, secret_values)
+            masked_webhook_url = "***" if webhook_url is not None else None
+            masked_headers = cast(
+                dict[str, object],
+                _mask_http_value(headers, set(), secret_values=secret_values),
+            )
+            masked_payload = _mask_http_value(payload, set(), secret_values=secret_values)
+            masked_email_from = (
+                _replace_known_secrets(email_from, secret_values)
+                if email_from is not None
+                else None
+            )
+            masked_email_to = cast(
+                list[object],
+                _mask_http_value(email_to, set(), secret_values=secret_values),
+            )
+            masked_smtp_host = (
+                _replace_known_secrets(smtp_host, secret_values) if smtp_host is not None else None
+            )
+            masked_smtp_username = "***" if smtp_username is not None else None
             notification = Notification(
                 title=title,
                 body=notification_body,
                 channel=op.channel,
                 urgency=op.urgency,
+                webhook_url=webhook_url,
+                headers=headers,
+                payload=payload,
+                email_from=email_from,
+                email_to=email_to,
+                smtp_host=smtp_host,
+                smtp_port=op.smtp_port,
+                smtp_username=smtp_username,
+                smtp_password=smtp_password,
+                smtp_starttls=op.smtp_starttls,
+                timeout_seconds=op.timeout_seconds,
+                retry=op.retry,
+                expected_statuses=op.expected_statuses,
+                network_allowlist=op.network_allowlist,
             )
             await self._notification_adapter.send(notification)
             self._log().node(node.node_id, f"notification sent: {op.channel}")
-            self._log().node_output(node.node_id, "notification body", notification_body)
+            self._log().node_output(node.node_id, "notification body", masked_body)
             return NodeOutput(
                 node_id=node.node_id,
                 success=True,
-                output=notification_body,
+                output=masked_body,
                 exit_code=0,
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
-                value=notification_body,
+                value=masked_body,
                 data={
-                    "title": title,
-                    "body": notification_body,
+                    "title": masked_title,
+                    "body": masked_body,
                     "channel": op.channel,
                     "urgency": op.urgency,
+                    "webhookUrl": masked_webhook_url,
+                    "headers": masked_headers,
+                    "payload": masked_payload,
+                    "emailFrom": masked_email_from,
+                    "emailTo": masked_email_to,
+                    "smtpHost": masked_smtp_host,
+                    "smtpPort": op.smtp_port,
+                    "smtpUsername": masked_smtp_username,
+                    "timeoutSeconds": op.timeout_seconds,
+                    "expectedStatuses": list(op.expected_statuses),
+                    "networkAllowlist": list(op.network_allowlist),
                 },
             )
 
@@ -6062,11 +6744,12 @@ class WorkflowExecutor:
             if loop_item and not explicit_inputs:
                 agent_input_ctx = {**agent_input_ctx, **loop_item}
             try:
+                memory_key = self._agent_memory_key(node.node_id, loop_item)
                 memory = await self._compact_agent_memory_if_needed(
-                    node.node_id,
+                    memory_key,
                     op,
                     op.memory,
-                    self._agent_memory(node.node_id, op.memory),
+                    self._agent_memory(memory_key, op.memory),
                     agent_config,
                     sub,
                 )
@@ -6084,15 +6767,13 @@ class WorkflowExecutor:
                     duration_seconds=time.monotonic() - start,
                     type=str(op.type),
                     data={
-                        "inputs": agent_input_ctx,
                         "message": message,
                         "agent_id": op.agent_id,
-                        "prompt": prompt_override or "",
-                        "thoughts": [],
                         "budget": {
                             "blocked": True,
                             "violations": exc.violations,
                         },
+                        "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                     },
                     error=message,
                 )
@@ -6101,6 +6782,13 @@ class WorkflowExecutor:
                 agent_input_ctx,
                 prompt_override,
                 memory,
+            )
+            self._log().active_attempt_preview(
+                node.node_id,
+                {
+                    "inputs": agent_input_ctx,
+                    "prompt": prompt_for_budget,
+                },
             )
             (
                 budget_violations_before_call,
@@ -6121,15 +6809,13 @@ class WorkflowExecutor:
                     duration_seconds=time.monotonic() - start,
                     type=str(op.type),
                     data={
-                        "inputs": agent_input_ctx,
                         "message": message,
                         "agent_id": op.agent_id,
-                        "prompt": prompt_for_budget,
-                        "thoughts": [],
                         "budget": {
                             "blocked": True,
                             "violations": budget_violations_before_call,
                         },
+                        "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                     },
                     error=message,
                 )
@@ -6157,7 +6843,7 @@ class WorkflowExecutor:
                 result,
                 streamed_thought_count=len(agent_streamed_thoughts),
             )
-            self._remember_agent_result(node.node_id, op.memory, result)
+            self._remember_agent_result(memory_key, op.memory, result)
             usage = usage_from_metadata(
                 provider=result.provider or agent_config.subscription,
                 profile=result.profile or agent_config.profile,
@@ -6184,6 +6870,17 @@ class WorkflowExecutor:
             success = result.success and not budget_violations_after_call
             if budget_violations_after_call:
                 result_output = "; ".join(budget_violations_after_call)
+            dashboard_updates: list[dict[str, object]] = []
+            if success and op.dashboard_updates:
+                dashboard_updates = self._apply_agent_dashboard_updates(
+                    node,
+                    op.dashboard_updates,
+                    result.output,
+                    result_message,
+                    ctx,
+                    graph,
+                    loop_item,
+                )
             return NodeOutput(
                 node_id=node.node_id,
                 success=success,
@@ -6192,27 +6889,124 @@ class WorkflowExecutor:
                 duration_seconds=time.monotonic() - start,
                 type=str(op.type),
                 data={
-                    "inputs": agent_input_ctx,
                     "message": result_message,
                     "agent_id": op.agent_id,
-                    "prompt": result.prompt or "",
-                    "thoughts": [
-                        self._bounded_agent_thought(node.node_id, thought)
-                        for thought in result.thoughts
-                    ],
                     "usage": usage.model_dump(),
+                    "dashboard_updates": dashboard_updates,
                     "budget": {
                         "violations": budget_violations_after_call,
                         "workflow_totals": self._llm_usage_totals.to_dict(),
-                        "node_totals": self._node_llm_usage_totals[
-                            node.node_id
-                        ].to_dict(),
+                        "node_totals": self._node_llm_usage_totals[node.node_id].to_dict(),
                     },
+                    "omittedFromNodeOutput": ["inputs", "prompt", "thoughts"],
                 },
                 error=result_output if not success else None,
             )
 
         raise ValueError(f"Unknown operation type: {op.type}")
+
+    def _apply_agent_dashboard_updates(
+        self,
+        node: GraphNode,
+        instructions: list[DashboardUpdateInstruction],
+        output: str,
+        message: str,
+        ctx: ExecutionContext,
+        graph: WorkflowGraph,
+        loop_item: dict[str, object] | None,
+    ) -> list[dict[str, object]]:
+        root: dict[str, object] = {"output": output, "message": message}
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed is not None:
+            root["data"] = parsed
+
+        template_context = self._template_context(node, ctx, graph, loop_item)
+        data_dir = self._data_dir or get_data_dir()
+        applied: list[dict[str, object]] = []
+        for instruction in instructions:
+            source_payload = _extract_dotted_path(root, instruction.source)
+            if source_payload is None:
+                source_payload = {}
+            if not isinstance(source_payload, dict):
+                raise ValueError(
+                    f"Dashboard update source '{instruction.source}' must resolve to an object"
+                )
+
+            action = str(source_payload.get("action") or instruction.action)
+            dashboard = str(
+                self._render_http_value(
+                    source_payload.get("dashboard") or instruction.dashboard,
+                    template_context,
+                )
+            )
+            component = str(
+                self._render_http_value(
+                    source_payload.get("component") or instruction.component,
+                    template_context,
+                )
+            )
+            item_id_value = source_payload.get("item_id") or instruction.item_id
+            item_id = (
+                str(self._render_http_value(item_id_value, template_context))
+                if item_id_value is not None
+                else None
+            )
+            item = cast(
+                dict[str, object],
+                self._render_http_value(
+                    source_payload.get("item") or instruction.item,
+                    template_context,
+                ),
+            )
+            patch = cast(
+                dict[str, object],
+                self._render_http_value(
+                    source_payload.get("patch") or instruction.patch,
+                    template_context,
+                ),
+            )
+            field = str(source_payload.get("field") or instruction.field)
+            value = self._render_http_value(
+                source_payload.get("value") if "value" in source_payload else instruction.value,
+                template_context,
+            )
+
+            if action == "add":
+                result_item = dashboard_add_item(dashboard, component, item, data_dir)
+            elif action == "update":
+                if not item_id:
+                    raise ValueError("Agent dashboard update requires item_id")
+                result_item = dashboard_update_item(dashboard, component, item_id, patch, data_dir)
+            elif action == "delete":
+                if not item_id:
+                    raise ValueError("Agent dashboard delete requires item_id")
+                result_item = dashboard_delete_item(dashboard, component, item_id, data_dir)
+            elif action == "move":
+                if not item_id:
+                    raise ValueError("Agent dashboard move requires item_id")
+                result_item = dashboard_move_item(
+                    dashboard,
+                    component,
+                    item_id,
+                    field,
+                    value,
+                    data_dir,
+                )
+            else:
+                raise ValueError(f"Unsupported agent dashboard action: {action}")
+
+            update_data: dict[str, object] = {
+                "action": action,
+                "dashboard": dashboard,
+                "component": component,
+                "item": result_item,
+            }
+            applied.append(update_data)
+            self._log().node(node.node_id, f"agent dashboard {action}: {dashboard}/{component}")
+        return applied
 
     def _bounded_agent_thought(self, node_id: str, value: str) -> str:
         return truncate_text_bytes(

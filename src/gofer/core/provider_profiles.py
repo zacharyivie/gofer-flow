@@ -4,17 +4,31 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from gofer.utils.paths import get_data_dir
 
-ProfileSubscription = Literal["claude_code", "codex"]
+ProfileSubscription = Literal["claude_code", "codex", "openai_api", "anthropic_api"]
+DIRECT_API_SUBSCRIPTIONS = {"openai_api", "anthropic_api"}
+DEFAULT_DIRECT_API_BASE_URLS = {
+    "openai_api": "https://api.openai.com/v1",
+    "anthropic_api": "https://api.anthropic.com/v1",
+}
+DEFAULT_DIRECT_API_KEY_ENVS = {
+    "openai_api": "OPENAI_API_KEY",
+    "anthropic_api": "ANTHROPIC_API_KEY",
+}
 ApprovalMode = Literal["default", "auto", "manual", "never", "on-request", "on-failure"]
 SandboxMode = Literal["default", "read-only", "workspace-write", "danger-full-access"]
 
 PROFILE_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+MASKED_SECRET_VALUE = "********"
+SENSITIVE_ENV_NAME_PATTERN = re.compile(
+    r"(^|_)(API_?KEY|AUTHORIZATION|AUTH|BEARER|CREDENTIALS?|KEY|PASSWORD|PASS|SECRET|TOKEN)(_|$)",
+    re.IGNORECASE,
+)
 
 
 class ProviderProfile(BaseModel):
@@ -30,12 +44,16 @@ class ProviderProfile(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     secret_refs: dict[str, str] = Field(default_factory=dict)
+    api_base_url: str | None = None
+    api_key_env: str | None = None
+    api_key_secret: str | None = None
+    organization: str | None = None
+    provider_options: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("name")
     @classmethod
     def _validate_name(cls, value: str) -> str:
-        if not PROFILE_NAME_PATTERN.fullmatch(value):
-            raise ValueError("Profile name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+        validate_provider_profile_name(value)
         return value
 
     @field_validator("timeout")
@@ -59,6 +77,11 @@ class ResolvedProviderSettings(BaseModel):
     mcp_servers: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     secret_refs: dict[str, str] = Field(default_factory=dict)
+    api_base_url: str | None = None
+    api_key_env: str | None = None
+    api_key_secret: str | None = None
+    organization: str | None = None
+    provider_options: dict[str, Any] = Field(default_factory=dict)
 
 
 def profile_store_path(data_dir: Path | None = None) -> Path:
@@ -96,6 +119,103 @@ def save_provider_profiles(
         }
     }
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def is_sensitive_env_name(name: str) -> bool:
+    normalized = name.strip().replace("-", "_")
+    return bool(SENSITIVE_ENV_NAME_PATTERN.search(normalized))
+
+
+def validate_provider_profile_name(name: str) -> None:
+    if not PROFILE_NAME_PATTERN.fullmatch(name):
+        raise ValueError("Profile name must match [A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+
+
+def sensitive_plaintext_env(profile: ProviderProfile) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in profile.env.items()
+        if is_sensitive_env_name(name) and name not in profile.secret_refs
+    }
+
+
+def validate_safe_provider_env(
+    env: dict[str, str],
+    *,
+    unsafe_env: dict[str, str] | None = None,
+) -> None:
+    unsafe_names = set((unsafe_env or {}).keys())
+    sensitive_names = sorted(
+        name for name in env if is_sensitive_env_name(name) and name not in unsafe_names
+    )
+    if sensitive_names:
+        joined = ", ".join(sensitive_names)
+        raise ValueError(
+            f"Sensitive provider env value(s) must use secret_refs: {joined}. "
+            "Use --secret-ref KEY=SECRET_NAME, or --unsafe-env KEY=VALUE for an "
+            "explicit local-only plaintext opt-in."
+        )
+
+
+def provider_profile_ui_payload(profile: ProviderProfile) -> dict[str, Any]:
+    payload = profile.model_dump(mode="json", exclude_none=True)
+    if profile.env:
+        payload["env"] = {
+            name: MASKED_SECRET_VALUE if is_sensitive_env_name(name) else value
+            for name, value in profile.env.items()
+        }
+    legacy_sensitive = sorted(sensitive_plaintext_env(profile))
+    if legacy_sensitive:
+        payload["masked_env"] = legacy_sensitive
+    return payload
+
+
+def provider_profile_from_ui_payload(
+    payload: dict[str, Any],
+    existing: ProviderProfile | None = None,
+) -> ProviderProfile:
+    raw_payload = dict(payload)
+    unsafe_env = _string_dict(raw_payload.pop("unsafe_env", {}), "unsafe_env")
+    raw_env = _string_dict(raw_payload.get("env", {}), "env")
+    secret_refs = _string_dict(raw_payload.get("secret_refs", {}), "secret_refs")
+    preserved_env: dict[str, str] = {}
+    if existing is not None:
+        for name, value in raw_env.items():
+            if (
+                is_sensitive_env_name(name)
+                and value == MASKED_SECRET_VALUE
+                and name in existing.env
+                and name not in secret_refs
+            ):
+                preserved_env[name] = existing.env[name]
+    env = {
+        name: value
+        for name, value in raw_env.items()
+        if not (
+            is_sensitive_env_name(name)
+            and value == MASKED_SECRET_VALUE
+            and name in secret_refs
+        )
+    }
+    env.update(preserved_env)
+    env.update(unsafe_env)
+    validate_safe_provider_env(
+        env,
+        unsafe_env={**preserved_env, **unsafe_env},
+    )
+    raw_payload["env"] = env
+    raw_payload["secret_refs"] = secret_refs
+    profile = ProviderProfile(**raw_payload)
+    validate_provider_profile(profile)
+    return profile
+
+
+def _string_dict(value: Any, field_name: str) -> dict[str, str]:
+    if value in (None, ""):
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be an object")
+    return {str(key): str(item) for key, item in value.items()}
 
 
 def resolve_provider_settings(
@@ -136,6 +256,15 @@ def resolve_provider_settings(
         mcp_servers=list(profile.mcp_servers) if profile else [],
         env=dict(profile.env) if profile else {},
         secret_refs=dict(profile.secret_refs) if profile else {},
+        api_base_url=(
+            profile.api_base_url
+            if profile and profile.api_base_url
+            else DEFAULT_DIRECT_API_BASE_URLS.get(subscription)
+        ),
+        api_key_env=_resolved_direct_api_key_env(profile, subscription),
+        api_key_secret=profile.api_key_secret if profile else None,
+        organization=profile.organization if profile else None,
+        provider_options=dict(profile.provider_options) if profile else {},
     )
 
 
@@ -173,14 +302,67 @@ def validate_provider_settings(settings: ResolvedProviderSettings) -> None:
                 "Claude Code provider profiles do not support sandbox_mode; "
                 "remove sandbox_mode from the profile or use a Codex profile"
             )
+        return
+    if settings.subscription in DIRECT_API_SUBSCRIPTIONS:
+        unsupported = []
+        if settings.tools:
+            unsupported.append("tools")
+        if settings.mcp_servers:
+            unsupported.append("mcp_servers")
+        if settings.extra_args:
+            unsupported.append("extra_args")
+        if settings.approval_mode not in (None, "default"):
+            unsupported.append("approval_mode")
+        if settings.sandbox_mode not in (None, "default"):
+            unsupported.append("sandbox_mode")
+        if unsupported:
+            raise ValueError(
+                f"Direct API provider profiles do not support {', '.join(unsupported)}"
+            )
+        if settings.api_key_secret and settings.api_key_env:
+            raise ValueError(
+                "Direct API provider profiles must use api_key_secret or api_key_env, "
+                "not both"
+            )
+
+
+def validate_provider_profile(profile: ProviderProfile) -> None:
+    validate_provider_settings(
+        ResolvedProviderSettings(
+            profile_name=profile.name,
+            subscription=profile.subscription,
+            model=profile.model,
+            timeout=profile.timeout,
+            reasoning=profile.reasoning,
+            approval_mode=profile.approval_mode,
+            sandbox_mode=profile.sandbox_mode,
+            extra_args=list(profile.extra_args),
+            tools=list(profile.tools),
+            mcp_servers=list(profile.mcp_servers),
+            env=dict(profile.env),
+            secret_refs=dict(profile.secret_refs),
+            api_base_url=profile.api_base_url,
+            api_key_env=profile.api_key_env,
+            api_key_secret=profile.api_key_secret,
+            organization=profile.organization,
+            provider_options=dict(profile.provider_options),
+        )
+    )
 
 
 def unresolved_provider_secret_refs(settings: ResolvedProviderSettings) -> list[str]:
-    return sorted({
+    missing = {
         secret_name
         for secret_name in settings.secret_refs.values()
         if not _secret_value(secret_name)
-    })
+    }
+    if settings.subscription in DIRECT_API_SUBSCRIPTIONS:
+        if settings.api_key_secret:
+            if not _secret_value(settings.api_key_secret):
+                missing.add(settings.api_key_secret)
+        elif settings.api_key_env and not os.environ.get(settings.api_key_env):
+            missing.add(settings.api_key_env)
+    return sorted(missing)
 
 
 def resolved_provider_env(settings: ResolvedProviderSettings) -> dict[str, str]:
@@ -195,6 +377,24 @@ def resolved_provider_env(settings: ResolvedProviderSettings) -> dict[str, str]:
                 f"or {secret_name} before running."
             )
         env[env_name] = secret
+    if settings.subscription in DIRECT_API_SUBSCRIPTIONS:
+        if settings.api_key_secret:
+            secret = _secret_value(settings.api_key_secret)
+            if secret is None:
+                raise ValueError(
+                    f"Provider profile '{settings.profile_name}' requires API key "
+                    f"secret '{settings.api_key_secret}'. Set "
+                    f"GOFER_SECRET_{settings.api_key_secret} or {settings.api_key_secret}."
+                )
+            env["GOFER_DIRECT_API_KEY"] = secret
+        elif settings.api_key_env:
+            secret = os.environ.get(settings.api_key_env)
+            if secret is None:
+                raise ValueError(
+                    f"Direct API provider '{settings.subscription}' requires "
+                    f"environment variable '{settings.api_key_env}'."
+                )
+            env["GOFER_DIRECT_API_KEY"] = secret
     return env
 
 
@@ -203,3 +403,14 @@ def _secret_value(name: str) -> str | None:
         if env_name in os.environ:
             return os.environ[env_name]
     return None
+
+
+def _resolved_direct_api_key_env(
+    profile: ProviderProfile | None,
+    subscription: ProfileSubscription,
+) -> str | None:
+    if profile and profile.api_key_secret:
+        return profile.api_key_env
+    if profile and profile.api_key_env:
+        return profile.api_key_env
+    return DEFAULT_DIRECT_API_KEY_ENVS.get(subscription)

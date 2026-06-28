@@ -16,6 +16,7 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
+    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FileOperation,
@@ -213,6 +214,8 @@ def _op_detail(op: Operation) -> str:
             return f"×{op.source.count}"
         if isinstance(op.source, TriggerEventsFanSource):
             return "trigger events"
+        if isinstance(op.source, DashboardItemsFanSource):
+            return f"dashboard {op.source.dashboard}/{op.source.component}"
         if isinstance(op.source, InfiniteFanSource):
             return "until BREAK"
     if isinstance(op, BreakOperation):
@@ -303,6 +306,8 @@ def _loop_cell(op: Operation) -> str:
         return f"count={op.source.count}"
     if isinstance(op.source, TriggerEventsFanSource):
         return "trigger events"
+    if isinstance(op.source, DashboardItemsFanSource):
+        return f"dashboard/{op.source.component}"
     if isinstance(op.source, InfiniteFanSource):
         return "infinite"
     return "—"

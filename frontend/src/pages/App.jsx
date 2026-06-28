@@ -7,6 +7,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  Database,
   Download,
   FolderOpen,
   GitBranch,
@@ -30,6 +31,12 @@ import {
 } from "lucide-react";
 import DagCanvas from "../components/DagCanvas.jsx";
 import { apiUrl } from "../lib/api.js";
+import {
+  applyWorkflowPatch,
+  buildPatchReview,
+  extractWorkflowPatch,
+  selectedPatchOperations,
+} from "../lib/workflowPatch.js";
 
 const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
 const DEFAULT_RETENTION_SETTINGS = {
@@ -77,7 +84,7 @@ async function fileToBase64(file) {
   return window.btoa(binary);
 }
 
-function formatBundleImportPreview(plan) {
+export function formatBundleImportPreview(plan) {
   const manifest = plan.manifest ?? {};
   const promptPaths = (manifest.includedPaths ?? [])
     .filter((item) => item.kind === "prompt" || item.kind === "prompt_template")
@@ -100,6 +107,9 @@ function formatBundleImportPreview(plan) {
     "Triggers:",
     ...previewTriggerLines(manifest.triggers),
   ];
+  if (plan.riskWarnings?.length) {
+    lines.push("", "High-risk configuration:", ...plan.riskWarnings.map((item) => `- ${item}`));
+  }
   if (plan.conflicts?.length) {
     lines.push("", "Conflicts:", ...plan.conflicts.map((item) => `- ${item.path}: ${item.action}`));
   }
@@ -142,6 +152,9 @@ function previewTriggerLines(items = []) {
     if (item.type === "webhook") {
       const details = [item.source, item.enabled === "true" ? "enabled" : "disabled"];
       if (item.tokenEnv) details.push(`secret ${item.tokenEnv}`);
+      if (item.allowUnauthenticated === "true") details.push("allows unauthenticated requests");
+      if (item.risk === "high") details.push("high risk");
+      if (item.riskReasons) details.push(`risk ${item.riskReasons}`);
       if (item.fanoutPath) details.push(`fanout ${item.fanoutPath}`);
       return `- webhook ${item.id}: ${details.join(", ")}`;
     }
@@ -151,8 +164,11 @@ function previewTriggerLines(items = []) {
 
 export default function App() {
   const [workflows, setWorkflows] = useState([]);
+  const [dashboards, setDashboards] = useState([]);
   const [promptAgentIds, setPromptAgentIds] = useState([]);
   const [activeWorkflowId, setActiveWorkflowId] = useState();
+  const [activeDashboardId, setActiveDashboardId] = useState();
+  const [workspaceMode, setWorkspaceMode] = useState("workflows");
   const [query, setQuery] = useState("");
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
@@ -192,6 +208,7 @@ export default function App() {
     info: null,
   });
   const [runState, setRunState] = useState({ running: false, error: "", result: null });
+  const [chatPatchReview, setChatPatchReview] = useState(null);
   const [logState, setLogState] = useState({
     loading: false,
     error: "",
@@ -218,7 +235,11 @@ export default function App() {
   const dirtyWorkflowRef = useRef();
   const deletedWorkflowIdsRef = useRef(new Set());
   const logRequestRef = useRef(0);
+  const pendingDashboardMutationsRef = useRef(0);
+  const pendingWorkflowPersistenceRef = useRef(new Set());
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
+  const activeDashboard =
+    dashboards.find((dashboard) => dashboard.id === activeDashboardId) ?? dashboards[0];
 
   const loadWorkflows = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
@@ -242,13 +263,21 @@ export default function App() {
             ? summarizeWorkflow(mergeSavedWorkflow(localWorkflow, workflow), payloadDataDir)
             : workflow;
         });
-        const dirtyWorkflowId = dirtyWorkflowRef.current?.id;
-        const localDirtyWorkflow = dirtyWorkflowId && !deletedWorkflowIdsRef.current.has(dirtyWorkflowId)
-          ? current.find((workflow) => workflow.id === dirtyWorkflowId)
-          : null;
+        const workflowIdsToPreserve = new Set(pendingWorkflowPersistenceRef.current);
+        if (dirtyWorkflowRef.current?.id) {
+          workflowIdsToPreserve.add(dirtyWorkflowRef.current.id);
+        }
         const mergedWorkflows =
-          silent && localDirtyWorkflow
-            ? preserveLocalWorkflow(refreshedWorkflows, localDirtyWorkflow, payloadDataDir)
+          silent && workflowIdsToPreserve.size
+            ? preserveLocalWorkflows(
+                refreshedWorkflows,
+                current.filter(
+                  (workflow) =>
+                    workflowIdsToPreserve.has(workflow.id) &&
+                    !deletedWorkflowIdsRef.current.has(workflow.id),
+                ),
+                payloadDataDir,
+              )
             : refreshedWorkflows;
 
         return silent && JSON.stringify(current) === JSON.stringify(mergedWorkflows)
@@ -270,6 +299,31 @@ export default function App() {
           error: error instanceof Error ? error.message : "Unable to load workflows",
         });
       }
+    }
+  }, []);
+
+  const loadDashboards = useCallback(async () => {
+    if (pendingDashboardMutationsRef.current > 0) {
+      return;
+    }
+    try {
+      const response = await fetch(apiUrl("/dashboards"));
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Dashboard API returned ${response.status}`);
+      }
+      const nextDashboards = payload.dashboards ?? [];
+      setDashboards(nextDashboards);
+      setActiveDashboardId((currentId) =>
+        nextDashboards.some((dashboard) => dashboard.id === currentId)
+          ? currentId
+          : nextDashboards[0]?.id,
+      );
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to load dashboards",
+      });
     }
   }, []);
 
@@ -338,7 +392,8 @@ export default function App() {
 
   useEffect(() => {
     loadWorkflows();
-  }, [loadWorkflows]);
+    loadDashboards();
+  }, [loadDashboards, loadWorkflows]);
 
   useEffect(() => {
     loadWorkflowTemplates();
@@ -352,12 +407,13 @@ export default function App() {
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       loadWorkflows({ silent: true });
+      loadDashboards();
       loadDoctor({ silent: true });
       loadQueue({ silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [loadDoctor, loadQueue, loadWorkflows]);
+  }, [loadDashboards, loadDoctor, loadQueue, loadWorkflows]);
 
   useEffect(() => {
     window.localStorage.setItem("gofer-ui-theme", theme);
@@ -739,6 +795,12 @@ export default function App() {
       return text.toLowerCase().includes(query.toLowerCase());
     });
   }, [query, workflows]);
+  const filteredDashboards = useMemo(() => {
+    return dashboards.filter((dashboard) => {
+      const text = `${dashboard.name} ${dashboard.id}`;
+      return text.toLowerCase().includes(query.toLowerCase());
+    });
+  }, [dashboards, query]);
   const usedAgentIds = useMemo(() => {
     return [
       ...new Set(
@@ -770,6 +832,7 @@ export default function App() {
 
   async function saveWorkflow(workflow, revision) {
     setSaveState({ saving: true, error: "" });
+    pendingWorkflowPersistenceRef.current.add(workflow.id);
     try {
       const savedWorkflow = await persistWorkflow(workflow);
 
@@ -794,10 +857,12 @@ export default function App() {
           error: error instanceof Error ? error.message : "Unable to save workflow",
         });
       }
+    } finally {
+      pendingWorkflowPersistenceRef.current.delete(workflow.id);
     }
   }
 
-  async function persistWorkflow(workflow) {
+  async function persistWorkflow(workflow, auditMetadata = null) {
     const response = await fetch(
       apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
       {
@@ -805,7 +870,10 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify(workflowPayloadForSave(workflow)),
+        body: JSON.stringify({
+          ...workflowPayloadForSave(workflow, dataDir),
+          ...(auditMetadata ? { auditMetadata } : {}),
+        }),
       },
     );
     const payload = await response.json();
@@ -813,6 +881,100 @@ export default function App() {
       throw new Error(payload.error || `Workflow API returned ${response.status}`);
     }
     return payload.workflow;
+  }
+
+  function openChatPatchReview({ message, prompt, thread }) {
+    if (!activeWorkflow) return;
+    const parsed = extractWorkflowPatch(message?.body ?? "");
+    if (!parsed.ok) {
+      setTopBarNotice({ type: "error", message: parsed.error });
+      return;
+    }
+    const review = buildPatchReview(parsed.patch, activeWorkflow);
+    setChatPatchReview({
+      audit: {
+        prompt: prompt?.body ?? "",
+        response: message?.body ?? "",
+        messageId: message?.id ?? null,
+        threadId: thread?.id ?? null,
+        threadTitle: thread?.title ?? "",
+      },
+      error: "",
+      patch: parsed.patch,
+      review,
+      saving: false,
+      workflowId: activeWorkflow.id,
+    });
+  }
+
+  async function applyReviewedChatPatch(selectedHunkIds) {
+    if (!chatPatchReview || !activeWorkflow) return;
+    const patch = selectedPatchOperations(chatPatchReview.patch, selectedHunkIds);
+    if (!patch.operations.length) {
+      setChatPatchReview((current) => ({
+        ...current,
+        error: "Select at least one change to apply.",
+      }));
+      return;
+    }
+
+    setChatPatchReview((current) => ({ ...current, saving: true, error: "" }));
+    try {
+      const nextWorkflow = applyWorkflowPatch(activeWorkflow, patch);
+      const validateResponse = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(nextWorkflow.id)}/validate`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(workflowPayloadForSave(nextWorkflow, dataDir)),
+        },
+      );
+      const validation = await validateResponse.json();
+      if (!validateResponse.ok) {
+        throw new Error(validation.error || `Workflow API returned ${validateResponse.status}`);
+      }
+      const validationErrors = (validation.diagnostics ?? []).filter(
+        (diagnostic) => diagnostic.severity === "error",
+      );
+      if (validationErrors.length) {
+        throw new Error(validationErrors.map((diagnostic) => diagnostic.message).join("; "));
+      }
+
+      setSaveState({ saving: true, error: "" });
+      pendingWorkflowPersistenceRef.current.add(nextWorkflow.id);
+      const savedWorkflow = await persistWorkflow(nextWorkflow, {
+        source: "chat_patch",
+        patchTitle: chatPatchReview.patch.title,
+        appliedHunkIds: patch.operations.map((operation) => operation.id),
+        prompt: chatPatchReview.audit.prompt,
+        response: chatPatchReview.audit.response,
+        messageId: chatPatchReview.audit.messageId,
+        threadId: chatPatchReview.audit.threadId,
+        threadTitle: chatPatchReview.audit.threadTitle,
+      });
+      setWorkflows((current) =>
+        current.map((candidate) =>
+          candidate.id === savedWorkflow.id
+            ? summarizeWorkflow(mergeSavedWorkflow(nextWorkflow, savedWorkflow), dataDir)
+            : candidate,
+        ),
+      );
+      saveRevisionRef.current += 1;
+      dirtyWorkflowRef.current = undefined;
+      setDirtyWorkflow(undefined);
+      setSaveState({ saving: false, error: "" });
+      setTopBarNotice({ type: "success", message: "Applied chat workflow patch." });
+      setChatPatchReview(null);
+    } catch (error) {
+      setChatPatchReview((current) => ({
+        ...current,
+        saving: false,
+        error: error instanceof Error ? error.message : "Unable to apply workflow patch",
+      }));
+      setSaveState({ saving: false, error: "" });
+    } finally {
+      pendingWorkflowPersistenceRef.current.delete(activeWorkflow?.id);
+    }
   }
 
   async function runWorkflowNow(workflow) {
@@ -828,6 +990,7 @@ export default function App() {
       selectedRunId: null,
     }));
     setSaveState({ saving: true, error: "" });
+    pendingWorkflowPersistenceRef.current.add(workflowToRun.id);
 
     try {
       const savedWorkflow = await persistWorkflow(workflowToRun);
@@ -884,6 +1047,8 @@ export default function App() {
       setSaveState((current) => ({ ...current, saving: false }));
       loadLatestLog(workflowToRun.id, { silent: true });
       loadRunLogs(workflowToRun.id, { silent: true });
+    } finally {
+      pendingWorkflowPersistenceRef.current.delete(workflowToRun.id);
     }
   }
 
@@ -1340,12 +1505,19 @@ export default function App() {
     try {
       if (isBundleFile(file)) {
         const bundleContent = await fileToBase64(file);
+        let grantId = "";
+        try {
+          const selectedPath = await window.goferDesktop?.grantDroppedPath?.(file);
+          grantId = window.goferDesktop?.workspace?.pathGrantForApi?.(selectedPath) || "";
+        } catch {
+          grantId = "";
+        }
         const previewResponse = await fetch(apiUrl("/workflows/import/preview"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ bundleContent, filename: file.name }),
+          body: JSON.stringify({ bundleContent, filename: file.name, grantId }),
         });
         const previewPayload = await previewResponse.json();
         if (!previewResponse.ok) {
@@ -1360,7 +1532,7 @@ export default function App() {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ bundleContent, filename: file.name }),
+          body: JSON.stringify({ bundleContent, filename: file.name, grantId }),
         });
         const importPayload = await importResponse.json();
         if (!importResponse.ok) {
@@ -1416,6 +1588,8 @@ export default function App() {
     if (!workflow || !outputPath.trim()) return;
     setExportDialog((current) => ({ ...current, error: "", saving: true }));
     try {
+      const trimmedOutputPath = outputPath.trim();
+      const grantId = window.goferDesktop?.workspace?.pathGrantForApi?.(trimmedOutputPath) || "";
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/export`),
         {
@@ -1423,7 +1597,7 @@ export default function App() {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ outputPath: outputPath.trim() }),
+          body: JSON.stringify({ outputPath: trimmedOutputPath, grantId }),
         },
       );
       const payload = await response.json();
@@ -1437,6 +1611,27 @@ export default function App() {
         ...current,
         error: error instanceof Error ? error.message : "Unable to export workflow bundle",
         saving: false,
+      }));
+    }
+  }
+
+  async function chooseExportDestination(currentPath) {
+    const workflow = exportDialog.workflow;
+    if (!workflow || !window.goferDesktop?.workspace?.selectPath) return;
+    try {
+      const selectedPath = await window.goferDesktop.workspace.selectPath({
+        currentPath: currentPath || dataDir,
+        directoryOnly: true,
+      });
+      if (!selectedPath) return;
+      const filename = `${workflow.id}.gof.zip`;
+      const separator = selectedPath.includes("\\") ? "\\" : "/";
+      const nextPath = `${selectedPath.replace(/[\\/]+$/, "")}${separator}${filename}`;
+      setExportDialog((current) => ({ ...current, outputPath: nextPath }));
+    } catch (error) {
+      setExportDialog((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to choose export destination",
       }));
     }
   }
@@ -1605,6 +1800,7 @@ export default function App() {
       }
       setDataDir(result.dataDir);
       await loadWorkflows();
+      await loadDashboards();
     } catch (error) {
       setTopBarNotice({
         type: "error",
@@ -1613,27 +1809,138 @@ export default function App() {
     }
   }
 
+  async function dashboardRequest(path, options = {}) {
+    const method = options.method ?? "GET";
+    const tracksMutation = method !== "GET";
+    if (tracksMutation) {
+      pendingDashboardMutationsRef.current += 1;
+    }
+    try {
+      const response = await fetch(apiUrl(path), {
+        headers: options.body ? { "Content-Type": "application/json" } : undefined,
+        ...options,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `Dashboard API returned ${response.status}`);
+      }
+      if (payload.dashboard) {
+        setDashboards((current) => {
+          const exists = current.some((dashboard) => dashboard.id === payload.dashboard.id);
+          return exists
+            ? current.map((dashboard) =>
+                dashboard.id === payload.dashboard.id ? payload.dashboard : dashboard,
+              )
+            : [payload.dashboard, ...current];
+        });
+        setActiveDashboardId(payload.dashboard.id);
+      }
+      return payload;
+    } finally {
+      if (tracksMutation) {
+        pendingDashboardMutationsRef.current = Math.max(
+          0,
+          pendingDashboardMutationsRef.current - 1,
+        );
+      }
+    }
+  }
+
+  async function createDashboard() {
+    try {
+      await dashboardRequest("/dashboards", {
+        method: "POST",
+        body: JSON.stringify({ name: "New Dashboard" }),
+      });
+      setWorkspaceMode("dashboards");
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to create dashboard",
+      });
+    }
+  }
+
+  async function duplicateDashboard(dashboard) {
+    if (!dashboard) return;
+    try {
+      await dashboardRequest(`/dashboards/${encodeURIComponent(dashboard.id)}`, {
+        method: "POST",
+        body: JSON.stringify({ duplicate: true }),
+      });
+      setWorkspaceMode("dashboards");
+      setTopBarNotice({ type: "success", message: `Duplicated ${dashboard.name}` });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to duplicate dashboard",
+      });
+    }
+  }
+
+  async function deleteDashboard(dashboard) {
+    if (!dashboard || !window.confirm(`Delete dashboard "${dashboard.name}"?`)) return;
+    try {
+      await dashboardRequest(`/dashboards/${encodeURIComponent(dashboard.id)}`, { method: "DELETE" });
+      await loadDashboards();
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to delete dashboard",
+      });
+    }
+  }
+
+  async function mutateDashboard(path, body) {
+    try {
+      await dashboardRequest(path, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to update dashboard",
+      });
+    }
+  }
+
+  function updateDashboardLocally(dashboardId, updater) {
+    setDashboards((current) =>
+      current.map((dashboard) => (dashboard.id === dashboardId ? updater(dashboard) : dashboard)),
+    );
+  }
+
   return (
     <main className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}>
       <WorkflowSidebar
+        activeDashboardId={activeDashboard?.id}
         activeWorkflowId={activeWorkflow?.id}
+        dashboards={filteredDashboards}
         dataDir={dataDir}
         loading={loadState.loading}
         query={query}
         runState={runState}
+        workspaceMode={workspaceMode}
         workflows={filteredWorkflows}
         width={workflowPaneWidth}
+        onCreateDashboard={createDashboard}
         onQueryChange={setQuery}
         onCreate={() => {
           setCreateState({ saving: false, error: "" });
           setCreateDialogOpen(true);
         }}
         onDataDirPick={changeDataDir}
+        onDeleteDashboard={deleteDashboard}
         onDeleteWorkflow={deleteWorkflow}
         onDuplicateWorkflow={duplicateWorkflow}
         onRefresh={loadWorkflows}
         onRenameWorkflow={renameWorkflow}
         onRunWorkflow={runWorkflowNow}
+        onSelectDashboard={(dashboardId) => {
+          setActiveDashboardId(dashboardId);
+          setWorkspaceMode("dashboards");
+        }}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 420,
@@ -1643,11 +1950,153 @@ export default function App() {
             onResize: setWorkflowPaneWidth,
           })
         }
-        onSelect={setActiveWorkflowId}
+        onSelect={(workflowId) => {
+          setActiveWorkflowId(workflowId);
+          setWorkspaceMode("workflows");
+        }}
+        onWorkspaceModeChange={setWorkspaceMode}
       />
 
       <section className="flex min-w-0 flex-1 flex-col border-x border-line bg-[#f9fbfd]">
-        {activeWorkflow ? (
+        {workspaceMode === "dashboards" ? (
+          <DashboardWorkspace
+            dashboard={activeDashboard}
+            loading={loadState.loading}
+            notice={topBarNotice}
+            onAddComponent={(dashboard, section, type = "board") =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
+                { title: dashboardComponentLabel(type), type },
+              )
+            }
+            onAddDashboard={createDashboard}
+            onAddItem={(dashboard, component, item) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
+                { action: "add", item },
+              )
+            }
+            onAddSection={(dashboard) =>
+              mutateDashboard(`/dashboards/${encodeURIComponent(dashboard.id)}/sections`, {
+                title: "New Section",
+              })
+            }
+            onDeleteDashboard={deleteDashboard}
+            onDuplicateDashboard={duplicateDashboard}
+            onDeleteSection={(dashboard, section) => {
+              if (!window.confirm(`Delete section "${section.title}"?`)) return;
+              dashboardRequest(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
+                { method: "DELETE" },
+              ).catch((error) =>
+                setTopBarNotice({
+                  type: "error",
+                  message: error instanceof Error ? error.message : "Unable to delete dashboard section",
+                }),
+              );
+            }}
+            onDeleteComponent={(dashboard, component) => {
+              if (!window.confirm(`Remove "${component.title}" from this section?`)) return;
+              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
+                ...currentDashboard,
+                sections: (currentDashboard.sections ?? []).map((section) => ({
+                  ...section,
+                  components: (section.components ?? []).filter((item) => item.id !== component.id),
+                })),
+              }));
+              dashboardRequest(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { method: "DELETE" },
+              ).catch((error) =>
+                setTopBarNotice({
+                  type: "error",
+                  message: error instanceof Error ? error.message : "Unable to remove dashboard component",
+                }),
+              );
+            }}
+            onDeleteItem={(dashboard, component, item) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
+                { action: "delete", itemId: item.id },
+              )
+            }
+            onRename={(dashboard, name) =>
+              mutateDashboard(`/dashboards/${encodeURIComponent(dashboard.id)}`, { name })
+            }
+            onUpdateSection={(dashboard, section, patch) => {
+              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
+                ...currentDashboard,
+                sections: (currentDashboard.sections ?? []).map((item) =>
+                  item.id === section.id
+                    ? {
+                        ...item,
+                        ...("title" in patch ? { title: patch.title } : {}),
+                        layout: patch.layout ? { ...(item.layout ?? {}), ...patch.layout } : item.layout,
+                      }
+                    : item,
+                ),
+              }));
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
+                patch,
+              );
+            }}
+            onSetSchema={(dashboard, component, schema) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { schema },
+              )
+            }
+            onSetViews={(dashboard, component, views) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { views },
+              )
+            }
+            onSetContent={(dashboard, component, content) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { content },
+              )
+            }
+            onSetComponentTitle={(dashboard, component, title) => {
+              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
+                ...currentDashboard,
+                sections: (currentDashboard.sections ?? []).map((section) => ({
+                  ...section,
+                  components: (section.components ?? []).map((item) =>
+                    item.id === component.id ? { ...item, title } : item,
+                  ),
+                })),
+              }));
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { title },
+              );
+            }}
+            onSetDisplay={(dashboard, component, display) => {
+              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
+                ...currentDashboard,
+                sections: (currentDashboard.sections ?? []).map((section) => ({
+                  ...section,
+                  components: (section.components ?? []).map((item) =>
+                    item.id === component.id ? { ...item, display } : item,
+                  ),
+                })),
+              }));
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
+                { display },
+              );
+            }}
+            onUpdateItem={(dashboard, component, item, patch) =>
+              mutateDashboard(
+                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
+                { action: "update", itemId: item.id, patch },
+              )
+            }
+          />
+        ) : activeWorkflow ? (
           <>
             <TopBar
               theme={theme}
@@ -1662,6 +2111,7 @@ export default function App() {
             />
             <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
             <DagCanvas
+              dashboards={dashboards}
               dataDir={dataDir}
               logState={logState}
               approvalState={approvalState}
@@ -1704,6 +2154,7 @@ export default function App() {
         activeWorkflowId={activeWorkflow?.id}
         workflow={activeWorkflow}
         workflows={workflows}
+        onReviewPatch={openChatPatchReview}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 520,
@@ -1726,6 +2177,13 @@ export default function App() {
           executionMode={executionMode}
           onExecutionModeChange={setExecutionMode}
           queueState={queueState}
+        />
+      ) : null}
+      {chatPatchReview ? (
+        <ChatPatchReviewDialog
+          reviewState={chatPatchReview}
+          onApply={applyReviewedChatPatch}
+          onCancel={() => setChatPatchReview(null)}
         />
       ) : null}
       <CreateWorkflowDialog
@@ -1754,6 +2212,9 @@ export default function App() {
           }
         }}
         onExport={confirmExportWorkflow}
+        onBrowse={
+          window.goferDesktop?.workspace?.selectPath ? chooseExportDestination : null
+        }
       />
 
       {historyState.open && activeWorkflow ? (
@@ -1875,26 +2336,42 @@ export function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
 }
 
 export function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
-  const foundWorkflow = remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id);
-  if (!foundWorkflow) {
-    return [...remoteWorkflows, localWorkflow];
+  return preserveLocalWorkflows(remoteWorkflows, [localWorkflow], dataDir);
+}
+
+export function preserveLocalWorkflows(remoteWorkflows, localWorkflows, dataDir = "") {
+  const localById = new Map(
+    (localWorkflows ?? []).filter(Boolean).map((workflow) => [workflow.id, workflow]),
+  );
+  if (!localById.size) {
+    return remoteWorkflows;
   }
-  return remoteWorkflows.map((workflow) =>
-    workflow.id === localWorkflow.id
+  const merged = remoteWorkflows.map((workflow) => {
+    const localWorkflow = localById.get(workflow.id);
+    return localWorkflow
       ? summarizeWorkflow({
           ...localWorkflow,
           sourcePath: workflow.sourcePath ?? localWorkflow.sourcePath,
           status: workflow.status ?? localWorkflow.status,
           updatedAt: workflow.updatedAt ?? localWorkflow.updatedAt,
         }, dataDir)
-      : workflow,
-  );
+      : workflow;
+  });
+  localById.forEach((localWorkflow) => {
+    if (!remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id)) {
+      merged.push(localWorkflow);
+    }
+  });
+  return merged;
 }
 
-export function workflowPayloadForSave(workflow) {
+export function workflowPayloadForSave(workflow, dataDir = "") {
   return {
     ...workflow,
-    filesystemAccess: normalizeWorkflowFilesystemAccess(workflow.filesystemAccess),
+    filesystemAccess: normalizeWorkflowFilesystemAccess([
+      dataDir ? { path: dataDir } : null,
+      ...(workflow.filesystemAccess ?? []),
+    ]),
     nodes: (workflow.nodes ?? []).map((node) => ({
       ...node,
       x: node.x ?? 0,
@@ -2057,14 +2534,19 @@ function resolveDisplayPath(pathValue = "", basePath = "") {
 }
 
 function WorkflowSidebar({
+  activeDashboardId,
   activeWorkflowId,
+  dashboards,
   dataDir,
   loading,
   query,
   runState,
+  workspaceMode,
   workflows,
+  onCreateDashboard,
   onCreate,
   onDataDirPick,
+  onDeleteDashboard,
   onDeleteWorkflow,
   onDuplicateWorkflow,
   onQueryChange,
@@ -2072,7 +2554,9 @@ function WorkflowSidebar({
   onRenameWorkflow,
   onResizeStart,
   onRunWorkflow,
+  onSelectDashboard,
   onSelect,
+  onWorkspaceModeChange,
   width,
 }) {
   const [dataDirCopied, setDataDirCopied] = useState(false);
@@ -2126,11 +2610,38 @@ function WorkflowSidebar({
           </button>
         </div>
 
-        <div className="mt-5 flex items-center gap-2 rounded-lg border border-line bg-slate-50 px-3 py-2">
+        <div className="mt-5 grid grid-cols-2 gap-2 rounded-lg border border-line bg-slate-50 p-1">
+          <button
+            className={`flex h-8 items-center justify-center gap-2 rounded-md text-xs font-medium transition ${
+              workspaceMode === "workflows"
+                ? "bg-white text-ink shadow-sm"
+                : "text-muted hover:text-ink"
+            }`}
+            type="button"
+            onClick={() => onWorkspaceModeChange("workflows")}
+          >
+            <Waypoints size={14} />
+            Workflows
+          </button>
+          <button
+            className={`flex h-8 items-center justify-center gap-2 rounded-md text-xs font-medium transition ${
+              workspaceMode === "dashboards"
+                ? "bg-white text-ink shadow-sm"
+                : "text-muted hover:text-ink"
+            }`}
+            type="button"
+            onClick={() => onWorkspaceModeChange("dashboards")}
+          >
+            <Database size={14} />
+            Dashboards
+          </button>
+        </div>
+
+        <div className="mt-3 flex items-center gap-2 rounded-lg border border-line bg-slate-50 px-3 py-2">
           <Search size={16} className="text-muted" />
           <input
             className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
-            placeholder="Search workflows"
+            placeholder={workspaceMode === "dashboards" ? "Search dashboards" : "Search workflows"}
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
           />
@@ -2140,20 +2651,36 @@ function WorkflowSidebar({
       <div className="flex items-center justify-between px-5 py-4">
         <div className="flex items-center gap-2 text-sm font-medium">
           <ListFilter size={16} className="text-muted" />
-          Workflows
+          {workspaceMode === "dashboards" ? "Dashboards" : "Workflows"}
         </div>
         <button
           className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-          title="Create workflow"
+          title={workspaceMode === "dashboards" ? "Create dashboard" : "Create workflow"}
           type="button"
-          onClick={onCreate}
+          onClick={workspaceMode === "dashboards" ? onCreateDashboard : onCreate}
         >
           <Plus size={16} />
         </button>
       </div>
 
       <div className="workflow-scrollbar flex-1 space-y-2 overflow-y-auto px-3 pb-4">
-        {workflows.length ? (
+        {workspaceMode === "dashboards" ? (
+          dashboards.length ? (
+            dashboards.map((dashboard) => (
+              <DashboardListItem
+                key={dashboard.id}
+                active={dashboard.id === activeDashboardId}
+                dashboard={dashboard}
+                onDelete={() => onDeleteDashboard(dashboard)}
+                onSelect={() => onSelectDashboard(dashboard.id)}
+              />
+            ))
+          ) : (
+            <div className="rounded-lg border border-dashed border-line bg-slate-50 p-4 text-sm leading-6 text-muted">
+              {loading ? "Loading dashboards..." : "No dashboards found."}
+            </div>
+          )
+        ) : workflows.length ? (
           workflows.map((workflow) => (
             <WorkflowListItem
               key={workflow.id}
@@ -2390,6 +2917,50 @@ function WorkflowListItem({
   );
 }
 
+function DashboardListItem({ active, dashboard, onDelete, onSelect }) {
+  const itemCount = (dashboard.sections ?? []).reduce(
+    (total, section) =>
+      total +
+      (section.components ?? []).reduce(
+        (componentTotal, component) => componentTotal + (component.items?.length ?? 0),
+        0,
+      ),
+    0,
+  );
+  return (
+    <div
+      className={`group rounded-lg border p-3 transition ${
+        active ? "border-teal-200 bg-teal-50" : "border-line bg-white hover:border-slate-300"
+      }`}
+    >
+      <button className="w-full text-left" type="button" onClick={onSelect}>
+        <div className="flex items-start gap-3">
+          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-slate-100 text-muted">
+            <Database size={15} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-semibold text-ink">{dashboard.name}</div>
+            <div className="mt-1 truncate text-xs text-muted">{dashboard.id}</div>
+            <div className="mt-2 text-xs text-muted">
+              {(dashboard.sections ?? []).length} sections · {itemCount} items
+            </div>
+          </div>
+        </div>
+      </button>
+      <div className="mt-2 flex justify-end opacity-0 transition group-hover:opacity-100">
+        <button
+          className="grid h-7 w-7 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
+          title="Delete dashboard"
+          type="button"
+          onClick={onDelete}
+        >
+          <Trash2 size={14} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TopBar({
   theme,
   updateState,
@@ -2620,7 +3191,7 @@ function formatRevisionDate(value) {
   return date.toLocaleString();
 }
 
-function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows }) {
+function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workflow, workflows }) {
   const chatScrollRef = useRef(null);
   const conversationMenuRef = useRef(null);
   const [draft, setDraft] = useState("");
@@ -3033,6 +3604,15 @@ function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows 
     });
   }
 
+  function reviewPatchMessage(message) {
+    const messageIndex = messages.findIndex((candidate) => candidate.id === message.id);
+    const prompt = messages
+      .slice(0, Math.max(0, messageIndex))
+      .reverse()
+      .find((candidate) => candidate.role === "user");
+    onReviewPatch?.({ message, prompt, thread: activeThread });
+  }
+
   return (
     <aside
       className="relative flex shrink-0 flex-col border-l border-line bg-white"
@@ -3174,7 +3754,12 @@ function ChatPane({ activeWorkflowId, onResizeStart, width, workflow, workflows 
                   }
                 />
               ) : (
-                <ChatMessageBubble key={item.message.id} message={item.message} />
+                <ChatMessageBubble
+                  key={item.message.id}
+                  message={item.message}
+                  workflow={workflow}
+                  onReviewPatch={reviewPatchMessage}
+                />
               ),
             )}
             {showTypingIndicator ? <TypingIndicator /> : null}
@@ -3298,6 +3883,141 @@ function ThreadList({ onCreate, onDelete, onOpen, threads }) {
   );
 }
 
+function ChatPatchReviewDialog({ onApply, onCancel, reviewState }) {
+  const hunks = reviewState.review.hunks;
+  const [selectedIds, setSelectedIds] = useState(() => hunks.map((hunk) => hunk.id));
+  const grouped = groupPatchHunksByRisk(hunks);
+  const canApply = reviewState.review.ok && selectedIds.length > 0 && !reviewState.saving;
+
+  function toggleHunk(hunkId) {
+    setSelectedIds((current) =>
+      current.includes(hunkId)
+        ? current.filter((candidate) => candidate !== hunkId)
+        : [...current, hunkId],
+    );
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/35 px-4">
+      <section className="max-h-[86vh] w-full max-w-3xl overflow-hidden rounded-xl border border-line bg-white shadow-panel">
+        <div className="border-b border-line px-5 py-4">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-ink">Review workflow patch</h2>
+              <p className="mt-1 text-sm text-muted">{reviewState.review.title}</p>
+            </div>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink"
+              title="Close patch review"
+              type="button"
+              onClick={onCancel}
+            >
+              <X size={16} />
+            </button>
+          </div>
+          {reviewState.review.summary ? (
+            <p className="mt-3 text-sm leading-6 text-slate-700">{reviewState.review.summary}</p>
+          ) : null}
+        </div>
+        <div className="workflow-scrollbar max-h-[58vh] space-y-4 overflow-y-auto px-5 py-4">
+          {reviewState.review.errors.length ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm leading-6 text-red-700">
+              <div className="font-semibold">Patch rejected</div>
+              <ul className="mt-1 list-disc space-y-1 pl-5">
+                {reviewState.review.errors.map((error) => (
+                  <li key={error}>{error}</li>
+                ))}
+              </ul>
+            </div>
+          ) : null}
+          {reviewState.error ? (
+            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm leading-6 text-red-700">
+              {reviewState.error}
+            </div>
+          ) : null}
+          {grouped.map(([risk, riskHunks]) => (
+            <section key={risk} className="rounded-lg border border-line">
+              <div className="border-b border-line bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-muted">
+                {riskLabel(risk)}
+              </div>
+              <div className="divide-y divide-line">
+                {riskHunks.map((hunk) => (
+                  <label
+                    key={hunk.id}
+                    className="flex cursor-pointer items-start gap-3 px-3 py-3 transition hover:bg-slate-50"
+                  >
+                    <input
+                      className="mt-1"
+                      type="checkbox"
+                      checked={selectedIds.includes(hunk.id)}
+                      disabled={!reviewState.review.ok || reviewState.saving}
+                      onChange={() => toggleHunk(hunk.id)}
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold text-ink">{hunk.label}</span>
+                      <span className="mt-1 block break-words text-xs leading-5 text-muted">
+                        {hunk.detail}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </section>
+          ))}
+        </div>
+        <div className="flex items-center justify-between gap-3 border-t border-line px-5 py-4">
+          <p className="text-xs text-muted">
+            Applying changes validates the draft and saves a revision with chat audit metadata.
+          </p>
+          <div className="flex shrink-0 items-center gap-2">
+            <button
+              className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              type="button"
+              disabled={reviewState.saving}
+              onClick={onCancel}
+            >
+              Reject
+            </button>
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+              type="button"
+              disabled={!canApply}
+              onClick={() => onApply(selectedIds)}
+            >
+              {reviewState.saving ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />}
+              Apply selected
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function groupPatchHunksByRisk(hunks) {
+  const order = ["destructive", "filesystem", "secret", "trigger", "agent", "graph", "workflow"];
+  const grouped = new Map();
+  for (const hunk of hunks) {
+    if (!grouped.has(hunk.risk)) grouped.set(hunk.risk, []);
+    grouped.get(hunk.risk).push(hunk);
+  }
+  return [...grouped.entries()].sort(
+    ([left], [right]) => order.indexOf(left) - order.indexOf(right),
+  );
+}
+
+function riskLabel(risk) {
+  return {
+    agent: "Agents",
+    destructive: "Destructive changes",
+    filesystem: "Filesystem access",
+    graph: "Graph changes",
+    secret: "Secrets and parameters",
+    trigger: "Triggers",
+    workflow: "Workflow settings",
+  }[risk] ?? risk;
+}
+
 function TypingIndicator() {
   return (
     <div className="flex justify-start" data-message-id="typing-indicator">
@@ -3315,8 +4035,10 @@ function TypingIndicator() {
   );
 }
 
-function ChatMessageBubble({ message }) {
+function ChatMessageBubble({ message, onReviewPatch, workflow }) {
   const isSystem = message.role === "system" || message.kind === "system";
+  const patchParse = message.role === "assistant" ? extractWorkflowPatch(message.body) : null;
+  const review = patchParse?.ok ? buildPatchReview(patchParse.patch, workflow) : null;
   return (
     <div
       data-message-id={message.id}
@@ -3334,6 +4056,23 @@ function ChatMessageBubble({ message }) {
         }`}
       >
         <pre className="whitespace-pre-wrap font-sans">{message.body}</pre>
+        {review ? (
+          <div className="mt-3 rounded-md border border-teal-200 bg-teal-50 p-2">
+            <div className="text-xs font-semibold text-teal-800">{review.title}</div>
+            <div className="mt-1 text-xs text-teal-700">
+              {review.hunks.length} proposed change{review.hunks.length === 1 ? "" : "s"}
+              {review.errors.length ? `, ${review.errors.length} validation issue${review.errors.length === 1 ? "" : "s"}` : ""}
+            </div>
+            <button
+              className="mt-2 inline-flex h-8 items-center gap-2 rounded-md border border-teal-200 bg-white px-2.5 text-xs font-semibold text-teal-800 transition hover:bg-teal-100"
+              type="button"
+              onClick={() => onReviewPatch?.(message)}
+            >
+              <GitBranch size={13} />
+              Review patch
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -3556,6 +4295,82 @@ function formatFanOutCount(fanOut) {
   return String(fanOut.count);
 }
 
+function formatNetworkAllowlistItems(sideEffectDetails) {
+  return (sideEffectDetails ?? [])
+    .filter(
+      (detail) =>
+        detail?.kind === "network" &&
+        Array.isArray(detail.networkAllowlist) &&
+        detail.networkAllowlist.length > 0,
+    )
+    .map((detail) => {
+      const host = detail.host ? ` ${detail.host}` : "";
+      return `Network allowlist${host}: ${detail.networkAllowlist.join(", ")}`;
+    });
+}
+
+function formatValidationItems(validation) {
+  const diagnostics = Array.isArray(validation?.diagnostics) ? validation.diagnostics : [];
+  return diagnostics.map((item) => {
+    const severity = item.severity ?? "warning";
+    const subject = item.subject || item.targetId;
+    return `${severity}: ${item.message}${subject ? ` (${subject})` : ""}`;
+  });
+}
+
+function hasBlockingValidationErrors(validation) {
+  if (validation?.ok === false) return true;
+  const diagnostics = Array.isArray(validation?.diagnostics) ? validation.diagnostics : [];
+  return diagnostics.some((item) => item?.severity === "error");
+}
+
+function formatSecretItem(item) {
+  if (item && typeof item === "object") return item.name ?? "";
+  return String(item);
+}
+
+function formatSecretReadinessItems(readiness) {
+  return (readiness ?? []).map((item) => {
+    const status = item.present || item.status === "present" ? "present" : "missing";
+    const sources = Array.isArray(item.sources) && item.sources.length ? ` (${item.sources.join(", ")})` : "";
+    return `${item.name}: ${status}${sources}`;
+  });
+}
+
+function formatConditionalBranchItems(branches) {
+  return (branches ?? []).map(
+    (branch) => `${branch.from} -> ${branch.to} when ${branch.label ?? branch.condition}`,
+  );
+}
+
+function formatResourceLimitItems(resourceLimits, executionLimits) {
+  if (!resourceLimits || typeof resourceLimits !== "object") return [];
+  return [
+    `Fan-out items: ${resourceLimits.max_fanout_items}`,
+    `Fan-out concurrency: ${resourceLimits.max_fanout_concurrency}`,
+    `Files scanned: ${resourceLimits.max_files_scanned}`,
+    `File read bytes: ${resourceLimits.max_file_read_bytes}`,
+    `Total node runs: ${executionLimits?.maxTotalNodeRuns ?? "default"}`,
+  ];
+}
+
+function formatUsageBudgetItems(usageBudget) {
+  if (!usageBudget?.enabled) return [];
+  return Object.entries(usageBudget)
+    .filter(([key, value]) => key !== "enabled" && value !== undefined && value !== null)
+    .map(([key, value]) => `${key}: ${value}`);
+}
+
+function formatProjectedUsageItems(projectedUsage) {
+  if (!projectedUsage || !projectedUsage.agent_calls) return [];
+  return [
+    `Agent calls: ${projectedUsage.agent_calls}`,
+    `Tokens: ${projectedUsage.total_tokens}`,
+    `Estimated cost: $${Number(projectedUsage.estimated_cost || 0).toFixed(6)}`,
+    `Agent time: ${Number(projectedUsage.agent_time_seconds || 0).toFixed(2)}s`,
+  ];
+}
+
 function formatTriggerContextItems(triggerContext) {
   if (!triggerContext || typeof triggerContext !== "object") return [];
   const items = [];
@@ -3647,9 +4462,19 @@ export function RunPreviewDialog({
   const destructiveActions = plan?.destructiveActions ?? [];
   const providers = plan?.providerRequirements ?? [];
   const requiredSecrets = plan?.requiredSecrets ?? [];
+  const secretReadinessItems = formatSecretReadinessItems(
+    plan?.secretReadiness ?? workflow.secretReadiness,
+  );
   const unresolvedValues = plan?.unresolvedDynamicValues ?? [];
   const triggerItems = formatTriggerContextItems(plan?.triggerContext);
+  const validationItems = formatValidationItems(plan?.validation);
+  const branchItems = formatConditionalBranchItems(plan?.conditionalBranches);
+  const resourceLimitItems = formatResourceLimitItems(plan?.resourceLimits, plan?.executionLimits);
+  const usageBudgetItems = formatUsageBudgetItems(plan?.usageBudget);
+  const projectedUsageItems = formatProjectedUsageItems(plan?.projectedLlmUsage);
+  const startNodes = plan?.startNodes ?? [];
   const generations = plan?.generations ?? [];
+  const validationBlocked = hasBlockingValidationErrors(plan?.validation);
 
   return (
     <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
@@ -3670,6 +4495,16 @@ export function RunPreviewDialog({
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-auto px-5 py-4">
+          {startNodes.length > 0 ? (
+            <PreviewSection title="Start nodes" items={startNodes} />
+          ) : null}
+          {validationItems.length > 0 ? (
+            <PreviewSection
+              title="Validation diagnostics"
+              tone={validationItems.some((item) => item.startsWith("error:")) ? "danger" : "warning"}
+              items={validationItems}
+            />
+          ) : null}
           {destructiveActions.length > 0 ? (
             <PreviewSection title="Destructive actions" tone="danger" items={destructiveActions} />
           ) : null}
@@ -3677,10 +4512,20 @@ export function RunPreviewDialog({
             <PreviewSection title="Warnings" tone="warning" items={warnings} />
           ) : null}
           {requiredSecrets.length > 0 ? (
-            <PreviewSection title="Required secrets" items={requiredSecrets} />
+            <PreviewSection title="Required secrets" items={requiredSecrets.map(formatSecretItem)} />
+          ) : null}
+          {secretReadinessItems.length > 0 ? (
+            <PreviewSection
+              title="Secret readiness"
+              tone={secretReadinessItems.some((item) => item.includes(": missing")) ? "warning" : "default"}
+              items={secretReadinessItems}
+            />
           ) : null}
           {triggerItems.length > 0 ? (
             <PreviewSection title="Trigger context" items={triggerItems} />
+          ) : null}
+          {branchItems.length > 0 ? (
+            <PreviewSection title="Conditional branches" items={branchItems} />
           ) : null}
           {Object.keys(parameterSchema).length > 0 ? (
             <section>
@@ -3721,6 +4566,15 @@ export function RunPreviewDialog({
                 return `${provider.agentId}: ${provider.subscription} binary=${binary} (${availability}) cwd=${provider.workingDir}${profile}${model}${timeout}${extraPaths}`;
               })}
             />
+          ) : null}
+          {projectedUsageItems.length > 0 ? (
+            <PreviewSection title="Projected LLM usage" items={projectedUsageItems} />
+          ) : null}
+          {usageBudgetItems.length > 0 ? (
+            <PreviewSection title="Usage budget" items={usageBudgetItems} />
+          ) : null}
+          {resourceLimitItems.length > 0 ? (
+            <PreviewSection title="Resource limits" items={resourceLimitItems} />
           ) : null}
           {unresolvedValues.length > 0 ? (
             <PreviewSection
@@ -3798,6 +4652,13 @@ export function RunPreviewDialog({
                             {(node.sideEffects ?? []).join("; ")}
                           </p>
                         ) : null}
+                        {formatNetworkAllowlistItems(node.sideEffectDetails).length > 0 ? (
+                          <ul className="mt-2 space-y-0.5 text-xs text-slate-600">
+                            {formatNetworkAllowlistItems(node.sideEffectDetails).map((item) => (
+                              <li key={`${node.id}-${item}`}>{item}</li>
+                            ))}
+                          </ul>
+                        ) : null}
                         {node.workingDir ? (
                           <p className="mt-2 break-words text-xs text-slate-600">
                             Working directory: {node.workingDir}
@@ -3833,6 +4694,19 @@ export function RunPreviewDialog({
                             </ul>
                           </div>
                         ) : null}
+                        {node.timeoutSeconds || node.retryCount || node.allowFailure ? (
+                          <p className="mt-2 text-xs text-slate-600">
+                            {[
+                              node.timeoutSeconds ? `Timeout: ${node.timeoutSeconds}s` : "",
+                              node.retryCount
+                                ? `Retries: ${node.retryCount} delay=${node.retryDelaySeconds}s`
+                                : "",
+                              node.allowFailure ? "Allow failure" : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </p>
+                        ) : null}
                       </div>
                     ))}
                   </div>
@@ -3843,13 +4717,20 @@ export function RunPreviewDialog({
         </div>
 
         <div className="flex justify-end gap-2 border-t border-line px-5 py-4">
+          {validationBlocked ? (
+            <p className="mr-auto self-center text-xs font-medium text-red-700">
+              Resolve validation errors before running.
+            </p>
+          ) : null}
           <button className="btn-ghost" type="button" onClick={onCancel}>
             Cancel
           </button>
           <button
             className="btn-primary inline-flex items-center justify-center gap-2 whitespace-nowrap"
+            disabled={validationBlocked}
             type="button"
             onClick={() => {
+              if (validationBlocked) return;
               const errors = validateWorkflowParameters(workflow, parameters);
               setParameterErrors(errors);
               if (Object.keys(errors).length === 0) {
@@ -4137,6 +5018,7 @@ function ExportWorkflowDialog({
   outputPath,
   saving,
   workflow,
+  onBrowse,
   onClose,
   onExport,
 }) {
@@ -4182,14 +5064,29 @@ function ExportWorkflowDialog({
         <div className="space-y-4 px-5 py-5">
           <label className="block">
             <span className="text-xs font-medium text-muted">Output path</span>
-            <input
-              autoFocus
-              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
-              disabled={saving}
-              placeholder="/path/to/workflow.gof.zip"
-              value={draftPath}
-              onChange={(event) => setDraftPath(event.target.value)}
-            />
+            <div className="mt-1 flex gap-2">
+              <input
+                autoFocus
+                className="h-10 min-w-0 flex-1 rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
+                disabled={saving}
+                placeholder="/path/to/workflow.gof.zip"
+                value={draftPath}
+                onChange={(event) => setDraftPath(event.target.value)}
+              />
+              {onBrowse ? (
+                <button
+                  className="grid h-10 w-10 flex-none place-items-center rounded-lg border border-line bg-white text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={saving}
+                  title="Choose export folder"
+                  type="button"
+                  onClick={async () => {
+                    await onBrowse(draftPath);
+                  }}
+                >
+                  <FolderOpen size={16} />
+                </button>
+              ) : null}
+            </div>
           </label>
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
@@ -4234,6 +5131,1675 @@ function TemplatePreviewList({ title, items }) {
       </ul>
     </div>
   );
+}
+
+function DashboardWorkspace({
+  dashboard,
+  loading,
+  notice,
+  onAddComponent,
+  onAddDashboard,
+  onAddItem,
+  onAddSection,
+  onDeleteDashboard,
+  onDuplicateDashboard,
+  onDeleteComponent,
+  onDeleteSection,
+  onDeleteItem,
+  onRename,
+  onSetComponentTitle,
+  onSetContent,
+  onSetDisplay,
+  onSetSchema,
+  onSetViews,
+  onUpdateSection,
+  onUpdateItem,
+}) {
+  const [draftName, setDraftName] = useState("");
+  const [editingSectionIds, setEditingSectionIds] = useState(() => new Set());
+
+  useEffect(() => {
+    setDraftName(dashboard?.name ?? "");
+    setEditingSectionIds(new Set());
+  }, [dashboard?.id, dashboard?.name]);
+
+  function toggleSectionEditing(sectionId) {
+    setEditingSectionIds((current) => {
+      const next = new Set(current);
+      if (next.has(sectionId)) {
+        next.delete(sectionId);
+      } else {
+        next.add(sectionId);
+      }
+      return next;
+    });
+  }
+
+  if (!dashboard) {
+    return (
+      <div className="flex flex-1 items-center justify-center p-8">
+        <div className="w-full max-w-md rounded-lg border border-dashed border-line bg-white p-6 text-center">
+          <Database className="mx-auto text-muted" size={28} />
+          <h2 className="mt-4 text-base font-semibold">No dashboards</h2>
+          <p className="mt-2 text-sm leading-6 text-muted">
+            {loading ? "Loading dashboards..." : "Create a dashboard to organize workflow state."}
+          </p>
+          <button
+            className="mt-5 inline-flex h-9 items-center gap-2 rounded-md bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700"
+            type="button"
+            onClick={onAddDashboard}
+          >
+            <Plus size={15} />
+            New dashboard
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <>
+      <div className="border-b border-line bg-white px-6 py-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2 text-xs font-medium uppercase text-muted">
+              <Database size={14} />
+              Dashboard
+            </div>
+            <input
+              className="mt-2 w-full bg-transparent text-xl font-semibold outline-none"
+              value={draftName}
+              onBlur={() => draftName.trim() && draftName !== dashboard.name && onRename(dashboard, draftName)}
+              onChange={(event) => setDraftName(event.target.value)}
+            />
+            <p className="mt-1 text-xs text-muted">ID: {dashboard.id}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              type="button"
+              onClick={() => onAddSection(dashboard)}
+            >
+              <Plus size={15} />
+              Section
+            </button>
+            <button
+              className="grid h-9 w-9 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Duplicate dashboard"
+              type="button"
+              onClick={() => onDuplicateDashboard(dashboard)}
+            >
+              <Copy size={15} />
+            </button>
+            <button
+              className="grid h-9 w-9 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
+              title="Delete dashboard"
+              type="button"
+              onClick={() => onDeleteDashboard(dashboard)}
+            >
+              <Trash2 size={15} />
+            </button>
+          </div>
+        </div>
+        {notice?.message ? (
+          <div
+            className={`mt-3 rounded-md border px-3 py-2 text-sm ${
+              notice.type === "error"
+                ? "border-red-200 bg-red-50 text-red-700"
+                : "border-emerald-200 bg-emerald-50 text-emerald-700"
+            }`}
+          >
+            {notice.message}
+          </div>
+        ) : null}
+      </div>
+
+      <div className="workflow-scrollbar flex-1 overflow-y-auto px-6 py-5">
+        {(dashboard.sections ?? []).length ? (
+          <div className="grid grid-cols-12 gap-5">
+            {dashboard.sections.map((section) => (
+              <DashboardSectionPanel
+                key={section.id}
+                dashboard={dashboard}
+                editing={editingSectionIds.has(section.id)}
+                section={section}
+                onAddComponent={onAddComponent}
+                onAddItem={onAddItem}
+                onDeleteComponent={onDeleteComponent}
+                onDeleteItem={onDeleteItem}
+                onDeleteSection={onDeleteSection}
+                onSetComponentTitle={onSetComponentTitle}
+                onSetContent={onSetContent}
+                onSetDisplay={onSetDisplay}
+                onSetSchema={onSetSchema}
+                onSetViews={onSetViews}
+                onToggleEditing={() => toggleSectionEditing(section.id)}
+                onUpdateItem={onUpdateItem}
+                onUpdateSection={onUpdateSection}
+              />
+            ))}
+          </div>
+        ) : (
+          <button
+            className="flex h-40 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-line bg-white text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+            type="button"
+            onClick={() => onAddSection(dashboard)}
+          >
+            <Plus size={16} />
+            Add section
+          </button>
+        )}
+      </div>
+    </>
+  );
+}
+
+function DashboardSectionPanel({
+  dashboard,
+  editing,
+  section,
+  onAddComponent,
+  onAddItem,
+  onDeleteComponent,
+  onDeleteItem,
+  onDeleteSection,
+  onSetComponentTitle,
+  onSetContent,
+  onSetDisplay,
+  onSetSchema,
+  onSetViews,
+  onToggleEditing,
+  onUpdateItem,
+  onUpdateSection,
+}) {
+  const [sectionTitleDraft, setSectionTitleDraft] = useState(section.title ?? "");
+
+  useEffect(() => {
+    setSectionTitleDraft(section.title ?? "");
+  }, [section.id, section.title]);
+
+  function commitSectionTitle() {
+    const title = sectionTitleDraft.trim();
+    if (title && title !== section.title) {
+      onUpdateSection(dashboard, section, { title });
+    } else {
+      setSectionTitleDraft(section.title ?? "");
+    }
+  }
+  const sectionTitleHidden = Boolean(section.layout?.hideTitle);
+
+  return (
+    <section
+      className={`col-span-12 rounded-lg border bg-white ${
+        editing ? "border-teal-200 shadow-sm" : "border-line"
+      }`}
+      style={{
+        gridColumn: `span ${dashboardSectionColumns(section)} / span ${dashboardSectionColumns(section)}`,
+      }}
+    >
+      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
+        <div className="min-w-0">
+          {editing ? (
+            <input
+              className="w-full min-w-0 bg-transparent text-base font-semibold outline-none focus:text-teal-700"
+              value={sectionTitleDraft}
+              onBlur={commitSectionTitle}
+              onChange={(event) => setSectionTitleDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+                if (event.key === "Escape") {
+                  setSectionTitleDraft(section.title ?? "");
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+          ) : (
+            <h2 className={`truncate text-base font-semibold ${sectionTitleHidden ? "sr-only" : ""}`}>
+              {section.title}
+            </h2>
+          )}
+          {editing ? <p className="mt-0.5 truncate text-xs text-muted">ID: {section.id}</p> : null}
+        </div>
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
+          {editing ? (
+            <>
+              <label className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted">
+                <input
+                  type="checkbox"
+                  checked={sectionTitleHidden}
+                  onChange={(event) =>
+                    onUpdateSection(dashboard, section, {
+                      layout: { ...(section.layout ?? {}), hideTitle: event.target.checked },
+                    })
+                  }
+                />
+                Hide title
+              </label>
+              <select
+                className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-muted outline-none transition hover:border-slate-300 focus:border-teal-500"
+                title="Section width"
+                value={dashboardSectionColumns(section)}
+                onChange={(event) =>
+                  onUpdateSection(dashboard, section, {
+                    layout: { ...(section.layout ?? {}), columns: Number(event.target.value) },
+                  })
+                }
+              >
+                {DASHBOARD_SECTION_WIDTHS.map((option) => (
+                  <option key={option.columns} value={option.columns}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              {DASHBOARD_COMPONENT_TYPES.map(({ type, label }) => (
+                <button
+                  key={type}
+                  className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                  type="button"
+                  onClick={() => onAddComponent(dashboard, section, type)}
+                >
+                  <Plus size={14} />
+                  {label}
+                </button>
+              ))}
+              <button
+                className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
+                title="Delete section"
+                type="button"
+                onClick={() => onDeleteSection(dashboard, section)}
+              >
+                <Trash2 size={14} />
+              </button>
+            </>
+          ) : null}
+          <button
+            className={`inline-flex h-8 items-center gap-2 rounded-md border px-2.5 text-xs font-medium transition ${
+              editing
+                ? "border-teal-200 bg-teal-50 text-teal-700 hover:bg-teal-100"
+                : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+            }`}
+            type="button"
+            onMouseDown={() => {
+              if (!editing) return;
+              const activeElement = document.activeElement;
+              if (activeElement && typeof activeElement.blur === "function") {
+                activeElement.blur();
+              }
+            }}
+            onClick={() => {
+              if (editing) commitSectionTitle();
+              onToggleEditing();
+            }}
+          >
+            <PencilLine size={14} />
+            {editing ? "Done" : "Edit"}
+          </button>
+        </div>
+      </div>
+      <div className={editing ? "grid min-w-0 grid-cols-1 gap-4 p-4 2xl:grid-cols-2" : "space-y-4 p-4"}>
+        {(section.components ?? []).length ? (
+          (section.components ?? []).map((component) =>
+            editing ? (
+              <DashboardComponentPanel
+                key={component.id}
+                component={component}
+                dashboard={dashboard}
+                onAddItem={onAddItem}
+                onDeleteComponent={onDeleteComponent}
+                onDeleteItem={onDeleteItem}
+                onSetComponentTitle={onSetComponentTitle}
+                onSetContent={onSetContent}
+                onSetDisplay={onSetDisplay}
+                onSetSchema={onSetSchema}
+                onSetViews={onSetViews}
+                onUpdateItem={onUpdateItem}
+              />
+            ) : (
+              <DashboardComponentView
+                key={component.id}
+                component={component}
+                dashboard={dashboard}
+                onAddItem={onAddItem}
+                onDeleteItem={onDeleteItem}
+                onUpdateItem={onUpdateItem}
+              />
+            ),
+          )
+        ) : (
+          <div className="rounded-md border border-dashed border-line bg-slate-50 px-4 py-8 text-center text-sm text-muted">
+            {editing ? "Add a component to this section." : "No dashboard content yet."}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function DashboardComponentPanel({
+  component,
+  dashboard,
+  onAddItem,
+  onDeleteComponent,
+  onDeleteItem,
+  onSetComponentTitle,
+  onSetContent,
+  onSetDisplay,
+  onSetSchema,
+  onSetViews,
+  onUpdateItem,
+}) {
+  const [titleDraft, setTitleDraft] = useState(component.title ?? "");
+  const [schemaDraft, setSchemaDraft] = useState(schemaToRows(component.schema));
+  const [viewDraft, setViewDraft] = useState(viewsToRows(component.views));
+  const [cardDisplayDraft, setCardDisplayDraft] = useState(displayToRows(component.display?.cardFields, "card"));
+  const [detailDisplayDraft, setDetailDisplayDraft] = useState(
+    displayToRows(component.display?.detailFields, "detail"),
+  );
+  const [contentDraft, setContentDraft] = useState(component.content ?? "");
+  const [itemDraft, setItemDraft] = useState({});
+  const fields = Object.keys(component.schema ?? {});
+  const views = component.views ?? [];
+
+  useEffect(() => {
+    setTitleDraft(component.title ?? "");
+    setSchemaDraft(schemaToRows(component.schema));
+    setViewDraft(viewsToRows(component.views));
+    setCardDisplayDraft(displayToRows(component.display?.cardFields, "card"));
+    setDetailDisplayDraft(displayToRows(component.display?.detailFields, "detail"));
+    setContentDraft(component.content ?? "");
+    setItemDraft({});
+  }, [component.id]);
+
+  function commitComponentTitle() {
+    const title = titleDraft.trim();
+    if (title && title !== component.title) {
+      onSetComponentTitle(dashboard, component, title);
+    } else {
+      setTitleDraft(component.title ?? "");
+    }
+  }
+
+  function saveSchema() {
+    const schema = {};
+    for (const row of schemaDraft) {
+      if (!row.name.trim()) continue;
+      schema[row.name.trim()] =
+        row.type === "enum"
+          ? {
+              type: "enum",
+              values: row.values.split(",").map((value) => value.trim()).filter(Boolean),
+            }
+          : row.type;
+    }
+    onSetSchema(dashboard, component, schema);
+  }
+
+  function addItem() {
+    const item = {};
+    for (const field of fields) {
+      if (itemDraft[field] !== undefined && itemDraft[field] !== "") {
+        item[field] = itemDraft[field];
+      }
+    }
+    onAddItem(dashboard, component, item);
+    setItemDraft({});
+  }
+
+  function setDefaultBoardViews() {
+    const defaultViews = [
+      { title: "Backlog", filter: { field: "status", operator: "equals", value: "backlog" } },
+      { title: "Todo", filter: { field: "status", operator: "equals", value: "todo" } },
+      { title: "In Progress", filter: { field: "status", operator: "equals", value: "in_progress" } },
+      { title: "Completed", filter: { field: "status", operator: "equals", value: "completed" } },
+    ];
+    setViewDraft(viewsToRows(defaultViews));
+    onSetViews(dashboard, component, defaultViews);
+  }
+
+  function saveViews() {
+    onSetViews(
+      dashboard,
+      component,
+      viewDraft
+        .filter((view) => view.title.trim())
+        .map((view) => ({
+          title: view.title.trim(),
+          filter: view.field.trim()
+            ? {
+                field: view.field.trim(),
+                operator: view.operator,
+                value: view.operator === "exists" ? null : view.value,
+              }
+            : null,
+        })),
+    );
+  }
+
+  function saveContent() {
+    onSetContent(dashboard, component, contentDraft);
+  }
+
+  function saveDisplay() {
+    onSetDisplay(dashboard, component, {
+      ...(component.display ?? {}),
+      cardFields: displayRowsToConfig(cardDisplayDraft),
+      detailFields: displayRowsToConfig(detailDisplayDraft),
+    });
+  }
+  const componentTitleHidden = Boolean(component.display?.hideTitle);
+
+  return (
+    <div className="min-w-0 overflow-hidden rounded-lg border border-line bg-white">
+      <div className="border-b border-line px-4 py-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <input
+              className="w-full min-w-0 bg-transparent text-sm font-semibold outline-none focus:text-teal-700"
+              value={titleDraft}
+              onBlur={commitComponentTitle}
+              onChange={(event) => setTitleDraft(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") event.currentTarget.blur();
+                if (event.key === "Escape") {
+                  setTitleDraft(component.title ?? "");
+                  event.currentTarget.blur();
+                }
+              }}
+            />
+            <p className="mt-0.5 truncate text-xs text-muted">
+              {component.type} · ID: {component.id}
+            </p>
+          </div>
+          <label className="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-line px-2 text-xs font-medium text-muted">
+            <input
+              type="checkbox"
+              checked={componentTitleHidden}
+              onChange={(event) =>
+                onSetDisplay(dashboard, component, {
+                  ...(component.display ?? {}),
+                  hideTitle: event.target.checked,
+                })
+              }
+            />
+            Hide title
+          </label>
+          {component.type === "board" ? (
+            <button
+              className="h-8 rounded-md border border-line px-2 text-xs font-medium text-muted transition hover:bg-slate-50 hover:text-ink"
+              type="button"
+              onClick={setDefaultBoardViews}
+            >
+              Defaults
+            </button>
+          ) : null}
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
+            title="Remove component"
+            type="button"
+            onClick={() => onDeleteComponent(dashboard, component)}
+          >
+            <Trash2 size={14} />
+          </button>
+        </div>
+      </div>
+
+      {component.type === "markdown" ? (
+        <DashboardMarkdownBlock
+          contentDraft={contentDraft}
+          onContentDraftChange={setContentDraft}
+          onSave={saveContent}
+        />
+      ) : (
+      <div className="space-y-4 p-4">
+        <div>
+          <div className="mb-2 flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase text-muted">Schema</span>
+            <button
+              className="text-xs font-medium text-teal-700"
+              type="button"
+              onClick={() =>
+                setSchemaDraft((current) => [
+                  ...current,
+                  { rowId: newDraftRowId("field"), name: "", type: "string", values: "" },
+                ])
+              }
+            >
+              Add field
+            </button>
+          </div>
+          <div className="space-y-2">
+            {schemaDraft.map((row, index) => (
+              <div
+                key={row.rowId}
+                className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px]"
+              >
+                <input
+                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                  placeholder="field"
+                  value={row.name}
+                  onChange={(event) =>
+                    setSchemaDraft((current) =>
+                      current.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, name: event.target.value } : item,
+                      ),
+                    )
+                  }
+                />
+                <select
+                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                  value={row.type}
+                  onChange={(event) =>
+                    setSchemaDraft((current) =>
+                      current.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, type: event.target.value } : item,
+                      ),
+                    )
+                  }
+                >
+                  {["string", "text", "number", "boolean", "date", "datetime", "enum", "json"].map((type) => (
+                    <option key={type} value={type}>
+                      {type}
+                    </option>
+                  ))}
+                </select>
+                <input
+                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500 disabled:bg-slate-50"
+                  disabled={row.type !== "enum"}
+                  placeholder="enum values"
+                  value={row.values}
+                  onChange={(event) =>
+                    setSchemaDraft((current) =>
+                      current.map((item, itemIndex) =>
+                        itemIndex === index ? { ...item, values: event.target.value } : item,
+                      ),
+                    )
+                  }
+                />
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
+                  type="button"
+                  onClick={() => setSchemaDraft((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                >
+                  <X size={14} />
+                </button>
+              </div>
+            ))}
+          </div>
+          <button
+            className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
+            type="button"
+            onClick={saveSchema}
+          >
+            Save schema
+          </button>
+        </div>
+
+        {component.type === "board" ? (
+          <div>
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-semibold uppercase text-muted">Columns</span>
+              <button
+                className="text-xs font-medium text-teal-700"
+                type="button"
+                onClick={() =>
+                  setViewDraft((current) => [
+                    ...current,
+                    {
+                      rowId: newDraftRowId("view"),
+                      title: "New column",
+                      field: "status",
+                      operator: "equals",
+                      value: "",
+                    },
+                  ])
+                }
+              >
+                Add column
+              </button>
+            </div>
+            <div className="space-y-2">
+              {viewDraft.map((view, index) => (
+                <div
+                  key={view.rowId}
+                  className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px_minmax(0,1fr)_72px]"
+                >
+                  <input
+                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                    placeholder="column title"
+                    value={view.title}
+                    onChange={(event) =>
+                      setViewDraft((current) =>
+                        current.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, title: event.target.value } : item,
+                        ),
+                      )
+                    }
+                  />
+                  <input
+                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                    placeholder="field"
+                    value={view.field}
+                    onChange={(event) =>
+                      setViewDraft((current) =>
+                        current.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, field: event.target.value } : item,
+                        ),
+                      )
+                    }
+                  />
+                  <select
+                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                    value={view.operator}
+                    onChange={(event) =>
+                      setViewDraft((current) =>
+                        current.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, operator: event.target.value } : item,
+                        ),
+                      )
+                    }
+                  >
+                    {["equals", "not_equals", "contains", "exists"].map((operator) => (
+                      <option key={operator} value={operator}>
+                        {operator}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500 disabled:bg-slate-50"
+                    disabled={view.operator === "exists"}
+                    placeholder="value"
+                    value={view.value}
+                    onChange={(event) =>
+                      setViewDraft((current) =>
+                        current.map((item, itemIndex) =>
+                          itemIndex === index ? { ...item, value: event.target.value } : item,
+                        ),
+                      )
+                    }
+                  />
+                  <div className="flex items-center justify-end gap-1">
+                    <button
+                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
+                      disabled={index === 0}
+                      type="button"
+                      onClick={() => setViewDraft((current) => moveArrayItem(current, index, index - 1))}
+                    >
+                      <ChevronUp size={14} />
+                    </button>
+                    <button
+                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
+                      disabled={index === viewDraft.length - 1}
+                      type="button"
+                      onClick={() => setViewDraft((current) => moveArrayItem(current, index, index + 1))}
+                    >
+                      <ChevronDown size={14} />
+                    </button>
+                    <button
+                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
+                      type="button"
+                      onClick={() => setViewDraft((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+                    >
+                      <X size={14} />
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <button
+              className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
+              type="button"
+              onClick={saveViews}
+            >
+              Save columns
+            </button>
+          </div>
+        ) : null}
+
+        {component.type === "board" ? (
+          <DashboardBoardDisplayEditor
+            cardDisplayDraft={cardDisplayDraft}
+            detailDisplayDraft={detailDisplayDraft}
+            fields={fields}
+            onAddCardField={() =>
+              setCardDisplayDraft((current) => [
+                ...current,
+                { rowId: newDraftRowId("card-display"), field: fields[0] ?? "title", style: "text" },
+              ])
+            }
+            onAddDetailField={() =>
+              setDetailDisplayDraft((current) => [
+                ...current,
+                { rowId: newDraftRowId("detail-display"), field: fields[0] ?? "title", style: "text" },
+              ])
+            }
+            onCardDisplayChange={setCardDisplayDraft}
+            onDetailDisplayChange={setDetailDisplayDraft}
+            onSave={saveDisplay}
+          />
+        ) : null}
+
+        <div>
+          <div className="mb-2 text-xs font-semibold uppercase text-muted">Items</div>
+          {fields.length ? (
+            <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {fields.map((field) => (
+                <input
+                  key={field}
+                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+                  placeholder={field}
+                  value={itemDraft[field] ?? ""}
+                  onChange={(event) => setItemDraft((current) => ({ ...current, [field]: event.target.value }))}
+                />
+              ))}
+              <button
+                className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                type="button"
+                onClick={addItem}
+              >
+                Add item
+              </button>
+            </div>
+          ) : null}
+
+          {component.type === "board" && views.length ? (
+            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 2xl:grid-cols-4">
+              {views.map((view) => (
+                <DashboardBoardColumn
+                  key={view.title}
+                  component={component}
+                  dashboard={dashboard}
+                  items={(component.items ?? []).filter((item) => dashboardItemMatchesView(item, view))}
+                  view={view}
+                  onAddItem={onAddItem}
+                  onDeleteItem={onDeleteItem}
+                  onMoveItem={(item, patch) => onUpdateItem(dashboard, component, item, patch)}
+                  onUpdateItem={onUpdateItem}
+                />
+              ))}
+            </div>
+          ) : component.type === "stats" ? (
+            <DashboardStats component={component} fields={fields} />
+          ) : component.type === "chart" ? (
+            <DashboardChart component={component} views={views} />
+          ) : component.type === "json_list" ? (
+            <pre className="max-h-72 overflow-auto rounded-md border border-line bg-slate-950 p-3 text-xs text-slate-100">
+              {JSON.stringify(component.items ?? [], null, 2)}
+            </pre>
+          ) : (
+            <div className="overflow-hidden rounded-md border border-line">
+              {(component.items ?? []).map((item) => (
+                <DashboardItemRow
+                  key={item.id}
+                  component={component}
+                  dashboard={dashboard}
+                  item={item}
+                  onDeleteItem={onDeleteItem}
+                  onUpdateItem={onUpdateItem}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+      )}
+    </div>
+  );
+}
+
+function DashboardBoardDisplayEditor({
+  cardDisplayDraft,
+  detailDisplayDraft,
+  fields,
+  onAddCardField,
+  onAddDetailField,
+  onCardDisplayChange,
+  onDetailDisplayChange,
+  onSave,
+}) {
+  return (
+    <div>
+      <div className="mb-2 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase text-muted">Card display</span>
+        <button className="text-xs font-medium text-teal-700" type="button" onClick={onAddCardField}>
+          Add card field
+        </button>
+      </div>
+      <DashboardDisplayRows
+        fields={fields}
+        rows={cardDisplayDraft}
+        styles={DASHBOARD_CARD_FIELD_STYLES}
+        onChange={onCardDisplayChange}
+      />
+
+      <div className="mb-2 mt-4 flex items-center justify-between">
+        <span className="text-xs font-semibold uppercase text-muted">Preview pane</span>
+        <button className="text-xs font-medium text-teal-700" type="button" onClick={onAddDetailField}>
+          Add preview field
+        </button>
+      </div>
+      <DashboardDisplayRows
+        fields={fields}
+        rows={detailDisplayDraft}
+        styles={DASHBOARD_DETAIL_FIELD_STYLES}
+        onChange={onDetailDisplayChange}
+      />
+
+      <button
+        className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
+        type="button"
+        onClick={onSave}
+      >
+        Save display
+      </button>
+    </div>
+  );
+}
+
+function DashboardDisplayRows({ fields, rows, styles, onChange }) {
+  return (
+    <div className="space-y-2">
+      {rows.map((row, index) => (
+        <div
+          key={row.rowId}
+          className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_140px_32px]"
+        >
+          <select
+            className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+            value={row.field}
+            onChange={(event) =>
+              onChange((current) =>
+                current.map((item, itemIndex) =>
+                  itemIndex === index ? { ...item, field: event.target.value } : item,
+                ),
+              )
+            }
+          >
+            {fields.map((field) => (
+              <option key={field} value={field}>
+                {field}
+              </option>
+            ))}
+          </select>
+          <select
+            className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+            value={row.style}
+            onChange={(event) =>
+              onChange((current) =>
+                current.map((item, itemIndex) =>
+                  itemIndex === index ? { ...item, style: event.target.value } : item,
+                ),
+              )
+            }
+          >
+            {styles.map((style) => (
+              <option key={style} value={style}>
+                {style}
+              </option>
+            ))}
+          </select>
+          <button
+            className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
+            type="button"
+            onClick={() => onChange((current) => current.filter((_, itemIndex) => itemIndex !== index))}
+          >
+            <X size={14} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DashboardComponentView({ component, dashboard, onAddItem, onDeleteItem, onUpdateItem }) {
+  const fields = Object.keys(component.schema ?? {});
+  const views = component.views ?? [];
+
+  if (component.type === "markdown") {
+    return (
+      <div className="rounded-lg border border-transparent bg-transparent">
+        <DashboardMarkdownPreview content={component.content} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-w-0 rounded-lg border border-line bg-white">
+      {component.display?.hideTitle ? null : (
+        <div className="border-b border-line px-4 py-3">
+          <h3 className="truncate text-sm font-semibold">{component.title}</h3>
+        </div>
+      )}
+      <div className="p-4">
+        {component.type === "board" && views.length ? (
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-4">
+            {views.map((view) => (
+              <DashboardBoardColumn
+                key={view.title}
+                component={component}
+                dashboard={dashboard}
+                items={(component.items ?? []).filter((item) => dashboardItemMatchesView(item, view))}
+                view={view}
+                onAddItem={onAddItem}
+                onDeleteItem={onDeleteItem}
+                onMoveItem={(item, patch) => onUpdateItem(dashboard, component, item, patch)}
+                onUpdateItem={onUpdateItem}
+              />
+            ))}
+          </div>
+        ) : component.type === "stats" ? (
+          <DashboardStats component={component} fields={fields} />
+        ) : component.type === "chart" ? (
+          <DashboardChart component={component} views={views} />
+        ) : component.type === "json_list" ? (
+          <pre className="max-h-72 overflow-auto rounded-md border border-line bg-slate-950 p-3 text-xs text-slate-100">
+            {JSON.stringify(component.items ?? [], null, 2)}
+          </pre>
+        ) : (
+          <div className="overflow-hidden rounded-md border border-line">
+            {(component.items ?? []).length ? (
+              (component.items ?? []).map((item) => (
+                <DashboardItemRow
+                  key={item.id}
+                  component={component}
+                  dashboard={dashboard}
+                  item={item}
+                  onDeleteItem={onDeleteItem}
+                  onUpdateItem={onUpdateItem}
+                />
+              ))
+            ) : (
+              <div className="bg-slate-50 px-3 py-6 text-center text-sm text-muted">No items yet.</div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DashboardBoardColumn({
+  component,
+  dashboard,
+  items,
+  view,
+  onAddItem,
+  onDeleteItem,
+  onMoveItem,
+  onUpdateItem,
+}) {
+  const [draftTitle, setDraftTitle] = useState("");
+  const [dragOver, setDragOver] = useState(false);
+  const [selectedItemId, setSelectedItemId] = useState(null);
+  const movePatch = dashboardBoardColumnPatch(view);
+  const titleField = dashboardPrimaryField(component);
+  const selectedItem = (component.items ?? []).find((item) => String(item.id) === String(selectedItemId));
+
+  function addCard() {
+    const title = draftTitle.trim();
+    if (!title || !movePatch) return;
+    onAddItem(dashboard, component, { [titleField]: title, ...movePatch });
+    setDraftTitle("");
+  }
+
+  function dropCard(event) {
+    event.preventDefault();
+    setDragOver(false);
+    if (!movePatch) return;
+    const raw = event.dataTransfer.getData("application/x-gofer-dashboard-card");
+    if (!raw) return;
+    try {
+      const payload = JSON.parse(raw);
+      if (payload.dashboardId !== dashboard.id || payload.componentId !== component.id) return;
+      const item = (component.items ?? []).find((candidate) => String(candidate.id) === String(payload.itemId));
+      if (item) {
+        onMoveItem(item, movePatch);
+      }
+    } catch {
+      // Ignore malformed drag payloads from outside the board.
+    }
+  }
+
+  return (
+    <div
+      className={`min-w-0 rounded-md border p-3 transition ${
+        dragOver ? "border-teal-300 bg-teal-50" : "border-line bg-slate-50"
+      }`}
+      onDragLeave={() => setDragOver(false)}
+      onDragOver={(event) => {
+        if (!movePatch) return;
+        event.preventDefault();
+        setDragOver(true);
+      }}
+      onDrop={dropCard}
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div>
+          <div className="text-xs font-semibold uppercase text-muted">{view.title}</div>
+          <div className="mt-0.5 text-[11px] text-muted">{items.length} items</div>
+        </div>
+      </div>
+      {movePatch ? (
+        <div className="mb-3 flex gap-2">
+          <input
+            className="h-8 min-w-0 flex-1 rounded-md border border-line bg-white px-2 text-xs outline-none focus:border-teal-500"
+            placeholder="Add card"
+            value={draftTitle}
+            onChange={(event) => setDraftTitle(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") addCard();
+              if (event.key === "Escape") setDraftTitle("");
+            }}
+          />
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:opacity-40"
+            disabled={!draftTitle.trim()}
+            title="Add card"
+            type="button"
+            onClick={addCard}
+          >
+            <Plus size={14} />
+          </button>
+        </div>
+      ) : null}
+      <div className="space-y-2">
+        {items.length ? (
+          items.map((item) => (
+            <DashboardItemCard
+              key={item.id}
+              component={component}
+              dashboard={dashboard}
+              draggable
+              item={item}
+              onDeleteItem={onDeleteItem}
+              onDragStart={(event) => {
+                event.dataTransfer.effectAllowed = "move";
+                event.dataTransfer.setData(
+                  "application/x-gofer-dashboard-card",
+                  JSON.stringify({
+                    dashboardId: dashboard.id,
+                    componentId: component.id,
+                    itemId: item.id,
+                  }),
+                );
+              }}
+              onOpen={() => setSelectedItemId(item.id)}
+              onUpdateItem={onUpdateItem}
+            />
+          ))
+        ) : (
+          <div className="rounded-md border border-dashed border-line bg-white px-3 py-6 text-center text-xs text-muted">
+            Drop cards here
+          </div>
+        )}
+      </div>
+      {selectedItem ? (
+        <DashboardItemPreviewPane
+          component={component}
+          dashboard={dashboard}
+          item={selectedItem}
+          onClose={() => setSelectedItemId(null)}
+          onDeleteItem={(targetDashboard, targetComponent, targetItem) => {
+            onDeleteItem(targetDashboard, targetComponent, targetItem);
+            setSelectedItemId(null);
+          }}
+          onUpdateItem={onUpdateItem}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function DashboardItemCard({
+  component,
+  dashboard,
+  draggable = false,
+  item,
+  onDeleteItem,
+  onDragStart,
+  onOpen,
+  onUpdateItem,
+}) {
+  return (
+    <div
+      className="cursor-pointer rounded-md border border-line bg-white p-3 text-xs shadow-sm transition hover:border-teal-200 hover:shadow"
+      draggable={draggable}
+      onDragStart={onDragStart}
+      onClick={onOpen}
+    >
+      <DashboardCardFields component={component} item={item} />
+    </div>
+  );
+}
+
+function DashboardCardFields({ component, item }) {
+  const rows = dashboardDisplayRows(component, "card");
+  return (
+    <div className="space-y-1.5">
+      {rows.map((row) => (
+        <DashboardDisplayValue key={`${row.field}-${row.style}`} item={item} row={row} compact />
+      ))}
+    </div>
+  );
+}
+
+function DashboardItemPreviewPane({ component, dashboard, item, onClose, onDeleteItem, onUpdateItem }) {
+  const rows = dashboardDisplayRows(component, "detail");
+  return (
+    <div className="fixed inset-y-0 right-0 z-50 flex w-[420px] max-w-[calc(100vw-40px)] flex-col border-l border-line bg-white shadow-2xl">
+      <div className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
+        <div className="min-w-0">
+          <div className="text-xs font-semibold uppercase text-muted">Card preview</div>
+          <div className="mt-1 truncate text-base font-semibold text-ink">
+            {item.title ?? item.name ?? item.id}
+          </div>
+        </div>
+        <button
+          className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink"
+          type="button"
+          onClick={onClose}
+        >
+          <X size={16} />
+        </button>
+      </div>
+      <div className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-4">
+        {rows.map((row) => (
+          <DashboardPreviewField
+            key={`${row.field}-${row.style}`}
+            component={component}
+            dashboard={dashboard}
+            item={item}
+            row={row}
+            onUpdateItem={onUpdateItem}
+          />
+        ))}
+      </div>
+      <div className="flex items-center justify-between gap-3 border-t border-line px-5 py-4">
+        <button
+          className="inline-flex h-9 items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 text-sm font-medium text-red-600 transition hover:bg-red-100"
+          type="button"
+          onClick={() => onDeleteItem(dashboard, component, item)}
+        >
+          <Trash2 size={15} />
+          Delete
+        </button>
+        <button
+          className="h-9 rounded-md bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"
+          type="button"
+          onClick={onClose}
+        >
+          Done
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function DashboardPreviewField({ component, dashboard, item, row, onUpdateItem }) {
+  const [draft, setDraft] = useState(String(item[row.field] ?? ""));
+  const fieldSchema = component.schema?.[row.field];
+  const enumValues = fieldSchema?.type === "enum" ? fieldSchema.values ?? [] : [];
+
+  useEffect(() => {
+    setDraft(String(item[row.field] ?? ""));
+  }, [item.id, item[row.field], row.field]);
+
+  function commit(nextValue = draft) {
+    if (nextValue !== String(item[row.field] ?? "")) {
+      onUpdateItem(dashboard, component, item, { [row.field]: nextValue });
+    }
+  }
+
+  if (enumValues.length && (row.style === "text" || row.style === "dropdown" || row.style === "textarea")) {
+    return (
+      <label className="block">
+        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
+        <select
+          className="mt-2 h-9 w-full rounded-md border border-line bg-white px-3 text-sm outline-none focus:border-teal-500"
+          value={draft}
+          onChange={(event) => {
+            setDraft(event.target.value);
+            commit(event.target.value);
+          }}
+        >
+          {enumValues.map((value) => (
+            <option key={String(value)} value={String(value)}>
+              {String(value)}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  }
+
+  if (row.style === "textarea") {
+    return (
+      <label className="block">
+        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
+        <textarea
+          className="mt-2 min-h-32 w-full resize-y rounded-md border border-line px-3 py-2 text-sm leading-6 outline-none focus:border-teal-500"
+          value={draft}
+          onBlur={commit}
+          onChange={(event) => setDraft(event.target.value)}
+        />
+      </label>
+    );
+  }
+
+  if (row.style === "text") {
+    return (
+      <label className="block">
+        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
+        <input
+          className="mt-2 h-9 w-full rounded-md border border-line px-3 text-sm outline-none focus:border-teal-500"
+          value={draft}
+          onBlur={commit}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") event.currentTarget.blur();
+            if (event.key === "Escape") {
+              setDraft(String(item[row.field] ?? ""));
+              event.currentTarget.blur();
+            }
+          }}
+        />
+      </label>
+    );
+  }
+
+  return (
+    <div>
+      <div className="text-xs font-semibold uppercase text-muted">{row.field}</div>
+      <DashboardDisplayValue item={item} row={row} />
+    </div>
+  );
+}
+
+function DashboardDisplayValue({ compact = false, item, row }) {
+  const value = item[row.field] ?? "";
+  const text = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
+  if (row.style === "heading") {
+    return <div className={`${compact ? "text-sm" : "text-xl"} font-semibold leading-6 text-ink`}>{text}</div>;
+  }
+  if (row.style === "muted") {
+    return <div className={`${compact ? "line-clamp-2 text-xs" : "text-sm"} leading-6 text-muted`}>{text}</div>;
+  }
+  if (row.style === "code") {
+    return (
+      <pre className="max-h-40 overflow-auto rounded-md bg-slate-950 p-2 text-xs text-slate-100">{text}</pre>
+    );
+  }
+  return <div className={`${compact ? "line-clamp-2 text-xs" : "text-sm"} leading-6 text-slate-700`}>{text}</div>;
+}
+
+function DashboardMarkdownBlock({ contentDraft, onContentDraftChange, onSave }) {
+  return (
+    <div className="space-y-3 p-4">
+      <textarea
+        className="min-h-28 w-full resize-y rounded-md border border-line px-3 py-2 text-sm leading-6 outline-none focus:border-teal-500"
+        placeholder={"# Label\n\nAdd explanatory dashboard text here."}
+        value={contentDraft}
+        onChange={(event) => onContentDraftChange(event.target.value)}
+      />
+      <div className="flex items-center justify-between gap-3">
+        <span className="text-xs text-muted">Markdown label and paragraph block</span>
+        <button
+          className="h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
+          type="button"
+          onClick={onSave}
+        >
+          Save Markdown
+        </button>
+      </div>
+      <div className="rounded-md border border-line bg-slate-50 p-4 text-ink">
+        <DashboardMarkdownPreview content={contentDraft} />
+      </div>
+    </div>
+  );
+}
+
+function DashboardMarkdownPreview({ content }) {
+  const blocks = dashboardMarkdownBlocks(content);
+  if (!blocks.length) {
+    return <p className="text-sm leading-6 text-muted">Markdown content</p>;
+  }
+  return (
+    <div className="space-y-2">
+      {blocks.map((block, index) => {
+        if (block.type === "heading") {
+          const Tag = block.level === 1 ? "h2" : block.level === 2 ? "h3" : "h4";
+          const sizeClass =
+            block.level === 1 ? "text-lg" : block.level === 2 ? "text-base" : "text-sm";
+          return (
+            <Tag key={`${block.type}-${index}`} className={`${sizeClass} font-semibold leading-6`}>
+              {block.text}
+            </Tag>
+          );
+        }
+        if (block.type === "list") {
+          return (
+            <ul key={`${block.type}-${index}`} className="list-disc space-y-1 pl-5 text-sm leading-6">
+              {block.items.map((item) => (
+                <li key={item}>{item}</li>
+              ))}
+            </ul>
+          );
+        }
+        return (
+          <p key={`${block.type}-${index}`} className="text-sm leading-6 text-slate-700">
+            {block.text}
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+function DashboardItemRow({ component, dashboard, item, onDeleteItem, onUpdateItem }) {
+  return (
+    <div className="border-b border-line bg-white p-2 text-xs last:border-b-0">
+      <DashboardItemFields
+        component={component}
+        dashboard={dashboard}
+        item={item}
+        onDeleteItem={onDeleteItem}
+        onUpdateItem={onUpdateItem}
+      />
+    </div>
+  );
+}
+
+function DashboardItemFields({ component, dashboard, item, onDeleteItem, onUpdateItem }) {
+  const fields = Object.keys(component.schema ?? {});
+  const [draft, setDraft] = useState(() => itemFieldsDraft(item, fields));
+
+  useEffect(() => {
+    setDraft(itemFieldsDraft(item, fields));
+  }, [item.id, fields.join("|")]);
+
+  function commitField(field) {
+    const nextValue = draft[field] ?? "";
+    if (String(nextValue) !== String(item[field] ?? "")) {
+      onUpdateItem(dashboard, component, item, { [field]: nextValue });
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-start justify-between gap-2">
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-medium text-ink">{item.title ?? item.name ?? item.id}</div>
+          <div className="mt-0.5 truncate text-[11px] text-muted">{item.id}</div>
+        </div>
+        <button
+          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
+          type="button"
+          onClick={() => onDeleteItem(dashboard, component, item)}
+        >
+          <Trash2 size={13} />
+        </button>
+      </div>
+      {fields.map((field) => (
+        <label key={field} className="grid grid-cols-[72px_1fr] items-center gap-2">
+          <span className="truncate text-[11px] text-muted">{field}</span>
+          <input
+            className="h-7 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
+            value={draft[field] ?? ""}
+            onBlur={() => commitField(field)}
+            onChange={(event) => setDraft((current) => ({ ...current, [field]: event.target.value }))}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.currentTarget.blur();
+              }
+              if (event.key === "Escape") {
+                setDraft(itemFieldsDraft(item, fields));
+                event.currentTarget.blur();
+              }
+            }}
+          />
+        </label>
+      ))}
+    </div>
+  );
+}
+
+function itemFieldsDraft(item, fields) {
+  return Object.fromEntries(fields.map((field) => [field, item[field] ?? ""]));
+}
+
+const DASHBOARD_COMPONENT_TYPES = [
+  { type: "markdown", label: "Markdown label" },
+  { type: "table", label: "Table" },
+  { type: "board", label: "Board" },
+  { type: "stats", label: "Stats" },
+  { type: "json_list", label: "JSON List" },
+  { type: "chart", label: "Chart" },
+];
+
+const DASHBOARD_SECTION_WIDTHS = [
+  { columns: 12, label: "Full" },
+  { columns: 8, label: "Wide" },
+  { columns: 6, label: "Half" },
+  { columns: 4, label: "Third" },
+];
+
+const DASHBOARD_CARD_FIELD_STYLES = ["heading", "text", "muted", "code"];
+const DASHBOARD_DETAIL_FIELD_STYLES = ["heading", "text", "muted", "textarea", "dropdown", "code"];
+
+function dashboardComponentLabel(type) {
+  if (type === "markdown") return "Markdown Label";
+  return DASHBOARD_COMPONENT_TYPES.find((item) => item.type === type)?.label ?? "Component";
+}
+
+function dashboardSectionColumns(section) {
+  const columns = Number(section.layout?.columns ?? 12);
+  return DASHBOARD_SECTION_WIDTHS.some((option) => option.columns === columns) ? columns : 12;
+}
+
+function dashboardPrimaryField(component) {
+  const fields = Object.keys(component.schema ?? {});
+  if (fields.includes("title")) return "title";
+  if (fields.includes("name")) return "name";
+  return fields[0] ?? "title";
+}
+
+function dashboardFieldSchema(component, field) {
+  return component.schema?.[field] ?? {};
+}
+
+function dashboardBoardColumnPatch(view) {
+  if (!view?.filter || view.filter.operator !== "equals" || !view.filter.field) {
+    return null;
+  }
+  return { [view.filter.field]: view.filter.value };
+}
+
+function dashboardDisplayRows(component, kind) {
+  const configured = kind === "card" ? component.display?.cardFields : component.display?.detailFields;
+  const fallback = kind === "card" ? defaultCardDisplay(component) : defaultDetailDisplay(component);
+  return (configured?.length ? configured : fallback).filter((row) => row.field);
+}
+
+function defaultCardDisplay(component) {
+  const fields = Object.keys(component.schema ?? {});
+  const primary = dashboardPrimaryField(component);
+  return [
+    { field: primary, style: "heading" },
+    ...(fields.includes("description") ? [{ field: "description", style: "muted" }] : []),
+  ];
+}
+
+function defaultDetailDisplay(component) {
+  const fields = Object.keys(component.schema ?? {});
+  const primary = dashboardPrimaryField(component);
+  const rows = [{ field: primary, style: "heading" }];
+  for (const field of fields) {
+    if (field === primary) continue;
+    rows.push({
+      field,
+      style: dashboardFieldSchema(component, field).type === "enum" ? "dropdown" : field === "description" ? "textarea" : "text",
+    });
+  }
+  return rows;
+}
+
+function displayToRows(rows, kind) {
+  const source = rows?.length
+    ? rows
+    : kind === "card"
+      ? [
+          { field: "title", style: "heading" },
+          { field: "description", style: "muted" },
+        ]
+      : [
+          { field: "title", style: "heading" },
+          { field: "status", style: "dropdown" },
+          { field: "description", style: "textarea" },
+        ];
+  return source.map((row) => ({
+    rowId: newDraftRowId(`${kind}-display`),
+    field: row.field ?? "",
+    style: row.style ?? "text",
+  }));
+}
+
+function displayRowsToConfig(rows) {
+  return rows
+    .filter((row) => row.field)
+    .map((row) => ({
+      field: row.field,
+      style: row.style || "text",
+    }));
+}
+
+function dashboardMarkdownBlocks(content) {
+  const blocks = [];
+  let listItems = [];
+  function flushList() {
+    if (listItems.length) {
+      blocks.push({ type: "list", items: listItems });
+      listItems = [];
+    }
+  }
+  for (const rawLine of String(content ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      flushList();
+      continue;
+    }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushList();
+      blocks.push({ type: "heading", level: heading[1].length, text: heading[2] });
+      continue;
+    }
+    const listItem = line.match(/^[-*]\s+(.+)$/);
+    if (listItem) {
+      listItems.push(listItem[1]);
+      continue;
+    }
+    flushList();
+    blocks.push({ type: "paragraph", text: line });
+  }
+  flushList();
+  return blocks;
+}
+
+function viewsToRows(views = []) {
+  const rows = views.map((view) => ({
+    rowId: view.id ?? newDraftRowId("view"),
+    title: view.title ?? "",
+    field: view.filter?.field ?? "",
+    operator: view.filter?.operator ?? "equals",
+    value: view.filter?.value ?? "",
+  }));
+  return rows.length
+    ? rows
+    : [
+        { rowId: newDraftRowId("view"), title: "Backlog", field: "status", operator: "equals", value: "backlog" },
+        { rowId: newDraftRowId("view"), title: "Todo", field: "status", operator: "equals", value: "todo" },
+        { rowId: newDraftRowId("view"), title: "In Progress", field: "status", operator: "equals", value: "in_progress" },
+        { rowId: newDraftRowId("view"), title: "Completed", field: "status", operator: "equals", value: "completed" },
+      ];
+}
+
+function newDraftRowId(prefix) {
+  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function moveArrayItem(items, fromIndex, toIndex) {
+  const next = [...items];
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, item);
+  return next;
+}
+
+function DashboardStats({ component, fields }) {
+  const items = component.items ?? [];
+  return (
+    <div className="grid grid-cols-2 gap-2">
+      <div className="rounded-md border border-line bg-slate-50 p-3">
+        <div className="text-[11px] font-semibold uppercase text-muted">Items</div>
+        <div className="mt-1 text-2xl font-semibold text-ink">{items.length}</div>
+      </div>
+      {fields.slice(0, 5).map((field) => (
+        <div key={field} className="rounded-md border border-line bg-slate-50 p-3">
+          <div className="truncate text-[11px] font-semibold uppercase text-muted">{field}</div>
+          <div className="mt-1 text-2xl font-semibold text-ink">
+            {new Set(items.map((item) => item[field]).filter((value) => value !== undefined && value !== "")).size}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function DashboardChart({ component, views }) {
+  const items = component.items ?? [];
+  const buckets = views.length
+    ? views.map((view) => ({
+        title: view.title,
+        count: items.filter((item) => dashboardItemMatchesView(item, view)).length,
+      }))
+    : [{ title: "Items", count: items.length }];
+  const max = Math.max(1, ...buckets.map((bucket) => bucket.count));
+  return (
+    <div className="space-y-2 rounded-md border border-line bg-slate-50 p-3">
+      {buckets.map((bucket) => (
+        <div key={bucket.title} className="grid grid-cols-[96px_1fr_32px] items-center gap-2 text-xs">
+          <div className="truncate font-medium text-muted">{bucket.title}</div>
+          <div className="h-2 overflow-hidden rounded-full bg-white">
+            <div className="h-full rounded-full bg-teal-600" style={{ width: `${(bucket.count / max) * 100}%` }} />
+          </div>
+          <div className="text-right font-semibold text-ink">{bucket.count}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function schemaToRows(schema = {}) {
+  const rows = Object.entries(schema).map(([name, config]) => {
+    const normalized = typeof config === "string" ? { type: config } : config ?? {};
+    return {
+      rowId: `field-${name}`,
+      name,
+      type: normalized.type ?? "string",
+      values: (normalized.values ?? []).join(", "),
+    };
+  });
+  return rows.length ? rows : [{ rowId: "field-title", name: "title", type: "string", values: "" }];
+}
+
+function dashboardItemMatchesView(item, view) {
+  const filter = view?.filter;
+  if (!filter?.field) return true;
+  const current = item[filter.field];
+  if (filter.operator === "not_equals") return String(current) !== String(filter.value);
+  if (filter.operator === "contains") {
+    return String(current ?? "").toLowerCase().includes(String(filter.value ?? "").toLowerCase());
+  }
+  if (filter.operator === "exists") return current !== undefined && current !== null && current !== "";
+  return String(current) === String(filter.value);
 }
 
 function EmptyWorkspace({ error, loading, onRefresh }) {

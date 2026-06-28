@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,9 +40,11 @@ const isProduction =
 const isSmokeTest = process.env.GOFER_ELECTRON_SMOKE_TEST === "1";
 let backendProcess;
 let backendLogStream;
+const desktopGrantSecret = crypto.randomBytes(32).toString("hex");
 const expectedBackendStops = new WeakSet();
 let isQuitting = false;
 let activeApiBaseUrl;
+let activeUiApiToken;
 let selectedDataDir;
 let mainWindow;
 let backendErrorWindow;
@@ -64,7 +67,7 @@ if (!singleInstanceLock) {
   process.exit(0);
 }
 
-function createWindow(apiBaseUrl) {
+function createWindow(apiBaseUrl, apiToken = "") {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 960,
@@ -77,7 +80,10 @@ function createWindow(apiBaseUrl) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: !isSmokeTest,
-      additionalArguments: [`--gofer-api-base-url=${apiBaseUrl}`],
+      additionalArguments: [
+        `--gofer-api-base-url=${apiBaseUrl}`,
+        `--gofer-api-token=${apiToken}`,
+      ],
     },
   });
 
@@ -129,7 +135,10 @@ function createWindow(apiBaseUrl) {
 function startBackend() {
   const manualApiBaseUrl = process.env.GOFER_API_BASE_URL || process.env.VITE_API_BASE_URL;
   if (manualApiBaseUrl) {
-    return Promise.resolve(manualApiBaseUrl);
+    return Promise.resolve({
+      apiBaseUrl: manualApiBaseUrl,
+      apiToken: process.env.GOFER_UI_API_TOKEN || "",
+    });
   }
 
   return new Promise((resolve, reject) => {
@@ -146,7 +155,11 @@ function startBackend() {
 
     const child = spawn(backendCommand.command, args, {
       cwd: repoRoot,
-      env: process.env,
+      env: {
+        ...process.env,
+        GOFER_DESKTOP_GRANT_SECRET: desktopGrantSecret,
+        GOFER_UI_EMIT_READY_TOKEN: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     backendProcess = child;
@@ -159,12 +172,12 @@ function startBackend() {
       fail(new Error("Timed out waiting for Gofer backend to start."));
     }, BACKEND_START_TIMEOUT_MS);
 
-    function succeed(apiBaseUrl) {
+    function succeed(apiBaseUrl, apiToken = "") {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutId);
       writeBackendLog(`READY ${apiBaseUrl}\n`);
-      resolve(apiBaseUrl);
+      resolve({ apiBaseUrl, apiToken });
     }
 
     function fail(error) {
@@ -176,23 +189,27 @@ function startBackend() {
     }
 
     function handleOutput(chunk) {
-      writeBackendLog(chunk.toString());
       stdoutBuffer += chunk.toString();
       const lines = stdoutBuffer.split(/\r?\n/);
       stdoutBuffer = lines.pop() ?? "";
 
       for (const line of lines) {
-        console.log(`[gofer-backend] ${line}`);
-        if (!line.startsWith(BACKEND_READY_PREFIX)) continue;
+        if (!line.startsWith(BACKEND_READY_PREFIX)) {
+          writeBackendLog(`${line}\n`);
+          console.log(`[gofer-backend] ${line}`);
+          continue;
+        }
 
         try {
           const payload = JSON.parse(line.slice(BACKEND_READY_PREFIX.length));
           const host = payload.host || "127.0.0.1";
           const port = Number(payload.port);
+          const apiToken = typeof payload.apiToken === "string" ? payload.apiToken : "";
           if (!port) {
             throw new Error("Ready payload did not include a valid port.");
           }
-          succeed(`http://${host}:${port}`);
+          console.log(`[gofer-backend] GOFER_UI_READY ${JSON.stringify({ host, port })}`);
+          succeed(`http://${host}:${port}`, apiToken);
         } catch (error) {
           fail(error);
         }
@@ -392,9 +409,10 @@ app.whenReady().then(async () => {
   setupIpcHandlers();
   setupAutoUpdater();
   try {
-    const apiBaseUrl = await startBackend();
-    activeApiBaseUrl = apiBaseUrl;
-    createWindow(apiBaseUrl);
+    const backend = await startBackend();
+    activeApiBaseUrl = backend.apiBaseUrl;
+    activeUiApiToken = backend.apiToken;
+    createWindow(backend.apiBaseUrl, backend.apiToken);
   } catch (error) {
     if (isSmokeTest) {
       console.error(
@@ -411,7 +429,7 @@ app.whenReady().then(async () => {
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0 && activeApiBaseUrl) {
-      createWindow(activeApiBaseUrl);
+      createWindow(activeApiBaseUrl, activeUiApiToken);
     }
   });
 });
@@ -841,7 +859,9 @@ async function grantPath(_event, options = {}) {
   if (!options.targetPath || typeof options.targetPath !== "string") {
     throw new Error("A path is required.");
   }
-  return pathHandle(path.resolve(options.targetPath));
+  const handle = pathHandle(path.resolve(options.targetPath));
+  await registerBackendPathGrant(handle);
+  return handle;
 }
 
 async function copyPath(_event, options = {}) {
@@ -1050,7 +1070,9 @@ async function selectPath(_event, options = {}) {
     return null;
   }
 
-  return getIpcSecurity().grantPath(result.filePaths[0]);
+  const handle = getIpcSecurity().grantPath(result.filePaths[0]);
+  await registerBackendPathGrant(handle);
+  return handle;
 }
 
 function resolvePickerDefaultPath(currentPath, grantId = "") {
@@ -1064,6 +1086,30 @@ function pathHandle(targetPath) {
     return { grantId: existingGrantId, path: targetPath };
   }
   return security.grantPath(targetPath);
+}
+
+async function registerBackendPathGrant(handle) {
+  if (!activeApiBaseUrl || !desktopGrantSecret) return;
+  if (!handle || typeof handle.path !== "string" || typeof handle.grantId !== "string") return;
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Gofer-Desktop-Grant-Secret": desktopGrantSecret,
+    };
+    if (activeUiApiToken) {
+      headers.Authorization = `Bearer ${activeUiApiToken}`;
+    }
+    const response = await fetch(`${activeApiBaseUrl}/api/desktop/path-grants`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ grantId: handle.grantId, path: handle.path }),
+    });
+    if (!response.ok) {
+      writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${response.status}\n`);
+    }
+  } catch (error) {
+    writeBackendLog(`PATH_GRANT_REGISTER_FAILED ${error?.message || error}\n`);
+  }
 }
 
 function getIpcSecurity() {
@@ -1083,15 +1129,16 @@ function getIpcSecurity() {
 async function restartBackend() {
   stopBackend();
   try {
-    const apiBaseUrl = await startBackend();
-    activeApiBaseUrl = apiBaseUrl;
+    const backend = await startBackend();
+    activeApiBaseUrl = backend.apiBaseUrl;
+    activeUiApiToken = backend.apiToken;
     if (backendErrorWindow && !backendErrorWindow.isDestroyed()) {
       backendErrorWindow.close();
     }
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.close();
     }
-    createWindow(apiBaseUrl);
+    createWindow(backend.apiBaseUrl, backend.apiToken);
   } catch (error) {
     createBackendErrorWindow(error);
   }

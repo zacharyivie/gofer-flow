@@ -6,10 +6,195 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from gofer.cli.main import app
-from gofer.core.health import run_health_checks, workflow_health_payload
+from gofer.core.health import (
+    HealthDiagnostic,
+    HealthReport,
+    run_health_checks,
+    workflow_health_payload,
+)
+from gofer.core.provider_profiles import ProviderProfile, save_provider_profiles
 from gofer.ui.api import list_workflow_payloads
 
 runner = CliRunner()
+
+
+def _doctor_report(
+    diagnostics: list[HealthDiagnostic],
+    tmp_path: Path,
+    *,
+    workflow_path: Path | None = None,
+) -> HealthReport:
+    return HealthReport(
+        ok=not any(item.severity == "error" for item in diagnostics),
+        diagnostics=diagnostics,
+        data_dir=tmp_path,
+        workflow_path=workflow_path,
+    )
+
+
+def _assert_before(output: str, first: str, second: str) -> None:
+    assert output.index(first) < output.index(second)
+
+
+def test_doctor_human_reports_ready_checks_when_all_diagnostics_ok(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    diagnostics = [
+        HealthDiagnostic(
+            id="python.version",
+            severity="ok",
+            message="Python version is supported.",
+        ),
+        HealthDiagnostic(
+            id="data_dir.available",
+            severity="ok",
+            message="Data directory is writable.",
+        ),
+    ]
+    monkeypatch.setattr(
+        "gofer.cli.commands.doctor.run_health_checks",
+        lambda **_kwargs: _doctor_report(diagnostics, tmp_path),
+    )
+
+    result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Gofer Flow doctor" in result.output
+    assert "Ready checks" in result.output
+    assert "- Python version is supported." in result.output
+    assert "- Data directory is writable." in result.output
+    assert "Errors" not in result.output
+    assert "Warnings" not in result.output
+    assert '"diagnostics"' not in result.output
+    assert "[green]" not in result.output
+
+
+def test_doctor_human_groups_warnings_separately_and_exits_zero(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    diagnostics = [
+        HealthDiagnostic(
+            id="provider.cli",
+            severity="warning",
+            message="Configured provider CLI 'codex' is not on PATH.",
+        ),
+        HealthDiagnostic(
+            id="shell.available",
+            severity="ok",
+            message="Shell binary 'bash' is available.",
+        ),
+    ]
+    monkeypatch.setattr(
+        "gofer.cli.commands.doctor.run_health_checks",
+        lambda **_kwargs: _doctor_report(diagnostics, tmp_path),
+    )
+
+    result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Warnings" in result.output
+    assert "- Configured provider CLI 'codex' is not on PATH." in result.output
+    assert "Ready checks" in result.output
+    assert "- Shell binary 'bash' is available." in result.output
+    assert "Errors" not in result.output
+    _assert_before(result.output, "Warnings", "Ready checks")
+    assert '"severity": "warning"' not in result.output
+    assert "[yellow]" not in result.output
+
+
+def test_doctor_human_groups_errors_and_exits_nonzero(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    diagnostics = [
+        HealthDiagnostic(
+            id="workflow.provider_cli",
+            severity="error",
+            message="Workflow provider CLI 'codex' is not on PATH.",
+        ),
+        HealthDiagnostic(
+            id="provider.cli",
+            severity="warning",
+            message="Configured provider CLI 'codex' is not on PATH.",
+        ),
+        HealthDiagnostic(
+            id="python.version",
+            severity="ok",
+            message="Python version is supported.",
+        ),
+    ]
+    monkeypatch.setattr(
+        "gofer.cli.commands.doctor.run_health_checks",
+        lambda **_kwargs: _doctor_report(diagnostics, tmp_path),
+    )
+
+    result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 1
+    assert "Errors" in result.output
+    assert "- Workflow provider CLI 'codex' is not on PATH." in result.output
+    assert "Warnings" in result.output
+    assert "- Configured provider CLI 'codex' is not on PATH." in result.output
+    assert "Ready checks" in result.output
+    assert "- Python version is supported." in result.output
+    _assert_before(result.output, "Errors", "Warnings")
+    _assert_before(result.output, "Warnings", "Ready checks")
+    assert '"errors"' not in result.output
+    assert "[red]" not in result.output
+
+
+def test_doctor_human_with_no_diagnostics_prints_only_header(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        "gofer.cli.commands.doctor.run_health_checks",
+        lambda **_kwargs: _doctor_report([], tmp_path),
+    )
+
+    result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "Gofer Flow doctor\n"
+
+
+def test_doctor_human_workflow_option_prints_workflow_diagnostics(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "workflow.toml"
+    seen: dict[str, object] = {}
+
+    def fake_run_health_checks(*, data_dir: Path | None = None, workflow: str | None = None):
+        seen["data_dir"] = data_dir
+        seen["workflow"] = workflow
+        return _doctor_report(
+            [
+                HealthDiagnostic(
+                    id="workflow.shell_available",
+                    severity="error",
+                    subject="node:build",
+                    message="Workflow node 'build' requires missing shell binary 'bash'.",
+                )
+            ],
+            tmp_path,
+            workflow_path=workflow_path,
+        )
+
+    monkeypatch.setattr("gofer.cli.commands.doctor.run_health_checks", fake_run_health_checks)
+
+    result = runner.invoke(
+        app,
+        ["doctor", "--workflow", "workflow-id", "--data-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 1
+    assert seen == {"data_dir": tmp_path, "workflow": "workflow-id"}
+    assert "Errors" in result.output
+    assert "- Workflow node 'build' requires missing shell binary 'bash'." in result.output
+    assert '"workflowPath"' not in result.output
 
 
 def test_doctor_json_reports_warnings_without_nonzero_exit(monkeypatch, tmp_path: Path) -> None:
@@ -87,6 +272,45 @@ working_dir = "."
             "subject": "codex",
             "message": "Configured provider CLI 'codex' is available.",
             "detail": {"binary": "codex", "path": "/bin/codex"},
+        }
+    ]
+
+
+def test_doctor_reports_legacy_plaintext_provider_profile_secrets(
+    tmp_path: Path,
+) -> None:
+    save_provider_profiles(
+        {
+            "legacy": ProviderProfile(
+                name="legacy",
+                subscription="codex",
+                env={
+                    "AWS_ACCESS_KEY_ID": "plaintext",
+                    "CODEX_API_KEY": "plaintext",
+                    "GOFER_TRACE": "1",
+                },
+            )
+        },
+        tmp_path,
+    )
+
+    payload = run_health_checks(data_dir=tmp_path).to_dict()
+
+    diagnostics = [
+        item
+        for item in payload["warnings"]
+        if item["id"] == "provider_profile.plaintext_secret"
+    ]
+    assert diagnostics == [
+        {
+            "id": "provider_profile.plaintext_secret",
+            "severity": "warning",
+            "subject": "legacy",
+            "message": (
+                "Provider profile 'legacy' stores sensitive env value(s) in "
+                "plaintext: AWS_ACCESS_KEY_ID, CODEX_API_KEY. Move them to secret_refs."
+            ),
+            "detail": {"profile": "legacy", "env": ["AWS_ACCESS_KEY_ID", "CODEX_API_KEY"]},
         }
     ]
 
@@ -587,3 +811,36 @@ dynamic_count = 1
 
     workflow_payload = payload["workflows"][0]
     assert workflow_payload["healthErrors"][0]["id"] == "workflow.provider_cli"
+
+
+def test_workflow_health_reports_missing_direct_api_secret(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    workflow_path = tmp_path / "direct.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "direct"
+name = "Direct"
+
+[agents.writer]
+subscription = "openai_api"
+working_dir = "."
+model = "gpt-5-mini"
+
+[[nodes]]
+id = "ask"
+type = "agent"
+agent_id = "writer"
+working_dir = "."
+""",
+        encoding="utf-8",
+    )
+
+    payload = workflow_health_payload(str(workflow_path), tmp_path)
+    error_ids = {item["id"] for item in payload["errors"]}
+
+    assert "workflow.provider_secret" in error_ids
+    assert "workflow.provider_cli" not in error_ids

@@ -256,5 +256,5 @@ working_dir = "."
     assert len(sidecars) == 1
     payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert payload["usageSummary"]["totals"]["agent_calls"] == 1
-    assert payload["nodeOutputs"]["ask"]["data"]["prompt"] == "***"
+    assert "prompt" not in payload["nodeOutputs"]["ask"]["data"]
     assert "Token:" not in sidecars[0].read_text(encoding="utf-8")

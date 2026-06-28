@@ -31,6 +31,9 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
+    DashboardItemOperation,
+    DashboardItemsFanSource,
+    DashboardUpdateInstruction,
     DeleteFileOperation,
     DirectoryFanSource,
     FailOperation,
@@ -66,6 +69,7 @@ from gofer.core.revisions import (
     restore_workflow_revision,
 )
 from gofer.core.run_outputs import write_run_node_outputs_payload
+from gofer.core.secrets import workflow_secret_readiness
 from gofer.core.templates import (
     create_workflow_from_template,
     list_workflow_templates,
@@ -78,10 +82,12 @@ from gofer.core.workflow import (
     ScheduleConfig,
     WatchConfig,
     WorkflowConfig,
+    masked_workflow_parameters,
     resolve_workflow_parameters,
 )
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
+from gofer.subscriptions.direct_api import AnthropicApiSubscription, OpenAiApiSubscription
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
     WorkflowCreateError,
@@ -91,12 +97,14 @@ from gofer.ui.api import (
     duplicate_workflow_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
+    list_workflow_payloads,
     list_workflow_run_logs_payload,
     prune_workflow_run_logs_payload,
     rename_workflow_payload,
     replay_workflow_trigger_payload,
     trigger_workflow_payload,
     workflow_run_log_payload,
+    write_run_summary_payload,
 )
 from gofer.ui.chat import delete_workflow_chat_prompt
 from gofer.utils.paths import get_data_dir
@@ -113,7 +121,16 @@ console = Console()
 _SUBSCRIPTIONS = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
+    "openai_api": OpenAiApiSubscription(),
+    "anthropic_api": AnthropicApiSubscription(),
 }
+
+
+def _write_cli_run_artifacts(result: Any, limits: Any, base: Path) -> None:
+    if result.log_path is None:
+        return
+    write_run_node_outputs_payload(result, limits)
+    write_run_summary_payload(base, result.workflow_id, result.log_path)
 
 
 def _resolve_workflow(name: str, data_dir: Path | None) -> AgenticWorkflow:
@@ -202,6 +219,7 @@ def _print_bundle_import_plan(plan: dict[str, Any], *, dry_run: bool) -> None:
     conflicts = plan.get("conflicts") or []
     required_secrets = plan.get("requiredSecrets") or []
     external_requirements = plan.get("externalRequirements") or []
+    risk_warnings = plan.get("riskWarnings") or []
 
     if created:
         console.print("[green]Will create:[/green]")
@@ -215,6 +233,10 @@ def _print_bundle_import_plan(plan: dict[str, Any], *, dry_run: bool) -> None:
         console.print("[yellow]Conflicts:[/yellow]")
         for conflict in conflicts:
             console.print(f"  • {conflict['path']}: {conflict['action']}")
+    if risk_warnings:
+        console.print("[red]High-risk configuration:[/red]")
+        for warning in risk_warnings:
+            console.print(f"  • {warning}")
     if required_secrets:
         console.print(
             "[yellow]Required secrets:[/yellow] "
@@ -313,6 +335,22 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
         f"[bold]Execution plan[/bold] for [cyan]{plan['workflowId']}[/cyan] "
         f"({plan['workflowName']})"
     )
+    start_nodes = plan.get("startNodes") or []
+    if start_nodes:
+        console.print("[bold]Start nodes:[/bold] " + ", ".join(str(node) for node in start_nodes))
+
+    validation = plan.get("validation") or {}
+    diagnostics = validation.get("diagnostics") if isinstance(validation, dict) else None
+    if isinstance(diagnostics, list) and diagnostics:
+        console.print("[bold]Validation diagnostics:[/bold]")
+        for item in diagnostics:
+            if not isinstance(item, dict):
+                continue
+            severity = str(item.get("severity") or "warning")
+            subject = str(item.get("subject") or item.get("targetId") or "")
+            suffix = f" [{subject}]" if subject else ""
+            console.print(f"  • {severity}: {item.get('message')}{suffix}")
+
     trigger = plan.get("triggerContext") or {}
     if trigger:
         trigger_parts = []
@@ -346,7 +384,40 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
 
     required_secrets = plan.get("requiredSecrets") or []
     if required_secrets:
-        console.print("[yellow]Required secrets:[/yellow] " + ", ".join(required_secrets))
+        console.print(
+            "[yellow]Required secrets:[/yellow] "
+            + ", ".join(_secret_name(item) for item in required_secrets)
+        )
+    readiness = plan.get("secretReadiness") or []
+    if readiness:
+        console.print("[bold]Secret readiness:[/bold]")
+        for item in readiness:
+            status = str(item.get("status") or "missing")
+            name = str(item.get("name") or "")
+            marker = "[green]present[/green]" if status == "present" else "[red]missing[/red]"
+            sources = item.get("sources") or []
+            suffix = f" ({', '.join(str(source) for source in sources)})" if sources else ""
+            console.print(f"  • {name}: {marker}{suffix}")
+
+    resource_limits = plan.get("resourceLimits") or {}
+    execution_limits = plan.get("executionLimits") or {}
+    if isinstance(resource_limits, dict):
+        console.print(
+            "[bold]Resource limits:[/bold] "
+            f"fanout_items={resource_limits.get('max_fanout_items')} "
+            f"fanout_concurrency={resource_limits.get('max_fanout_concurrency')} "
+            f"files_scanned={resource_limits.get('max_files_scanned')} "
+            f"max_node_runs={execution_limits.get('maxTotalNodeRuns')}"
+        )
+
+    usage_budget = plan.get("usageBudget") or {}
+    if isinstance(usage_budget, dict) and usage_budget.get("enabled"):
+        budget_parts = [
+            f"{key}={value}"
+            for key, value in usage_budget.items()
+            if key != "enabled" and value is not None
+        ]
+        console.print("[bold]Usage budget:[/bold] " + ", ".join(budget_parts))
 
     projected_usage = plan.get("projectedLlmUsage") or {}
     if isinstance(projected_usage, dict) and projected_usage.get("agent_calls"):
@@ -356,6 +427,12 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
             f"tokens~{projected_usage.get('total_tokens')} "
             f"cost~${float(projected_usage.get('estimated_cost') or 0.0):.6f}"
         )
+
+    parameters = plan.get("parameters") or {}
+    if isinstance(parameters, dict) and parameters:
+        console.print("[bold]Workflow parameters:[/bold]")
+        for name, value in parameters.items():
+            console.print(f"  • {name}={value}")
 
     providers = plan.get("providerRequirements") or []
     if providers:
@@ -378,6 +455,14 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
                 line += f" extra_paths={', '.join(str(path) for path in extra_paths)}"
             console.print(line)
 
+    branches = plan.get("conditionalBranches") or []
+    if branches:
+        console.print("[bold]Conditional branches:[/bold]")
+        for branch in branches:
+            console.print(
+                f"  • {branch.get('from')} -> {branch.get('to')} when {branch.get('label')}"
+            )
+
     unresolved = plan.get("unresolvedDynamicValues") or []
     if unresolved:
         console.print("[yellow]Unresolved dynamic values:[/yellow]")
@@ -391,6 +476,7 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
         table.add_column("Working dir")
         table.add_column("Impact")
         table.add_column("Fan-out")
+        table.add_column("Policy")
         for node in generation.get("nodes") or []:
             fan_out = node.get("fanOut")
             fan_text = ""
@@ -408,18 +494,46 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
                         + ", ".join(str(value) for value in node["unresolvedDynamicValues"]),
                     ]
                 ).strip("; ")
+            policy_parts = []
+            if node.get("timeoutSeconds") is not None:
+                policy_parts.append(f"timeout={node.get('timeoutSeconds')}s")
+            if node.get("retryCount"):
+                policy_parts.append(
+                    f"retries={node.get('retryCount')} delay={node.get('retryDelaySeconds')}s"
+                )
+            if node.get("allowFailure"):
+                policy_parts.append("allow_failure=true")
+            if not node.get("awaitAllInputs", True):
+                policy_parts.append("await_all_inputs=false")
             table.add_row(
                 node["id"],
                 node["type"],
                 str(node.get("workingDir") or ""),
                 impact,
                 fan_text,
+                "; ".join(policy_parts),
             )
         console.print(table)
         for node in generation.get("nodes") or []:
+            impact = "; ".join(node.get("sideEffects") or []) or node.get("detail", "")
+            if impact:
+                console.print(f"  Impact for {node['id']}: {impact}")
             working_dir = node.get("workingDir")
             if working_dir:
                 console.print(f"  Working dir for {node['id']}: {working_dir}")
+            policy_parts = []
+            if node.get("timeoutSeconds") is not None:
+                policy_parts.append(f"timeout={node.get('timeoutSeconds')}s")
+            if node.get("retryCount"):
+                policy_parts.append(
+                    f"retries={node.get('retryCount')} delay={node.get('retryDelaySeconds')}s"
+                )
+            if node.get("allowFailure"):
+                policy_parts.append("allow_failure=true")
+            if not node.get("awaitAllInputs", True):
+                policy_parts.append("await_all_inputs=false")
+            if policy_parts:
+                console.print(f"  Policy for {node['id']}: {'; '.join(policy_parts)}")
             fan_out = node.get("fanOut") or {}
             if fan_out:
                 console.print(
@@ -448,7 +562,10 @@ def _print_validate_http_diagnostics(plan: dict[str, Any]) -> None:
             console.print(f"  • {request}")
     required_secrets = plan.get("requiredSecrets") or []
     if required_secrets:
-        console.print("[yellow]Required secrets:[/yellow] " + ", ".join(required_secrets))
+        console.print(
+            "[yellow]Required secrets:[/yellow] "
+            + ", ".join(_secret_name(item) for item in required_secrets)
+        )
     unresolved = plan.get("unresolvedDynamicValues") or []
     if unresolved:
         console.print("[yellow]Unresolved dynamic values:[/yellow]")
@@ -463,6 +580,12 @@ def _format_plan_sample(item: Any) -> str:
         if "name" in item:
             return str(item["name"])
         return json.dumps(item, sort_keys=True, default=str)
+    return str(item)
+
+
+def _secret_name(item: Any) -> str:
+    if isinstance(item, dict):
+        return str(item.get("name") or "")
     return str(item)
 
 
@@ -520,6 +643,25 @@ def _parse_json_value(value: str | None, option_name: str) -> object | None:
     return parsed
 
 
+def _parse_json_dict(value: str | None, option_name: str) -> dict[str, object]:
+    if not value:
+        return {}
+    parsed = _parse_json_value(value, option_name)
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter(f"{option_name} must be a JSON object")
+    return parsed
+
+
+def _parse_dashboard_updates(values: list[str] | None) -> list[DashboardUpdateInstruction]:
+    updates: list[DashboardUpdateInstruction] = []
+    for value in values or []:
+        parsed = _parse_json_value(value, "--dashboard-update-json")
+        if not isinstance(parsed, dict):
+            raise typer.BadParameter("--dashboard-update-json must be a JSON object")
+        updates.append(DashboardUpdateInstruction.model_validate(parsed))
+    return updates
+
+
 def _save_workflow(wf: AgenticWorkflow, path: Path) -> None:
     try:
         wf.validate(path)
@@ -539,6 +681,9 @@ def _fan_source_from_options(
     fan_include_content: bool,
     fan_max_concurrency: int,
     fan_fail_fast: bool,
+    dashboard_name: str | None,
+    dashboard_component: str | None,
+    dashboard_filter: str | None,
 ) -> Any | None:
     if fan_source is None:
         return None
@@ -579,10 +724,24 @@ def _fan_source_from_options(
             max_concurrency=fan_max_concurrency,
             fail_fast=fan_fail_fast,
         )
+    if normalized in {"dashboard-items", "dashboard_items"}:
+        if not dashboard_name:
+            raise typer.BadParameter("--dashboard is required for dashboard-items fan-out")
+        if not dashboard_component:
+            raise typer.BadParameter("--component is required for dashboard-items fan-out")
+        return DashboardItemsFanSource(
+            type="dashboard_items",
+            dashboard=dashboard_name,
+            component=dashboard_component,
+            filter=dashboard_filter,
+            max_concurrency=fan_max_concurrency,
+            fail_fast=fan_fail_fast,
+        )
     if normalized == "infinite":
         return InfiniteFanSource(type="infinite")
     raise typer.BadParameter(
-        "--fan-source must be one of count, tabular, directory, trigger-events, infinite"
+        "--fan-source must be one of count, tabular, directory, trigger-events, "
+        "dashboard-items, infinite"
     )
 
 
@@ -655,6 +814,32 @@ def _operation_from_options(
     notification_body: str,
     notification_channel: str,
     notification_urgency: str,
+    notification_webhook_url: str | None,
+    notification_headers: dict[str, str],
+    notification_payload: object | None,
+    notification_email_from: str | None,
+    notification_email_to: list[str],
+    notification_smtp_host: str | None,
+    notification_smtp_port: int,
+    notification_smtp_username: str | None,
+    notification_smtp_password: str | None,
+    notification_smtp_starttls: bool,
+    notification_timeout_seconds: float,
+    notification_retry_attempts: int,
+    notification_retry_backoff_seconds: float,
+    notification_retry_statuses: list[int],
+    notification_expected_statuses: list[int],
+    notification_network_allowlist: list[str],
+    dashboard_action: str,
+    dashboard_name: str | None,
+    dashboard_component: str | None,
+    dashboard_item_id: str | None,
+    dashboard_item: dict[str, object],
+    dashboard_patch: dict[str, object],
+    dashboard_filter: str | dict[str, object] | None,
+    dashboard_field: str,
+    dashboard_value: object | None,
+    dashboard_updates: list[DashboardUpdateInstruction],
 ) -> Operation:
     normalized = node_type.replace("-", "_")
     match normalized:
@@ -870,8 +1055,10 @@ def _operation_from_options(
                 notification_title=notification_title,
             )
         case OperationType.NOTIFICATION:
-            if notification_channel != "desktop":
-                raise typer.BadParameter("--channel must be desktop")
+            if notification_channel not in {"desktop", "slack", "teams", "webhook", "email"}:
+                raise typer.BadParameter(
+                    "--channel must be desktop, slack, teams, webhook, or email"
+                )
             if notification_urgency not in {"low", "normal", "critical"}:
                 raise typer.BadParameter("--urgency must be low, normal, or critical")
             return NotificationOperation(
@@ -880,6 +1067,45 @@ def _operation_from_options(
                 body=notification_body or message,
                 channel=notification_channel,  # type: ignore[arg-type]
                 urgency=notification_urgency,  # type: ignore[arg-type]
+                webhook_url=notification_webhook_url,
+                headers=notification_headers,
+                payload=notification_payload,
+                email_from=notification_email_from,
+                email_to=notification_email_to,
+                smtp_host=notification_smtp_host,
+                smtp_port=notification_smtp_port,
+                smtp_username=notification_smtp_username,
+                smtp_password=notification_smtp_password,
+                smtp_starttls=notification_smtp_starttls,
+                timeout_seconds=notification_timeout_seconds,
+                retry=HttpRetryPolicy(
+                    attempts=notification_retry_attempts,
+                    backoff_seconds=notification_retry_backoff_seconds,
+                    retry_on_statuses=notification_retry_statuses,
+                ),
+                expected_statuses=notification_expected_statuses,
+                network_allowlist=notification_network_allowlist,
+            )
+        case OperationType.DASHBOARD_ITEM:
+            if dashboard_name is None or dashboard_component is None:
+                raise typer.BadParameter(
+                    "--dashboard and --component are required for dashboard_item nodes"
+                )
+            if dashboard_action not in {"read", "add", "update", "delete", "move"}:
+                raise typer.BadParameter(
+                    "--dashboard-action must be one of read, add, update, delete, move"
+                )
+            return DashboardItemOperation(
+                type=OperationType.DASHBOARD_ITEM,
+                action=dashboard_action,  # type: ignore[arg-type]
+                dashboard=dashboard_name,
+                component=dashboard_component,
+                item_id=dashboard_item_id,
+                item=dashboard_item,
+                patch=dashboard_patch,
+                filter=dashboard_filter,
+                field=dashboard_field,
+                value=dashboard_value,
             )
         case OperationType.AGENT:
             if agent_id is None or working_dir is None:
@@ -903,6 +1129,7 @@ def _operation_from_options(
                 skill_name=skill_name,
                 memory=memory,  # type: ignore[arg-type]
                 input_mapping=input_mapping,
+                dashboard_updates=dashboard_updates,
             )
     raise typer.BadParameter(
         "node type must be one of "
@@ -910,7 +1137,7 @@ def _operation_from_options(
         "agent, read_file, write_file, "
         "copy_file, move_file, delete_file, file, folder, open_resource, prompt_file, "
         "common_llm_task, local_vectorize, local_search, http_request, "
-        "approval_gate, notification"
+        "approval_gate, notification, dashboard_item"
     )
 
 
@@ -944,7 +1171,8 @@ def run(
         raise typer.Exit(1)
 
     profile_data_dir = data_dir or get_data_dir()
-    wf.validate(workflow_path, profile_data_dir)
+    if not dry_run:
+        wf.validate(workflow_path, profile_data_dir)
     _print_agent_access_summary(wf, workflow_path.parent)
     trigger_context = _parse_trigger_context(trigger_json)
     try:
@@ -989,8 +1217,7 @@ def run(
         .with_parameters(run_parameters)
         .run()
     )
-    if result.log_path:
-        write_run_node_outputs_payload(result, wf.config.resource_limits)
+    _write_cli_run_artifacts(result, wf.config.resource_limits, base)
 
     if verbose:
         for node_id, node_out in result.node_outputs.items():
@@ -1160,8 +1387,7 @@ def resume(
         )
         .run()
     )
-    if result.log_path:
-        write_run_node_outputs_payload(result, wf.config.resource_limits)
+    _write_cli_run_artifacts(result, wf.config.resource_limits, base)
 
     if verbose:
         for node_id, node_out in result.node_outputs.items():
@@ -1204,20 +1430,35 @@ def plan(
         "--trigger-json",
         help="Trigger context JSON object for trigger-event fan-out estimates",
     ),
+    param: list[str] | None = typer.Option(
+        None,
+        "--param",
+        help="Workflow parameter as KEY=VALUE. May be repeated.",
+    ),
+    params_json: str | None = typer.Option(
+        None,
+        "--params-json",
+        help="Workflow parameters as a JSON object",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Preview execution order, fan-out, provider calls, and side effects."""
     try:
         wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
         profile_data_dir = data_dir or get_data_dir()
-        wf.validate(workflow_path, profile_data_dir)
         trigger_context = _parse_trigger_context(trigger_json)
+        run_parameters = resolve_workflow_parameters(
+            wf.config,
+            _parse_param_values(param, params_json),
+            allow_missing_required=True,
+        )
         plan_payload = build_execution_plan(
             wf,
             workflow_path=workflow_path,
             data_dir=profile_data_dir,
             trigger_context=trigger_context,
         )
+        plan_payload["parameters"] = masked_workflow_parameters(wf.config, run_parameters)
     except Exception as exc:
         console.print(f"[red]Plan failed: {exc}[/red]")
         raise typer.Exit(1)
@@ -1318,6 +1559,52 @@ def usage(
     console.print(table)
 
 
+@app.command("secrets")
+def secrets(
+    workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
+    json_output: bool = typer.Option(False, "--json", help="Print readiness as JSON"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
+    """Show required workflow secrets and whether they are available locally."""
+    try:
+        wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
+        profile_data_dir = data_dir or get_data_dir()
+        readiness = [
+            item.to_dict()
+            for item in workflow_secret_readiness(
+                wf,
+                workflow_path=workflow_path,
+                data_dir=profile_data_dir,
+            )
+        ]
+    except Exception as exc:
+        console.print(f"[red]Secret readiness failed: {exc}[/red]")
+        raise typer.Exit(1)
+
+    payload = {
+        "workflowId": wf.config.id,
+        "ok": not any(not item["present"] for item in readiness),
+        "requiredSecrets": [item["name"] for item in readiness],
+        "secretReadiness": readiness,
+    }
+    if json_output:
+        sys.stdout.write(json.dumps(payload, default=str))
+        sys.stdout.write("\n")
+        return
+
+    if not readiness:
+        console.print(f"No required secrets found for [bold]{wf.config.id}[/bold].")
+        return
+    console.print(f"[bold]Secret readiness for {wf.config.id}[/bold]")
+    for item in readiness:
+        status = "[green]present[/green]" if item["present"] else "[red]missing[/red]"
+        sources = item.get("sources") or []
+        suffix = f" ({', '.join(str(source) for source in sources)})" if sources else ""
+        console.print(f"  • {item['name']}: {status}{suffix}")
+    if not payload["ok"]:
+        raise typer.Exit(1)
+
+
 @app.command("stop")
 def stop(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
@@ -1395,8 +1682,8 @@ def _resume_decided_approval(
         console.print(f"[yellow]Approval recorded, but resume failed: {exc}[/yellow]")
         return
     if result is not None:
-        if result.log_path:
-            write_run_node_outputs_payload(result, workflow.config.resource_limits)
+        base = data_dir or workflow_path.parent
+        _write_cli_run_artifacts(result, workflow.config.resource_limits, base)
         console.print(f"[green]Resumed[/green] {request.workflow_id} {request.run_id}")
 
 
@@ -1822,6 +2109,7 @@ def logs_list(
     status: str | None = typer.Option(None, "--status", help="Filter by status"),
     trigger: str | None = typer.Option(None, "--trigger", help="Filter by trigger type"),
     search: str | None = typer.Option(None, "--search", help="Search run metadata and log text"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """List run logs for a workflow."""
@@ -1840,9 +2128,20 @@ def logs_list(
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
 
+    if json_output:
+        sys.stdout.write(json.dumps(payload, default=str))
+        sys.stdout.write("\n")
+        return
+
     runs = payload.get("runs") or []
     if not runs:
         console.print(f"No run logs found for [bold]{workflow_id}[/bold].")
+        pagination = payload.get("pagination") if isinstance(payload, dict) else {}
+        if isinstance(pagination, dict) and pagination.get("searchTruncated"):
+            console.print(
+                "[yellow]Search stopped at the configured log scan byte limit; "
+                "results may be incomplete.[/yellow]"
+            )
         return
 
     for run_log in runs:
@@ -1857,6 +2156,12 @@ def logs_list(
                     str(base / "logs" / workflow_id / str(run_log["id"])),
                 )
             )
+        )
+    pagination = payload.get("pagination") if isinstance(payload, dict) else {}
+    if isinstance(pagination, dict) and pagination.get("searchTruncated"):
+        console.print(
+            "[yellow]Search stopped at the configured log scan byte limit; "
+            "results may be incomplete.[/yellow]"
         )
 
 
@@ -1910,6 +2215,7 @@ def logs_prune(
         help="Keep failed runs newer than N days",
     ),
     apply: bool = typer.Option(False, "--apply", help="Delete matching runs instead of previewing"),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Preview or prune old workflow run logs and sidecar files."""
@@ -1926,6 +2232,11 @@ def logs_prune(
     except (KeyError, WorkflowLogError) as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1)
+
+    if json_output:
+        sys.stdout.write(json.dumps(payload, default=str))
+        sys.stdout.write("\n")
+        return
 
     runs = payload.get("runs") or []
     action = "Would remove" if payload.get("dryRun") else "Removed"
@@ -2091,7 +2402,11 @@ def clear_watch(
 def add_agent(
     workflow: str = typer.Argument(..., help="Workflow ID or path to TOML file"),
     agent_id: str = typer.Option(..., "--id", help="Agent ID"),
-    subscription: str = typer.Option(..., "--subscription", help="codex or claude_code"),
+    subscription: str = typer.Option(
+        ...,
+        "--subscription",
+        help="codex, claude_code, openai_api, or anthropic_api",
+    ),
     working_dir: Path = typer.Option(..., "--working-dir", help="Agent working directory"),
     prompt_path: Path = typer.Option(..., "--prompt-path", help="Prompt markdown path"),
     tool: list[str] | None = typer.Option(None, "--tool", help="Allowed tool name"),
@@ -2263,7 +2578,7 @@ def add_node(
     fan_source: str | None = typer.Option(
         None,
         "--fan-source",
-        help="loop source: count, tabular, directory, trigger-events, or infinite",
+        help="loop source: count, tabular, directory, trigger-events, dashboard-items, or infinite",
     ),
     fan_count: str = typer.Option("1", "--fan-count"),
     fan_path: Path | None = typer.Option(None, "--fan-path"),
@@ -2315,6 +2630,84 @@ def add_node(
     notification_body: str = typer.Option("", "--notification-body", help="Notification body"),
     notification_channel: str = typer.Option("desktop", "--channel", help="Notification channel"),
     notification_urgency: str = typer.Option("normal", "--urgency", help="Notification urgency"),
+    notification_webhook_url: str | None = typer.Option(
+        None, "--notification-webhook-url", help="Slack, Teams, or generic webhook URL"
+    ),
+    notification_header: list[str] | None = typer.Option(
+        None, "--notification-header", help="Notification webhook header KEY=VALUE"
+    ),
+    notification_payload_json: str | None = typer.Option(
+        None, "--notification-payload-json", help="Generic webhook JSON payload"
+    ),
+    notification_email_from: str | None = typer.Option(
+        None, "--notification-email-from", help="Email sender address"
+    ),
+    notification_email_to: list[str] | None = typer.Option(
+        None, "--notification-email-to", help="Email recipient address"
+    ),
+    notification_smtp_host: str | None = typer.Option(
+        None, "--notification-smtp-host", help="SMTP host for email notifications"
+    ),
+    notification_smtp_port: int = typer.Option(
+        587, "--notification-smtp-port", help="SMTP port for email notifications"
+    ),
+    notification_smtp_username: str | None = typer.Option(
+        None, "--notification-smtp-username", help="SMTP username or secret ref"
+    ),
+    notification_smtp_password: str | None = typer.Option(
+        None, "--notification-smtp-password", help="SMTP password secret ref"
+    ),
+    notification_smtp_starttls: bool = typer.Option(
+        True, "--notification-smtp-starttls/--no-notification-smtp-starttls"
+    ),
+    notification_timeout: float = typer.Option(
+        30.0, "--notification-timeout", help="Notification delivery timeout in seconds"
+    ),
+    notification_retry_attempts: int = typer.Option(
+        1, "--notification-retry-attempts", help="Notification delivery attempts"
+    ),
+    notification_retry_backoff: float = typer.Option(
+        0.0, "--notification-retry-backoff", help="Seconds between notification retries"
+    ),
+    notification_retry_status: list[int] | None = typer.Option(
+        None, "--notification-retry-status", help="Webhook HTTP status that should be retried"
+    ),
+    notification_expected_status: list[int] | None = typer.Option(
+        None, "--notification-expected-status", help="Expected webhook success status"
+    ),
+    notification_network_allowlist: list[str] | None = typer.Option(
+        None, "--notification-network-allowlist", help="Allowed webhook host or CIDR"
+    ),
+    dashboard_action: str = typer.Option(
+        "read", "--dashboard-action", help="Dashboard item action: read, add, update, delete, move"
+    ),
+    dashboard_name: str | None = typer.Option(
+        None, "--dashboard", help="Dashboard name or ID for dashboard_item nodes"
+    ),
+    dashboard_component: str | None = typer.Option(
+        None, "--component", help="Dashboard component ID for dashboard_item nodes"
+    ),
+    dashboard_item_id: str | None = typer.Option(
+        None, "--item-id", help="Dashboard item ID for update/delete/move"
+    ),
+    dashboard_item_json: str | None = typer.Option(
+        None, "--item-json", help="Dashboard item JSON object for add"
+    ),
+    dashboard_patch_json: str | None = typer.Option(
+        None, "--patch-json", help="Dashboard patch JSON object for update"
+    ),
+    dashboard_filter: str | None = typer.Option(
+        None, "--filter", help="Dashboard read filter, such as status=backlog"
+    ),
+    dashboard_field: str = typer.Option("status", "--field", help="Dashboard move field"),
+    dashboard_value_json: str | None = typer.Option(
+        None, "--value-json", help="Dashboard move value as JSON"
+    ),
+    dashboard_update_json: list[str] | None = typer.Option(
+        None,
+        "--dashboard-update-json",
+        help="Agent dashboard write-back instruction JSON object; repeatable",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Add or replace a workflow node."""
@@ -2380,6 +2773,9 @@ def add_node(
                 fan_include_content,
                 fan_max_concurrency,
                 fan_fail_fast,
+                dashboard_name,
+                dashboard_component,
+                dashboard_filter,
             ),
             http_method=http_method,
             http_url=http_url,
@@ -2403,6 +2799,38 @@ def add_node(
             notification_body=notification_body,
             notification_channel=notification_channel,
             notification_urgency=notification_urgency,
+            notification_webhook_url=notification_webhook_url,
+            notification_headers=_parse_key_values(
+                notification_header,
+                "--notification-header",
+            ),
+            notification_payload=_parse_json_value(
+                notification_payload_json,
+                "--notification-payload-json",
+            ),
+            notification_email_from=notification_email_from,
+            notification_email_to=notification_email_to or [],
+            notification_smtp_host=notification_smtp_host,
+            notification_smtp_port=notification_smtp_port,
+            notification_smtp_username=notification_smtp_username,
+            notification_smtp_password=notification_smtp_password,
+            notification_smtp_starttls=notification_smtp_starttls,
+            notification_timeout_seconds=notification_timeout,
+            notification_retry_attempts=notification_retry_attempts,
+            notification_retry_backoff_seconds=notification_retry_backoff,
+            notification_retry_statuses=notification_retry_status or [],
+            notification_expected_statuses=notification_expected_status or [200, 201, 202, 204],
+            notification_network_allowlist=notification_network_allowlist or [],
+            dashboard_action=dashboard_action,
+            dashboard_name=dashboard_name,
+            dashboard_component=dashboard_component,
+            dashboard_item_id=dashboard_item_id,
+            dashboard_item=_parse_json_dict(dashboard_item_json, "--item-json"),
+            dashboard_patch=_parse_json_dict(dashboard_patch_json, "--patch-json"),
+            dashboard_filter=dashboard_filter,
+            dashboard_field=dashboard_field,
+            dashboard_value=_parse_json_value(dashboard_value_json, "--value-json"),
+            dashboard_updates=_parse_dashboard_updates(dashboard_update_json),
         )
         wf.add_operation(
             GraphNode(
@@ -2497,32 +2925,36 @@ def rm_edge(
 
 
 @app.command("list")
-def list_workflows(data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True)) -> None:
+def list_workflows(
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON"),
+    data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
+) -> None:
     """List all workflows in the data directory."""
     base = data_dir or get_data_dir()
-    if not base.exists():
-        console.print(f"No workflows found in [bold]{base}[/bold].")
+    payload = list_workflow_payloads(base)
+    workflows = payload.get("workflows") or []
+    if json_output:
+        sys.stdout.write(json.dumps(payload, default=str))
+        sys.stdout.write("\n")
         return
 
-    toml_files = sorted(base.glob("*.toml"))
-    if not toml_files:
+    if not workflows:
         console.print(f"No workflows found in [bold]{base}[/bold].")
         return
 
     rows = []
-    for path in toml_files:
-        try:
-            wf = AgenticWorkflow.from_file(path)
-        except Exception:
-            continue
-        schedule = wf.config.schedule.cron_expression if wf.config.schedule else "—"
+    for workflow in workflows:
+        schedule_payload = workflow.get("schedule") or {}
+        schedule = (
+            schedule_payload.get("cronExpression") if isinstance(schedule_payload, dict) else None
+        ) or "—"
         rows.append(
             (
-                wf.config.id,
-                wf.config.name,
+                str(workflow.get("id") or ""),
+                str(workflow.get("name") or ""),
                 schedule,
-                str(len(wf.agents)),
-                str(len(list(wf.graph._graph.nodes()))),
+                str(len(workflow.get("agents") or [])),
+                str(len(workflow.get("nodes") or [])),
             )
         )
 
@@ -2779,7 +3211,11 @@ def recipe_watch_folder_summarize(
     watch_path: Path = typer.Option(..., "--watch-path", help="Folder to watch"),
     glob: str = typer.Option("*", "--glob", help="Changed file glob"),
     recursive: bool = typer.Option(False, "--recursive", help="Watch subdirectories"),
-    provider: str = typer.Option("codex", "--provider", help="codex or claude_code"),
+    provider: str = typer.Option(
+        "codex",
+        "--provider",
+        help="codex, claude_code, openai_api, or anthropic_api",
+    ),
     working_dir: Path = typer.Option(Path("."), "--working-dir", help="Agent working dir"),
     max_concurrency: int = typer.Option(
         4, "--max-concurrency", min=1, help="Agent fan-out concurrency"

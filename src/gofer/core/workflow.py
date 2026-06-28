@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import tomli_w as _tomli_w
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
 
 from gofer.core.agent import AgentConfig, agent_external_access_warnings, configured_extra_paths
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode, WorkflowGraph
@@ -92,15 +92,30 @@ class WebhookTriggerConfig(BaseModel):
     enabled: bool = False
     token: str | None = None
     token_env: str | None = None
+    allow_unauthenticated: bool = False
     payload_schema: dict[str, Any] = Field(default_factory=dict)
     fanout_path: str | None = None
     source: str = "webhook"
     concurrency_policy: Literal["allow", "reject_if_running"] = "allow"
+    sensitive_payload_fields: list[str] = Field(default_factory=list)
+    store_raw_payload: bool = False
 
     @field_validator("id")
     @classmethod
     def _validate_id(cls, value: str) -> str:
         return validate_workflow_id(value)
+
+    @property
+    def has_authentication(self) -> bool:
+        return bool(self.token or self.token_env)
+
+    @property
+    def requires_unauthenticated_warning(self) -> bool:
+        return self.enabled and self.allow_unauthenticated and not self.has_authentication
+
+    @property
+    def missing_authentication(self) -> bool:
+        return self.enabled and not self.has_authentication and not self.allow_unauthenticated
 
 
 class FilesystemAccessEntry(BaseModel):
@@ -108,6 +123,49 @@ class FilesystemAccessEntry(BaseModel):
     read: bool = True
     write: bool = True
     execute: bool = False
+
+
+class WorkflowCanvasGroup(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    label: str
+    color: str = "#0f766e"
+    node_ids: list[str] = Field(default_factory=list, alias="nodeIds")
+    x: int = 0
+    y: int = 0
+    width: int = 360
+    height: int = 240
+    collapsed: bool = False
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            raise ValueError("Canvas group id must contain only letters, numbers, ., :, _, or -")
+        return value
+
+    @field_validator("color")
+    @classmethod
+    def _validate_color(cls, value: str) -> str:
+        if not re.fullmatch(r"#[0-9A-Fa-f]{6}", value):
+            raise ValueError("Canvas group color must be a #RRGGBB value")
+        return value
+
+    @field_validator("width", "height")
+    @classmethod
+    def _validate_size(cls, value: int) -> int:
+        if value < 80:
+            raise ValueError("Canvas group width and height must be at least 80")
+        return value
+
+
+class WorkflowCanvasMetadata(BaseModel):
+    groups: list[WorkflowCanvasGroup] = Field(default_factory=list)
+
+
+class WorkflowMetadata(BaseModel):
+    canvas: WorkflowCanvasMetadata = Field(default_factory=WorkflowCanvasMetadata)
 
 
 class WorkflowConfig(BaseModel):
@@ -122,6 +180,7 @@ class WorkflowConfig(BaseModel):
     run_continuously: bool = False
     max_total_node_runs: int = 1000
     filesystem_access: list[FilesystemAccessEntry] = Field(default_factory=list)
+    metadata: WorkflowMetadata = Field(default_factory=WorkflowMetadata)
 
     @field_validator("id")
     @classmethod
@@ -157,6 +216,8 @@ def resolve_workflow_parameters(
     config: WorkflowConfig,
     provided: dict[str, Any] | None = None,
     defaults: dict[str, Any] | None = None,
+    *,
+    allow_missing_required: bool = False,
 ) -> dict[str, Any]:
     values: dict[str, Any] = {}
     provided = provided or {}
@@ -173,6 +234,8 @@ def resolve_workflow_parameters(
             raw = parameter.default
         if raw is None or raw == "":
             if parameter.required:
+                if allow_missing_required:
+                    continue
                 raise ValueError(f"Missing required workflow parameter: {name}")
             if raw == "" and parameter.type in {"string", "text", "multiline"}:
                 values[name] = ""
@@ -349,6 +412,25 @@ class AgenticWorkflow:
                             f"Provider profile{profile} has missing secret "
                             f"reference(s): {names}"
                         )
+        node_ids = {node.node_id for node in self.graph.nodes_in_order()}
+        for group in self.config.metadata.canvas.groups:
+            unknown = sorted(set(group.node_ids) - node_ids)
+            if unknown:
+                raise ValueError(
+                    f"Canvas group '{group.id}' references unknown node(s): "
+                    f"{', '.join(unknown)}"
+                )
+        missing_auth_webhooks = [
+            trigger_id
+            for trigger_id, trigger in sorted(self.config.webhooks.items())
+            if trigger.missing_authentication
+        ]
+        if missing_auth_webhooks:
+            raise ValueError(
+                "Enabled webhook trigger(s) missing authentication: "
+                + ", ".join(missing_auth_webhooks)
+                + ". Set token_env, token, or allow_unauthenticated = true."
+            )
         for warning in self.resource_warnings(path_base):
             warnings.warn(warning, UserWarning, stacklevel=2)
 
@@ -476,6 +558,7 @@ class AgenticWorkflow:
                 for entry in wf_data.get("filesystem_access", [])
                 if isinstance(entry, dict)
             ],
+            metadata=WorkflowMetadata(**wf_data.get("metadata", {})),
         )
         workflow = cls(config)
 
@@ -588,6 +671,11 @@ class AgenticWorkflow:
                 _paths_to_str(entry.model_dump(exclude_defaults=True))
                 for entry in self.config.filesystem_access
             ]
+        if self.config.metadata != WorkflowMetadata():
+            data["workflow"]["metadata"] = self.config.metadata.model_dump(
+                exclude_defaults=True,
+                exclude_none=True,
+            )
 
         if self.agents:
             data["agents"] = {

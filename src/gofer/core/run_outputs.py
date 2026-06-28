@@ -46,7 +46,8 @@ def redact_prompt_fields(value: object) -> object:
     if isinstance(value, dict):
         redacted: dict[str, object] = {}
         for key, item in value.items():
-            if str(key).lower() == "prompt":
+            normalized = str(key).lower()
+            if normalized in {"prompt", "thoughts", "inputs"}:
                 redacted[str(key)] = "***"
             else:
                 redacted[str(key)] = redact_prompt_fields(item)

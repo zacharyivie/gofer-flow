@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import smtplib
 import sys
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Literal, Protocol
 
 import anyio
 
+from gofer.core.http import HttpClient, HttpRequest, UrllibHttpClient
+from gofer.core.operations import HttpRetryPolicy
 from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess
 
@@ -99,16 +103,12 @@ class ApprovalRequest:
     def from_dict(cls, data: dict[str, object]) -> ApprovalRequest:
         decision_data = data.get("decision")
         decision = (
-            ApprovalDecision.from_dict(decision_data)
-            if isinstance(decision_data, dict)
-            else None
+            ApprovalDecision.from_dict(decision_data) if isinstance(decision_data, dict) else None
         )
         approvers = data.get("approvers")
         timeout_value = data.get("timeoutSeconds")
         timeout_seconds = (
-            float(timeout_value)
-            if isinstance(timeout_value, (str, int, float))
-            else None
+            float(timeout_value) if isinstance(timeout_value, (str, int, float)) else None
         )
         timeout_decision = str(
             data.get("timeoutDecision") or data.get("timeout_decision") or "timeout"
@@ -127,17 +127,14 @@ class ApprovalRequest:
             timeout_decision=timeout_decision,  # type: ignore[arg-type]
             decision=decision,
             workflow_path=(
-                str(data.get("workflowPath") or data.get("workflow_path") or "")
-                or None
+                str(data.get("workflowPath") or data.get("workflow_path") or "") or None
             ),
             log_path=str(data.get("logPath") or data.get("log_path") or "") or None,
             checkpoint_path=(
-                str(data.get("checkpointPath") or data.get("checkpoint_path") or "")
-                or None
+                str(data.get("checkpointPath") or data.get("checkpoint_path") or "") or None
             ),
             waiter_seen_at=(
-                str(data.get("waiterSeenAt") or data.get("waiter_seen_at") or "")
-                or None
+                str(data.get("waiterSeenAt") or data.get("waiter_seen_at") or "") or None
             ),
             waiter_pid=(
                 int(waiter_pid)
@@ -149,15 +146,13 @@ class ApprovalRequest:
                 else None
             ),
             resume_claimed_at=(
-                str(data.get("resumeClaimedAt") or data.get("resume_claimed_at") or "")
-                or None
+                str(data.get("resumeClaimedAt") or data.get("resume_claimed_at") or "") or None
             ),
             resume_claimed_by_pid=(
                 int(resume_pid)
                 if isinstance(
                     resume_pid := (
-                        data.get("resumeClaimedByPid")
-                        or data.get("resume_claimed_by_pid")
+                        data.get("resumeClaimedByPid") or data.get("resume_claimed_by_pid")
                     ),
                     (str, int),
                 )
@@ -222,18 +217,10 @@ class ApprovalStore:
         if request is None:
             raise ValueError("Pending approval not found")
         if request.decision is not None:
-            raise ValueError(
-                f"Approval already decided as {request.decision.decision}"
-            )
-        if (
-            request.approvers
-            and decided_by != "gofer"
-            and decided_by not in request.approvers
-        ):
+            raise ValueError(f"Approval already decided as {request.decision.decision}")
+        if request.approvers and decided_by != "gofer" and decided_by not in request.approvers:
             allowed = ", ".join(request.approvers)
-            raise ValueError(
-                f"Approver {decided_by!r} is not allowed; expected one of: {allowed}"
-            )
+            raise ValueError(f"Approver {decided_by!r} is not allowed; expected one of: {allowed}")
         request.status = "decided"
         request.decision = ApprovalDecision(
             decision=decision,
@@ -271,11 +258,7 @@ class ApprovalStore:
         self.create_or_update(request)
 
     def list_pending(self, workflow_id: str | None = None) -> list[ApprovalRequest]:
-        return [
-            request
-            for request in self.list_requests(workflow_id)
-            if request.decision is None
-        ]
+        return [request for request in self.list_requests(workflow_id) if request.decision is None]
 
     def list_requests(self, workflow_id: str | None = None) -> list[ApprovalRequest]:
         root = self.base_dir / "approvals"
@@ -343,11 +326,24 @@ class Notification:
     body: str
     channel: str = "desktop"
     urgency: str = "normal"
+    webhook_url: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    payload: object | None = None
+    email_from: str | None = None
+    email_to: list[str] = field(default_factory=list)
+    smtp_host: str | None = None
+    smtp_port: int = 587
+    smtp_username: str | None = None
+    smtp_password: str | None = None
+    smtp_starttls: bool = True
+    timeout_seconds: float = 30.0
+    retry: HttpRetryPolicy = field(default_factory=HttpRetryPolicy)
+    expected_statuses: list[int] = field(default_factory=lambda: [200, 201, 202, 204])
+    network_allowlist: list[str] = field(default_factory=list)
 
 
 class NotificationAdapter(Protocol):
-    async def send(self, notification: Notification) -> None:
-        ...
+    async def send(self, notification: Notification) -> None: ...
 
 
 class DesktopNotificationAdapter:
@@ -394,6 +390,124 @@ class DesktopNotificationAdapter:
             raise RuntimeError(
                 _notification_failure_message("notify-send", returncode, stdout, stderr)
             )
+
+
+class MultiChannelNotificationAdapter:
+    def __init__(
+        self,
+        *,
+        desktop_adapter: NotificationAdapter | None = None,
+        http_client: HttpClient | None = None,
+    ) -> None:
+        self._desktop_adapter = desktop_adapter or DesktopNotificationAdapter()
+        self._http_client = http_client or UrllibHttpClient()
+
+    async def send(self, notification: Notification) -> None:
+        if notification.channel == "desktop":
+            await self._desktop_adapter.send(notification)
+            return
+        if notification.channel in {"slack", "teams", "webhook"}:
+            await self._send_webhook(notification)
+            return
+        if notification.channel == "email":
+            await self._send_email(notification)
+            return
+        raise ValueError(f"Unsupported notification channel: {notification.channel}")
+
+    async def _send_webhook(self, notification: Notification) -> None:
+        if not notification.webhook_url:
+            raise ValueError(f"{notification.channel} notifications require webhook_url")
+        payload = _notification_webhook_payload(notification)
+        body = json.dumps(payload, default=str).encode("utf-8")
+        headers = {"Content-Type": "application/json", **notification.headers}
+        attempts = max(1, notification.retry.attempts)
+        retry_statuses = set(notification.retry.retry_on_statuses)
+        expected_statuses = set(notification.expected_statuses or [200])
+        last_error: str | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                response = await self._http_client.send(
+                    HttpRequest(
+                        method="POST",
+                        url=notification.webhook_url,
+                        headers=headers,
+                        body=body,
+                        timeout_seconds=notification.timeout_seconds,
+                        network_allowlist=notification.network_allowlist,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                last_error = (
+                    f"{notification.channel} webhook failed after {attempt} "
+                    f"attempt{'s' if attempt != 1 else ''}: {exc}"
+                )
+                if attempt >= attempts:
+                    break
+                await anyio.sleep(notification.retry.backoff_seconds)
+                continue
+            if response.status in expected_statuses:
+                return
+            last_error = (
+                f"{notification.channel} webhook returned HTTP {response.status}: "
+                f"{response.body[:500].decode('utf-8', errors='replace')}"
+            )
+            if response.status not in retry_statuses or attempt >= attempts:
+                break
+            await anyio.sleep(notification.retry.backoff_seconds)
+        raise RuntimeError(last_error or f"{notification.channel} webhook failed")
+
+    async def _send_email(self, notification: Notification) -> None:
+        if not notification.smtp_host:
+            raise ValueError("email notifications require smtp_host")
+        if not notification.email_from:
+            raise ValueError("email notifications require email_from")
+        if not notification.email_to:
+            raise ValueError("email notifications require email_to")
+        attempts = max(1, notification.retry.attempts)
+        last_error: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                await anyio.to_thread.run_sync(_send_email_sync, notification)
+                return
+            except (OSError, smtplib.SMTPException) as exc:
+                last_error = exc
+                if attempt >= attempts:
+                    break
+                await anyio.sleep(notification.retry.backoff_seconds)
+        raise RuntimeError(f"email notification failed: {last_error}") from last_error
+
+
+def _notification_webhook_payload(notification: Notification) -> object:
+    if notification.payload is not None:
+        return notification.payload
+    if notification.channel == "slack":
+        return {"text": f"*{notification.title}*\n{notification.body}".strip()}
+    if notification.channel == "teams":
+        return {"text": f"**{notification.title}**\n\n{notification.body}".strip()}
+    return {
+        "title": notification.title,
+        "body": notification.body,
+        "urgency": notification.urgency,
+        "channel": notification.channel,
+    }
+
+
+def _send_email_sync(notification: Notification) -> None:
+    message = EmailMessage()
+    message["Subject"] = notification.title
+    message["From"] = notification.email_from or ""
+    message["To"] = ", ".join(notification.email_to)
+    message.set_content(notification.body)
+    with smtplib.SMTP(
+        notification.smtp_host or "",
+        notification.smtp_port,
+        timeout=notification.timeout_seconds,
+    ) as smtp:
+        if notification.smtp_starttls:
+            smtp.starttls()
+        if notification.smtp_username or notification.smtp_password:
+            smtp.login(notification.smtp_username or "", notification.smtp_password or "")
+        smtp.send_message(message)
 
 
 async def _send_windows_desktop_notification(notification: Notification) -> None:
@@ -444,9 +558,7 @@ try {
         timeout=8,
     )
     if returncode != 0:
-        raise RuntimeError(
-            _notification_failure_message("PowerShell", returncode, stdout, stderr)
-        )
+        raise RuntimeError(_notification_failure_message("PowerShell", returncode, stdout, stderr))
 
 
 def _windows_powershell_path() -> str | None:

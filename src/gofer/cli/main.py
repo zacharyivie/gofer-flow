@@ -4,11 +4,12 @@ from pathlib import Path
 
 import typer
 
-from gofer.cli.commands import agent, doctor, provider, runner, schedule, watch, workflow
+from gofer.cli.commands import agent, dashboard, doctor, provider, runner, schedule, watch, workflow
 
 app = typer.Typer(name="gof", help="Gofer Flow", no_args_is_help=True)
 app.add_typer(workflow.app, name="workflow")
 app.add_typer(agent.app, name="agent")
+app.add_typer(dashboard.app, name="dashboard")
 app.add_typer(provider.app, name="provider")
 app.add_typer(runner.app, name="runner")
 app.add_typer(schedule.app, name="schedule")

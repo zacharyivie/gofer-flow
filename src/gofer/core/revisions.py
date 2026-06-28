@@ -41,6 +41,7 @@ class WorkflowRevision:
     summary: list[str]
     path: Path
     toml: str
+    metadata: dict[str, Any] | None = None
 
     def to_dict(self, *, include_toml: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -53,6 +54,8 @@ class WorkflowRevision:
         }
         if include_toml:
             payload["toml"] = self.toml
+        if self.metadata:
+            payload["metadata"] = self.metadata
         return payload
 
 
@@ -68,6 +71,7 @@ def capture_workflow_revision(
     author: str = "gofer",
     retention: RevisionRetention | None = None,
     coalesce_seconds: int = AUTOSAVE_COALESCE_SECONDS,
+    metadata: dict[str, Any] | None = None,
 ) -> WorkflowRevision | None:
     if not workflow_path.exists():
         raise WorkflowRevisionError(f"Workflow file '{workflow_path}' not found")
@@ -106,6 +110,8 @@ def capture_workflow_revision(
         "summary": summarize_workflow_diff(previous_toml, toml_text),
         "toml": toml_text,
     }
+    if metadata:
+        document["metadata"] = metadata
     path.write_text(json.dumps(document, indent=2, sort_keys=True), encoding="utf-8")
     revision = _load_revision(path)
     prune_workflow_revisions(workflow_id, data_dir, retention or RevisionRetention())
@@ -278,6 +284,7 @@ def _load_revision(path: Path) -> WorkflowRevision:
             summary=[str(item) for item in data.get("summary", [])],
             path=path,
             toml=str(data["toml"]),
+            metadata=data.get("metadata") if isinstance(data.get("metadata"), dict) else None,
         )
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
         raise WorkflowRevisionError(f"Invalid revision file '{path}': {exc}") from exc

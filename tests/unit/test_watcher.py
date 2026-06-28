@@ -299,7 +299,7 @@ working_dir = "."
     assert len(sidecars) == 1
     payload = json.loads(sidecars[0].read_text(encoding="utf-8"))
     assert payload["usageSummary"]["totals"]["agent_calls"] == 1
-    assert payload["nodeOutputs"]["ask"]["data"]["prompt"] == "***"
+    assert "prompt" not in payload["nodeOutputs"]["ask"]["data"]
 
 
 def test_watched_execution_passes_trigger_context_to_executor(

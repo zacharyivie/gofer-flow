@@ -2,7 +2,52 @@ from __future__ import annotations
 
 import pytest
 
-from gofer.core.approvals import DesktopNotificationAdapter, Notification
+from gofer.core.approvals import (
+    DesktopNotificationAdapter,
+    MultiChannelNotificationAdapter,
+    Notification,
+)
+from gofer.core.http import HttpRequest, HttpResponse
+from gofer.core.operations import HttpRetryPolicy
+
+
+class FakeHttpClient:
+    def __init__(self, responses: list[HttpResponse]) -> None:
+        self.responses = responses
+        self.requests: list[HttpRequest] = []
+
+    async def send(self, request: HttpRequest) -> HttpResponse:
+        self.requests.append(request)
+        return self.responses.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_multi_channel_notification_adapter_retries_webhook_status() -> None:
+    http_client = FakeHttpClient(
+        [
+            HttpResponse(status=503, headers={}, body=b"try again"),
+            HttpResponse(status=202, headers={}, body=b"ok"),
+        ]
+    )
+    adapter = MultiChannelNotificationAdapter(http_client=http_client)
+
+    await adapter.send(
+        Notification(
+            title="Done",
+            body="Complete",
+            channel="slack",
+            webhook_url="https://hooks.example.test/services/token",
+            retry=HttpRetryPolicy(attempts=2, retry_on_statuses=[503]),
+            timeout_seconds=2,
+        )
+    )
+
+    assert len(http_client.requests) == 2
+    request = http_client.requests[0]
+    assert request.method == "POST"
+    assert request.url == "https://hooks.example.test/services/token"
+    assert request.timeout_seconds == 2
+    assert b"*Done*\\nComplete" in (request.body or b"")
 
 
 @pytest.mark.asyncio

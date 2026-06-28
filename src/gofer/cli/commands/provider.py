@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import cast
 
 import typer
 from rich.console import Console
@@ -10,6 +11,8 @@ from gofer.core.provider_profiles import (
     ProviderProfile,
     load_provider_profiles,
     save_provider_profiles,
+    validate_provider_profile,
+    validate_safe_provider_env,
 )
 from gofer.utils.paths import get_data_dir
 
@@ -18,7 +21,7 @@ profile_app = typer.Typer(help="Manage named provider profiles", no_args_is_help
 app.add_typer(profile_app, name="profile")
 console = Console()
 
-_SUBSCRIPTIONS = ["codex", "claude_code"]
+_SUBSCRIPTIONS = ["codex", "claude_code", "openai_api", "anthropic_api"]
 
 
 @profile_app.command("list")
@@ -27,15 +30,15 @@ def list_profiles(data_dir: Path | None = typer.Option(None, "--data-dir", hidde
     if not profiles:
         console.print("No provider profiles found.")
         return
-    table = Table("Name", "Subscription", "Model", "Timeout", "Approval", "Sandbox")
+    table = Table("Name", "Subscription", "Model", "Timeout", "API Key", "Base URL")
     for profile in profiles.values():
         table.add_row(
             profile.name,
             profile.subscription,
             profile.model or "",
             str(profile.timeout or ""),
-            profile.approval_mode or "",
-            profile.sandbox_mode or "",
+            profile.api_key_secret or profile.api_key_env or "",
+            profile.api_base_url or "",
         )
     console.print(table)
 
@@ -43,7 +46,11 @@ def list_profiles(data_dir: Path | None = typer.Option(None, "--data-dir", hidde
 @profile_app.command("create")
 def create_profile(
     name: str = typer.Argument(..., help="Profile name"),
-    subscription: str = typer.Option("codex", "--subscription", help="codex or claude_code"),
+    subscription: str = typer.Option(
+        "codex",
+        "--subscription",
+        help="codex, claude_code, openai_api, or anthropic_api",
+    ),
     model: str | None = typer.Option(None, "--model", help="Provider model"),
     timeout: float | None = typer.Option(None, "--timeout", help="Default timeout in seconds"),
     reasoning: str | None = typer.Option(None, "--reasoning", help="Reasoning/effort setting"),
@@ -65,11 +72,24 @@ def create_profile(
         help="Default MCP server (repeatable)",
     ),
     env: list[str] | None = typer.Option(None, "--env", help="KEY=VALUE env var (repeatable)"),
+    unsafe_env: list[str] | None = typer.Option(
+        None,
+        "--unsafe-env",
+        help="Explicit local-only plaintext sensitive env var (repeatable)",
+    ),
     secret_ref: list[str] | None = typer.Option(
         None,
         "--secret-ref",
         help="KEY=SECRET_NAME secret env reference (repeatable)",
     ),
+    api_base_url: str | None = typer.Option(None, "--api-base-url", help="Direct API base URL"),
+    api_key_env: str | None = typer.Option(None, "--api-key-env", help="Direct API key env var"),
+    api_key_secret: str | None = typer.Option(
+        None,
+        "--api-key-secret",
+        help="Direct API key secret name",
+    ),
+    organization: str | None = typer.Option(None, "--organization", help="Provider organization"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     if subscription not in _SUBSCRIPTIONS:
@@ -91,7 +111,12 @@ def create_profile(
         tool=tool,
         mcp_server=mcp_server,
         env=env,
+        unsafe_env=unsafe_env,
         secret_ref=secret_ref,
+        api_base_url=api_base_url,
+        api_key_env=api_key_env,
+        api_key_secret=api_key_secret,
+        organization=organization,
     )
     profiles[name] = profile
     save_provider_profiles(profiles, data_dir or get_data_dir())
@@ -114,11 +139,24 @@ def edit_profile(
     tool: list[str] | None = typer.Option(None, "--tool", help="Replace default tools"),
     mcp_server: list[str] | None = typer.Option(None, "--mcp-server", help="Replace MCP servers"),
     env: list[str] | None = typer.Option(None, "--env", help="Replace env vars"),
+    unsafe_env: list[str] | None = typer.Option(
+        None,
+        "--unsafe-env",
+        help="Replace or add explicit local-only plaintext sensitive env vars",
+    ),
     secret_ref: list[str] | None = typer.Option(
         None,
         "--secret-ref",
         help="Replace secret env references",
     ),
+    api_base_url: str | None = typer.Option(None, "--api-base-url", help="Direct API base URL"),
+    api_key_env: str | None = typer.Option(None, "--api-key-env", help="Direct API key env var"),
+    api_key_secret: str | None = typer.Option(
+        None,
+        "--api-key-secret",
+        help="Direct API key secret name",
+    ),
+    organization: str | None = typer.Option(None, "--organization", help="Provider organization"),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     profiles = load_provider_profiles(data_dir or get_data_dir())
@@ -134,6 +172,10 @@ def edit_profile(
             "reasoning": reasoning,
             "approval_mode": approval_mode,
             "sandbox_mode": sandbox_mode,
+            "api_base_url": api_base_url,
+            "api_key_env": api_key_env,
+            "api_key_secret": api_key_secret,
+            "organization": organization,
         }.items()
         if value is not None
     }
@@ -143,15 +185,41 @@ def edit_profile(
         updates["tools"] = list(tool)
     if mcp_server is not None:
         updates["mcp_servers"] = list(mcp_server)
-    if env is not None:
-        updates["env"] = _parse_key_value_options(env, "--env", "KEY=VALUE")
+    try:
+        if env is not None:
+            parsed_env = _parse_key_value_options(env, "--env", "KEY=VALUE")
+            validate_safe_provider_env(parsed_env)
+            updates["env"] = parsed_env
+        if unsafe_env is not None:
+            parsed_unsafe_env = _parse_key_value_options(
+                unsafe_env,
+                "--unsafe-env",
+                "KEY=VALUE",
+            )
+            base_env = cast(dict[str, str], updates.get("env", profile.env))
+            updates["env"] = {**base_env, **parsed_unsafe_env}
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
     if secret_ref is not None:
-        updates["secret_refs"] = _parse_key_value_options(
+        parsed_secret_refs = _parse_key_value_options(
             secret_ref,
             "--secret-ref",
             "KEY=SECRET_NAME",
         )
-    profiles[name] = profile.model_copy(update=updates)
+        updates["secret_refs"] = parsed_secret_refs
+        if parsed_secret_refs:
+            base_env = cast(dict[str, str], updates.get("env", profile.env))
+            updates["env"] = {
+                name: value for name, value in base_env.items() if name not in parsed_secret_refs
+            }
+    updated_profile = profile.model_copy(update=updates)
+    try:
+        validate_provider_profile(updated_profile)
+    except ValueError as exc:
+        console.print(f"[red]{exc}[/red]")
+        raise typer.Exit(1) from exc
+    profiles[name] = updated_profile
     save_provider_profiles(profiles, data_dir or get_data_dir())
     console.print(f"[green]Updated provider profile[/green] [bold]{name}[/bold]")
 
@@ -186,10 +254,22 @@ def _profile_from_options(
     tool: list[str] | None,
     mcp_server: list[str] | None,
     env: list[str] | None,
+    unsafe_env: list[str] | None,
     secret_ref: list[str] | None,
+    api_base_url: str | None,
+    api_key_env: str | None,
+    api_key_secret: str | None,
+    organization: str | None,
 ) -> ProviderProfile:
     try:
-        return ProviderProfile(
+        parsed_env = _parse_key_value_options(env or [], "--env", "KEY=VALUE")
+        parsed_unsafe_env = _parse_key_value_options(
+            unsafe_env or [],
+            "--unsafe-env",
+            "KEY=VALUE",
+        )
+        validate_safe_provider_env(parsed_env)
+        profile = ProviderProfile(
             name=name,
             subscription=subscription,  # type: ignore[arg-type]
             model=model,
@@ -200,13 +280,19 @@ def _profile_from_options(
             extra_args=list(extra_arg or []),
             tools=list(tool or []),
             mcp_servers=list(mcp_server or []),
-            env=_parse_key_value_options(env or [], "--env", "KEY=VALUE"),
+            env={**parsed_env, **parsed_unsafe_env},
             secret_refs=_parse_key_value_options(
                 secret_ref or [],
                 "--secret-ref",
                 "KEY=SECRET_NAME",
             ),
+            api_base_url=api_base_url,
+            api_key_env=api_key_env,
+            api_key_secret=api_key_secret,
+            organization=organization,
         )
+        validate_provider_profile(profile)
+        return profile
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
         raise typer.Exit(1) from exc
@@ -219,9 +305,14 @@ def _parse_key_value_options(
 ) -> dict[str, str]:
     parsed: dict[str, str] = {}
     for pair in values:
+        if pair == "":
+            continue
         if "=" not in pair:
             console.print(f"[red]Invalid {option_name} value '{pair}': expected {expected}[/red]")
             raise typer.Exit(1)
         key, _, value = pair.partition("=")
+        if not key:
+            console.print(f"[red]Invalid {option_name} value '{pair}': expected {expected}[/red]")
+            raise typer.Exit(1)
         parsed[key] = value
     return parsed

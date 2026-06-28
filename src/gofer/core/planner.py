@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import re
 import shutil
 import urllib.parse
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from gofer.core.agent import configured_extra_paths
 from gofer.core.graph import EdgeConditionType, GraphNode
 from gofer.core.llm_prompts import common_llm_task_prompt
+from gofer.core.network_policy import network_policy_warnings
 from gofer.core.operations import (
     AgentOperation,
     ApprovalGateOperation,
@@ -44,13 +44,20 @@ from gofer.core.operations import (
     WriteFileOperation,
 )
 from gofer.core.provider_profiles import (
+    DIRECT_API_SUBSCRIPTIONS,
     resolve_provider_settings,
-    unresolved_provider_secret_refs,
     validate_provider_settings,
 )
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
+from gofer.core.secrets import (
+    secret_reference_names as workflow_secret_reference_names,
+)
+from gofer.core.secrets import (
+    workflow_secret_readiness,
+)
 from gofer.core.usage import LlmUsageBudget, LlmUsageTotals, budget_violations, estimate_tokens
-from gofer.core.workflow import AgenticWorkflow
+from gofer.core.validation import validate_workflow
+from gofer.core.workflow import AgenticWorkflow, FilesystemAccessEntry
 
 SAMPLE_LIMIT = 5
 SECRET_REF_PATTERN = re.compile(
@@ -82,26 +89,57 @@ def build_execution_plan(
     path_base = workflow_path.parent if workflow_path is not None else None
     profile_data_dir = data_dir if data_dir is not None else path_base
     warnings = workflow.resource_warnings(path_base)
+    warnings.extend(_webhook_risk_warnings(workflow))
     plan: dict[str, Any] = {
         "workflowId": workflow.config.id,
         "workflowName": workflow.config.name,
+        "startNodes": _start_nodes(workflow),
         "generations": [],
         "edges": _edge_plan(workflow),
+        "conditionalBranches": _conditional_branches(workflow),
         "warnings": warnings,
+        "validation": validate_workflow(
+            workflow,
+            workflow_path=workflow_path,
+            data_dir=data_dir,
+        ).to_dict(),
         "destructiveActions": [],
         "destructiveActionDetails": [],
         "requiredSecrets": [],
+        "secretReadiness": [],
         "providerRequirements": [],
         "projectedLlmUsage": LlmUsageTotals().to_dict(),
+        "usageBudget": _usage_budget_plan(workflow.config.llm_budget),
+        "resourceLimits": limits.model_dump(),
+        "executionLimits": {
+            "maxTotalNodeRuns": workflow.config.max_total_node_runs,
+            "runContinuously": workflow.config.run_continuously,
+        },
         "triggerContext": _trigger_plan(workflow, trigger_context, path_base),
         "unresolvedDynamicValues": [],
     }
     if path_base is not None:
         plan["pathResolutionBase"] = str(path_base)
 
-    secret_names: set[str] = set()
+    secret_statuses = workflow_secret_readiness(
+        workflow,
+        workflow_path=workflow_path,
+        data_dir=profile_data_dir,
+    )
+    secret_names: set[str] = {status.name for status in secret_statuses}
     provider_keys: dict[
-        tuple[str, str, str | None, str | None, float | None, str, str | None, bool],
+        tuple[
+            str,
+            str,
+            str | None,
+            str | None,
+            float | None,
+            str,
+            str | None,
+            bool,
+            str | None,
+            bool,
+        ],
         set[str],
     ] = {}
     dynamic_values: set[str] = set()
@@ -127,9 +165,7 @@ def build_execution_plan(
             )
             planned_nodes.append(node_plan)
             plan["destructiveActions"].extend(node_plan["destructiveActions"])
-            plan["destructiveActionDetails"].extend(
-                node_plan["destructiveActionDetails"]
-            )
+            plan["destructiveActionDetails"].extend(node_plan["destructiveActionDetails"])
             plan["warnings"].extend(node_plan["warnings"])
             projected_usage = node_plan.get("projectedLlmUsage")
             if isinstance(projected_usage, dict):
@@ -162,20 +198,18 @@ def build_execution_plan(
                         if requirement.get("profile") is not None
                         else None
                     ),
-                    (
-                        str(requirement["model"])
-                        if requirement.get("model") is not None
-                        else None
-                    ),
+                    (str(requirement["model"]) if requirement.get("model") is not None else None),
                     (
                         float(requirement["timeout"])
                         if requirement.get("timeout") is not None
                         else None
                     ),
                     str(requirement["workingDir"]),
+                    (str(requirement["binary"]) if requirement.get("binary") is not None else None),
+                    bool(requirement.get("directApi", False)),
                     (
-                        str(requirement["binary"])
-                        if requirement.get("binary") is not None
+                        str(requirement["apiBaseUrl"])
+                        if requirement.get("apiBaseUrl") is not None
                         else None
                     ),
                     bool(requirement["available"]),
@@ -188,17 +222,18 @@ def build_execution_plan(
                 inherited_fan_out,
                 node_plan.get("fanOut"),
             )
-        plan["generations"].append({
-            "index": generation_index,
-            "nodes": planned_nodes,
-        })
+        plan["generations"].append(
+            {
+                "index": generation_index,
+                "nodes": planned_nodes,
+            }
+        )
 
     plan["warnings"] = sorted(set(plan["warnings"]))
     plan["destructiveActions"] = sorted(set(plan["destructiveActions"]))
-    plan["destructiveActionDetails"] = _dedupe_details(
-        plan["destructiveActionDetails"]
-    )
+    plan["destructiveActionDetails"] = _dedupe_details(plan["destructiveActionDetails"])
     plan["requiredSecrets"] = sorted(secret_names)
+    plan["secretReadiness"] = [status.to_dict() for status in secret_statuses]
     plan["providerRequirements"] = []
     for (
         agent_id,
@@ -208,6 +243,8 @@ def build_execution_plan(
         timeout,
         working_dir,
         binary,
+        direct_api,
+        api_base_url,
         available,
     ), extra_paths in sorted(provider_keys.items()):
         provider_requirement: dict[str, Any] = {
@@ -215,6 +252,8 @@ def build_execution_plan(
             "subscription": subscription,
             "workingDir": working_dir,
             "binary": binary,
+            "directApi": direct_api,
+            "apiBaseUrl": api_base_url,
             "available": available,
             "extraPaths": sorted(extra_paths),
         }
@@ -262,6 +301,31 @@ def build_execution_plan(
     return plan
 
 
+def _start_nodes(workflow: AgenticWorkflow) -> list[str]:
+    return sorted(
+        str(node_id) for node_id, degree in workflow.graph._graph.in_degree() if int(degree) == 0
+    )
+
+
+def _conditional_branches(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
+    return [
+        edge
+        for edge in _edge_plan(workflow)
+        if edge["condition"]
+        not in {
+            EdgeConditionType.ALWAYS.value,
+            EdgeConditionType.AFTER_LOOP.value,
+        }
+    ]
+
+
+def _usage_budget_plan(budget: LlmUsageBudget) -> dict[str, Any]:
+    return {
+        "enabled": budget.enabled(),
+        **budget.model_dump(exclude_none=True),
+    }
+
+
 def _edge_plan(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
     edges = []
     for from_id, to_id in workflow.graph._graph.edges():
@@ -269,13 +333,15 @@ def _edge_plan(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
         label = edge.condition.value
         if edge.condition == EdgeConditionType.OUTPUT_MATCHES and edge.output_pattern:
             label = f"output_matches:{edge.output_pattern}"
-        edges.append({
-            "from": from_id,
-            "to": to_id,
-            "condition": edge.condition.value,
-            "label": label,
-            "outputPattern": edge.output_pattern,
-        })
+        edges.append(
+            {
+                "from": from_id,
+                "to": to_id,
+                "condition": edge.condition.value,
+                "label": label,
+                "outputPattern": edge.output_pattern,
+            }
+        )
     return edges
 
 
@@ -321,9 +387,61 @@ def _trigger_plan(
         }
     if workflow.config.run_continuously:
         plan["runContinuously"] = True
+    if workflow.config.webhooks:
+        plan["webhooks"] = {
+            trigger_id: {
+                "enabled": config.enabled,
+                "source": config.source,
+                "fanoutPath": config.fanout_path,
+                "tokenConfigured": config.has_authentication,
+                "allowUnauthenticated": config.allow_unauthenticated,
+                "storeRawPayload": config.store_raw_payload,
+                "replayPayloadRetention": "raw" if config.store_raw_payload else "sanitized",
+                "sensitivePayloadFields": sorted(config.sensitive_payload_fields),
+                "risk": "high"
+                if config.store_raw_payload
+                or config.missing_authentication
+                or config.requires_unauthenticated_warning
+                else "normal",
+                "riskReasons": _webhook_risk_reasons(config),
+            }
+            for trigger_id, config in sorted(workflow.config.webhooks.items())
+        }
     if trigger_context:
         plan["provided"] = trigger_context
     return plan
+
+
+def _webhook_risk_warnings(workflow: AgenticWorkflow) -> list[str]:
+    warnings: list[str] = []
+    for trigger_id, config in sorted(workflow.config.webhooks.items()):
+        if config.missing_authentication:
+            warnings.append(
+                f"Enabled webhook trigger '{trigger_id}' has no authentication configured; "
+                "runtime requests will be rejected."
+            )
+        if config.requires_unauthenticated_warning:
+            warnings.append(
+                f"Webhook trigger '{trigger_id}' allows unauthenticated requests; "
+                "this is high risk and intended only for local testing."
+            )
+        if config.store_raw_payload:
+            warnings.append(
+                f"Webhook trigger '{trigger_id}' stores raw replay payloads; "
+                "incoming secrets may be persisted."
+            )
+    return warnings
+
+
+def _webhook_risk_reasons(config: Any) -> list[str]:
+    reasons: list[str] = []
+    if config.missing_authentication:
+        reasons.append("missing_authentication")
+    if config.requires_unauthenticated_warning:
+        reasons.append("unauthenticated_allowed")
+    if config.store_raw_payload:
+        reasons.append("raw_payload_retention")
+    return reasons
 
 
 def _node_plan(
@@ -347,7 +465,23 @@ def _node_plan(
         warnings,
     ) = _operation_impact(op, path_base)
     warnings.extend(_agent_registration_warnings(op, workflow))
-    fan_out = _fan_out_plan(op, trigger_context, limits, sample_limit, path_base)
+    warnings.extend(
+        _operation_access_warnings(
+            op,
+            workflow,
+            node.node_id,
+            path_base,
+            trigger_context,
+        )
+    )
+    fan_out = _fan_out_plan(
+        op,
+        workflow,
+        trigger_context,
+        limits,
+        sample_limit,
+        path_base,
+    )
     if fan_out is not None:
         warnings.extend(str(warning) for warning in fan_out.get("warnings", []))
     required_secrets = _required_secrets(op, workflow, path_base, data_dir)
@@ -377,8 +511,7 @@ def _node_plan(
         if not requirement.get("available"):
             binary = requirement.get("binary") or requirement["subscription"]
             warnings.append(
-                f"Provider CLI '{binary}' is not available for agent "
-                f"{requirement['agentId']}"
+                f"Provider CLI '{binary}' is not available for agent {requirement['agentId']}"
             )
     unresolved = _unresolved_values(node, workflow)
 
@@ -398,7 +531,11 @@ def _node_plan(
         "projectedLlmUsage": projected_llm_usage,
         "workingDir": _working_dir(op, workflow, path_base),
         "retryCount": node.retry_count,
+        "retryDelaySeconds": node.retry_delay_seconds,
         "timeoutSeconds": node.timeout_seconds,
+        "allowFailure": node.allow_failure,
+        "awaitAllInputs": node.await_all_inputs,
+        "onFailure": node.on_failure,
         "inputs": dict(node.inputs),
         "unresolvedDynamicValues": unresolved,
     }
@@ -465,10 +602,7 @@ def _projected_budget_warnings(
         estimated_cost=_float_usage_value(usage.get("estimated_cost")),
         agent_time_seconds=_float_usage_value(usage.get("agent_time_seconds")),
     )
-    return [
-        f"Projected {warning}"
-        for warning in budget_violations(totals, budget, scope=scope)
-    ]
+    return [f"Projected {warning}" for warning in budget_violations(totals, budget, scope=scope)]
 
 
 def _int_usage_value(value: object) -> int:
@@ -514,10 +648,12 @@ def _historical_llm_usage_average(
         for node_usage in nodes:
             if not isinstance(node_usage, dict) or node_usage.get("node_id") != node_id:
                 continue
-            samples.append((
-                int(node_usage.get("output_tokens") or 0),
-                float(node_usage.get("duration_seconds") or 0.0),
-            ))
+            samples.append(
+                (
+                    int(node_usage.get("output_tokens") or 0),
+                    float(node_usage.get("duration_seconds") or 0.0),
+                )
+            )
     if not samples:
         return {"output_tokens": 0.0, "duration_seconds": 0.0, "samples": 0.0}
     return {
@@ -633,214 +769,254 @@ def _operation_impact(
     warnings: list[str] = []
     if isinstance(op, BashCommandOperation):
         side_effects.append(f"shell command: {op.command}")
-        side_effect_details.append({
-            "kind": "command",
-            "action": "execute",
-            "command": op.command,
-            "destructive": True,
-            "effectsInferred": False,
-        })
+        side_effect_details.append(
+            {
+                "kind": "command",
+                "action": "execute",
+                "command": op.command,
+                "destructive": True,
+                "effectsInferred": False,
+            }
+        )
         destructive.append(f"unknown shell command effects: {op.command}")
-        destructive_details.append({
-            "kind": "command",
-            "action": "unknown_effects",
-            "command": op.command,
-            "destructive": True,
-            "effectsInferred": False,
-        })
+        destructive_details.append(
+            {
+                "kind": "command",
+                "action": "unknown_effects",
+                "command": op.command,
+                "destructive": True,
+                "effectsInferred": False,
+            }
+        )
         warnings.append("Shell command effects cannot be inferred")
     elif isinstance(op, PythonScriptOperation):
         script_path = _resolve_path(op.script_path, path_base)
         side_effects.append(f"python script: {script_path}")
-        side_effect_details.append(_path_detail(
-            kind="script",
-            action="execute_python",
-            path=script_path,
-            destructive=True,
-            effects_inferred=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="script",
+                action="execute_python",
+                path=script_path,
+                destructive=True,
+                effects_inferred=False,
+            )
+        )
         destructive.append(f"unknown python script effects: {script_path}")
-        destructive_details.append(_path_detail(
-            kind="script",
-            action="unknown_effects",
-            path=script_path,
-            destructive=True,
-            effects_inferred=False,
-        ))
+        destructive_details.append(
+            _path_detail(
+                kind="script",
+                action="unknown_effects",
+                path=script_path,
+                destructive=True,
+                effects_inferred=False,
+            )
+        )
         warnings.append("Script effects cannot be inferred")
         if not script_path.exists():
             warnings.append(f"Missing python script: {script_path}")
     elif isinstance(op, ShellScriptOperation):
         script_path = _resolve_path(op.script_path, path_base)
         side_effects.append(f"shell script: {script_path}")
-        side_effect_details.append(_path_detail(
-            kind="script",
-            action="execute_shell",
-            path=script_path,
-            destructive=True,
-            effects_inferred=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="script",
+                action="execute_shell",
+                path=script_path,
+                destructive=True,
+                effects_inferred=False,
+            )
+        )
         destructive.append(f"unknown shell script effects: {script_path}")
-        destructive_details.append(_path_detail(
-            kind="script",
-            action="unknown_effects",
-            path=script_path,
-            destructive=True,
-            effects_inferred=False,
-        ))
+        destructive_details.append(
+            _path_detail(
+                kind="script",
+                action="unknown_effects",
+                path=script_path,
+                destructive=True,
+                effects_inferred=False,
+            )
+        )
         warnings.append("Script effects cannot be inferred")
         if not script_path.exists():
             warnings.append(f"Missing shell script: {script_path}")
     elif isinstance(op, ReadFileOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"read file: {path}")
-        side_effect_details.append(_path_detail(
-            kind="file",
-            action="read",
-            path=path,
-            destructive=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="file",
+                action="read",
+                path=path,
+                destructive=False,
+            )
+        )
         if not path.exists():
             warnings.append(f"Missing read target: {path}")
     elif isinstance(op, WriteFileOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"write file: {path}")
-        side_effect_details.append(_path_detail(
-            kind="file",
-            action="append" if op.append else "write",
-            path=path,
-            destructive=op.append or op.overwrite,
-            append=op.append,
-            overwrite=op.overwrite,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="file",
+                action="append" if op.append else "write",
+                path=path,
+                destructive=op.append or op.overwrite,
+                append=op.append,
+                overwrite=op.overwrite,
+            )
+        )
         if op.append:
             destructive.append(f"append file: {path}")
-            destructive_details.append(_path_detail(
-                kind="file",
-                action="append",
-                path=path,
-                destructive=True,
-                append=True,
-            ))
+            destructive_details.append(
+                _path_detail(
+                    kind="file",
+                    action="append",
+                    path=path,
+                    destructive=True,
+                    append=True,
+                )
+            )
         elif op.overwrite:
             destructive.append(f"overwrite file: {path}")
-            destructive_details.append(_path_detail(
-                kind="file",
-                action="overwrite",
-                path=path,
-                destructive=True,
-                overwrite=True,
-            ))
+            destructive_details.append(
+                _path_detail(
+                    kind="file",
+                    action="overwrite",
+                    path=path,
+                    destructive=True,
+                    overwrite=True,
+                )
+            )
         else:
             warnings.append(f"Write fails if target exists: {path}")
     elif isinstance(op, CopyFileOperation):
         source_path = _resolve_path(op.source_path, path_base)
         destination_path = _resolve_path(op.destination_path, path_base)
         side_effects.append(f"copy file: {source_path} -> {destination_path}")
-        side_effect_details.append(_two_path_detail(
-            kind="file",
-            action="copy",
-            source_path=source_path,
-            destination_path=destination_path,
-            destructive=op.overwrite,
-            overwrite=op.overwrite,
-        ))
+        side_effect_details.append(
+            _two_path_detail(
+                kind="file",
+                action="copy",
+                source_path=source_path,
+                destination_path=destination_path,
+                destructive=op.overwrite,
+                overwrite=op.overwrite,
+            )
+        )
         if not source_path.exists():
             warnings.append(f"Missing copy source: {source_path}")
         if op.overwrite:
             destructive.append(f"overwrite copy destination: {destination_path}")
-            destructive_details.append(_path_detail(
-                kind="file",
-                action="overwrite_copy_destination",
-                path=destination_path,
-                destructive=True,
-                overwrite=True,
-            ))
+            destructive_details.append(
+                _path_detail(
+                    kind="file",
+                    action="overwrite_copy_destination",
+                    path=destination_path,
+                    destructive=True,
+                    overwrite=True,
+                )
+            )
     elif isinstance(op, MoveFileOperation):
         source_path = _resolve_path(op.source_path, path_base)
         destination_path = _resolve_path(op.destination_path, path_base)
         side_effects.append(f"move file: {source_path} -> {destination_path}")
-        side_effect_details.append(_two_path_detail(
-            kind="file",
-            action="move",
-            source_path=source_path,
-            destination_path=destination_path,
-            destructive=True,
-            overwrite=op.overwrite,
-        ))
+        side_effect_details.append(
+            _two_path_detail(
+                kind="file",
+                action="move",
+                source_path=source_path,
+                destination_path=destination_path,
+                destructive=True,
+                overwrite=op.overwrite,
+            )
+        )
         destructive.append(f"move source: {source_path}")
-        destructive_details.append(_two_path_detail(
-            kind="file",
-            action="move",
-            source_path=source_path,
-            destination_path=destination_path,
-            destructive=True,
-            overwrite=op.overwrite,
-        ))
+        destructive_details.append(
+            _two_path_detail(
+                kind="file",
+                action="move",
+                source_path=source_path,
+                destination_path=destination_path,
+                destructive=True,
+                overwrite=op.overwrite,
+            )
+        )
         if not source_path.exists():
             warnings.append(f"Missing move source: {source_path}")
         if op.overwrite:
             destructive.append(f"overwrite move destination: {destination_path}")
-            destructive_details.append(_path_detail(
-                kind="file",
-                action="overwrite_move_destination",
-                path=destination_path,
-                destructive=True,
-                overwrite=True,
-            ))
+            destructive_details.append(
+                _path_detail(
+                    kind="file",
+                    action="overwrite_move_destination",
+                    path=destination_path,
+                    destructive=True,
+                    overwrite=True,
+                )
+            )
     elif isinstance(op, DeleteFileOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"delete file: {path}")
         action = "recursive delete" if op.recursive else "delete"
-        side_effect_details.append(_path_detail(
-            kind="file",
-            action="delete",
-            path=path,
-            destructive=True,
-            recursive=op.recursive,
-            missing_ok=op.missing_ok,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="file",
+                action="delete",
+                path=path,
+                destructive=True,
+                recursive=op.recursive,
+                missing_ok=op.missing_ok,
+            )
+        )
         destructive.append(f"{action}: {path}")
-        destructive_details.append(_path_detail(
-            kind="file",
-            action="recursive_delete" if op.recursive else "delete",
-            path=path,
-            destructive=True,
-            recursive=op.recursive,
-            missing_ok=op.missing_ok,
-        ))
+        destructive_details.append(
+            _path_detail(
+                kind="file",
+                action="recursive_delete" if op.recursive else "delete",
+                path=path,
+                destructive=True,
+                recursive=op.recursive,
+                missing_ok=op.missing_ok,
+            )
+        )
         if not path.exists() and not op.missing_ok:
             warnings.append(f"Missing delete target: {path}")
     elif isinstance(op, FileOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"reference file: {path}")
-        side_effect_details.append(_path_detail(
-            kind="file",
-            action="reference",
-            path=path,
-            destructive=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="file",
+                action="reference",
+                path=path,
+                destructive=False,
+            )
+        )
         if not path.exists():
             warnings.append(f"Missing file resource: {path}")
     elif isinstance(op, FolderOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"reference folder: {path}")
-        side_effect_details.append(_path_detail(
-            kind="folder",
-            action="reference",
-            path=path,
-            destructive=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="folder",
+                action="reference",
+                path=path,
+                destructive=False,
+            )
+        )
         if not path.exists():
             warnings.append(f"Missing folder resource: {path}")
     elif isinstance(op, OpenResourceOperation):
         side_effects.append(f"open resource: {op.target}")
-        side_effect_details.append({
-            "kind": "resource",
-            "action": "open",
-            "target": op.target,
-            "destructive": False,
-        })
+        side_effect_details.append(
+            {
+                "kind": "resource",
+                "action": "open",
+                "target": op.target,
+                "destructive": False,
+            }
+        )
     elif isinstance(op, PromptFileOperation):
         output_path = _resolve_path(op.output_path, path_base)
         side_effects.append(f"write prompt file: {output_path}")
@@ -856,55 +1032,65 @@ def _operation_impact(
         side_effect_details.append(detail)
         if op.overwrite:
             destructive.append(f"overwrite prompt file: {output_path}")
-            destructive_details.append(_path_detail(
-                kind="file",
-                action="overwrite_prompt",
-                path=output_path,
-                destructive=True,
-                overwrite=True,
-            ))
+            destructive_details.append(
+                _path_detail(
+                    kind="file",
+                    action="overwrite_prompt",
+                    path=output_path,
+                    destructive=True,
+                    overwrite=True,
+                )
+            )
         if op.template_path is not None:
             template_path = _resolve_path(op.template_path, path_base)
             if not template_path.exists():
                 warnings.append(f"Missing prompt template: {template_path}")
     elif isinstance(op, CommonLlmTaskOperation):
         side_effects.append(f"provider call: {op.agent_id} {op.task}")
-        side_effect_details.append({
-            "kind": "provider",
-            "action": "call",
-            "agentId": op.agent_id,
-            "task": op.task,
-            "destructive": False,
-        })
+        side_effect_details.append(
+            {
+                "kind": "provider",
+                "action": "call",
+                "agentId": op.agent_id,
+                "task": op.task,
+                "destructive": False,
+            }
+        )
     elif isinstance(op, LocalVectorizeOperation):
         source_path = _resolve_path(op.source_path, path_base)
         index_path = _resolve_path(op.index_path, path_base)
         side_effects.append(f"scan files: {source_path}")
-        side_effect_details.append(_two_path_detail(
-            kind="file",
-            action="vectorize",
-            source_path=source_path,
-            destination_path=index_path,
-            destructive=True,
-        ))
+        side_effect_details.append(
+            _two_path_detail(
+                kind="file",
+                action="vectorize",
+                source_path=source_path,
+                destination_path=index_path,
+                destructive=True,
+            )
+        )
         destructive.append(f"write vector index: {index_path}")
-        destructive_details.append(_path_detail(
-            kind="file",
-            action="write_vector_index",
-            path=index_path,
-            destructive=True,
-        ))
+        destructive_details.append(
+            _path_detail(
+                kind="file",
+                action="write_vector_index",
+                path=index_path,
+                destructive=True,
+            )
+        )
         if not source_path.exists():
             warnings.append(f"Missing vectorize source: {source_path}")
     elif isinstance(op, LocalSearchOperation):
         index_path = _resolve_path(op.index_path, path_base)
         side_effects.append(f"read vector index: {index_path}")
-        side_effect_details.append(_path_detail(
-            kind="file",
-            action="read_vector_index",
-            path=index_path,
-            destructive=False,
-        ))
+        side_effect_details.append(
+            _path_detail(
+                kind="file",
+                action="read_vector_index",
+                path=index_path,
+                destructive=False,
+            )
+        )
         if not index_path.exists():
             warnings.append(f"Missing search index: {index_path}")
     elif isinstance(op, HttpRequestOperation):
@@ -913,69 +1099,108 @@ def _operation_impact(
         configured_secret_fields = {field.lower() for field in op.secret_fields}
         secret_values = _http_plan_secret_values(op, configured_secret_fields)
         side_effects.append(f"http request: {op.method.upper()} {host}")
-        side_effect_details.append({
-            "kind": "network",
-            "action": "http_request",
-            "method": op.method.upper(),
-            "url": _masked_http_plan_url(
-                op,
-                configured_secret_fields,
-                secret_values,
-            ),
-            "host": host,
-            "params": _masked_http_plan_value(
-                op.params,
-                configured_secret_fields,
-                secret_values=secret_values,
-            ),
-            "expectedStatuses": list(op.expected_statuses),
-            "destructive": op.method.upper() not in {"GET", "HEAD", "OPTIONS"},
-            "effectsInferred": True,
-        })
+        side_effect_details.append(
+            {
+                "kind": "network",
+                "action": "http_request",
+                "method": op.method.upper(),
+                "url": _masked_http_plan_url(
+                    op,
+                    configured_secret_fields,
+                    secret_values,
+                ),
+                "host": host,
+                "params": _masked_http_plan_value(
+                    op.params,
+                    configured_secret_fields,
+                    secret_values=secret_values,
+                ),
+                "expectedStatuses": list(op.expected_statuses),
+                "networkAllowlist": list(op.network_allowlist),
+                "destructive": op.method.upper() not in {"GET", "HEAD", "OPTIONS"},
+                "effectsInferred": True,
+            }
+        )
         if "{{" in op.url and "}}" in op.url:
             warnings.append(f"HTTP request URL contains unresolved dynamic values: {op.url}")
+        warnings.extend(network_policy_warnings(op.url, op.network_allowlist))
     elif isinstance(op, ApprovalGateOperation):
         side_effects.append("pause for approval")
-        side_effect_details.append({
-            "kind": "approval",
-            "action": "wait",
-            "message": op.message,
-            "approvers": list(op.approvers),
-            "timeoutSeconds": op.timeout_seconds,
-            "timeoutDecision": op.timeout_decision,
-            "notify": op.notify,
-            "destructive": False,
-            "effectsInferred": True,
-        })
+        side_effect_details.append(
+            {
+                "kind": "approval",
+                "action": "wait",
+                "message": op.message,
+                "approvers": list(op.approvers),
+                "timeoutSeconds": op.timeout_seconds,
+                "timeoutDecision": op.timeout_decision,
+                "notify": op.notify,
+                "destructive": False,
+                "effectsInferred": True,
+            }
+        )
         warnings.append(f"Workflow pauses for approval at node message: {op.message}")
         if "{{" in op.message and "}}" in op.message:
-            warnings.append(
-                f"Approval message contains unresolved dynamic values: {op.message}"
-            )
+            warnings.append(f"Approval message contains unresolved dynamic values: {op.message}")
     elif isinstance(op, NotificationOperation):
-        side_effects.append(f"desktop notification: {op.title}")
-        side_effect_details.append({
-            "kind": "notification",
-            "action": "send",
-            "channel": op.channel,
-            "title": op.title,
-            "body": op.body,
-            "urgency": op.urgency,
-            "destructive": False,
-            "effectsInferred": True,
-        })
+        side_effects.append(f"{op.channel} notification: {op.title}")
+        secret_values = _notification_plan_secret_values(op)
+        side_effect_details.append(
+            {
+                "kind": "notification",
+                "action": "send",
+                "channel": op.channel,
+                "title": op.title,
+                "body": op.body,
+                "urgency": op.urgency,
+                "webhookUrl": _masked_notification_plan_url(op.webhook_url, secret_values),
+                "headers": _masked_http_plan_value(
+                    op.headers,
+                    set(),
+                    secret_values=secret_values,
+                ),
+                "payload": _masked_http_plan_value(
+                    op.payload,
+                    set(),
+                    secret_values=secret_values,
+                ),
+                "emailFrom": _masked_http_plan_value(
+                    op.email_from,
+                    set(),
+                    secret_values=secret_values,
+                ),
+                "emailTo": _masked_http_plan_value(
+                    op.email_to,
+                    set(),
+                    secret_values=secret_values,
+                ),
+                "smtpHost": _masked_http_plan_value(
+                    op.smtp_host,
+                    set(),
+                    secret_values=secret_values,
+                ),
+                "smtpPort": op.smtp_port,
+                "smtpUsername": _masked_notification_plan_credential(op.smtp_username),
+                "timeoutSeconds": op.timeout_seconds,
+                "retry": op.retry.model_dump(),
+                "expectedStatuses": list(op.expected_statuses),
+                "networkAllowlist": list(op.network_allowlist),
+                "destructive": False,
+                "effectsInferred": True,
+            }
+        )
         if "{{" in op.body and "}}" in op.body:
-            warnings.append(
-                f"Notification body contains unresolved dynamic values: {op.body}"
-            )
+            warnings.append(f"Notification body contains unresolved dynamic values: {op.body}")
     elif isinstance(op, AgentOperation):
         side_effects.append(f"provider call: {op.agent_id}")
-        side_effect_details.append({
-            "kind": "provider",
-            "action": "call",
-            "agentId": op.agent_id,
-            "destructive": False,
-        })
+        side_effect_details.append(
+            {
+                "kind": "provider",
+                "action": "call",
+                "agentId": op.agent_id,
+                "destructive": False,
+            }
+        )
         if op.prompt_path is not None:
             prompt_path = _resolve_path(op.prompt_path, path_base)
             if not prompt_path.exists():
@@ -989,6 +1214,144 @@ def _operation_impact(
     )
 
 
+def _operation_access_warnings(
+    op: object,
+    workflow: AgenticWorkflow,
+    node_id: str,
+    path_base: Path | None,
+    trigger_context: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+
+    def check(
+        path: Path,
+        permission: Literal["read", "write", "execute"],
+        label: str,
+    ) -> None:
+        resolved = _resolve_path(path, path_base)
+        if _path_has_workflow_access(workflow, resolved, permission, path_base):
+            return
+        warnings.append(
+            f"Node '{node_id}' {label} requires {permission} access to outside path "
+            f"{resolved}; add it to workflow filesystem_access."
+        )
+
+    if isinstance(op, PythonScriptOperation | ShellScriptOperation):
+        check(op.script_path, "execute", "script path")
+    elif isinstance(op, ReadFileOperation):
+        check(op.path, "read", "read path")
+    elif isinstance(op, WriteFileOperation):
+        check(op.path, "write", "write path")
+    elif isinstance(op, CopyFileOperation):
+        check(op.source_path, "read", "copy source path")
+        check(op.destination_path, "write", "copy destination path")
+    elif isinstance(op, MoveFileOperation):
+        check(op.source_path, "write", "move source path")
+        check(op.destination_path, "write", "move destination path")
+    elif isinstance(op, DeleteFileOperation):
+        check(op.path, "write", "delete path")
+    elif isinstance(op, FileOperation):
+        check(op.path, "read", "file resource path")
+    elif isinstance(op, FolderOperation):
+        check(op.path, "read", "folder resource path")
+    elif isinstance(op, OpenResourceOperation):
+        if _open_resource_target_is_local_path(op):
+            check(Path(op.target), "read", "open_resource target path")
+    elif isinstance(op, PromptFileOperation):
+        if op.template_path is not None:
+            check(op.template_path, "read", "prompt template path")
+        check(op.output_path, "write", "prompt output path")
+    elif isinstance(op, LocalVectorizeOperation):
+        index_path = _resolve_path(op.index_path, path_base)
+        check(op.source_path, "read", "local_vectorize source path")
+        check(op.index_path, "write", "local_vectorize index path")
+        check(index_path.parent, "write", "local_vectorize index directory")
+        check(
+            _default_vector_entries_path(index_path),
+            "write",
+            "local_vectorize entries path",
+        )
+    elif isinstance(op, LocalSearchOperation):
+        check(op.index_path, "read", "local_search index path")
+
+    source = op.source if isinstance(op, LoopOperation) else None
+    if isinstance(source, TabularFanSource):
+        check(source.path, "read", "tabular fan-out path")
+    elif isinstance(source, DirectoryFanSource):
+        check(source.path, "read", "directory fan-out path")
+    elif isinstance(source, TriggerEventsFanSource) and source.include_content:
+        events = trigger_context.get("events")
+        if isinstance(events, list):
+            for index, event in enumerate(events):
+                if not isinstance(event, dict) or not event.get("path"):
+                    continue
+                check(Path(str(event["path"])), "read", f"trigger event {index} path")
+
+    return warnings
+
+
+def _default_vector_entries_path(index_path: Path) -> Path:
+    return index_path.with_name(f"{index_path.name}.entries.jsonl")
+
+
+def _open_resource_target_is_local_path(op: OpenResourceOperation) -> bool:
+    if op.resource_type == "app":
+        return False
+    if op.resource_type == "url":
+        return False
+    return "://" not in op.target
+
+
+def _path_has_workflow_access(
+    workflow: AgenticWorkflow,
+    path: Path,
+    permission: Literal["read", "write", "execute"],
+    path_base: Path | None,
+) -> bool:
+    if path_base is None:
+        return True
+    resolved_path = _resolved_for_access(path)
+    trusted_root = _resolved_for_access(path_base)
+    if resolved_path == trusted_root or trusted_root in resolved_path.parents:
+        root_entry = _project_root_access_entry(workflow, trusted_root, path_base)
+        return getattr(root_entry, permission) if root_entry is not None else True
+    for entry in workflow.config.filesystem_access:
+        if not getattr(entry, permission):
+            continue
+        if _access_entry_covers_path(entry, resolved_path, path_base):
+            return True
+    return False
+
+
+def _access_entry_covers_path(
+    entry: FilesystemAccessEntry,
+    resolved_path: Path,
+    path_base: Path | None,
+) -> bool:
+    entry_path = _resolve_path(entry.path, path_base)
+    resolved_entry = _resolved_for_access(entry_path)
+    return resolved_path == resolved_entry or resolved_entry in resolved_path.parents
+
+
+def _project_root_access_entry(
+    workflow: AgenticWorkflow,
+    trusted_root: Path,
+    path_base: Path | None,
+) -> FilesystemAccessEntry | None:
+    for entry in workflow.config.filesystem_access:
+        entry_path = _resolve_path(entry.path, path_base)
+        if _resolved_for_access(entry_path) == trusted_root:
+            return entry
+    return None
+
+
+def _resolved_for_access(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
+
+
 def _agent_registration_warnings(op: object, workflow: AgenticWorkflow) -> list[str]:
     if isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
         if op.agent_id not in workflow.agents:
@@ -998,6 +1361,7 @@ def _agent_registration_warnings(op: object, workflow: AgenticWorkflow) -> list[
 
 def _fan_out_plan(
     op: object,
+    workflow: AgenticWorkflow,
     trigger_context: dict[str, Any],
     limits: ResourceLimits,
     sample_limit: int,
@@ -1039,16 +1403,18 @@ def _fan_out_plan(
             else:
                 count = None
                 sample = []
-                plan["warnings"].append(
-                    f"Unresolved dynamic count expression: {source.count}"
-                )
+                plan["warnings"].append(f"Unresolved dynamic count expression: {source.count}")
             plan["count"] = count
             plan["countExact"] = count is not None
             plan["countLowerBound"] = count
             plan["sampleItems"] = sample
         elif isinstance(source, TabularFanSource):
             path = _resolve_path(source.path, path_base)
-            if not path.exists():
+            if not _path_has_workflow_access(workflow, path, "read", path_base):
+                plan["warnings"].append(
+                    f"Tabular fan-out preview skipped because read access is not granted: {path}"
+                )
+            elif not path.exists():
                 plan["warnings"].append(f"Missing tabular fan-out source: {path}")
             else:
                 tabular_count, tabular_sample, tabular_warnings, partial = _preview_tabular(
@@ -1067,12 +1433,14 @@ def _fan_out_plan(
             plan["path"] = str(path)
             plan["glob"] = source.glob
             plan["includeContent"] = source.include_content
-            if not path.exists():
+            if not _path_has_workflow_access(workflow, path, "read", path_base):
+                plan["warnings"].append(
+                    f"Directory fan-out preview skipped because read access is not granted: {path}"
+                )
+            elif not path.exists():
                 plan["warnings"].append(f"Missing directory fan-out source: {path}")
             elif not path.is_dir():
-                plan["warnings"].append(
-                    f"Directory fan-out source is not a directory: {path}"
-                )
+                plan["warnings"].append(f"Directory fan-out source is not a directory: {path}")
             else:
                 directory_count, directory_sample, directory_warnings, scanned, partial = (
                     _preview_directory(source, path, limits, sample_limit)
@@ -1129,9 +1497,7 @@ def _agent_dynamic_count_plan(
         "countExact": False,
         "countLowerBound": None,
         "sampleItems": [],
-        "warnings": [
-            "agent dynamic_count is deprecated; use a loop node feeding this agent"
-        ],
+        "warnings": ["agent dynamic_count is deprecated; use a loop node feeding this agent"],
     }
     if isinstance(op.dynamic_count, int):
         count = op.dynamic_count
@@ -1154,9 +1520,7 @@ def _agent_dynamic_count_plan(
                 f"Agent dynamic_count {count} exceeds limit {limits.max_fanout_items}"
             )
     else:
-        plan["warnings"].append(
-            f"Unresolved dynamic_count expression: {op.dynamic_count}"
-        )
+        plan["warnings"].append(f"Unresolved dynamic_count expression: {op.dynamic_count}")
     return plan
 
 
@@ -1185,11 +1549,13 @@ def _preview_directory(
             continue
         count += 1
         if len(sample) < sample_limit:
-            sample.append({
-                "path": str(path),
-                "name": path.name,
-                "sizeBytes": path.stat().st_size,
-            })
+            sample.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "sizeBytes": path.stat().st_size,
+                }
+            )
         if count > limits.max_fanout_items:
             partial = True
             warnings.append(
@@ -1221,8 +1587,7 @@ def _preview_tabular(
             return False
         partial = True
         warnings.append(
-            f"Tabular fan-out count {count} exceeds limit {row_limit}; "
-            "preview count is partial"
+            f"Tabular fan-out count {count} exceeds limit {row_limit}; preview count is partial"
         )
         return True
 
@@ -1411,7 +1776,11 @@ def _required_secrets(
                 operation_timeout=op.timeout,
                 data_dir=data_dir,
             )
-            profile_secrets.update(unresolved_provider_secret_refs(settings))
+            profile_secrets.update(settings.secret_refs.values())
+            if settings.api_key_secret:
+                profile_secrets.add(settings.api_key_secret)
+            elif settings.api_key_env:
+                profile_secrets.add(settings.api_key_env)
     elif isinstance(op, CommonLlmTaskOperation):
         agent = workflow.agents.get(op.agent_id)
         if agent is not None:
@@ -1425,22 +1794,27 @@ def _required_secrets(
                 operation_timeout=op.timeout,
                 data_dir=data_dir,
             )
-            profile_secrets.update(unresolved_provider_secret_refs(settings))
+            profile_secrets.update(settings.secret_refs.values())
+            if settings.api_key_secret:
+                profile_secrets.add(settings.api_key_secret)
+            elif settings.api_key_env:
+                profile_secrets.add(settings.api_key_env)
     elif isinstance(op, HttpRequestOperation):
         for field, value in _iter_strings(op.model_dump(by_alias=True)):
             values[field] = value
-    return sorted(profile_secrets | {
-        secret
-        for value in values.values()
-        for secret in _secret_reference_names(str(value))
-        if secret is not None
-        and not os.environ.get(f"GOFER_SECRET_{secret}")
-        and not os.environ.get(secret)
-    } | {
-        value[4:]
-        for value in values.values()
-        if str(value).startswith("env:") and not os.environ.get(str(value)[4:])
-    })
+    elif isinstance(op, NotificationOperation):
+        for field, value in _iter_strings(op.model_dump()):
+            values[field] = value
+    return sorted(
+        profile_secrets
+        | {
+            secret
+            for value in values.values()
+            for secret in workflow_secret_reference_names(str(value))
+            if secret is not None
+        }
+        | {value[4:] for value in values.values() if str(value).startswith("env:")}
+    )
 
 
 def _provider_requirements(
@@ -1469,7 +1843,8 @@ def _provider_requirements(
             validation_errors.append(str(exc))
         extra_paths = _configured_extra_paths(agent, path_base)
         binary = _provider_binary(settings.subscription)
-        available = shutil.which(binary) is not None if binary is not None else False
+        is_direct = settings.subscription in DIRECT_API_SUBSCRIPTIONS
+        available = True if is_direct else shutil.which(binary) is not None if binary else False
         requirement = {
             "agentId": agent.agent_id,
             "subscription": settings.subscription,
@@ -1479,6 +1854,8 @@ def _provider_requirements(
             "workingDir": str(_resolve_path(op.working_dir, path_base)),
             "binary": binary,
             "available": available,
+            "directApi": is_direct,
+            "apiBaseUrl": settings.api_base_url if is_direct else None,
             "extraPaths": extra_paths,
         }
         if validation_errors:
@@ -1520,11 +1897,7 @@ def _working_dir(
     path_base: Path | None,
 ) -> str | None:
     if isinstance(op, BashCommandOperation):
-        return (
-            str(_resolve_path(op.working_dir, path_base))
-            if op.working_dir is not None
-            else None
-        )
+        return str(_resolve_path(op.working_dir, path_base)) if op.working_dir is not None else None
     if isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
         return str(_resolve_path(op.working_dir, path_base))
     agent_id = getattr(op, "agent_id", None)
@@ -1609,7 +1982,9 @@ def _is_sensitive_field(path: str, configured: set[str]) -> bool:
     if normalized in configured:
         return True
     name = normalized.rsplit(".", maxsplit=1)[-1]
-    return name in SENSITIVE_FIELD_NAMES or any(token in name for token in ("token", "secret"))
+    return name in SENSITIVE_FIELD_NAMES or any(
+        token in name for token in ("token", "secret", "password")
+    )
 
 
 def _collect_plan_leaf_strings(value: object) -> set[str]:
@@ -1643,9 +2018,7 @@ def _collect_http_plan_secret_values(
             if _is_sensitive_field(child_path, configured):
                 values.update(_collect_plan_leaf_strings(item))
             else:
-                values.update(
-                    _collect_http_plan_secret_values(item, configured, child_path)
-                )
+                values.update(_collect_http_plan_secret_values(item, configured, child_path))
         return values
     if isinstance(value, list):
         values = set()
@@ -1745,6 +2118,30 @@ def _masked_http_plan_url(
         parsed._replace(query=urllib.parse.urlencode(masked_pairs))
     )
     return _replace_http_plan_secret_values(masked_url, secret_values)
+
+
+def _notification_plan_secret_values(op: NotificationOperation) -> set[str]:
+    values: set[str] = set()
+    values.update(_collect_http_plan_secret_values(op.headers, set()))
+    values.update(_collect_http_plan_secret_values(op.payload, set()))
+    values.update(_collect_http_plan_secret_values(op.smtp_username, set(), "smtp_username"))
+    values.update(_collect_http_plan_secret_values(op.smtp_password, set(), "smtp_password"))
+    if op.webhook_url:
+        parsed = urllib.parse.urlsplit(op.webhook_url)
+        for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+            if _is_sensitive_field(key, set()):
+                values.add(value)
+    return {value for value in values if value}
+
+
+def _masked_notification_plan_credential(value: str | None) -> str | None:
+    return "***" if value is not None else None
+
+
+def _masked_notification_plan_url(url: str | None, secret_values: set[str]) -> str | None:
+    if url is None:
+        return None
+    return "***"
 
 
 def _fan_source_label(source: object, path_base: Path | None) -> str:

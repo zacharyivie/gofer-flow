@@ -24,6 +24,7 @@ from gofer.core.operations import (
     BashCommandOperation,
     CopyFileOperation,
     CountFanSource,
+    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FanSource,
@@ -314,7 +315,8 @@ class WorkflowBuilder:
                 agent_id = unique_agent_id(name, data_dir)
 
                 subscription = questionary.select(
-                    "Subscription:", choices=["claude_code", "codex"]
+                    "Subscription:",
+                    choices=["claude_code", "codex", "openai_api", "anthropic_api"],
                 ).ask()
                 if subscription is None:
                     return
@@ -382,6 +384,7 @@ class WorkflowBuilder:
                 "Row in a JSONL/CSV file",
                 "File in a directory",
                 "File watcher trigger event",
+                "Dashboard items",
                 "Indefinitely until BREAK",
             ],
         ).ask()
@@ -430,6 +433,19 @@ class WorkflowBuilder:
             return TriggerEventsFanSource(
                 type="trigger_events",
                 include_content=include_content,
+            )
+
+        if source_type == "Dashboard items":
+            dashboard = questionary.text("Dashboard name or ID:").ask()
+            component = questionary.text("Component ID:").ask()
+            if not dashboard or not component:
+                return None
+            filter_rule = questionary.text("Filter (example: status=todo, optional):").ask()
+            return DashboardItemsFanSource(
+                type="dashboard_items",
+                dashboard=dashboard,
+                component=component,
+                filter=filter_rule or None,
             )
 
         if source_type == "Indefinitely until BREAK":

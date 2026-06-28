@@ -1,6 +1,7 @@
 const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 const API_BASE_URL_ARG = "--gofer-api-base-url=";
+const API_TOKEN_ARG = "--gofer-api-token=";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8765";
 const LOCAL_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
@@ -9,6 +10,11 @@ function readApiBaseUrl() {
   const value = arg ? arg.slice(API_BASE_URL_ARG.length) : DEFAULT_API_BASE_URL;
 
   return isSafeLocalHttpUrl(value) ? value : DEFAULT_API_BASE_URL;
+}
+
+function readApiToken() {
+  const arg = process.argv.find((value) => value.startsWith(API_TOKEN_ARG));
+  return arg ? arg.slice(API_TOKEN_ARG.length) : "";
 }
 
 function isSafeLocalHttpUrl(value) {
@@ -24,6 +30,7 @@ function isSafeLocalHttpUrl(value) {
 }
 
 contextBridge.exposeInMainWorld("goferApiBaseUrl", readApiBaseUrl());
+contextBridge.exposeInMainWorld("goferApiToken", readApiToken());
 const pathGrants = new Map();
 
 function rememberPathGrant(payload) {
@@ -60,7 +67,27 @@ function stripGrantIds(value) {
 }
 
 function grantForPath(targetPath) {
-  return typeof targetPath === "string" ? pathGrants.get(targetPath) || "" : "";
+  if (typeof targetPath !== "string") return "";
+  const target = normalizeGrantPath(targetPath);
+  let selectedGrantId = "";
+  let selectedRootLength = -1;
+  for (const [rootPath, grantId] of pathGrants.entries()) {
+    const root = normalizeGrantPath(rootPath);
+    if (!root) continue;
+    const matchesRoot = target === root || target.startsWith(`${root}/`);
+    if (matchesRoot && root.length > selectedRootLength) {
+      selectedGrantId = grantId;
+      selectedRootLength = root.length;
+    }
+  }
+  return selectedGrantId;
+}
+
+function normalizeGrantPath(targetPath) {
+  return String(targetPath ?? "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
 }
 
 async function invokeDesktop(channel, payload = {}) {
@@ -100,8 +127,8 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       revealPath(targetPath),
     getPathInfo: (targetPath) =>
       getPathInfo(targetPath),
-    grantPath: (targetPath) =>
-      grantPath(targetPath),
+    pathGrantForApi: (targetPath) =>
+      grantForPath(targetPath),
     copyPath: (options = {}) =>
       copyPath(options),
     deletePath: (targetPath) =>
@@ -159,12 +186,6 @@ function getPathInfo(targetPath) {
     grantId: grantForPath(targetPath),
     targetPath: typeof targetPath === "string" ? targetPath : "",
   });
-}
-
-function grantPath(targetPath) {
-  return invokeDesktop("gofer:grant-path", {
-    targetPath: typeof targetPath === "string" ? targetPath : "",
-  }).then((payload) => (payload && typeof payload.path === "string" ? payload.path : null));
 }
 
 function copyPath(options = {}) {

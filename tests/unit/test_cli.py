@@ -15,6 +15,7 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     DirectoryFanSource,
     LoopOperation,
+    NotificationOperation,
     OperationType,
 )
 from gofer.core.provider_profiles import (
@@ -127,6 +128,89 @@ def test_provider_profile_cli_create_list_and_remove(tmp_path: Path) -> None:
     assert rm_result.exit_code == 0, rm_result.output
 
 
+def test_provider_profile_cli_list_no_profiles(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["provider", "profile", "list", "--data-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "No provider profiles found." in result.output
+
+
+def test_provider_profile_cli_create_rejects_invalid_inputs(tmp_path: Path) -> None:
+    duplicate = ProviderProfile(name="fast", subscription="codex")
+    save_provider_profiles({"fast": duplicate}, tmp_path)
+
+    cases = [
+        (
+            ["provider", "profile", "create", "fast", "--data-dir", str(tmp_path)],
+            "already exists",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "create",
+                "bad-sub",
+                "--subscription",
+                "missing",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Invalid subscription",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "create",
+                "bad-env",
+                "--env",
+                "NO_EQUALS",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Invalid --env value",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "create",
+                "bad-secret",
+                "--secret-ref",
+                "NO_EQUALS",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Invalid --secret-ref value",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "create",
+                "bad-setting",
+                "--subscription",
+                "openai_api",
+                "--tool",
+                "Read",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Direct API provider profiles do not support tools",
+        ),
+    ]
+
+    for args, snippet in cases:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1, result.output
+        assert snippet in result.output
+
+    assert set(load_provider_profiles(tmp_path)) == {"fast"}
+
+
 def test_provider_profile_cli_create_and_edit_secret_refs(tmp_path: Path) -> None:
     create_result = runner.invoke(
         app,
@@ -165,6 +249,244 @@ def test_provider_profile_cli_create_and_edit_secret_refs(tmp_path: Path) -> Non
     assert edit_result.exit_code == 0, edit_result.output
     assert profiles["secure"].env == {"PLAIN": "value"}
     assert profiles["secure"].secret_refs == {"ANTHROPIC_API_KEY": "NEW_TOKEN"}
+
+
+def test_provider_profile_cli_edit_updates_and_replaces_collections(tmp_path: Path) -> None:
+    save_provider_profiles(
+        {
+            "work": ProviderProfile(
+                name="work",
+                subscription="claude_code",
+                model="old",
+                timeout=10,
+                extra_args=["--old"],
+                tools=["Read", "Write"],
+                mcp_servers=["legacy"],
+                env={"KEEP": "yes", "ANTHROPIC_API_KEY": "plaintext"},
+                secret_refs={"OLD_KEY": "OLD_SECRET"},
+            )
+        },
+        tmp_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "edit",
+            "work",
+            "--model",
+            "claude-sonnet",
+            "--timeout",
+            "30",
+            "--extra-arg",
+            "--verbose",
+            "--tool",
+            "Read",
+            "--mcp-server",
+            "main",
+            "--env",
+            "NEXT=1",
+            "--secret-ref",
+            "ANTHROPIC_API_KEY=ANTHROPIC_TOKEN",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    profile = load_provider_profiles(tmp_path)["work"]
+    persisted = json.loads((tmp_path / "provider-profiles.json").read_text(encoding="utf-8"))
+
+    assert result.exit_code == 0, result.output
+    assert profile.model == "claude-sonnet"
+    assert profile.timeout == 30
+    assert profile.extra_args == ["--verbose"]
+    assert profile.tools == ["Read"]
+    assert profile.mcp_servers == ["main"]
+    assert profile.env == {"NEXT": "1"}
+    assert profile.secret_refs == {"ANTHROPIC_API_KEY": "ANTHROPIC_TOKEN"}
+    assert "plaintext" not in json.dumps(persisted)
+    assert "ANTHROPIC_TOKEN" in json.dumps(persisted)
+
+
+def test_provider_profile_cli_edit_clears_env_and_secret_refs(tmp_path: Path) -> None:
+    save_provider_profiles(
+        {
+            "work": ProviderProfile(
+                name="work",
+                subscription="codex",
+                env={"TRACE": "1"},
+                secret_refs={"CODEX_API_KEY": "CODEX_TOKEN"},
+            )
+        },
+        tmp_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "edit",
+            "work",
+            "--env",
+            "",
+            "--secret-ref",
+            "",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    profile = load_provider_profiles(tmp_path)["work"]
+
+    assert result.exit_code == 0, result.output
+    assert profile.env == {}
+    assert profile.secret_refs == {}
+
+
+def test_provider_profile_cli_edit_rejects_missing_and_malformed_options(
+    tmp_path: Path,
+) -> None:
+    save_provider_profiles({"work": ProviderProfile(name="work", subscription="codex")}, tmp_path)
+
+    cases = [
+        (
+            ["provider", "profile", "edit", "missing", "--data-dir", str(tmp_path)],
+            "not found",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "edit",
+                "work",
+                "--env",
+                "NO_EQUALS",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Invalid --env value",
+        ),
+        (
+            [
+                "provider",
+                "profile",
+                "edit",
+                "work",
+                "--secret-ref",
+                "NO_EQUALS",
+                "--data-dir",
+                str(tmp_path),
+            ],
+            "Invalid --secret-ref value",
+        ),
+    ]
+
+    for args, snippet in cases:
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1, result.output
+        assert snippet in result.output
+
+
+def test_provider_profile_cli_rm_missing_and_confirmation_abort(tmp_path: Path) -> None:
+    save_provider_profiles({"work": ProviderProfile(name="work", subscription="codex")}, tmp_path)
+
+    missing = runner.invoke(
+        app,
+        ["provider", "profile", "rm", "missing", "--data-dir", str(tmp_path)],
+    )
+    aborted = runner.invoke(
+        app,
+        ["provider", "profile", "rm", "work", "--data-dir", str(tmp_path)],
+        input="n\n",
+    )
+
+    assert missing.exit_code == 1, missing.output
+    assert "not found" in missing.output
+    assert aborted.exit_code == 1, aborted.output
+    assert "Aborted" in aborted.output
+    assert set(load_provider_profiles(tmp_path)) == {"work"}
+
+
+def test_provider_profile_cli_rejects_sensitive_plaintext_env(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "create",
+            "bad",
+            "--subscription",
+            "codex",
+            "--env",
+            "AWS_ACCESS_KEY_ID=plaintext",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "must use secret_refs" in result.output
+    assert load_provider_profiles(tmp_path) == {}
+
+
+def test_provider_profile_cli_allows_explicit_unsafe_env(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "create",
+            "unsafe",
+            "--subscription",
+            "codex",
+            "--unsafe-env",
+            "CODEX_API_KEY=plaintext",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    profiles = load_provider_profiles(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert profiles["unsafe"].env == {"CODEX_API_KEY": "plaintext"}
+
+
+def test_provider_profile_cli_secret_ref_replaces_legacy_plaintext_env(
+    tmp_path: Path,
+) -> None:
+    save_provider_profiles(
+        {
+            "legacy": ProviderProfile(
+                name="legacy",
+                subscription="codex",
+                env={"CODEX_API_KEY": "plaintext", "GOFER_TRACE": "1"},
+            )
+        },
+        tmp_path,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "provider",
+            "profile",
+            "edit",
+            "legacy",
+            "--secret-ref",
+            "CODEX_API_KEY=CODEX_TOKEN",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    profiles = load_provider_profiles(tmp_path)
+
+    assert result.exit_code == 0, result.output
+    assert profiles["legacy"].env == {"GOFER_TRACE": "1"}
+    assert profiles["legacy"].secret_refs == {"CODEX_API_KEY": "CODEX_TOKEN"}
 
 
 def test_runner_cli_register_queue_status_cancel(tmp_path: Path) -> None:
@@ -398,6 +720,55 @@ def test_workflow_add_node_persists_common_inputs(tmp_path: Path) -> None:
         "stdin": "previous.text",
         "env.FILE_PATH": "loop.current.file_path",
     }
+
+
+def test_workflow_add_notification_node_persists_network_channel(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Notify Flow", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "add-node",
+            "notify-flow",
+            "--id",
+            "slack",
+            "--type",
+            "notification",
+            "--channel",
+            "slack",
+            "--title",
+            "Deploy",
+            "--notification-body",
+            "Done",
+            "--notification-webhook-url",
+            "{{secret.SLACK_WEBHOOK_URL}}",
+            "--notification-header",
+            "Authorization=Bearer {{secret.API_TOKEN}}",
+            "--notification-payload-json",
+            '{"text":"Done"}',
+            "--notification-retry-attempts",
+            "2",
+            "--notification-expected-status",
+            "202",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / "notify-flow.toml")
+    op = wf.graph._nodes["slack"].operation
+    assert isinstance(op, NotificationOperation)
+    assert op.channel == "slack"
+    assert op.webhook_url == "{{secret.SLACK_WEBHOOK_URL}}"
+    assert op.headers == {"Authorization": "Bearer {{secret.API_TOKEN}}"}
+    assert op.payload == {"text": "Done"}
+    assert op.retry.attempts == 2
+    assert op.expected_statuses == [202]
 
 
 def test_workflow_add_control_nodes(tmp_path: Path) -> None:
@@ -792,6 +1163,41 @@ def test_workflow_run_dry_run(tmp_path: Path) -> None:
     assert "shell command: echo hello" in result.output
     assert not (tmp_path / "logs").exists()
     assert not workflow_stop_path("simple", tmp_path).exists()
+
+
+def test_workflow_secrets_json_reports_readiness(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.delenv("GOFER_SECRET_API_TOKEN", raising=False)
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    f = tmp_path / "secret.toml"
+    f.write_text(
+        """
+[workflow]
+id = "secret"
+name = "Secret"
+
+[[nodes]]
+id = "notify"
+type = "notification"
+body = "Token {{secret.API_TOKEN}}"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        ["workflow", "secrets", str(f), "--json", "--data-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["ok"] is False
+    assert payload["requiredSecrets"] == ["API_TOKEN"]
+    assert payload["secretReadiness"][0]["status"] == "missing"
+    assert payload["secretReadiness"][0]["sources"] == ["node:notify"]
 
 
 def test_workflow_approval_cli_lists_and_decides(tmp_path: Path) -> None:
@@ -1533,6 +1939,60 @@ working_dir = "work"
     assert result.exit_code == 0, result.output
     assert "Working dir" in result.output
     assert str(workdir) in result.output
+
+
+def test_workflow_plan_prints_preview_metadata(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "wf.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "metadata-plan"
+name = "Metadata Plan"
+max_total_node_runs = 12
+
+[workflow.resource_limits]
+max_fanout_items = 4
+max_fanout_concurrency = 2
+max_files_scanned = 9
+
+[workflow.llm_budget]
+max_agent_calls = 1
+
+[[nodes]]
+id = "first"
+type = "bash_command"
+command = "echo first"
+retry_count = 2
+retry_delay_seconds = 3
+timeout_seconds = 30
+allow_failure = true
+
+[[nodes]]
+id = "second"
+type = "bash_command"
+command = "echo second"
+
+[[edges]]
+from = "first"
+to = "second"
+condition = "on_success"
+""".strip()
+    )
+
+    result = runner.invoke(app, ["workflow", "plan", str(workflow_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Start nodes:" in result.output
+    assert "first" in result.output
+    assert "Resource limits:" in result.output
+    assert "fanout_items=4" in result.output
+    assert "Usage budget:" in result.output
+    assert "max_agent_calls=1" in result.output
+    assert "Conditional branches:" in result.output
+    assert "first -> second when on_success" in result.output
+    assert "retries=2 delay=3.0s" in result.output
+    assert "timeout=30.0s" in result.output
+    assert "allow_failure=true" in result.output
 
 
 def test_workflow_import_command(tmp_path: Path) -> None:

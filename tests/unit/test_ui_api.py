@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -218,6 +219,61 @@ password = "cleartext-secret"
     assert "cleartext-secret" in workflow_path.read_text()
 
 
+def test_notification_workflow_payload_masks_literal_secrets_and_preserves_on_save(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "notify-ui.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "notify-ui"
+name = "Notify UI"
+
+[[nodes]]
+id = "notify"
+type = "notification"
+channel = "email"
+webhook_url = "https://hooks.example.test/services/secret-token"
+headers = { Authorization = "Bearer header-secret" }
+payload = { password = "payload-secret", safe = "ok" }
+email_from = "gofer@example.test"
+email_to = ["ops@example.test"]
+smtp_host = "smtp.example.test"
+smtp_username = "smtp-user"
+smtp_password = "smtp-secret"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+    workflow = payload["workflows"][0]
+    node = workflow["nodes"][0]
+    operation = node["operation"]
+
+    serialized = json.dumps(workflow)
+    assert "secret-token" not in serialized
+    assert "header-secret" not in serialized
+    assert "payload-secret" not in serialized
+    assert "smtp-user" not in serialized
+    assert "smtp-secret" not in serialized
+    assert operation["webhook_url"] == "***"
+    assert operation["headers"]["Authorization"] == "***"
+    assert operation["payload"]["password"] == "***"
+    assert operation["payload"]["safe"] == "ok"
+    assert operation["smtp_username"] == "***"
+    assert operation["smtp_password"] == "***"
+
+    update_workflow_payload("notify-ui", workflow, tmp_path)
+
+    stored = workflow_path.read_text(encoding="utf-8")
+    assert "secret-token" in stored
+    assert "header-secret" in stored
+    assert "payload-secret" in stored
+    assert "smtp-user" in stored
+    assert "smtp-secret" in stored
+
+
 def test_http_workflow_payload_preserves_masked_url_query_secrets_on_save(
     tmp_path: Path,
 ) -> None:
@@ -292,6 +348,141 @@ working_dir = "."
     assert workflow["name"] == "Empty With Agent"
     assert workflow["nodes"] == []
     assert workflow["edges"] == []
+
+
+def test_list_workflow_payloads_uses_index_for_large_cached_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for index in range(150):
+        (tmp_path / f"flow-{index:03d}.toml").write_text(
+            f"""
+[workflow]
+id = "flow-{index:03d}"
+name = "Flow {index:03d}"
+""".strip(),
+            encoding="utf-8",
+        )
+
+    first = list_workflow_payloads(tmp_path)
+    assert len(first["workflows"]) == 150
+
+    def fail_parse(path: Path) -> object:
+        raise AssertionError(f"uncached workflow parse for {path.name}")
+
+    monkeypatch.setattr(api_module.AgenticWorkflow, "from_file", fail_parse)
+
+    second = list_workflow_payloads(tmp_path)
+
+    assert len(second["workflows"]) == 150
+    assert second["workflows"][0]["id"] == "flow-000"
+
+
+def test_cached_workflow_payloads_do_not_scan_run_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_workflow_payload("Indexed Runs", tmp_path)
+    log_dir = tmp_path / "logs" / "indexed-runs"
+    log_dir.mkdir(parents=True)
+    for index in range(25):
+        (log_dir / f"2026-06-13T10-{index:02d}-00-0400.log").write_text(
+            "2026-06-13T10:00:00-04:00 - indexed-runs started successfully\n"
+            "2026-06-13T10:00:01-04:00 - INFO - indexed-runs completed successfully\n",
+            encoding="utf-8",
+        )
+    list_workflow_run_logs_payload("indexed-runs", tmp_path)
+
+    def fail_log_sort(log_dir: Path, *, reverse: bool) -> list[Path]:
+        raise AssertionError(f"workflow list scanned logs in {log_dir}")
+
+    def fail_parse(path: Path) -> object:
+        raise AssertionError(f"uncached workflow parse for {path.name}")
+
+    monkeypatch.setattr(api_module, "_sorted_run_log_paths", fail_log_sort)
+    monkeypatch.setattr(api_module.AgenticWorkflow, "from_file", fail_parse)
+
+    payload = list_workflow_payloads(tmp_path)
+
+    assert payload["workflows"][0]["status"] == "Success"
+
+
+def test_rebuilt_workflow_payload_uses_run_index_for_latest_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_workflow_payload("Indexed Status", tmp_path)
+    log_dir = tmp_path / "logs" / "indexed-status"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text(
+        "2026-06-13T10:00:00-04:00 - indexed-status started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - indexed-status completed successfully\n",
+        encoding="utf-8",
+    )
+    list_workflow_run_logs_payload("indexed-status", tmp_path, status="success")
+    (tmp_path / "indexes" / "workflows.json").unlink()
+
+    def fail_log_sort(log_dir: Path, *, reverse: bool) -> list[Path]:
+        raise AssertionError(f"workflow summary scanned logs in {log_dir}")
+
+    monkeypatch.setattr(api_module, "_sorted_run_log_paths", fail_log_sort)
+
+    payload = list_workflow_payloads(tmp_path)
+
+    assert payload["workflows"][0]["status"] == "Success"
+
+
+def test_latest_workflow_log_payload_uses_index_without_scanning_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    create_workflow_payload("Indexed Latest", tmp_path)
+    log_dir = tmp_path / "logs" / "indexed-latest"
+    log_dir.mkdir(parents=True)
+    latest = log_dir / "2026-06-13T10-00-00-0400.log"
+    old = log_dir / "2026-06-13T11-00-00-0400.log"
+    latest.write_text(
+        "2026-06-13T10:00:00-04:00 - indexed-latest started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - indexed-latest completed successfully newest-mtime\n",
+        encoding="utf-8",
+    )
+    old.write_text(
+        "2026-06-13T11:00:00-04:00 - indexed-latest started successfully\n"
+        "2026-06-13T11:00:01-04:00 - INFO - indexed-latest completed successfully\n",
+        encoding="utf-8",
+    )
+    os.utime(old, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(latest, ns=(2_000_000_000, 2_000_000_000))
+    list_workflow_run_logs_payload("indexed-latest", tmp_path, status="success")
+
+    def fail_log_sort(log_dir: Path, *, reverse: bool) -> list[Path]:
+        raise AssertionError(f"latest scanned logs in {log_dir}")
+
+    monkeypatch.setattr(api_module, "_sorted_run_log_paths", fail_log_sort)
+
+    payload = latest_workflow_log_payload("indexed-latest", tmp_path)
+
+    assert payload["logPath"] == f"logs/indexed-latest/{latest.name}"
+    assert "newest-mtime" in payload["logText"]
+
+
+def test_workflow_index_corruption_falls_back_to_rescan(tmp_path: Path) -> None:
+    (tmp_path / "rescan.toml").write_text(
+        """
+[workflow]
+id = "rescan"
+name = "Rescan"
+""".strip(),
+        encoding="utf-8",
+    )
+    index_dir = tmp_path / "indexes"
+    index_dir.mkdir()
+    (index_dir / "workflows.json").write_text("{not json", encoding="utf-8")
+
+    payload = list_workflow_payloads(tmp_path)
+
+    assert payload["workflows"][0]["id"] == "rescan"
 
 
 def test_list_workflow_payloads_reports_prompt_agent_ids(tmp_path: Path) -> None:
@@ -615,6 +806,41 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
     assert 'summary = "collect.text"' in text
 
 
+def test_update_workflow_payload_records_chat_patch_revision_metadata(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Chat Patch", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "patched",
+            "label": "Patched",
+            "type": "bash_command",
+            "operation": {"type": "bash_command", "command": "echo patched"},
+        }
+    ]
+    workflow["auditMetadata"] = {
+        "source": "chat_patch",
+        "patchTitle": "Patch from chat",
+        "appliedHunkIds": ["hunk-1"],
+        "prompt": "Add a patch",
+        "response": "Structured patch response",
+        "threadId": "thread-1",
+        "messageId": "message-1",
+        "ignored": "not persisted",
+    }
+
+    update_workflow_payload("chat-patch", workflow, tmp_path)
+
+    revision_dir = tmp_path / "workflow-revisions" / "chat-patch"
+    revisions = sorted(revision_dir.glob("*.json"))
+    latest = json.loads(revisions[-1].read_text(encoding="utf-8"))
+    assert latest["source"] == "chat_patch"
+    assert latest["metadata"]["patchTitle"] == "Patch from chat"
+    assert latest["metadata"]["appliedHunkIds"] == ["hunk-1"]
+    assert latest["metadata"]["prompt"] == "Add a patch"
+    assert latest["metadata"]["response"] == "Structured patch response"
+    assert latest["metadata"]["threadId"] == "thread-1"
+    assert "ignored" not in latest["metadata"]
+
+
 def test_update_workflow_payload_persists_ui_node_positions(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Positions", tmp_path)
     workflow["nodes"] = [
@@ -697,8 +923,41 @@ overwrite = true
     plan = workflow_plan_payload("preview", tmp_path)
 
     assert plan["workflowId"] == "preview"
+    assert plan["startNodes"] == ["write"]
+    assert plan["validation"]["ok"] is True
+    assert plan["resourceLimits"]["max_fanout_items"] == 1000
     assert plan["generations"][0]["nodes"][0]["type"] == "write_file"
     assert f"overwrite file: {tmp_path / 'out.txt'}" in plan["destructiveActions"]
+
+
+def test_workflow_plan_payload_returns_validation_errors_without_running(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "invalid-preview.toml").write_text(
+        """
+[workflow]
+id = "invalid-preview"
+name = "Invalid Preview"
+
+[[nodes]]
+id = "first"
+type = "start"
+
+[[nodes]]
+id = "second"
+type = "start"
+""".strip()
+    )
+
+    plan = workflow_plan_payload("invalid-preview", tmp_path)
+
+    assert plan["workflowId"] == "invalid-preview"
+    assert plan["validation"]["ok"] is False
+    assert "Workflow can only contain one START node" in plan["validation"]["errors"][0]["message"]
+    assert [node["id"] for node in plan["generations"][0]["nodes"]] == [
+        "first",
+        "second",
+    ]
 
 
 def test_workflow_plan_payload_uses_workflow_relative_agent_extra_paths(
@@ -726,9 +985,7 @@ working_dir = "."
 
     plan = workflow_plan_payload("relative-agent-paths", tmp_path)
 
-    assert plan["providerRequirements"][0]["extraPaths"] == [
-        str((tmp_path / "shared").resolve())
-    ]
+    assert plan["providerRequirements"][0]["extraPaths"] == [str((tmp_path / "shared").resolve())]
 
 
 def test_update_workflow_payload_allows_empty_agent_prompt_path(tmp_path: Path) -> None:
@@ -860,6 +1117,81 @@ def test_run_workflow_payload_supports_dry_run(tmp_path: Path) -> None:
     assert "unknown shell command effects: echo hello" in plan["destructiveActions"]
     assert plan["triggerContext"]["provided"]["event"]["kind"] == "manual"
     assert not (tmp_path / "logs" / "runnable").exists()
+
+
+def test_run_workflow_dry_run_returns_plan_with_validation_errors(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "invalid-dry-run.toml").write_text(
+        """
+[workflow]
+id = "invalid-dry-run"
+name = "Invalid Dry Run"
+
+[[nodes]]
+id = "first"
+type = "start"
+
+[[nodes]]
+id = "second"
+type = "start"
+""".strip()
+    )
+
+    plan = anyio.run(run_workflow_payload, "invalid-dry-run", tmp_path, True)
+
+    assert plan["validation"]["ok"] is False
+    assert "Workflow can only contain one START node" in plan["validation"]["errors"][0]["message"]
+
+
+def test_run_workflow_blocks_execution_with_validation_errors(tmp_path: Path) -> None:
+    (tmp_path / "invalid-run.toml").write_text(
+        """
+[workflow]
+id = "invalid-run"
+name = "Invalid Run"
+
+[[nodes]]
+id = "first"
+type = "start"
+
+[[nodes]]
+id = "second"
+type = "start"
+""".strip()
+    )
+
+    with pytest.raises(WorkflowRunError, match="Workflow can only contain one START node"):
+        anyio.run(run_workflow_payload, "invalid-run", tmp_path, False)
+
+
+def test_run_workflow_payload_fails_before_execution_for_missing_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GOFER_SECRET_API_TOKEN", raising=False)
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    workflow = create_workflow_payload("Secret Runnable", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "secret",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo should-not-run",
+                "env": {"TOKEN": "{{secret.API_TOKEN}}"},
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("secret-runnable", workflow, tmp_path)
+
+    with pytest.raises(WorkflowRunError, match="Missing required secret"):
+        anyio.run(run_workflow_payload, "secret-runnable", tmp_path, False)
+
+    log_dir = tmp_path / "logs" / "secret-runnable"
+    if log_dir.exists():
+        assert not list(log_dir.glob("*.log"))
 
 
 def test_run_workflow_payload_includes_external_agent_access_warnings(
@@ -1153,8 +1485,7 @@ def test_run_workflow_payload_bounds_aggregate_node_output_text(tmp_path: Path) 
     run = anyio.run(run_workflow_payload, "bounded-response", tmp_path, False)
 
     output_bytes = sum(
-        byte_len(node["output"])
-        + sum(byte_len(fan["output"]) for fan in node["fanOutputs"])
+        byte_len(node["output"]) + sum(byte_len(fan["output"]) for fan in node["fanOutputs"])
         for node in run["nodeOutputs"].values()
     )
     assert run["success"] is True
@@ -1184,9 +1515,7 @@ def test_stop_workflow_run_payload_disables_run_continuously(tmp_path: Path) -> 
 
     assert result["stopped"] is True
     assert reloaded["runContinuously"] is False
-    assert "run_continuously" not in (tmp_path / "continuous-stop.toml").read_text(
-        encoding="utf-8"
-    )
+    assert "run_continuously" not in (tmp_path / "continuous-stop.toml").read_text(encoding="utf-8")
 
 
 def test_stop_workflow_run_payload_stops_specific_running_log(tmp_path: Path) -> None:
@@ -1581,8 +1910,7 @@ def test_list_workflow_run_logs_payload_reads_trigger_from_bounded_head(
     log_dir.mkdir(parents=True)
     run = log_dir / "2026-06-13T10-00-00-0400.log"
     run.write_text(
-        "2026-06-13T10:00:00-04:00 - INFO - trigger=schedule=nightly\n"
-        + ("x" * 200_000),
+        "2026-06-13T10:00:00-04:00 - INFO - trigger=schedule=nightly\n" + ("x" * 200_000),
         encoding="utf-8",
     )
 
@@ -1659,6 +1987,163 @@ def test_list_workflow_run_logs_payload_uses_summary_sidecar_for_cheap_page(
     assert payload["runs"][0]["id"] == run.name
     assert payload["runs"][0]["nodeCount"] == 2
     assert payload["runs"][0]["status"] == "success"
+
+
+def test_list_workflow_run_logs_payload_uses_index_for_large_cached_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    for index in range(1000):
+        run = log_dir / f"2026-06-13T10-{index // 60:02d}-{index % 60:02d}-0400.log"
+        run.write_text(
+            f"2026-06-13T10:{index // 60:02d}:{index % 60:02d}-04:00 - "
+            "history-flow started successfully\n"
+            f"2026-06-13T10:{index // 60:02d}:{index % 60:02d}-04:00 - "
+            "INFO - history-flow completed successfully\n",
+            encoding="utf-8",
+        )
+
+    first = list_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        limit=5,
+        status="success",
+    )
+    assert len(first["runs"]) == 5
+
+    def fail_bounded_status(path: Path, max_bytes: int = 64 * 1024) -> str:
+        raise AssertionError(f"uncached status read for {path.name}")
+
+    def fail_log_sort(log_dir: Path, *, reverse: bool) -> list[Path]:
+        raise AssertionError(f"cached history scanned logs in {log_dir}")
+
+    monkeypatch.setattr(api_module, "_log_status_bounded", fail_bounded_status)
+    monkeypatch.setattr(api_module, "_sorted_run_log_paths", fail_log_sort)
+
+    second = list_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        limit=5,
+        status="success",
+    )
+
+    assert len(second["runs"]) == 5
+    assert second["pagination"]["total"] == 1000
+
+    unfiltered = list_workflow_run_logs_payload("history-flow", tmp_path, limit=5)
+
+    assert len(unfiltered["runs"]) == 5
+    assert unfiltered["pagination"]["total"] == 1000
+
+
+def test_paginated_run_history_does_not_prune_index_entries(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    for index in range(5):
+        run = log_dir / f"2026-06-13T1{index}-00-00-0400.log"
+        run.write_text(
+            f"2026-06-13T1{index}:00:00-04:00 - history-flow started successfully\n"
+            f"2026-06-13T1{index}:00:01-04:00 - INFO - history-flow completed successfully\n",
+            encoding="utf-8",
+        )
+
+    indexed = list_workflow_run_logs_payload("history-flow", tmp_path, status="success")
+    assert indexed["pagination"]["total"] == 5
+
+    index_path = tmp_path / "indexes" / "runs-history-flow.json"
+    assert len(json.loads(index_path.read_text(encoding="utf-8"))["runs"]) == 5
+
+    first_page = list_workflow_run_logs_payload("history-flow", tmp_path, limit=2)
+    assert [run["id"] for run in first_page["runs"]] == [
+        "2026-06-13T14-00-00-0400.log",
+        "2026-06-13T13-00-00-0400.log",
+    ]
+    assert len(json.loads(index_path.read_text(encoding="utf-8"))["runs"]) == 5
+
+    older_page = list_workflow_run_logs_payload("history-flow", tmp_path, offset=4, limit=1)
+    assert [run["id"] for run in older_page["runs"]] == ["2026-06-13T10-00-00-0400.log"]
+    assert len(json.loads(index_path.read_text(encoding="utf-8"))["runs"]) == 5
+
+
+def test_run_index_corruption_falls_back_to_rescan(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2026-06-13T10-00-00-0400.log"
+    run.write_text(
+        "2026-06-13T10:00:00-04:00 - history-flow started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    index_dir = tmp_path / "indexes"
+    index_dir.mkdir()
+    (index_dir / "runs-history-flow.json").write_text("{not json", encoding="utf-8")
+
+    payload = list_workflow_run_logs_payload("history-flow", tmp_path)
+
+    assert payload["runs"][0]["id"] == run.name
+    assert payload["runs"][0]["status"] == "success"
+
+
+def test_run_log_search_is_bounded_by_resource_limits(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Search Bound", tmp_path)
+    workflow["resourceLimits"] = ResourceLimits(max_api_log_response_bytes=20).model_dump()
+    update_workflow_payload("search-bound", workflow, tmp_path)
+    log_dir = tmp_path / "logs" / "search-bound"
+    log_dir.mkdir(parents=True)
+    first = log_dir / "2026-06-13T10-00-00-0400.log"
+    second = log_dir / "2026-06-13T11-00-00-0400.log"
+    first.write_text("a" * 100 + "needle\n", encoding="utf-8")
+    second.write_text("b" * 100 + "needle\n", encoding="utf-8")
+
+    payload = list_workflow_run_logs_payload("search-bound", tmp_path, search="needle")
+
+    assert payload["runs"] == []
+    assert payload["pagination"]["searchTruncated"] is True
+    assert payload["pagination"]["searchScannedBytes"] == 20
+
+
+def test_prune_workflow_run_logs_payload_updates_run_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    log_dir = tmp_path / "logs" / "history-flow"
+    log_dir.mkdir(parents=True)
+    old = log_dir / "2020-01-01T10-00-00-0000.log"
+    old.write_text(
+        "2020-01-01T10:00:00+00:00 - history-flow started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - history-flow completed successfully\n",
+        encoding="utf-8",
+    )
+    sidecars = [
+        old.with_suffix(".events.json"),
+        old.with_suffix(".outputs.json"),
+        old.with_suffix(".summary.json"),
+        old.with_suffix(".trigger.json"),
+        old.with_suffix(".resume.json"),
+    ]
+    for sidecar in sidecars:
+        sidecar.write_text("{}", encoding="utf-8")
+    list_workflow_run_logs_payload("history-flow", tmp_path, status="success")
+
+    def fail_log_sort(log_dir: Path, *, reverse: bool) -> list[Path]:
+        raise AssertionError(f"prune scanned logs in {log_dir}")
+
+    monkeypatch.setattr(api_module, "_sorted_run_log_paths", fail_log_sort)
+
+    prune_workflow_run_logs_payload(
+        "history-flow",
+        tmp_path,
+        keep_last=0,
+        keep_days=0,
+        dry_run=False,
+    )
+
+    index = json.loads((tmp_path / "indexes" / "runs-history-flow.json").read_text())
+    assert old.name not in index["runs"]
+    assert not old.exists()
+    assert all(not sidecar.exists() for sidecar in sidecars)
 
 
 def test_retention_settings_persist_and_prune_uses_saved_defaults(tmp_path: Path) -> None:
@@ -1819,6 +2304,7 @@ def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:
         "2026-06-13T10:00:00-04:00 - status-flow started successfully\n"
         "2026-06-13T10:00:00-04:00 - INFO - dry_run=False\n"
     )
+    list_workflow_run_logs_payload("status-flow", tmp_path)
 
     assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Running"
 
@@ -1832,7 +2318,7 @@ def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:
 
     assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Error"
 
-    stopped_log = log_dir / "2026-06-13T10-00-02-0400.log"
+    stopped_log = log_dir / "2099-06-13T10-00-02-0400.log"
     stopped_log.write_text(
         "2026-06-13T10:00:02-04:00 - status-flow started successfully\n"
         "2026-06-13T10:00:02-04:00 - WARNING - status-flow stopped by user\n"
@@ -1840,8 +2326,80 @@ def test_list_workflow_payloads_uses_latest_run_status(tmp_path: Path) -> None:
     stopped_log.with_suffix(".events.json").write_text(
         json.dumps({"events": [{"nodeId": "workflow", "status": "stopped"}], "nodes": {}})
     )
+    list_workflow_run_logs_payload("status-flow", tmp_path)
 
     assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Stopped"
+
+
+def test_list_workflow_payloads_rescans_stale_cached_latest_run(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Indexed Status", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo hello",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("indexed-status", workflow, tmp_path)
+
+    log_dir = tmp_path / "logs" / "indexed-status"
+    log_dir.mkdir(parents=True)
+    latest = log_dir / "2026-06-13T10-00-00-0400.log"
+    latest.write_text(
+        "2026-06-13T10:00:00-04:00 - indexed-status started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - indexed-status completed successfully\n",
+        encoding="utf-8",
+    )
+    list_workflow_run_logs_payload("indexed-status", tmp_path)
+
+    assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Success"
+
+    latest.unlink()
+
+    assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Ready"
+
+
+def test_workflow_upsert_preserves_latest_run_validation_metadata(tmp_path: Path) -> None:
+    workflow = create_workflow_payload("Edited Indexed Status", tmp_path)
+    workflow["nodes"] = [
+        {
+            "id": "hello",
+            "type": "bash_command",
+            "operation": {
+                "type": "bash_command",
+                "command": "echo hello",
+            },
+            "settings": {},
+        }
+    ]
+    update_workflow_payload("edited-indexed-status", workflow, tmp_path)
+
+    log_dir = tmp_path / "logs" / "edited-indexed-status"
+    log_dir.mkdir(parents=True)
+    latest = log_dir / "2026-06-13T10-00-00-0400.log"
+    latest.write_text(
+        "2026-06-13T10:00:00-04:00 - edited-indexed-status started successfully\n"
+        "2026-06-13T10:00:01-04:00 - INFO - edited-indexed-status completed successfully\n",
+        encoding="utf-8",
+    )
+    list_workflow_run_logs_payload("edited-indexed-status", tmp_path)
+
+    assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Success"
+
+    workflow["description"] = "Edited after a successful run"
+    update_workflow_payload("edited-indexed-status", workflow, tmp_path)
+
+    workflow_index = json.loads((tmp_path / "indexes" / "workflows.json").read_text())
+    latest_run = workflow_index["workflows"]["edited-indexed-status.toml"]["latestRun"]
+    assert latest_run["id"] == latest.name
+
+    latest.unlink()
+
+    assert list_workflow_payloads(tmp_path)["workflows"][0]["status"] == "Ready"
 
 
 def test_workflow_approval_payloads_list_and_decide_requests(tmp_path: Path) -> None:
@@ -2111,9 +2669,7 @@ condition = "on_failure"
             workflow_path=str(workflow_path),
             log_path=str(log_path),
             checkpoint_path=str(checkpoint_path),
-            requested_at=(datetime.now(UTC) - timedelta(seconds=5)).isoformat(
-                timespec="seconds"
-            ),
+            requested_at=(datetime.now(UTC) - timedelta(seconds=5)).isoformat(timespec="seconds"),
         )
     )
 

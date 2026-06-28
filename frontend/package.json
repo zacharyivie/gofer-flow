@@ -17,6 +17,7 @@
     "build": "vite build",
     "check:build": "vite build",
     "test": "node --test src/pages/App.test.mjs",
+    "test:browser": "npm run build && node ./browser-tests/run-studio-browser.cjs",
     "dist": "npm run backend:build && npm run build && electron-builder",
     "dist:linux": "npm run backend:build && npm run build && electron-builder --linux AppImage deb rpm",
     "dist:appimage": "npm run backend:build && npm run build && electron-builder --linux AppImage",

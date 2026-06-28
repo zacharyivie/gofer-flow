@@ -25,6 +25,31 @@ from gofer.core.bundles import (
     import_workflow_bundle,
     preview_workflow_bundle,
 )
+from gofer.core.dashboards import (
+    DashboardComponentType,
+    DashboardError,
+    add_component,
+    add_item,
+    add_section,
+    create_dashboard,
+    delete_component,
+    delete_dashboard,
+    delete_item,
+    delete_section,
+    duplicate_dashboard,
+    list_dashboards,
+    list_items,
+    load_dashboard,
+    move_item,
+    rename_dashboard,
+    set_component_content,
+    set_component_display,
+    set_component_schema,
+    set_component_title,
+    set_component_views,
+    update_item,
+    update_section,
+)
 from gofer.core.executor import (
     ResumeOptions,
     WorkflowExecutor,
@@ -37,12 +62,19 @@ from gofer.core.executor import (
 )
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode
 from gofer.core.health import run_health_checks, workflow_health_diagnostics
-from gofer.core.operations import HttpRequestOperation, Operation, OperationType
+from gofer.core.operations import (
+    HttpRequestOperation,
+    NotificationOperation,
+    Operation,
+    OperationType,
+)
 from gofer.core.planner import build_execution_plan
 from gofer.core.provider_profiles import (
-    ProviderProfile,
     load_provider_profiles,
+    provider_profile_from_ui_payload,
+    provider_profile_ui_payload,
     save_provider_profiles,
+    validate_provider_profile_name,
 )
 from gofer.core.resources import (
     DEFAULT_RESOURCE_LIMITS,
@@ -63,6 +95,7 @@ from gofer.core.runner import (
     RunnerQueueStore,
     workflow_required_capabilities,
 )
+from gofer.core.secrets import workflow_secret_readiness
 from gofer.core.templates import (
     create_workflow_from_template,
     list_workflow_templates,
@@ -79,12 +112,14 @@ from gofer.core.workflow import (
     FilesystemAccessEntry,
     WebhookTriggerConfig,
     WorkflowConfig,
+    WorkflowMetadata,
     masked_workflow_parameters,
     resolve_workflow_parameters,
     validate_workflow_id,
 )
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
+from gofer.subscriptions.direct_api import AnthropicApiSubscription, OpenAiApiSubscription
 from gofer.ui.chat import delete_workflow_chat_prompt, workflow_chat_prompt_path
 from gofer.utils.paths import get_data_dir
 from gofer.utils.run_state import (
@@ -141,10 +176,16 @@ class WorkflowBundleError(ValueError):
     pass
 
 
+class DashboardUiError(ValueError):
+    pass
+
+
 _operation_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 _subscriptions = {
     "claude_code": ClaudeCodeSubscription(),
     "codex": CodexSubscription(),
+    "openai_api": OpenAiApiSubscription(),
+    "anthropic_api": AnthropicApiSubscription(),
 }
 _active_run_stop_events: dict[tuple[str, str], set[threading.Event]] = {}
 _active_run_log_paths: dict[tuple[str, str], dict[threading.Event, Path]] = {}
@@ -157,6 +198,9 @@ RUN_SUMMARY_SUFFIX = ".summary.json"
 RUN_TRIGGER_SUFFIX = ".trigger.json"
 RETENTION_SETTINGS_FILE = "retention.json"
 DEFAULT_RETENTION_SETTINGS = {"keepDays": 14, "keepFailedDays": 30, "keepLast": 100}
+INDEX_VERSION = 1
+WORKFLOW_INDEX_FILE = "workflows.json"
+RUN_INDEX_PREFIX = "runs-"
 
 
 def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
@@ -173,16 +217,37 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
             "promptAgentIds": [],
         }
 
+    workflow_index = _read_workflow_index(base)
+    index_entries = _workflow_index_entries(workflow_index)
+    index_changed = False
     for path in sorted(base.glob("*.toml")):
+        cached = _workflow_index_payload(base, index_entries.get(path.name), path)
+        if cached is not None:
+            workflows.append(cached)
+            continue
         try:
             workflow = AgenticWorkflow.from_file(path)
         except Exception as exc:
             error = {"path": path.name, "message": str(exc)}
             errors.append(error)
-            workflows.append(invalid_workflow_payload(path, str(exc)))
+            payload = invalid_workflow_payload(path, str(exc))
+            workflows.append(payload)
+            index_entries[path.name] = _workflow_index_entry(path, payload)
+            index_changed = True
             continue
 
-        workflows.append(workflow_to_payload(workflow, path))
+        payload = workflow_to_payload(workflow, path)
+        workflows.append(payload)
+        index_entries[path.name] = _workflow_index_entry(path, payload)
+        index_changed = True
+
+    existing_names = {path.name for path in base.glob("*.toml")}
+    stale_names = [name for name in index_entries if name not in existing_names]
+    for name in stale_names:
+        index_entries.pop(name, None)
+        index_changed = True
+    if index_changed:
+        _write_workflow_index(base, index_entries)
 
     return {
         "dataDir": str(base),
@@ -202,11 +267,7 @@ def health_payload(
 
 def provider_profiles_payload(data_dir: Path | None = None) -> dict[str, Any]:
     profiles = load_provider_profiles(_data_dir(data_dir))
-    return {
-        "profiles": [
-            profile.model_dump(mode="json", exclude_none=True) for profile in profiles.values()
-        ]
-    }
+    return {"profiles": [provider_profile_ui_payload(profile) for profile in profiles.values()]}
 
 
 def runner_queue_payload(data_dir: Path | None = None) -> dict[str, Any]:
@@ -216,6 +277,246 @@ def runner_queue_payload(data_dir: Path | None = None) -> dict[str, Any]:
         "runners": [runner.to_payload() for runner in store.list_runners()],
         "runs": [run.to_payload() for run in store.list_runs()],
     }
+
+
+def dashboard_payload(data_dir: Path | None = None) -> dict[str, Any]:
+    try:
+        dashboards = list_dashboards(_data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {
+        "dashboards": [dashboard.model_dump(mode="json", by_alias=True) for dashboard in dashboards]
+    }
+
+
+def create_dashboard_payload(
+    name: str,
+    data_dir: Path | None = None,
+    dashboard_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = create_dashboard(name, _data_dir(data_dir), dashboard_id)
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def update_dashboard_payload(
+    dashboard_id: str,
+    data_dir: Path | None = None,
+    *,
+    name: str | None = None,
+    duplicate: bool = False,
+) -> dict[str, Any]:
+    try:
+        dashboard = (
+            duplicate_dashboard(dashboard_id, _data_dir(data_dir), name)
+            if duplicate
+            else rename_dashboard(dashboard_id, name or "", _data_dir(data_dir))
+        )
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def delete_dashboard_payload(dashboard_id: str, data_dir: Path | None = None) -> dict[str, Any]:
+    try:
+        delete_dashboard(dashboard_id, _data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"deleted": dashboard_id}
+
+
+def add_dashboard_section_payload(
+    dashboard_id: str,
+    title: str,
+    data_dir: Path | None = None,
+    section_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = add_section(dashboard_id, title, _data_dir(data_dir), section_id)
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def update_dashboard_section_payload(
+    dashboard_id: str,
+    section_id: str,
+    data_dir: Path | None = None,
+    *,
+    title: str | None = None,
+    layout: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = update_section(
+            dashboard_id,
+            section_id,
+            _data_dir(data_dir),
+            title=title,
+            layout=layout,
+        )
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def delete_dashboard_section_payload(
+    dashboard_id: str,
+    section_id: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = delete_section(dashboard_id, section_id, _data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def add_dashboard_component_payload(
+    dashboard_id: str,
+    section_id: str,
+    title: str,
+    component_type: DashboardComponentType,
+    data_dir: Path | None = None,
+    component_id: str | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = add_component(
+            dashboard_id,
+            section_id,
+            title,
+            component_type,
+            _data_dir(data_dir),
+            component_id,
+        )
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def delete_dashboard_component_payload(
+    dashboard_id: str,
+    component_id: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        dashboard = delete_component(dashboard_id, component_id, _data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def update_dashboard_component_payload(
+    dashboard_id: str,
+    component_id: str,
+    data_dir: Path | None = None,
+    *,
+    content: str | None = None,
+    display: dict[str, Any] | None = None,
+    schema: dict[str, Any] | None = None,
+    title: str | None = None,
+    views: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    try:
+        if title is not None:
+            dashboard = set_component_title(
+                dashboard_id,
+                component_id,
+                title,
+                _data_dir(data_dir),
+            )
+        elif content is not None:
+            dashboard = set_component_content(
+                dashboard_id,
+                component_id,
+                content,
+                _data_dir(data_dir),
+            )
+        elif schema is not None:
+            dashboard = set_component_schema(
+                dashboard_id,
+                component_id,
+                schema,
+                _data_dir(data_dir),
+            )
+        elif views is not None:
+            dashboard = set_component_views(dashboard_id, component_id, views, _data_dir(data_dir))
+        elif display is not None:
+            dashboard = set_component_display(
+                dashboard_id,
+                component_id,
+                display,
+                _data_dir(data_dir),
+            )
+        else:
+            dashboard = load_dashboard(dashboard_id, _data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
+
+
+def dashboard_items_payload(
+    dashboard_id: str,
+    component_id: str,
+    data_dir: Path | None = None,
+    filter_rule: str | None = None,
+) -> dict[str, Any]:
+    try:
+        items = list_items(dashboard_id, component_id, _data_dir(data_dir), filter_rule)
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"items": items}
+
+
+def mutate_dashboard_item_payload(
+    dashboard_id: str,
+    component_id: str,
+    action: str,
+    body: dict[str, Any],
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    try:
+        if action == "add":
+            item = add_item(
+                dashboard_id,
+                component_id,
+                dict(body.get("item") or {}),
+                _data_dir(data_dir),
+            )
+        elif action == "update":
+            item = update_item(
+                dashboard_id,
+                component_id,
+                str(body.get("itemId") or body.get("id") or ""),
+                dict(body.get("patch") or body.get("item") or {}),
+                _data_dir(data_dir),
+            )
+        elif action == "delete":
+            item = delete_item(
+                dashboard_id,
+                component_id,
+                str(body.get("itemId") or body.get("id") or ""),
+                _data_dir(data_dir),
+            )
+        elif action == "move":
+            item = move_item(
+                dashboard_id,
+                component_id,
+                str(body.get("itemId") or body.get("id") or ""),
+                str(body.get("field") or "status"),
+                body.get("value"),
+                _data_dir(data_dir),
+            )
+        else:
+            raise DashboardUiError(f"Unsupported dashboard item action: {action}")
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    try:
+        dashboard = load_dashboard(dashboard_id, _data_dir(data_dir))
+    except DashboardError as exc:
+        raise DashboardUiError(str(exc)) from exc
+    return {"item": item, "dashboard": dashboard.model_dump(mode="json", by_alias=True)}
 
 
 def queue_workflow_run_payload(
@@ -276,20 +577,26 @@ def upsert_provider_profile_payload(
     payload: dict[str, Any],
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
+    profiles = load_provider_profiles(_data_dir(data_dir))
+    existing_name = payload.get("name")
+    existing = profiles.get(existing_name) if isinstance(existing_name, str) else None
     try:
-        profile = ProviderProfile(**payload)
+        profile = provider_profile_from_ui_payload(payload, existing)
     except ValueError as exc:
         raise ProviderProfileError(str(exc)) from exc
-    profiles = load_provider_profiles(_data_dir(data_dir))
     profiles[profile.name] = profile
     save_provider_profiles(profiles, _data_dir(data_dir))
-    return {"profile": profile.model_dump(mode="json", exclude_none=True)}
+    return {"profile": provider_profile_ui_payload(profile)}
 
 
 def delete_provider_profile_payload(
     name: str,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
+    try:
+        validate_provider_profile_name(name)
+    except ValueError as exc:
+        raise ProviderProfileError(str(exc)) from exc
     profiles = load_provider_profiles(_data_dir(data_dir))
     if name not in profiles:
         raise ProviderProfileError(f"Provider profile '{name}' not found")
@@ -312,6 +619,248 @@ def prompt_agent_ids(data_dir: Path) -> list[str]:
 def _agent_id_sort_key(agent_id: str) -> tuple[int, str]:
     match = re.fullmatch(r"agent-(\d+)", agent_id)
     return (int(match.group(1)) if match else 0, agent_id)
+
+
+def _index_dir(base: Path) -> Path:
+    return _safe_path(base, "indexes", error_cls=WorkflowLogError)
+
+
+def _workflow_index_path(base: Path) -> Path:
+    return _index_dir(base) / WORKFLOW_INDEX_FILE
+
+
+def _run_index_path(base: Path, workflow_id: str) -> Path:
+    safe_id = _validate_storage_workflow_id(workflow_id, WorkflowLogError)
+    return _index_dir(base) / f"{RUN_INDEX_PREFIX}{safe_id}.json"
+
+
+def _read_index_document(path: Path) -> dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("version") != INDEX_VERSION:
+        return {}
+    return payload
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp_path.write_text(
+        json.dumps(payload, default=str, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, path)
+
+
+def _read_workflow_index(base: Path) -> dict[str, Any]:
+    return _read_index_document(_workflow_index_path(base))
+
+
+def _workflow_index_entries(index: dict[str, Any]) -> dict[str, Any]:
+    entries = index.get("workflows")
+    return cast(dict[str, Any], entries) if isinstance(entries, dict) else {}
+
+
+def _write_workflow_index(base: Path, entries: dict[str, Any]) -> None:
+    try:
+        _write_json_atomic(
+            _workflow_index_path(base),
+            {
+                "version": INDEX_VERSION,
+                "updatedAt": datetime.now(UTC).isoformat(),
+                "workflows": entries,
+            },
+        )
+    except OSError:
+        return
+
+
+def _file_index_stat(path: Path) -> dict[str, Any]:
+    stat = path.stat()
+    return {"mtimeNs": stat.st_mtime_ns, "size": stat.st_size}
+
+
+def _index_stat_matches(entry: dict[str, Any], path: Path) -> bool:
+    try:
+        stat = _file_index_stat(path)
+    except OSError:
+        return False
+    return bool(entry.get("mtimeNs") == stat["mtimeNs"] and entry.get("size") == stat["size"])
+
+
+def _workflow_status_from_run_status(status: object) -> str:
+    status_value = str(status or "unknown")
+    if status_value == "success":
+        return "Success"
+    if status_value == "error":
+        return "Error"
+    if status_value == "stopped":
+        return "Stopped"
+    return "Running"
+
+
+def _workflow_payload_with_latest_run(
+    payload: dict[str, Any],
+    latest_run: dict[str, Any] | None,
+) -> dict[str, Any]:
+    updated = dict(payload)
+    updated["status"] = (
+        _workflow_status_from_run_status(latest_run.get("status"))
+        if latest_run is not None
+        else "Ready"
+    )
+    tags = list(updated.get("tags") or [])
+    if tags:
+        tags[0] = str(updated["status"]).lower()
+    else:
+        tags = [str(updated["status"]).lower()]
+    updated["tags"] = tags
+    return updated
+
+
+def _latest_run_index_metadata(log_path: Path, summary: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        return {
+            "id": log_path.name,
+            **_file_index_stat(log_path),
+            "status": summary.get("status"),
+            "startedAt": summary.get("startedAt"),
+            "finishedAt": summary.get("finishedAt"),
+            "triggerType": summary.get("triggerType"),
+        }
+    except OSError:
+        return None
+
+
+def _workflow_index_entry(
+    path: Path,
+    payload: dict[str, Any],
+    latest_run: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        **_file_index_stat(path),
+        "latestRun": latest_run,
+        "payload": _workflow_payload_with_latest_run(payload, latest_run),
+    }
+
+
+def _workflow_index_latest_run_matches(base: Path, entry: dict[str, Any]) -> bool:
+    latest_run = entry.get("latestRun")
+    if latest_run is None:
+        return True
+    if not isinstance(latest_run, dict):
+        return False
+    run_id = latest_run.get("id")
+    payload = entry.get("payload")
+    workflow_id = payload.get("id") if isinstance(payload, dict) else None
+    if not isinstance(run_id, str) or not isinstance(workflow_id, str):
+        return False
+    log_path = base / "logs" / workflow_id / run_id
+    return _index_stat_matches(latest_run, log_path)
+
+
+def _workflow_index_payload(base: Path, entry: Any, path: Path) -> dict[str, Any] | None:
+    if not isinstance(entry, dict) or not _index_stat_matches(entry, path):
+        return None
+    if not _workflow_index_latest_run_matches(base, entry):
+        return None
+    payload = entry.get("payload")
+    return cast(dict[str, Any], payload) if isinstance(payload, dict) else None
+
+
+def _upsert_workflow_index(base: Path, path: Path, payload: dict[str, Any]) -> None:
+    entries = _workflow_index_entries(_read_workflow_index(base))
+    workflow_id = str(payload.get("id") or _slugify(path.stem))
+    existing = entries.get(path.name)
+    latest_run = None
+    if isinstance(existing, dict) and _workflow_index_latest_run_matches(base, existing):
+        existing_latest_run = existing.get("latestRun")
+        if isinstance(existing_latest_run, dict):
+            latest_run = existing_latest_run
+    if latest_run is None:
+        latest_run = _latest_run_metadata_from_index_entries(
+            base,
+            workflow_id,
+            _run_index_entries(_read_run_index(base, workflow_id)),
+        )
+    try:
+        entries[path.name] = _workflow_index_entry(path, payload, latest_run)
+    except OSError:
+        return
+    _write_workflow_index(base, entries)
+
+
+def _remove_workflow_index_entry(base: Path, workflow_id: str) -> None:
+    entries = _workflow_index_entries(_read_workflow_index(base))
+    if entries.pop(f"{workflow_id}.toml", None) is not None:
+        _write_workflow_index(base, entries)
+
+
+def _workflow_index_key_for_id(entries: dict[str, Any], workflow_id: str) -> str | None:
+    direct = f"{workflow_id}.toml"
+    if direct in entries:
+        return direct
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        payload = entry.get("payload")
+        if isinstance(payload, dict) and payload.get("id") == workflow_id:
+            return key
+    return None
+
+
+def _sync_workflow_index_latest_run(
+    base: Path,
+    workflow_id: str,
+    latest_run: dict[str, Any] | None,
+) -> None:
+    entries = _workflow_index_entries(_read_workflow_index(base))
+    key = _workflow_index_key_for_id(entries, workflow_id)
+    if key is None:
+        return
+    entry = entries.get(key)
+    if not isinstance(entry, dict):
+        return
+    payload = entry.get("payload")
+    if not isinstance(payload, dict):
+        return
+    entry["latestRun"] = latest_run
+    entry["payload"] = _workflow_payload_with_latest_run(payload, latest_run)
+    _write_workflow_index(base, entries)
+
+
+def _latest_run_metadata_from_index_entries(
+    base: Path,
+    workflow_id: str,
+    entries: dict[str, Any],
+) -> dict[str, Any] | None:
+    latest_name = None
+    latest_key: tuple[int, str] | None = None
+    for name, entry in entries.items():
+        if not isinstance(name, str) or not isinstance(entry, dict):
+            continue
+        log_path = base / "logs" / workflow_id / name
+        if not RUN_ID_PATTERN.fullmatch(name) or not _index_stat_matches(entry, log_path):
+            continue
+        mtime_ns = entry.get("mtimeNs")
+        if not isinstance(mtime_ns, int):
+            continue
+        key = (mtime_ns, name)
+        if latest_key is None or key > latest_key:
+            latest_name = name
+            latest_key = key
+    if latest_name is None:
+        return None
+    entry = entries.get(latest_name)
+    if not isinstance(entry, dict):
+        return None
+    summary = entry.get("summary")
+    if not isinstance(summary, dict):
+        return None
+    log_path = base / "logs" / workflow_id / latest_name
+    return _latest_run_index_metadata(log_path, summary)
 
 
 def invalid_workflow_payload(path: Path, message: str) -> dict[str, Any]:
@@ -373,7 +922,9 @@ def create_workflow_payload(
         except ValueError as exc:
             raise WorkflowCreateError(str(exc)) from exc
         capture_workflow_revision(result.path, base, source="template", author="ui")
-        return workflow_to_payload(result.workflow, result.path)
+        payload = workflow_to_payload(result.workflow, result.path)
+        _upsert_workflow_index(base, result.path, payload)
+        return payload
 
     workflow_id = _slugify(workflow_name)
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowCreateError)
@@ -383,7 +934,9 @@ def create_workflow_payload(
     workflow = AgenticWorkflow(WorkflowConfig(id=workflow_id, name=workflow_name))
     workflow.to_file(path)
     capture_workflow_revision(path, base, source="create", author="ui")
-    return workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path)
+    _upsert_workflow_index(base, path, payload)
+    return payload
 
 
 def import_workflow_payload(content: str, data_dir: Path | None = None) -> dict[str, Any]:
@@ -407,7 +960,9 @@ def import_workflow_payload(content: str, data_dir: Path | None = None) -> dict[
     except Exception as exc:
         raise WorkflowCreateError(str(exc)) from exc
 
-    return workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path)
+    _upsert_workflow_index(base, path, payload)
+    return payload
 
 
 def export_workflow_bundle_payload(
@@ -432,9 +987,15 @@ def export_workflow_bundle_payload(
 def preview_workflow_bundle_payload(
     bundle_path: Path,
     data_dir: Path | None = None,
+    *,
+    resource_limits: ResourceLimits | None = None,
 ) -> dict[str, Any]:
     try:
-        return preview_workflow_bundle(bundle_path, data_dir=_data_dir(data_dir)).to_dict()
+        return preview_workflow_bundle(
+            bundle_path,
+            data_dir=_data_dir(data_dir),
+            limits=resource_limits,
+        ).to_dict()
     except BundleError as exc:
         raise WorkflowBundleError(str(exc)) from exc
 
@@ -445,6 +1006,7 @@ def import_workflow_bundle_payload(
     *,
     replace: bool = False,
     dry_run: bool = False,
+    resource_limits: ResourceLimits | None = None,
 ) -> dict[str, Any]:
     try:
         plan = import_workflow_bundle(
@@ -452,6 +1014,7 @@ def import_workflow_bundle_payload(
             data_dir=_data_dir(data_dir),
             replace=replace,
             dry_run=dry_run,
+            limits=resource_limits,
         )
     except BundleError as exc:
         raise WorkflowBundleError(str(exc)) from exc
@@ -462,6 +1025,15 @@ def import_workflow_bundle_payload(
             source="import",
             author="ui",
         )
+        try:
+            workflow = AgenticWorkflow.from_file(plan.workflow_path)
+            _upsert_workflow_index(
+                _data_dir(data_dir),
+                plan.workflow_path,
+                workflow_to_payload(workflow, plan.workflow_path),
+            )
+        except Exception:
+            pass
     return plan.to_dict()
 
 
@@ -475,6 +1047,10 @@ def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> d
         _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowUpdateError),
         ignore_errors=True,
     )
+    try:
+        _run_index_path(base, workflow_id).unlink()
+    except FileNotFoundError:
+        pass
     shutil.rmtree(
         _workflow_storage_dir(
             base,
@@ -485,6 +1061,7 @@ def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> d
         ignore_errors=True,
     )
     delete_workflow_chat_prompt(base, workflow_id)
+    _remove_workflow_index_entry(base, workflow_id)
     return {"workflowId": workflow_id, "deleted": True}
 
 
@@ -505,7 +1082,9 @@ def rename_workflow_payload(
     workflow = AgenticWorkflow.from_file(path)
     workflow.config.name = workflow_name
     workflow.to_file(path)
-    return workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path)
+    _upsert_workflow_index(base, path, payload)
+    return payload
 
 
 def _next_duplicate_name(original_name: str, base: Path) -> tuple[str, str]:
@@ -580,7 +1159,9 @@ def duplicate_workflow_payload(
     _copy_workflow_toml_with_identity(path, target_path, candidate_id, candidate_name)
     duplicated = AgenticWorkflow.from_file(target_path)
     capture_workflow_revision(target_path, base, source="duplicate", author="ui")
-    return workflow_to_payload(duplicated, target_path)
+    payload = workflow_to_payload(duplicated, target_path)
+    _upsert_workflow_index(base, target_path, payload)
+    return payload
 
 
 def delete_workflow_chat_payload(
@@ -609,18 +1190,53 @@ def update_workflow_payload(
         raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
 
     try:
+        audit_metadata = _workflow_audit_metadata(payload.pop("auditMetadata", None))
         workflow = AgenticWorkflow.from_file(path)
         payload = _restore_masked_http_secrets(payload, workflow)
+        payload = _restore_masked_notification_secrets(payload, workflow)
         payload = _restore_masked_webhook_secrets(payload, workflow)
         workflow = workflow_from_payload(payload)
         workflow.validate(path, base)
         workflow.to_file(path)
         _write_ui_node_positions(path, _ui_node_positions_from_payload(payload))
-        capture_workflow_revision(path, base, source="autosave", author="ui")
+        capture_workflow_revision(
+            path,
+            base,
+            source="chat_patch" if audit_metadata else "autosave",
+            author="ui",
+            metadata=audit_metadata,
+        )
     except Exception as exc:
         raise WorkflowUpdateError(str(exc)) from exc
 
-    return workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path)
+    _upsert_workflow_index(base, path, payload)
+    return payload
+
+
+def _workflow_audit_metadata(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    allowed_keys = {
+        "appliedHunkIds",
+        "messageId",
+        "patchTitle",
+        "prompt",
+        "response",
+        "source",
+        "threadId",
+        "threadTitle",
+    }
+    metadata: dict[str, Any] = {}
+    for key in allowed_keys:
+        if key not in value:
+            continue
+        item = value[key]
+        if isinstance(item, list):
+            metadata[key] = [str(part)[:256] for part in item[:50]]
+        elif item is not None:
+            metadata[key] = str(item)[:4000]
+    return metadata or None
 
 
 def list_workflow_history_payload(
@@ -743,11 +1359,6 @@ async def run_workflow_payload(
 
     try:
         workflow = AgenticWorkflow.from_file(path)
-        validation = validate_workflow(workflow, workflow_path=path, data_dir=base)
-        if not validation.ok:
-            messages = "; ".join(item.message for item in validation.errors)
-            raise WorkflowRunError(f"Workflow validation failed: {messages}")
-        workflow.validate(path, base)
     except Exception as exc:
         raise WorkflowRunError(str(exc)) from exc
     resource_warnings = workflow.resource_warnings(path.parent)
@@ -765,6 +1376,15 @@ async def run_workflow_payload(
         )
         plan["parameters"] = masked_workflow_parameters(workflow.config, run_parameters)
         return plan
+
+    try:
+        validation = validate_workflow(workflow, workflow_path=path, data_dir=base)
+        if not validation.ok:
+            messages = "; ".join(item.message for item in validation.errors)
+            raise WorkflowRunError(f"Workflow validation failed: {messages}")
+        workflow.validate(path, base)
+    except Exception as exc:
+        raise WorkflowRunError(str(exc)) from exc
 
     run_key = _run_key(base, workflow_id)
     cancel_event = threading.Event()
@@ -898,9 +1518,7 @@ async def trigger_workflow_payload(
         )
     if not trigger_config.enabled:
         raise WorkflowTriggerError(f"Webhook trigger '{trigger_id}' is disabled")
-    expected_token = _webhook_expected_token(trigger_config.token, trigger_config.token_env)
-    if expected_token is not None and not hmac.compare_digest(token or "", expected_token):
-        raise WorkflowTriggerError("Unauthorized webhook trigger request")
+    _authorize_webhook_trigger(trigger_config, token)
     if trigger_config.concurrency_policy == "reject_if_running":
         active_run_ids = _active_run_ids(workflow_id, base)
         if active_run_ids:
@@ -912,6 +1530,8 @@ async def trigger_workflow_payload(
         headers=headers or {},
         source=source or trigger_config.source,
         fanout_path=trigger_config.fanout_path,
+        sensitive_payload_fields=set(trigger_config.sensitive_payload_fields),
+        store_raw_payload=trigger_config.store_raw_payload,
     )
     run = await run_workflow_payload(
         workflow_id,
@@ -938,10 +1558,20 @@ async def trigger_workflow_payload(
         "receivedAt": trigger_context["receivedAt"],
         "source": trigger_context["source"],
         "headers": trigger_context["headers"],
-        "payload": payload,
+        "payload": trigger_context["payload"]
+        if trigger_config.store_raw_payload
+        else trigger_context["sanitizedPayload"],
+        "payloadSanitized": not trigger_config.store_raw_payload,
+        "replayNotice": (
+            "Webhook payload was sanitized before replay storage; sensitive fields are "
+            "masked and replay will use the masked values."
+            if not trigger_config.store_raw_payload
+            else "Raw webhook payload retention is enabled for exact replay."
+        ),
     }
     if log_path is not None:
         _write_run_trigger_payload(log_path, replay)
+        _write_run_summary_payload(base, workflow_id, log_path)
     return {
         "workflowId": workflow_id,
         "triggerId": trigger_id,
@@ -978,13 +1608,9 @@ async def replay_workflow_trigger_payload(
         workflow = AgenticWorkflow.from_file(path)
         config = workflow.config.webhooks.get(replay_trigger_id)
         if config is not None:
-            expected_token = _webhook_expected_token(config.token, config.token_env)
+            expected_token = _webhook_expected_token(config)
             if require_token:
-                if expected_token is not None and not hmac.compare_digest(
-                    token or "",
-                    expected_token,
-                ):
-                    raise WorkflowTriggerError("Unauthorized webhook trigger request")
+                _authorize_webhook_trigger(config, token)
             else:
                 replay_token = expected_token
     except Exception:
@@ -1014,8 +1640,11 @@ def workflow_plan_payload(
         raise WorkflowPlanError(f"Workflow '{workflow_id}' not found")
     try:
         workflow = AgenticWorkflow.from_file(path)
-        workflow.validate(path, base)
-        run_parameters = resolve_workflow_parameters(workflow.config, parameters)
+        run_parameters = resolve_workflow_parameters(
+            workflow.config,
+            parameters,
+            allow_missing_required=True,
+        )
         plan = build_execution_plan(
             workflow,
             workflow_path=path,
@@ -1285,6 +1914,18 @@ def _run_trigger_path(log_path: Path) -> Path:
     return log_path.with_suffix(RUN_TRIGGER_SUFFIX)
 
 
+def _sorted_run_log_paths(log_dir: Path, *, reverse: bool) -> list[Path]:
+    paths = [path for path in log_dir.glob("*.log") if path.is_file()]
+
+    def sort_key(path: Path) -> tuple[int, str]:
+        try:
+            return (path.stat().st_mtime_ns, path.name)
+        except OSError:
+            return (0, path.name)
+
+    return sorted(paths, key=sort_key, reverse=reverse)
+
+
 def _write_run_trigger_payload(log_path: Path, payload: dict[str, Any]) -> None:
     try:
         _run_trigger_path(log_path).write_text(
@@ -1379,13 +2020,33 @@ def _read_run_events_document(log_path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _webhook_expected_token(token: str | None, token_env: str | None) -> str | None:
-    if token:
-        return token
-    if token_env:
-        value = os.getenv(token_env)
+def _webhook_expected_token(config: WebhookTriggerConfig) -> str | None:
+    if config.token:
+        return config.token
+    if config.token_env:
+        value = os.getenv(config.token_env)
         return value if value else None
     return None
+
+
+def _authorize_webhook_trigger(config: WebhookTriggerConfig, token: str | None) -> None:
+    if config.missing_authentication:
+        raise WorkflowTriggerError(
+            f"Webhook trigger '{config.id}' has no authentication configured"
+        )
+    if config.allow_unauthenticated and not config.has_authentication:
+        return
+    expected_token = _webhook_expected_token(config)
+    if expected_token is None:
+        if config.token_env:
+            raise WorkflowTriggerError(
+                f"Webhook trigger '{config.id}' token_env '{config.token_env}' is not set"
+            )
+        raise WorkflowTriggerError(
+            f"Webhook trigger '{config.id}' has no authentication configured"
+        )
+    if not hmac.compare_digest(token or "", expected_token):
+        raise WorkflowTriggerError("Unauthorized webhook trigger request")
 
 
 def _normalize_trigger_headers(headers: dict[str, Any]) -> dict[str, str]:
@@ -1432,6 +2093,27 @@ def _webhook_events(payload: Any, fanout_path: str | None) -> list[dict[str, obj
     return events
 
 
+def _webhook_sensitive_payload_fields(fields: set[str] | None = None) -> set[str]:
+    normalized: set[str] = set()
+    for field in fields or set():
+        value = str(field).strip().lower()
+        if not value:
+            continue
+        normalized.add(value)
+        if value.startswith("payload."):
+            normalized.add(value.removeprefix("payload."))
+        else:
+            normalized.add(f"payload.{value}")
+    return normalized
+
+
+def _sanitize_webhook_payload(payload: Any, sensitive_payload_fields: set[str]) -> Any:
+    return _mask_http_value(
+        payload,
+        _webhook_sensitive_payload_fields(sensitive_payload_fields),
+    )
+
+
 def _webhook_trigger_context(
     *,
     trigger_id: str,
@@ -1439,11 +2121,16 @@ def _webhook_trigger_context(
     headers: dict[str, Any],
     source: str,
     fanout_path: str | None,
+    sensitive_payload_fields: set[str] | None = None,
+    store_raw_payload: bool = False,
 ) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     received_at = datetime.now(UTC).isoformat()
     normalized_headers = _normalize_trigger_headers(headers)
-    events = _webhook_events(payload, fanout_path)
+    configured_sensitive_fields = _webhook_sensitive_payload_fields(sensitive_payload_fields)
+    sanitized_payload = _sanitize_webhook_payload(payload, configured_sensitive_fields)
+    execution_payload = payload if store_raw_payload else sanitized_payload
+    events = _webhook_events(execution_payload, fanout_path)
     context: dict[str, Any] = {
         "type": "webhook",
         "mode": "webhook",
@@ -1451,7 +2138,11 @@ def _webhook_trigger_context(
         "source": source,
         "requestId": request_id,
         "receivedAt": received_at,
-        "payload": payload,
+        "payload": execution_payload,
+        "sanitizedPayload": sanitized_payload,
+        "payloadSanitized": not store_raw_payload,
+        "sensitivePayloadFields": sorted(configured_sensitive_fields),
+        "rawPayloadRetention": store_raw_payload,
         "headers": normalized_headers,
         "events": events,
         "events_json": json.dumps(events, default=str),
@@ -1526,7 +2217,7 @@ def _node_outputs_payload(
     truncated = False
     payload: dict[str, Any] = {}
     for node_id, output in node_outputs.items():
-        output_data = output.data
+        output_data = _compact_agent_output_data(output.type, output.data)
         output_text = output.output
         final_agent_message = _final_agent_message(output.type, output_data)
         if output.type == "http_request" and isinstance(output.data, dict):
@@ -1605,6 +2296,25 @@ def _final_agent_message(output_type: str | None, data: Any) -> str | None:
         return None
     message = data.get("message")
     return message if isinstance(message, str) else None
+
+
+def _compact_agent_output_data(output_type: str | None, data: Any) -> Any:
+    if output_type not in {
+        str(OperationType.AGENT),
+        str(OperationType.COMMON_LLM_TASK),
+    }:
+        return data
+    if not isinstance(data, dict):
+        return data
+    compacted = {
+        str(key): value
+        for key, value in data.items()
+        if str(key).lower() not in {"prompt", "thoughts", "inputs"}
+    }
+    omitted = [str(key) for key in data if str(key).lower() in {"prompt", "thoughts", "inputs"}]
+    if omitted:
+        compacted["omittedFromOutputPayload"] = omitted
+    return compacted
 
 
 def _uncapped_agent_message_data(message: str | None) -> dict[str, str]:
@@ -1701,11 +2411,16 @@ def latest_workflow_log_payload(workflow_id: str, data_dir: Path | None = None) 
     if not log_dir.exists():
         return {"workflowId": workflow_id, "logPath": None, "logText": ""}
 
-    logs = sorted(log_dir.glob("*.log"), key=lambda path: (path.stat().st_mtime, path.name))
-    if not logs:
-        return {"workflowId": workflow_id, "logPath": None, "logText": ""}
+    latest = _latest_run_path_from_workflow_index(base, workflow_id)
+    if latest is None:
+        logs = _run_log_paths(base, workflow_id, log_dir, reverse=False)
+        if not logs:
+            return {"workflowId": workflow_id, "logPath": None, "logText": ""}
+        latest = logs[-1]
+        _indexed_run_summaries(base, workflow_id, [latest], cheap=True)
 
-    latest = logs[-1]
+    if not latest.exists():
+        return {"workflowId": workflow_id, "logPath": None, "logText": ""}
     try:
         text, truncated = tail_text_file(latest, limits.max_api_log_response_bytes)
     except OSError as exc:
@@ -1720,6 +2435,26 @@ def latest_workflow_log_payload(workflow_id: str, data_dir: Path | None = None) 
         **_read_run_node_outputs_payload(latest),
         **_read_run_events_payload(latest),
     }
+
+
+def _latest_run_path_from_workflow_index(base: Path, workflow_id: str) -> Path | None:
+    entries = _workflow_index_entries(_read_workflow_index(base))
+    key = _workflow_index_key_for_id(entries, workflow_id)
+    if key is None:
+        return None
+    entry = entries.get(key)
+    if not isinstance(entry, dict):
+        return None
+    latest_run = entry.get("latestRun")
+    if not isinstance(latest_run, dict):
+        return None
+    run_id = latest_run.get("id")
+    if not isinstance(run_id, str) or not RUN_ID_PATTERN.fullmatch(run_id):
+        return None
+    log_path = base / "logs" / workflow_id / run_id
+    if not _index_stat_matches(latest_run, log_path):
+        return None
+    return log_path
 
 
 def _workflow_terminal_event(events: list[Any]) -> dict[str, Any]:
@@ -1737,6 +2472,12 @@ def _write_run_summary_payload(base: Path, workflow_id: str, log_path: Path) -> 
         )
     except OSError:
         return
+    _upsert_run_index(base, workflow_id, log_path)
+
+
+def write_run_summary_payload(base: Path, workflow_id: str, log_path: Path) -> None:
+    """Write the run summary sidecar and update metadata indexes for a completed run."""
+    _write_run_summary_payload(base, workflow_id, log_path)
 
 
 def _read_run_summary_payload(base: Path, log_path: Path) -> dict[str, Any] | None:
@@ -1758,6 +2499,179 @@ def _read_run_summary_payload(base: Path, log_path: Path) -> dict[str, Any] | No
     payload["modifiedAt"] = stat.st_mtime
     payload["logSizeBytes"] = stat.st_size
     return payload
+
+
+def _read_run_index(base: Path, workflow_id: str) -> dict[str, Any]:
+    return _read_index_document(_run_index_path(base, workflow_id))
+
+
+def _run_index_entries(index: dict[str, Any]) -> dict[str, Any]:
+    entries = index.get("runs")
+    return cast(dict[str, Any], entries) if isinstance(entries, dict) else {}
+
+
+def _write_run_index(
+    base: Path,
+    workflow_id: str,
+    entries: dict[str, Any],
+    *,
+    complete: bool = False,
+) -> None:
+    log_dir = _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowLogError)
+    try:
+        payload: dict[str, Any] = {
+            "version": INDEX_VERSION,
+            "workflowId": workflow_id,
+            "updatedAt": datetime.now(UTC).isoformat(),
+            "complete": complete,
+            "runs": entries,
+        }
+        if complete and log_dir.exists():
+            payload["logDir"] = _file_index_stat(log_dir)
+        _write_json_atomic(
+            _run_index_path(base, workflow_id),
+            payload,
+        )
+    except OSError:
+        return
+
+
+def _run_index_entry(log_path: Path, summary: dict[str, Any]) -> dict[str, Any]:
+    return {**_file_index_stat(log_path), "summary": summary}
+
+
+def _run_index_summary(entry: Any, log_path: Path) -> dict[str, Any] | None:
+    if not isinstance(entry, dict) or not _index_stat_matches(entry, log_path):
+        return None
+    summary = entry.get("summary")
+    return cast(dict[str, Any], summary) if isinstance(summary, dict) else None
+
+
+def _complete_run_index_log_paths(
+    base: Path,
+    workflow_id: str,
+    log_dir: Path,
+    *,
+    reverse: bool,
+) -> list[Path] | None:
+    index = _read_run_index(base, workflow_id)
+    if not index.get("complete"):
+        return None
+    log_dir_entry = index.get("logDir")
+    if not isinstance(log_dir_entry, dict) or not _index_stat_matches(log_dir_entry, log_dir):
+        return None
+    entries = _run_index_entries(index)
+    indexed_paths: list[tuple[tuple[int, str], Path]] = []
+    for name, entry in entries.items():
+        if not isinstance(name, str):
+            return None
+        if not isinstance(entry, dict):
+            return None
+        log_path = log_dir / name
+        if not RUN_ID_PATTERN.fullmatch(name) or not _index_stat_matches(entry, log_path):
+            return None
+        mtime_ns = entry.get("mtimeNs")
+        if not isinstance(mtime_ns, int):
+            return None
+        indexed_paths.append(((mtime_ns, name), log_path))
+    return [
+        log_path
+        for _, log_path in sorted(
+            indexed_paths,
+            key=lambda item: item[0],
+            reverse=reverse,
+        )
+    ]
+
+
+def _run_log_paths(
+    base: Path,
+    workflow_id: str,
+    log_dir: Path,
+    *,
+    reverse: bool,
+) -> list[Path]:
+    indexed = _complete_run_index_log_paths(base, workflow_id, log_dir, reverse=reverse)
+    if indexed is not None:
+        return indexed
+    return _sorted_run_log_paths(log_dir, reverse=reverse)
+
+
+def _indexed_run_summaries(
+    base: Path,
+    workflow_id: str,
+    log_paths: list[Path],
+    *,
+    cheap: bool,
+    prune_missing: bool = False,
+) -> list[dict[str, Any]]:
+    index = _read_run_index(base, workflow_id)
+    entries = _run_index_entries(index)
+    changed = False
+    summaries: list[dict[str, Any]] = []
+    for log_path in log_paths:
+        summary = _run_index_summary(entries.get(log_path.name), log_path)
+        if summary is None:
+            try:
+                summary = _log_run_summary(base, workflow_id, log_path, cheap=cheap)
+            except OSError:
+                continue
+            entries[log_path.name] = _run_index_entry(log_path, summary)
+            changed = True
+        summaries.append(summary)
+    if prune_missing:
+        existing_names = {path.name for path in log_paths}
+        stale_names = [name for name in entries if name not in existing_names]
+        for name in stale_names:
+            entries.pop(name, None)
+            changed = True
+    log_dir = _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowLogError)
+    log_dir_entry = index.get("logDir")
+    complete_changed = prune_missing and (
+        not bool(index.get("complete"))
+        or not isinstance(log_dir_entry, dict)
+        or not _index_stat_matches(log_dir_entry, log_dir)
+    )
+    if changed or complete_changed:
+        _write_run_index(base, workflow_id, entries, complete=prune_missing)
+        _sync_workflow_index_latest_run(
+            base,
+            workflow_id,
+            _latest_run_metadata_from_index_entries(base, workflow_id, entries),
+        )
+    return summaries
+
+
+def _upsert_run_index(base: Path, workflow_id: str, log_path: Path) -> None:
+    index = _read_run_index(base, workflow_id)
+    entries = _run_index_entries(index)
+    try:
+        summary = _log_run_summary(base, workflow_id, log_path)
+    except OSError:
+        return
+    entries[log_path.name] = _run_index_entry(log_path, summary)
+    _write_run_index(base, workflow_id, entries, complete=bool(index.get("complete")))
+    _sync_workflow_index_latest_run(
+        base,
+        workflow_id,
+        _latest_run_metadata_from_index_entries(base, workflow_id, entries),
+    )
+
+
+def _remove_run_index_entries(base: Path, workflow_id: str, run_ids: list[str]) -> None:
+    index = _read_run_index(base, workflow_id)
+    entries = _run_index_entries(index)
+    changed = False
+    for run_id in run_ids:
+        if entries.pop(run_id, None) is not None:
+            changed = True
+    if changed:
+        _write_run_index(base, workflow_id, entries, complete=bool(index.get("complete")))
+        _sync_workflow_index_latest_run(
+            base,
+            workflow_id,
+            _latest_run_metadata_from_index_entries(base, workflow_id, entries),
+        )
 
 
 def _log_run_summary(
@@ -1862,14 +2776,10 @@ def list_workflow_run_logs_payload(
             "pagination": {"offset": max(0, offset), "limit": limit, "total": 0},
         }
 
-    logs = sorted(
-        log_dir.glob("*.log"),
-        key=lambda log_path: (log_path.stat().st_mtime, log_path.name),
-        reverse=True,
-    )
+    logs = _run_log_paths(base, workflow_id, log_dir, reverse=True)
     needs_prepage_filter = bool(status or trigger_type or started_after or started_before or search)
     if needs_prepage_filter:
-        runs = [_log_run_summary(base, workflow_id, log_path, cheap=True) for log_path in logs]
+        runs = _indexed_run_summaries(base, workflow_id, logs, cheap=True, prune_missing=True)
         if status:
             runs = [run for run in runs if str(run.get("status")) == status]
         if trigger_type:
@@ -1880,16 +2790,35 @@ def list_workflow_run_logs_payload(
             ]
     else:
         runs = [{"id": log_path.name, "path": log_path} for log_path in logs]
+    search_scanned_bytes = 0
+    search_truncated = False
     if search:
         query = search.lower()
-        runs = [
-            run
-            for run in runs
-            if query in str(run.get("id", "")).lower()
-            or query in str(run.get("status", "")).lower()
-            or query in str(run.get("triggerType", "")).lower()
-            or _log_contains_text(log_dir / str(run.get("id")), query)
-        ]
+        limits = _workflow_resource_limits(workflow_id, base)
+        remaining_bytes = max(0, limits.max_api_log_response_bytes)
+        matched_runs = []
+        for run in runs:
+            if (
+                query in str(run.get("id", "")).lower()
+                or query in str(run.get("status", "")).lower()
+                or query in str(run.get("triggerType", "")).lower()
+            ):
+                matched_runs.append(run)
+                continue
+            if remaining_bytes <= 0:
+                search_truncated = True
+                continue
+            matched, scanned, truncated = _log_contains_text_bounded(
+                log_dir / str(run.get("id")),
+                query,
+                remaining_bytes,
+            )
+            search_scanned_bytes += scanned
+            remaining_bytes -= scanned
+            search_truncated = search_truncated or truncated
+            if matched:
+                matched_runs.append(run)
+        runs = matched_runs
 
     total = len(runs)
     page_offset = max(0, offset)
@@ -1899,16 +2828,17 @@ def list_workflow_run_logs_payload(
     elif page_offset:
         runs = runs[page_offset:]
     if not needs_prepage_filter:
-        runs = [
-            _log_run_summary(base, workflow_id, run["path"])
-            for run in runs
-            if isinstance(run.get("path"), Path)
-        ]
+        page_paths = [run["path"] for run in runs if isinstance(run.get("path"), Path)]
+        runs = _indexed_run_summaries(base, workflow_id, page_paths, cheap=False)
 
+    pagination: dict[str, Any] = {"offset": page_offset, "limit": page_limit, "total": total}
+    if search:
+        pagination["searchTruncated"] = search_truncated
+        pagination["searchScannedBytes"] = search_scanned_bytes
     return {
         "workflowId": workflow_id,
         "runs": runs,
-        "pagination": {"offset": page_offset, "limit": page_limit, "total": total},
+        "pagination": pagination,
     }
 
 
@@ -1927,11 +2857,20 @@ def _run_started_at_in_range(
     return not (normalized_before and started > normalized_before)
 
 
-def _log_contains_text(log_path: Path, query: str) -> bool:
+def _log_contains_text_bounded(
+    log_path: Path,
+    query: str,
+    max_bytes: int,
+) -> tuple[bool, int, bool]:
     try:
-        return query in log_path.read_text(encoding="utf-8", errors="replace").lower()
+        size = log_path.stat().st_size
+        read_bytes = min(max(0, max_bytes), size)
+        with log_path.open("rb") as handle:
+            data = handle.read(read_bytes)
     except OSError:
-        return False
+        return False, 0, False
+    text = data.decode("utf-8", errors="replace").lower()
+    return query in text, read_bytes, read_bytes < size
 
 
 def workflow_run_log_payload(
@@ -2004,12 +2943,8 @@ def prune_workflow_run_logs_payload(
     log_dir = _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowLogError)
     if not log_dir.exists():
         return {"workflowId": workflow_id, "dryRun": dry_run, "runs": [], "deleted": []}
-    logs = sorted(
-        log_dir.glob("*.log"),
-        key=lambda log_path: (log_path.stat().st_mtime, log_path.name),
-        reverse=True,
-    )
-    runs = [_log_run_summary(base, workflow_id, log_path, cheap=True) for log_path in logs]
+    logs = _run_log_paths(base, workflow_id, log_dir, reverse=True)
+    runs = _indexed_run_summaries(base, workflow_id, logs, cheap=True, prune_missing=True)
     active_run_ids = _active_run_ids(workflow_id, base)
     retained_ids = {str(run["id"]) for run in runs[: max(0, keep_last or 0)]}
     now = datetime.now(UTC)
@@ -2037,6 +2972,7 @@ def prune_workflow_run_logs_payload(
             run_id = str(run["id"])
             _delete_run_log_files(log_dir / run_id)
             deleted.append(run_id)
+        _remove_run_index_entries(base, workflow_id, deleted)
     return {
         "workflowId": workflow_id,
         "dryRun": dry_run,
@@ -2172,6 +3108,8 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
         if item.get("token") == "***":
             item.pop("token", None)
         item.pop("tokenConfigured", None)
+        item.pop("risk", None)
+        item.pop("riskReasons", None)
         webhooks[str(trigger_id)] = WebhookTriggerConfig(
             id=str(trigger_id),
             **_without(item, "id"),
@@ -2193,6 +3131,7 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
                 for item in payload.get("filesystemAccess", [])
                 if isinstance(item, dict) and item.get("path")
             ],
+            metadata=WorkflowMetadata(**(payload.get("metadata") or {})),
         )
     )
 
@@ -2275,6 +3214,8 @@ def _workflow_payload_to_validation_data(payload: dict[str, Any]) -> dict[str, A
         workflow_data["llm_budget"] = payload.get("llmBudget")
     if payload.get("filesystemAccess"):
         workflow_data["filesystem_access"] = payload.get("filesystemAccess")
+    if payload.get("metadata"):
+        workflow_data["metadata"] = payload.get("metadata")
 
     nodes: list[dict[str, Any]] = []
     for node in payload.get("nodes") or []:
@@ -2368,6 +3309,62 @@ def _restore_masked_webhook_secrets(
             restored_item["token"] = existing_config.token
         restored_webhooks[str(trigger_id)] = restored_item
     restored["webhooks"] = restored_webhooks
+    return restored
+
+
+def _restore_masked_notification_secrets(
+    payload: dict[str, Any],
+    existing: AgenticWorkflow,
+) -> dict[str, Any]:
+    existing_operations = {
+        node.node_id: node.operation
+        for node in existing.graph.nodes_in_order()
+        if isinstance(node.operation, NotificationOperation)
+    }
+    if not existing_operations:
+        return payload
+
+    restored = dict(payload)
+    restored_nodes: list[Any] = []
+    for node_data in payload.get("nodes") or []:
+        if not isinstance(node_data, dict):
+            restored_nodes.append(node_data)
+            continue
+        existing_operation = existing_operations.get(str(node_data.get("id") or ""))
+        operation_data = node_data.get("operation")
+        if not isinstance(existing_operation, NotificationOperation) or not isinstance(
+            operation_data,
+            dict,
+        ):
+            restored_nodes.append(node_data)
+            continue
+        restored_operation = _restore_masked_notification_operation(
+            operation_data,
+            _model_dump(existing_operation),
+        )
+        restored_nodes.append({**node_data, "operation": restored_operation})
+    restored["nodes"] = restored_nodes
+    return restored
+
+
+def _restore_masked_notification_operation(
+    operation: dict[str, Any],
+    existing_operation: dict[str, Any],
+) -> dict[str, Any]:
+    restored = dict(operation)
+    restored["webhook_url"] = _restore_masked_http_url(
+        restored.get("webhook_url"),
+        existing_operation.get("webhook_url"),
+        set(),
+    )
+    for key in ("headers", "payload", "email_to"):
+        value = restored.get(key)
+        existing_value = existing_operation.get(key)
+        if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
+            restored[key] = _restore_masked_http_value(value, existing_value, set())
+    for key in ("email_from", "smtp_host", "smtp_username", "smtp_password"):
+        if restored.get(key) == "***":
+            restored[key] = existing_operation.get(key, restored[key])
     return restored
 
 
@@ -2538,6 +3535,14 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         else validate_workflow(workflow)
     )
     validation_diagnostics = [item.to_dict() for item in validation_report.diagnostics]
+    secret_readiness = [
+        item.to_dict()
+        for item in workflow_secret_readiness(
+            workflow,
+            workflow_path=path,
+            data_dir=path.parent if path is not None else None,
+        )
+    ]
 
     return {
         "id": workflow.config.id,
@@ -2561,6 +3566,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         ],
         "healthErrors": [item.to_dict() for item in health_diagnostics if item.severity == "error"],
         "validationDiagnostics": validation_diagnostics,
+        "secretReadiness": secret_readiness,
         "validationWarnings": [
             item for item in validation_diagnostics if item.get("severity") == "warning"
         ],
@@ -2573,6 +3579,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
             entry.model_dump(mode="json", exclude_none=True)
             for entry in workflow.config.filesystem_access
         ],
+        "metadata": _model_dump(workflow.config.metadata),
         "tags": tags,
         "agents": {
             agent_id: _model_dump(agent_config)
@@ -2609,15 +3616,75 @@ def _webhook_config_payload(webhooks: dict[str, Any]) -> dict[str, Any]:
     for trigger_id, config in webhooks.items():
         item = config.model_dump(mode="json", exclude_none=True)
         item["tokenConfigured"] = bool(item.pop("token", None) or item.get("token_env"))
+        item["riskReasons"] = _webhook_payload_risk_reasons(config)
+        item["risk"] = "high" if item["riskReasons"] else "normal"
         payload[trigger_id] = item
     return payload
+
+
+def _webhook_payload_risk_reasons(config: WebhookTriggerConfig) -> list[str]:
+    reasons: list[str] = []
+    if config.missing_authentication:
+        reasons.append("missing_authentication")
+    if config.requires_unauthenticated_warning:
+        reasons.append("unauthenticated_allowed")
+    if config.store_raw_payload:
+        reasons.append("raw_payload_retention")
+    return reasons
 
 
 def _ui_operation_payload(operation: Operation) -> dict[str, Any]:
     data = _model_dump(operation)
     if isinstance(operation, HttpRequestOperation):
         return _masked_http_operation_payload(operation, data)
+    if isinstance(operation, NotificationOperation):
+        return _masked_notification_operation_payload(operation, data)
     return data
+
+
+def _masked_notification_operation_payload(
+    operation: NotificationOperation,
+    data: dict[str, Any],
+) -> dict[str, Any]:
+    secret_values = set()
+    secret_values.update(_collect_configured_secret_values(operation.headers, set()))
+    secret_values.update(_collect_configured_secret_values(operation.payload, set()))
+    secret_values.update(
+        _collect_configured_secret_values(
+            {
+                "smtp_username": operation.smtp_username,
+                "smtp_password": operation.smtp_password,
+            },
+            set(),
+        )
+    )
+    secret_values = {value for value in secret_values if value}
+
+    masked = dict(data)
+    webhook_url = masked.get("webhook_url")
+    if isinstance(webhook_url, str):
+        masked["webhook_url"] = (
+            webhook_url
+            if "{{secret." in webhook_url or webhook_url.strip().startswith("secret:")
+            else "***"
+        )
+    for key in ("headers", "payload", "email_to"):
+        value = masked.get(key)
+        if isinstance(value, (dict, list)):
+            masked[key] = _preserve_secret_reference_placeholders(
+                _mask_http_value(value, set(), secret_values=secret_values),
+                value,
+            )
+    for key in ("email_from", "smtp_host", "smtp_username", "smtp_password"):
+        value = masked.get(key)
+        if isinstance(value, str):
+            if "{{secret." in value or value.strip().startswith("secret:"):
+                masked[key] = value
+            elif key in {"smtp_username", "smtp_password"} or _is_sensitive_field(key, set()):
+                masked[key] = "***"
+            else:
+                masked[key] = _mask_http_text(value, set(), secret_values=secret_values)
+    return masked
 
 
 def _masked_http_operation_payload(
@@ -3007,18 +4074,26 @@ def _latest_run_status(workflow_id: str, path: Path | None) -> str:
     if path is None:
         return "Ready"
 
-    log_dir = path.parent / "logs" / workflow_id
+    base = path.parent
+    log_dir = base / "logs" / workflow_id
     if not log_dir.exists():
         return "Ready"
 
-    logs = sorted(
-        log_dir.glob("*.log"),
-        key=lambda log_path: (log_path.stat().st_mtime, log_path.name),
-    )
-    if not logs:
-        return "Ready"
+    latest = _latest_run_path_from_workflow_index(base, workflow_id)
+    if latest is None:
+        logs = _run_log_paths(base, workflow_id, log_dir, reverse=False)
+        if not logs:
+            return "Ready"
+        latest = logs[-1]
 
-    status = _log_status(logs[-1])
+    summary = _run_index_summary(
+        _run_index_entries(_read_run_index(base, workflow_id)).get(latest.name),
+        latest,
+    )
+    if summary is None:
+        summaries = _indexed_run_summaries(base, workflow_id, [latest], cheap=True)
+        summary = summaries[0] if summaries else {}
+    status = str(summary.get("status") or "unknown")
     if status == "success":
         return "Success"
     if status == "error":

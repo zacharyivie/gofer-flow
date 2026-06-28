@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import anyio
@@ -227,6 +228,110 @@ message = "{{params.report_date}}"
     assert run["success"] is True
     assert run["parameters"] == {"report_date": "2026-06-26", "token": "***"}
     assert "clear-secret" not in Path(tmp_path, run["logPath"]).read_text(encoding="utf-8")
+
+
+def test_ui_plan_allows_missing_required_params_for_preview(tmp_path: Path) -> None:
+    (tmp_path / "api-params-preview.toml").write_text(
+        """
+[workflow]
+id = "api-params-preview"
+name = "API Params Preview"
+
+[workflow.parameters.report_date]
+type = "date"
+required = true
+
+[workflow.parameters.token]
+type = "secret"
+required = true
+
+[[nodes]]
+id = "start"
+type = "pass"
+message = "{{params.report_date}}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    plan = workflow_plan_payload(
+        "api-params-preview",
+        tmp_path,
+        parameters={"report_date": "", "token": ""},
+    )
+
+    assert plan["workflowId"] == "api-params-preview"
+    assert plan["validation"]["ok"] is True
+    assert plan["parameters"] == {}
+
+
+def test_cli_plan_accepts_params_json_and_masks_secret(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "cli-plan.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "cli-plan-params"
+name = "CLI Plan Params"
+
+[workflow.parameters.message]
+type = "string"
+required = true
+
+[workflow.parameters.token]
+type = "secret"
+required = true
+
+[[nodes]]
+id = "echo"
+type = "pass"
+message = "{{params.message}}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "workflow",
+            "plan",
+            str(workflow_path),
+            "--json",
+            "--params-json",
+            '{"message":"hello","token":"clear-secret"}',
+        ],
+    )
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["parameters"] == {"message": "hello", "token": "***"}
+    assert "clear-secret" not in result.output
+
+
+def test_cli_plan_allows_missing_required_params(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "cli-plan-missing.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "cli-plan-missing"
+name = "CLI Plan Missing"
+
+[workflow.parameters.message]
+type = "string"
+required = true
+
+[[nodes]]
+id = "echo"
+type = "pass"
+message = "{{params.message}}"
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, ["workflow", "plan", str(workflow_path), "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["workflowId"] == "cli-plan-missing"
+    assert payload["parameters"] == {}
 
 
 def test_schedule_and_watch_store_parameter_defaults() -> None:

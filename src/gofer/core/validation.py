@@ -10,19 +10,32 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from apscheduler.triggers.cron import CronTrigger
 
 from gofer.core.graph import EdgeConditionType
+from gofer.core.network_policy import network_policy_warnings
 from gofer.core.operations import (
     AgentOperation,
     CommonLlmTaskOperation,
+    CopyFileOperation,
+    DeleteFileOperation,
     DirectoryFanSource,
+    FileOperation,
+    FolderOperation,
+    HttpRequestOperation,
     LocalSearchOperation,
     LocalVectorizeOperation,
     LoopOperation,
+    MoveFileOperation,
+    NotificationOperation,
+    OpenResourceOperation,
     PromptFileOperation,
     PythonScriptOperation,
+    ReadFileOperation,
     ShellScriptOperation,
     TabularFanSource,
+    TriggerEventsFanSource,
+    WriteFileOperation,
 )
-from gofer.core.workflow import AgenticWorkflow
+from gofer.core.secrets import workflow_secret_readiness
+from gofer.core.workflow import AgenticWorkflow, FilesystemAccessEntry, WebhookTriggerConfig
 
 ValidationSeverity = Literal["error", "warning"]
 ValidationTargetType = Literal["workflow", "node", "edge", "agent", "trigger"]
@@ -200,6 +213,7 @@ def validate_workflow(
     diagnostics.extend(_node_diagnostics(workflow, path_base))
     diagnostics.extend(_edge_diagnostics(workflow))
     diagnostics.extend(_trigger_diagnostics(workflow, path_base))
+    diagnostics.extend(_secret_readiness_diagnostics(workflow, workflow_path, data_dir))
 
     return WorkflowValidationReport(
         ok=not any(item.severity == "error" for item in diagnostics),
@@ -207,6 +221,37 @@ def validate_workflow(
         workflow_id=workflow.config.id,
         workflow_path=workflow_path,
     )
+
+
+def _secret_readiness_diagnostics(
+    workflow: AgenticWorkflow,
+    workflow_path: Path | None,
+    data_dir: Path | None,
+) -> list[ValidationDiagnostic]:
+    readiness = workflow_secret_readiness(
+        workflow,
+        workflow_path=workflow_path,
+        data_dir=data_dir,
+    )
+    if not readiness:
+        return []
+    missing = [item.name for item in readiness if not item.present]
+    names = [item.name for item in readiness]
+    message = "Required secrets: " + ", ".join(names)
+    if missing:
+        message += ". Missing: " + ", ".join(missing)
+    return [
+        ValidationDiagnostic(
+            code="workflow.secret_readiness",
+            severity="warning",
+            target_type="workflow",
+            field="secrets",
+            message=message,
+            detail={
+                "secretReadiness": [item.to_dict() for item in readiness],
+            },
+        )
+    ]
 
 
 def _raw_workflow_id(data: dict[str, Any]) -> str | None:
@@ -233,9 +278,7 @@ def _raw_edge_diagnostics(data: dict[str, Any]) -> list[ValidationDiagnostic]:
         from_node = str(edge.get("from", ""))
         to_node = str(edge.get("to", ""))
         if from_node not in node_ids:
-            diagnostics.append(
-                _dangling_edge_diagnostic(edge_id, "from", from_node, edge)
-            )
+            diagnostics.append(_dangling_edge_diagnostic(edge_id, "from", from_node, edge))
         if to_node not in node_ids:
             diagnostics.append(_dangling_edge_diagnostic(edge_id, "to", to_node, edge))
     return diagnostics
@@ -268,6 +311,7 @@ def _node_diagnostics(
     node_ids = {node.node_id for node in workflow.graph.nodes_in_order()}
     for node in workflow.graph.nodes_in_order():
         op = node.operation
+        diagnostics.extend(_filesystem_access_diagnostics(workflow, op, node.node_id, path_base))
         if isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
             if op.agent_id not in workflow.agents:
                 diagnostics.append(
@@ -278,8 +322,7 @@ def _node_diagnostics(
                         target_id=node.node_id,
                         field="agent_id",
                         message=(
-                            f"Node '{node.node_id}' references missing agent "
-                            f"'{op.agent_id}'."
+                            f"Node '{node.node_id}' references missing agent '{op.agent_id}'."
                         ),
                         fixes=(
                             ValidationFix(
@@ -302,6 +345,10 @@ def _node_diagnostics(
                 )
             if isinstance(op, AgentOperation):
                 diagnostics.extend(_dynamic_count_diagnostics(op, node.node_id, node_ids))
+        elif isinstance(op, HttpRequestOperation):
+            diagnostics.extend(_http_request_network_diagnostics(op, node.node_id))
+        elif isinstance(op, NotificationOperation):
+            diagnostics.extend(_notification_diagnostics(op, node.node_id))
 
         if isinstance(op, (PythonScriptOperation, ShellScriptOperation)):
             diagnostics.extend(
@@ -376,8 +423,7 @@ def _edge_diagnostics(workflow: AgenticWorkflow) -> list[ValidationDiagnostic]:
                         target_id=edge_id,
                         field="outputPattern",
                         message=(
-                            f"Edge '{from_node} -> {to_node}' has an invalid output "
-                            f"regex: {exc}."
+                            f"Edge '{from_node} -> {to_node}' has an invalid output regex: {exc}."
                         ),
                         fixes=(
                             ValidationFix(
@@ -486,7 +532,80 @@ def _trigger_diagnostics(
                 ),
             )
         )
+    for trigger_id, config in sorted(workflow.config.webhooks.items()):
+        if config.missing_authentication:
+            diagnostics.append(
+                ValidationDiagnostic(
+                    code="workflow.webhook_authentication_missing",
+                    severity="error",
+                    target_type="trigger",
+                    target_id=trigger_id,
+                    field="authentication",
+                    message=(
+                        f"Enabled webhook trigger '{trigger_id}' has no token, token_env, "
+                        "or explicit unauthenticated opt-in."
+                    ),
+                    detail=_webhook_authentication_detail(config),
+                    fixes=(
+                        ValidationFix(
+                            action="set_webhook_token_env",
+                            label="Set token_env for the webhook trigger",
+                            payload={"triggerId": trigger_id},
+                        ),
+                        ValidationFix(
+                            action="allow_unauthenticated_webhook",
+                            label="Explicitly allow unauthenticated local testing",
+                            payload={"triggerId": trigger_id, "allowUnauthenticated": True},
+                        ),
+                    ),
+                )
+            )
+        elif config.requires_unauthenticated_warning:
+            diagnostics.append(
+                ValidationDiagnostic(
+                    code="workflow.webhook_unauthenticated_allowed",
+                    severity="warning",
+                    target_type="trigger",
+                    target_id=trigger_id,
+                    field="allowUnauthenticated",
+                    message=(
+                        f"Webhook trigger '{trigger_id}' explicitly allows unauthenticated "
+                        "requests. This is high risk and should only be used for local testing."
+                    ),
+                    detail=_webhook_authentication_detail(config),
+                )
+            )
+        if not config.store_raw_payload:
+            continue
+        diagnostics.append(
+            ValidationDiagnostic(
+                code="workflow.webhook_raw_payload_retention",
+                severity="warning",
+                target_type="trigger",
+                target_id=trigger_id,
+                field="storeRawPayload",
+                message=(
+                    f"Webhook trigger '{trigger_id}' stores raw replay payloads. "
+                    "This is high risk because incoming secrets may be persisted in "
+                    ".trigger.json sidecars."
+                ),
+                detail={
+                    "risk": "high",
+                    "replayPayloadRetention": "raw",
+                    "storeRawPayload": True,
+                },
+            )
+        )
     return diagnostics
+
+
+def _webhook_authentication_detail(config: WebhookTriggerConfig) -> dict[str, Any]:
+    return {
+        "risk": "high",
+        "authentication": "none" if not config.has_authentication else "token",
+        "tokenConfigured": config.has_authentication,
+        "allowUnauthenticated": config.allow_unauthenticated,
+    }
 
 
 def _dynamic_count_diagnostics(
@@ -508,10 +627,7 @@ def _dynamic_count_diagnostics(
     )
     if source_node and source_node not in node_ids:
         severity = "error"
-        message = (
-            f"Node '{node_id}' dynamic_count references unknown source "
-            f"'{source_node}'."
-        )
+        message = f"Node '{node_id}' dynamic_count references unknown source '{source_node}'."
     return [
         ValidationDiagnostic(
             code="workflow.dynamic_count_source",
@@ -552,6 +668,278 @@ def _fan_source_diagnostics(
             allow_file=False,
         )
     return []
+
+
+def _filesystem_access_diagnostics(
+    workflow: AgenticWorkflow,
+    op: object,
+    node_id: str,
+    path_base: Path | None,
+) -> list[ValidationDiagnostic]:
+    diagnostics: list[ValidationDiagnostic] = []
+
+    def check(
+        path: Path,
+        permission: Literal["read", "write", "execute"],
+        field: str,
+        label: str,
+    ) -> None:
+        resolved = _resolve_path(path, path_base)
+        if _path_has_workflow_access(workflow, resolved, permission, path_base):
+            return
+        diagnostics.append(
+            ValidationDiagnostic(
+                code="workflow.filesystem_access",
+                severity="warning",
+                target_type="node",
+                target_id=node_id,
+                field=field,
+                message=(
+                    f"{label} '{path}' resolves outside the trusted project folder "
+                    f"and lacks {permission} permission in filesystem_access."
+                ),
+                detail={
+                    "path": str(resolved),
+                    "permission": permission,
+                },
+            )
+        )
+
+    if isinstance(op, PythonScriptOperation | ShellScriptOperation):
+        check(op.script_path, "execute", "operation.script_path", "Script path")
+    elif isinstance(op, ReadFileOperation):
+        check(op.path, "read", "operation.path", "Read path")
+    elif isinstance(op, WriteFileOperation):
+        check(op.path, "write", "operation.path", "Write path")
+    elif isinstance(op, CopyFileOperation):
+        check(op.source_path, "read", "operation.source_path", "Copy source path")
+        check(
+            op.destination_path,
+            "write",
+            "operation.destination_path",
+            "Copy destination path",
+        )
+    elif isinstance(op, MoveFileOperation):
+        check(op.source_path, "write", "operation.source_path", "Move source path")
+        check(
+            op.destination_path,
+            "write",
+            "operation.destination_path",
+            "Move destination path",
+        )
+    elif isinstance(op, DeleteFileOperation):
+        check(op.path, "write", "operation.path", "Delete path")
+    elif isinstance(op, FileOperation):
+        check(op.path, "read", "operation.path", "File resource path")
+    elif isinstance(op, FolderOperation):
+        check(op.path, "read", "operation.path", "Folder resource path")
+    elif isinstance(op, OpenResourceOperation):
+        if _open_resource_target_is_local_path(op):
+            check(
+                Path(op.target),
+                "read",
+                "operation.target",
+                "Open resource target path",
+            )
+    elif isinstance(op, PromptFileOperation):
+        if op.template_path is not None:
+            check(
+                op.template_path,
+                "read",
+                "operation.template_path",
+                "Prompt template path",
+            )
+        check(op.output_path, "write", "operation.output_path", "Prompt output path")
+    elif isinstance(op, LocalVectorizeOperation):
+        index_path = _resolve_path(op.index_path, path_base)
+        check(
+            op.source_path,
+            "read",
+            "operation.source_path",
+            "Local vector source path",
+        )
+        check(
+            op.index_path,
+            "write",
+            "operation.index_path",
+            "Local vector index path",
+        )
+        check(
+            index_path.parent,
+            "write",
+            "operation.index_path",
+            "Local vector index directory",
+        )
+        check(
+            _default_vector_entries_path(index_path),
+            "write",
+            "operation.index_path",
+            "Local vector entries path",
+        )
+    elif isinstance(op, LocalSearchOperation):
+        check(op.index_path, "read", "operation.index_path", "Local search index path")
+
+    source = op.source if isinstance(op, LoopOperation) else None
+    if isinstance(source, TabularFanSource):
+        check(source.path, "read", "operation.source.path", "Tabular fan-out path")
+    elif isinstance(source, DirectoryFanSource):
+        check(source.path, "read", "operation.source.path", "Directory fan-out path")
+    elif isinstance(source, TriggerEventsFanSource) and source.include_content:
+        diagnostics.append(
+            ValidationDiagnostic(
+                code="workflow.filesystem_access_trigger_content",
+                severity="warning",
+                target_type="node",
+                target_id=node_id,
+                field="operation.source.include_content",
+                message=(
+                    "Trigger-event fan-out with include_content reads event paths at "
+                    "runtime and requires read permission for each outside event path."
+                ),
+            )
+        )
+    return diagnostics
+
+
+def _http_request_network_diagnostics(
+    op: HttpRequestOperation,
+    node_id: str,
+) -> list[ValidationDiagnostic]:
+    return [
+        ValidationDiagnostic(
+            code="workflow.http_network_policy",
+            severity="warning",
+            target_type="node",
+            target_id=node_id,
+            field="operation.url",
+            message=warning,
+            detail={
+                "networkAllowlist": list(op.network_allowlist),
+            },
+        )
+        for warning in network_policy_warnings(op.url, op.network_allowlist)
+    ]
+
+
+def _notification_diagnostics(
+    op: NotificationOperation,
+    node_id: str,
+) -> list[ValidationDiagnostic]:
+    diagnostics: list[ValidationDiagnostic] = []
+    if op.channel in {"slack", "teams", "webhook"}:
+        if not op.webhook_url:
+            diagnostics.append(
+                ValidationDiagnostic(
+                    code="workflow.notification_webhook_url_missing",
+                    severity="error",
+                    target_type="node",
+                    target_id=node_id,
+                    field="operation.webhook_url",
+                    message=(
+                        f"Node '{node_id}' uses {op.channel} notifications but has no webhook_url."
+                    ),
+                )
+            )
+        else:
+            diagnostics.extend(
+                ValidationDiagnostic(
+                    code="workflow.notification_network_policy",
+                    severity="warning",
+                    target_type="node",
+                    target_id=node_id,
+                    field="operation.webhook_url",
+                    message=warning,
+                    detail={"networkAllowlist": list(op.network_allowlist)},
+                )
+                for warning in network_policy_warnings(
+                    op.webhook_url,
+                    op.network_allowlist,
+                )
+            )
+    if op.channel == "email":
+        required = {
+            "smtp_host": op.smtp_host,
+            "email_from": op.email_from,
+            "email_to": op.email_to,
+        }
+        for field_name, value in required.items():
+            if value:
+                continue
+            diagnostics.append(
+                ValidationDiagnostic(
+                    code="workflow.notification_email_config_missing",
+                    severity="error",
+                    target_type="node",
+                    target_id=node_id,
+                    field=f"operation.{field_name}",
+                    message=(
+                        f"Node '{node_id}' uses email notifications but is missing {field_name}."
+                    ),
+                )
+            )
+    return diagnostics
+
+
+def _default_vector_entries_path(index_path: Path) -> Path:
+    return index_path.with_name(f"{index_path.name}.entries.jsonl")
+
+
+def _open_resource_target_is_local_path(op: OpenResourceOperation) -> bool:
+    if op.resource_type == "app":
+        return False
+    if op.resource_type == "url":
+        return False
+    return "://" not in op.target
+
+
+def _path_has_workflow_access(
+    workflow: AgenticWorkflow,
+    path: Path,
+    permission: Literal["read", "write", "execute"],
+    path_base: Path | None,
+) -> bool:
+    if path_base is None:
+        return True
+    resolved_path = _resolved_for_access(path)
+    trusted_root = _resolved_for_access(path_base)
+    if resolved_path == trusted_root or trusted_root in resolved_path.parents:
+        root_entry = _project_root_access_entry(workflow, trusted_root, path_base)
+        return getattr(root_entry, permission) if root_entry is not None else True
+    for entry in workflow.config.filesystem_access:
+        if not getattr(entry, permission):
+            continue
+        if _access_entry_covers_path(entry, resolved_path, path_base):
+            return True
+    return False
+
+
+def _access_entry_covers_path(
+    entry: FilesystemAccessEntry,
+    resolved_path: Path,
+    path_base: Path | None,
+) -> bool:
+    entry_path = _resolve_path(entry.path, path_base)
+    resolved_entry = _resolved_for_access(entry_path)
+    return resolved_path == resolved_entry or resolved_entry in resolved_path.parents
+
+
+def _project_root_access_entry(
+    workflow: AgenticWorkflow,
+    trusted_root: Path,
+    path_base: Path | None,
+) -> FilesystemAccessEntry | None:
+    for entry in workflow.config.filesystem_access:
+        entry_path = _resolve_path(entry.path, path_base)
+        if _resolved_for_access(entry_path) == trusted_root:
+            return entry
+    return None
+
+
+def _resolved_for_access(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except OSError:
+        return path.absolute()
 
 
 def _missing_prompt_file_diagnostics(

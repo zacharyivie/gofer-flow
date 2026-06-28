@@ -961,6 +961,68 @@ def test_sections_to_workflow_updates_llm_approval_and_notification_branches() -
     assert notify_op.urgency == "critical"
 
 
+def test_workflow_sections_expose_and_preserve_notification_channel_config() -> None:
+    wf = AgenticWorkflow(WorkflowConfig(id="notify", name="Notify"))
+    wf.add_operation(
+        GraphNode(
+            node_id="notify",
+            operation=NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                title="Deploy",
+                body="Done",
+                channel="slack",
+                webhook_url="{{secret.SLACK_WEBHOOK_URL}}",
+                headers={"Authorization": "{{secret.API_TOKEN}}"},
+                payload={"text": "{{deploy.output}}"},
+                email_from="gofer@example.test",
+                email_to=["ops@example.test"],
+                smtp_host="smtp.example.test",
+                smtp_port=2525,
+                smtp_username="{{secret.SMTP_USER}}",
+                smtp_password="{{secret.SMTP_PASSWORD}}",
+                smtp_starttls=False,
+                timeout_seconds=12.5,
+                retry=HttpRetryPolicy(
+                    attempts=3,
+                    backoff_seconds=1.5,
+                    retry_on_statuses=[429, 503],
+                ),
+                expected_statuses=[200, 202],
+                network_allowlist=["10.0.0.0/8"],
+            ),
+        )
+    )
+
+    sections = workflow_to_sections(wf)
+    node_sec = next(s for s in sections if "notify" in s.title)
+    fm = {fd.key: fd.value for fd in node_sec.fields}
+
+    assert fm["nodes.notify.channel"] == "slack"
+    channel_field = next(fd for fd in node_sec.fields if fd.key == "nodes.notify.channel")
+    assert channel_field.choices == ["desktop", "slack", "teams", "webhook", "email"]
+    assert fm["nodes.notify.webhook_url"] == "{{secret.SLACK_WEBHOOK_URL}}"
+    assert fm["nodes.notify.headers"] == {"Authorization": "{{secret.API_TOKEN}}"}
+    assert '"text": "{{deploy.output}}"' in fm["nodes.notify.payload"]
+    assert fm["nodes.notify.smtp_starttls"] is False
+    assert fm["nodes.notify.retry.retry_on_statuses"] == ["429", "503"]
+
+    _set_field(sections, "nodes.notify.title", "Deploy finished")
+    _set_field(sections, "nodes.notify.payload", '{"text": "updated"}')
+    sections_to_workflow(sections, wf)
+    op = wf.graph._nodes["notify"].operation
+
+    assert isinstance(op, NotificationOperation)
+    assert op.title == "Deploy finished"
+    assert op.channel == "slack"
+    assert op.webhook_url == "{{secret.SLACK_WEBHOOK_URL}}"
+    assert op.headers == {"Authorization": "{{secret.API_TOKEN}}"}
+    assert op.payload == {"text": "updated"}
+    assert op.smtp_password == "{{secret.SMTP_PASSWORD}}"
+    assert op.smtp_starttls is False
+    assert op.retry.retry_on_statuses == [429, 503]
+    assert op.network_allowlist == ["10.0.0.0/8"]
+
+
 # ── agent_to_sections / sections_to_agent ────────────────────────────────────
 
 

@@ -36,6 +36,14 @@ from gofer.core.operations import (
     TabularFanSource,
     WriteFileOperation,
 )
+from gofer.core.provider_profiles import (
+    DIRECT_API_SUBSCRIPTIONS,
+    load_provider_profiles,
+    resolve_provider_settings,
+    sensitive_plaintext_env,
+    unresolved_provider_secret_refs,
+    validate_provider_settings,
+)
 from gofer.core.workflow import AgenticWorkflow
 from gofer.utils.paths import get_data_dir
 
@@ -470,8 +478,9 @@ def _workflow_assistant_cli_diagnostic(data_dir: Path) -> HealthDiagnostic:
 
 def _configured_provider_diagnostics(data_dir: Path) -> list[HealthDiagnostic]:
     providers = _configured_providers_in_data_dir(data_dir)
+    diagnostics = _provider_profile_secret_storage_diagnostics(data_dir)
     if not providers:
-        return [
+        return diagnostics + [
             HealthDiagnostic(
                 id="provider.cli",
                 severity="ok",
@@ -479,8 +488,18 @@ def _configured_provider_diagnostics(data_dir: Path) -> list[HealthDiagnostic]:
             )
         ]
 
-    diagnostics: list[HealthDiagnostic] = []
     for provider in sorted(providers):
+        if provider in DIRECT_API_SUBSCRIPTIONS:
+            diagnostics.append(
+                HealthDiagnostic(
+                    id="provider.direct_api",
+                    severity="ok",
+                    subject=provider,
+                    message=f"Direct API provider '{provider}' is supported.",
+                    detail={"provider": provider},
+                )
+            )
+            continue
         binary = PROVIDER_BINARIES[provider]
         path = shutil.which(binary)
         diagnostics.append(
@@ -499,6 +518,40 @@ def _configured_provider_diagnostics(data_dir: Path) -> list[HealthDiagnostic]:
     return diagnostics
 
 
+def _provider_profile_secret_storage_diagnostics(data_dir: Path) -> list[HealthDiagnostic]:
+    try:
+        profiles = load_provider_profiles(data_dir)
+    except (OSError, ValueError) as exc:
+        return [
+            HealthDiagnostic(
+                id="provider_profile.store",
+                severity="warning",
+                subject=str(data_dir / "provider-profiles.json"),
+                message=f"Provider profile store could not be inspected: {exc}",
+            )
+        ]
+
+    diagnostics: list[HealthDiagnostic] = []
+    for profile in profiles.values():
+        plaintext = sensitive_plaintext_env(profile)
+        if plaintext:
+            names = sorted(plaintext)
+            diagnostics.append(
+                HealthDiagnostic(
+                    id="provider_profile.plaintext_secret",
+                    severity="warning",
+                    subject=profile.name,
+                    message=(
+                        f"Provider profile '{profile.name}' stores sensitive env "
+                        f"value(s) in plaintext: {', '.join(names)}. Move them to "
+                        "secret_refs."
+                    ),
+                    detail={"profile": profile.name, "env": names},
+                )
+            )
+    return diagnostics
+
+
 def _configured_providers_in_data_dir(data_dir: Path) -> set[str]:
     if not data_dir.exists() or not data_dir.is_dir():
         return set()
@@ -513,6 +566,7 @@ def _configured_providers_in_data_dir(data_dir: Path) -> set[str]:
             agent.subscription
             for agent in workflow.agents.values()
             if agent.subscription in PROVIDER_BINARIES
+            or agent.subscription in DIRECT_API_SUBSCRIPTIONS
         )
     return providers
 
@@ -521,6 +575,17 @@ def _workflow_provider_diagnostics(workflow: AgenticWorkflow) -> list[HealthDiag
     providers = {agent.subscription for agent in workflow.agents.values()}
     diagnostics: list[HealthDiagnostic] = []
     for provider in sorted(providers):
+        if provider in DIRECT_API_SUBSCRIPTIONS:
+            diagnostics.append(
+                HealthDiagnostic(
+                    id="workflow.provider_direct_api",
+                    severity="ok",
+                    subject=provider,
+                    message=f"Workflow direct API provider '{provider}' is supported.",
+                    detail={"provider": provider},
+                )
+            )
+            continue
         binary = PROVIDER_BINARIES[provider]
         path = shutil.which(binary)
         diagnostics.append(
@@ -546,7 +611,65 @@ def _workflow_agent_diagnostics(
     diagnostics: list[HealthDiagnostic] = []
     for agent in workflow.agents.values():
         diagnostics.extend(_agent_config_diagnostics(agent, path_base, f"agent:{agent.agent_id}"))
+        if agent.subscription in DIRECT_API_SUBSCRIPTIONS:
+            diagnostics.extend(_direct_provider_profile_diagnostics(agent, path_base))
     return diagnostics
+
+
+def _direct_provider_profile_diagnostics(
+    agent: AgentConfig,
+    data_dir: Path,
+) -> list[HealthDiagnostic]:
+    try:
+        settings = resolve_provider_settings(
+            agent_subscription=agent.subscription,
+            profile_name=agent.profile,
+            agent_model=agent.model,
+            data_dir=data_dir,
+        )
+        validate_provider_settings(settings)
+    except ValueError as exc:
+        return [
+            HealthDiagnostic(
+                id="workflow.provider_profile",
+                severity="error",
+                subject=agent.agent_id,
+                message=str(exc),
+            )
+        ]
+    missing = unresolved_provider_secret_refs(settings)
+    if missing:
+        return [
+            HealthDiagnostic(
+                id="workflow.provider_secret",
+                severity="error",
+                subject=agent.agent_id,
+                message=(
+                    f"Direct provider '{settings.subscription}' is missing API "
+                    f"secret(s): {', '.join(missing)}."
+                ),
+                detail={
+                    "provider": settings.subscription,
+                    "profile": settings.profile_name,
+                    "model": settings.model,
+                    "missingSecrets": missing,
+                },
+            )
+        ]
+    return [
+        HealthDiagnostic(
+            id="workflow.provider_secret",
+            severity="ok",
+            subject=agent.agent_id,
+            message=f"Direct provider '{settings.subscription}' API secret is configured.",
+            detail={
+                "provider": settings.subscription,
+                "profile": settings.profile_name,
+                "model": settings.model,
+                "apiBaseUrl": settings.api_base_url,
+            },
+        )
+    ]
 
 
 def _agent_config_diagnostics(

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import json
 import zipfile
+from io import StringIO
 from pathlib import Path
 
 import pytest
+from rich.console import Console
 
+from gofer.cli.commands import workflow as workflow_cmd
 from gofer.core.bundles import (
     BundleError,
     export_workflow_bundle,
     import_workflow_bundle,
     preview_workflow_bundle,
 )
+from gofer.core.resources import ResourceLimits
 from gofer.core.validation import validate_workflow_file
 
 
@@ -68,7 +72,10 @@ def test_export_import_bundle_round_trips_and_validates(tmp_path: Path) -> None:
         "scripts/hello.sh",
     }
     assert manifest.required_secrets == [
-        {"name": "API_TOKEN", "description": "Required by bundled workflow"}
+        {
+            "name": "API_TOKEN",
+            "description": "Required by prompts/hello.md",
+        }
     ]
 
     plan = import_workflow_bundle(bundle_path, data_dir=target_dir)
@@ -274,10 +281,80 @@ fanout_path = "payload.items"
             "source": "github",
             "enabled": "true",
             "concurrencyPolicy": "allow",
+            "tokenConfigured": "true",
+            "allowUnauthenticated": "false",
+            "risk": "normal",
             "tokenEnv": "GITHUB_WEBHOOK_TOKEN",
             "fanoutPath": "payload.items",
         },
     ]
+    assert manifest.required_secrets == [
+        {
+            "name": "GITHUB_WEBHOOK_TOKEN",
+            "description": "Required by trigger:github.token_env",
+        }
+    ]
+
+
+def test_import_bundle_preview_warns_for_unauthenticated_webhook_opt_in(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "local.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "local"
+name = "Local"
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+
+[[nodes]]
+id = "start"
+type = "pass"
+message = "ok"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "local.zip"
+
+    manifest = export_workflow_bundle(workflow_path, bundle_path)
+    plan = preview_workflow_bundle(bundle_path, data_dir=tmp_path / "imported")
+
+    assert manifest.triggers[0]["risk"] == "high"
+    assert manifest.triggers[0]["riskReasons"] == "unauthenticated_allowed"
+    assert any("allows unauthenticated requests" in warning for warning in plan.risk_warnings)
+    assert any(
+        "allows unauthenticated requests" in warning
+        for warning in plan.to_dict()["riskWarnings"]
+    )
+
+
+def test_cli_bundle_import_plan_prints_risk_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = StringIO()
+    monkeypatch.setattr(
+        workflow_cmd,
+        "console",
+        Console(file=output, force_terminal=False, width=160),
+    )
+
+    workflow_cmd._print_bundle_import_plan(
+        {
+            "workflowId": "local-hook",
+            "workflowPath": "/tmp/local-hook.toml",
+            "riskWarnings": [
+                "Webhook trigger 'github' explicitly allows unauthenticated requests; "
+                "only use this for local testing.",
+            ],
+        },
+        dry_run=True,
+    )
+
+    text = output.getvalue()
+    assert "High-risk configuration:" in text
+    assert "explicitly allows unauthenticated requests" in text
 
 
 def test_export_bundle_sanitizes_http_secret_fields(tmp_path: Path) -> None:
@@ -309,7 +386,7 @@ secret_fields = ["headers.Authorization", "json.password", "url", "api_key", "pa
     manifest = export_workflow_bundle(workflow_path, bundle_path)
 
     assert manifest.required_secrets == [
-        {"name": "API_TOKEN", "description": "Required by bundled workflow"}
+        {"name": "API_TOKEN", "description": "Required by workflow.toml"}
     ]
     with zipfile.ZipFile(bundle_path) as archive:
         bundled_workflow = archive.read("workflow.toml").decode("utf-8")
@@ -353,8 +430,54 @@ json = { secret = "json-secret", safe = "public" }
     assert "param-secret" not in bundled_workflow
     assert "json-secret" not in bundled_workflow
     assert "visible=ok" in bundled_workflow
-    assert "query = \"public\"" in bundled_workflow
-    assert "safe = \"public\"" in bundled_workflow
+    assert 'query = "public"' in bundled_workflow
+    assert 'safe = "public"' in bundled_workflow
+
+
+def test_export_bundle_sanitizes_notification_secret_fields(tmp_path: Path) -> None:
+    workflow_path = tmp_path / "notify.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "notify"
+name = "Notify"
+
+[[nodes]]
+id = "slack"
+type = "notification"
+channel = "slack"
+webhook_url = "https://hooks.example.test/services/T000/B000/secret-token?visible=ok"
+headers = { Authorization = "Bearer header-secret" }
+payload = { password = "payload-secret", safe = "{{secret.SAFE_VALUE}}" }
+
+[[nodes]]
+id = "email"
+type = "notification"
+channel = "email"
+email_from = "gofer@example.test"
+email_to = ["ops@example.test"]
+smtp_host = "smtp.example.test"
+smtp_username = "smtp-user"
+smtp_password = "smtp-secret"
+""".strip()
+        + "\n"
+    )
+    bundle_path = tmp_path / "notify.zip"
+
+    manifest = export_workflow_bundle(workflow_path, bundle_path)
+
+    assert manifest.required_secrets == [
+        {"name": "SAFE_VALUE", "description": "Required by workflow.toml"}
+    ]
+    with zipfile.ZipFile(bundle_path) as archive:
+        bundled_workflow = archive.read("workflow.toml").decode("utf-8")
+
+    assert "secret-token" not in bundled_workflow
+    assert "header-secret" not in bundled_workflow
+    assert "payload-secret" not in bundled_workflow
+    assert "smtp-user" not in bundled_workflow
+    assert "smtp-secret" not in bundled_workflow
+    assert "{{secret.SAFE_VALUE}}" in bundled_workflow
 
 
 def test_export_bundle_sanitizes_agent_and_node_env_secrets(tmp_path: Path) -> None:
@@ -384,8 +507,8 @@ env = { PASSWORD = "cleartext-password", LOG_LEVEL = "info" }
     manifest = export_workflow_bundle(workflow_path, bundle_path)
 
     assert manifest.required_secrets == [
-        {"name": "OPENAI_API_KEY", "description": "Required by bundled workflow"},
-        {"name": "PASSWORD", "description": "Required by bundled workflow"},
+        {"name": "OPENAI_API_KEY", "description": "Required by workflow.toml"},
+        {"name": "PASSWORD", "description": "Required by workflow.toml"},
     ]
     with zipfile.ZipFile(bundle_path) as archive:
         bundled_workflow = archive.read("workflow.toml").decode("utf-8")
@@ -421,3 +544,192 @@ def test_import_bundle_rejects_unsafe_archive_entries(tmp_path: Path) -> None:
         preview_workflow_bundle(bundle_path, data_dir=tmp_path / "target")
 
     assert not (tmp_path / "outside.txt").exists()
+
+
+def _write_minimal_bundle(
+    bundle_path: Path,
+    *,
+    workflow_id: str = "limited",
+    workflow_body: str | None = None,
+    included_paths: list[dict[str, str]] | None = None,
+    files: dict[str, str | bytes] | None = None,
+    compression: int = zipfile.ZIP_DEFLATED,
+) -> None:
+    manifest = {
+        "formatVersion": 1,
+        "workflow": {"id": workflow_id, "name": "Limited"},
+        "includedPaths": included_paths or [],
+        "requiredSecrets": [],
+        "providerAssumptions": [],
+        "externalRequirements": [],
+    }
+    workflow_body = workflow_body or (f'[workflow]\nid = "{workflow_id}"\nname = "Limited"\n')
+    with zipfile.ZipFile(bundle_path, "w", compression=compression) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest))
+        archive.writestr("workflow.toml", workflow_body)
+        for name, data in (files or {}).items():
+            archive.writestr(name, data)
+
+
+def test_import_bundle_rejects_excessive_entry_count(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "entries.zip"
+    _write_minimal_bundle(bundle_path, files={"extra.txt": "extra\n"})
+
+    limits = ResourceLimits(max_bundle_entries=2)
+
+    with pytest.raises(BundleError, match="entry count exceeded limit 2 entries"):
+        preview_workflow_bundle(bundle_path, data_dir=tmp_path / "target", limits=limits)
+
+    with pytest.raises(BundleError, match="entry count exceeded limit 2 entries"):
+        import_workflow_bundle(
+            bundle_path,
+            data_dir=tmp_path / "target",
+            dry_run=True,
+            limits=limits,
+        )
+
+
+def test_import_bundle_rejects_zip_bomb_compression_ratio(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "ratio.zip"
+    _write_minimal_bundle(bundle_path, files={"payload.txt": "A" * 4000})
+
+    with pytest.raises(BundleError, match="compression ratio exceeded limit 2:1"):
+        preview_workflow_bundle(
+            bundle_path,
+            data_dir=tmp_path / "target",
+            limits=ResourceLimits(max_bundle_compression_ratio=2),
+        )
+
+
+def test_import_bundle_rejects_data_bearing_directory_entries(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "data-dir.zip"
+    with zipfile.ZipFile(bundle_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "formatVersion": 1,
+                    "workflow": {"id": "limited", "name": "Limited"},
+                    "includedPaths": [],
+                    "requiredSecrets": [],
+                    "providerAssumptions": [],
+                    "externalRequirements": [],
+                }
+            ),
+        )
+        archive.writestr("workflow.toml", '[workflow]\nid = "limited"\nname = "Limited"\n')
+        archive.writestr("payload/", "A" * 4000)
+
+    with pytest.raises(BundleError, match="directory entry contains file data"):
+        preview_workflow_bundle(bundle_path, data_dir=tmp_path / "target")
+
+
+def test_import_bundle_rejects_excessive_total_uncompressed_size(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "total.zip"
+    _write_minimal_bundle(
+        bundle_path,
+        files={
+            "one.txt": "1" * 100,
+            "two.txt": "2" * 100,
+        },
+        compression=zipfile.ZIP_STORED,
+    )
+
+    with pytest.raises(BundleError, match="total uncompressed size exceeded limit 300 bytes"):
+        preview_workflow_bundle(
+            bundle_path,
+            data_dir=tmp_path / "target",
+            limits=ResourceLimits(max_bundle_total_uncompressed_bytes=300),
+        )
+
+
+def test_import_bundle_rejects_oversized_metadata_entries(tmp_path: Path) -> None:
+    manifest_bundle = tmp_path / "manifest-too-large.zip"
+    _write_minimal_bundle(manifest_bundle)
+    workflow_bundle = tmp_path / "workflow-too-large.zip"
+    _write_minimal_bundle(
+        workflow_bundle,
+        workflow_body='[workflow]\nid = "limited"\nname = "Limited"\n' + "# pad\n" * 40,
+    )
+
+    with pytest.raises(BundleError, match="manifest\\.json size exceeded metadata limit 60 bytes"):
+        preview_workflow_bundle(
+            manifest_bundle,
+            data_dir=tmp_path / "target",
+            limits=ResourceLimits(max_bundle_metadata_bytes=60),
+        )
+
+    with pytest.raises(BundleError, match="workflow\\.toml size exceeded metadata limit 200 bytes"):
+        preview_workflow_bundle(
+            workflow_bundle,
+            data_dir=tmp_path / "target",
+            limits=ResourceLimits(max_bundle_metadata_bytes=200),
+        )
+
+
+def test_import_bundle_uses_bundle_limit_environment_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bundle_path = tmp_path / "env-limits.zip"
+    _write_minimal_bundle(bundle_path, files={"extra.txt": "extra\n"})
+    monkeypatch.setenv("GOFER_BUNDLE_MAX_ENTRIES", "2")
+
+    with pytest.raises(BundleError, match="entry count exceeded limit 2 entries"):
+        preview_workflow_bundle(bundle_path, data_dir=tmp_path / "target")
+
+
+def test_import_bundle_accepts_valid_bundle_under_resource_limits(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    target_dir = tmp_path / "target"
+    source_dir.mkdir()
+    workflow_path = _write_bundle_source(source_dir)
+    bundle_path = tmp_path / "hello.gof.zip"
+    export_workflow_bundle(workflow_path, bundle_path)
+
+    plan = import_workflow_bundle(
+        bundle_path,
+        data_dir=target_dir,
+        limits=ResourceLimits(
+            max_bundle_entries=4,
+            max_bundle_entry_bytes=4096,
+            max_bundle_total_uncompressed_bytes=4096,
+            max_bundle_compressed_bytes=4096,
+            max_bundle_metadata_bytes=2048,
+            max_bundle_compression_ratio=100,
+        ),
+    )
+
+    assert plan.workflow_id == "hello"
+    assert (target_dir / "hello.toml").exists()
+    assert (target_dir / "prompts" / "hello.md").exists()
+
+
+def test_import_bundle_rejects_before_partial_asset_writes(tmp_path: Path) -> None:
+    bundle_path = tmp_path / "oversized-asset.zip"
+    target_dir = tmp_path / "target"
+    _write_minimal_bundle(
+        bundle_path,
+        workflow_id="partial",
+        workflow_body=(
+            '[workflow]\nid = "partial"\nname = "Partial"\n\n'
+            '[[nodes]]\nid = "script"\ntype = "shell_script"\nscript_path = "scripts/run.sh"\n'
+        ),
+        included_paths=[
+            {
+                "path": "scripts/run.sh",
+                "archivePath": "assets/scripts/run.sh",
+                "kind": "script",
+            }
+        ],
+        files={"assets/scripts/run.sh": "echo should-not-write\n"},
+        compression=zipfile.ZIP_STORED,
+    )
+
+    with pytest.raises(BundleError, match="entry size exceeded limit 10 bytes"):
+        import_workflow_bundle(
+            bundle_path,
+            data_dir=target_dir,
+            limits=ResourceLimits(max_bundle_entry_bytes=10),
+        )
+
+    assert not target_dir.exists()

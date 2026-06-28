@@ -21,10 +21,13 @@ from gofer.core.operations import (
     DeleteFileOperation,
     DirectoryFanSource,
     HttpRequestOperation,
+    LocalSearchOperation,
+    LocalVectorizeOperation,
     LoopOperation,
     MoveFileOperation,
     NotificationOperation,
     OperationType,
+    PromptFileOperation,
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
@@ -34,7 +37,13 @@ from gofer.core.operations import (
 )
 from gofer.core.planner import build_execution_plan
 from gofer.core.resources import ResourceLimits
-from gofer.core.workflow import AgenticWorkflow, WatchConfig, WorkflowConfig
+from gofer.core.usage import LlmUsageBudget
+from gofer.core.workflow import (
+    AgenticWorkflow,
+    FilesystemAccessEntry,
+    WatchConfig,
+    WorkflowConfig,
+)
 
 
 def test_plan_command_script_file_agent_and_conditional_edges(
@@ -51,7 +60,15 @@ def test_plan_command_script_file_agent_and_conditional_edges(
     prompt.write_text("Summarize")
     extra_dir = tmp_path / "shared"
     extra_dir.mkdir()
-    workflow = AgenticWorkflow(WorkflowConfig(id="plan-demo", name="Plan Demo"))
+    workflow = AgenticWorkflow(
+        WorkflowConfig(
+            id="plan-demo",
+            name="Plan Demo",
+            resource_limits=ResourceLimits(max_fanout_items=5, max_files_scanned=20),
+            llm_budget=LlmUsageBudget(max_agent_calls=2),
+            max_total_node_runs=25,
+        )
+    )
     workflow.register_agent(
         AgentConfig(
             agent_id="reviewer",
@@ -141,36 +158,60 @@ def test_plan_command_script_file_agent_and_conditional_edges(
             ),
         )
     )
-    workflow.then("command", "script", EdgeConfig(
-        from_node="command",
-        to_node="script",
-        condition=EdgeConditionType.ON_SUCCESS,
-    ))
-    workflow.then("script", "agent", EdgeConfig(
-        from_node="script",
-        to_node="agent",
-        condition=EdgeConditionType.OUTPUT_MATCHES,
-        output_pattern="ok",
-    ))
+    workflow.then(
+        "command",
+        "script",
+        EdgeConfig(
+            from_node="command",
+            to_node="script",
+            condition=EdgeConditionType.ON_SUCCESS,
+        ),
+    )
+    workflow.then(
+        "script",
+        "agent",
+        EdgeConfig(
+            from_node="script",
+            to_node="agent",
+            condition=EdgeConditionType.OUTPUT_MATCHES,
+            output_pattern="ok",
+        ),
+    )
 
     plan = build_execution_plan(workflow)
 
     assert [generation["index"] for generation in plan["generations"]] == [0, 1, 2]
+    assert plan["startNodes"] == ["command", "copy", "delete", "move", "read", "write"]
+    assert plan["resourceLimits"]["max_fanout_items"] == 5
+    assert plan["executionLimits"]["maxTotalNodeRuns"] == 25
+    assert plan["usageBudget"] == {"enabled": True, "max_agent_calls": 2}
+    assert plan["validation"]["ok"] is False
+    assert any(
+        item["message"].startswith("Script path") for item in plan["validation"]["diagnostics"]
+    )
+    assert plan["conditionalBranches"] == [
+        {
+            "from": "command",
+            "to": "script",
+            "condition": "on_success",
+            "label": "on_success",
+            "outputPattern": None,
+        },
+        {
+            "from": "script",
+            "to": "agent",
+            "condition": "output_matches",
+            "label": "output_matches:ok",
+            "outputPattern": "ok",
+        },
+    ]
     assert "Shell command effects cannot be inferred" in plan["warnings"]
-    assert "unknown shell command effects: rm -rf build && echo done" in plan[
-        "destructiveActions"
-    ]
-    assert f"unknown python script effects: {tmp_path / 'job.py'}" in plan[
-        "destructiveActions"
-    ]
+    assert "unknown shell command effects: rm -rf build && echo done" in plan["destructiveActions"]
+    assert f"unknown python script effects: {tmp_path / 'job.py'}" in plan["destructiveActions"]
     assert f"overwrite file: {tmp_path / 'out.txt'}" in plan["destructiveActions"]
-    assert f"overwrite copy destination: {tmp_path / 'copy.txt'}" in plan[
-        "destructiveActions"
-    ]
+    assert f"overwrite copy destination: {tmp_path / 'copy.txt'}" in plan["destructiveActions"]
     assert f"move source: {source}" in plan["destructiveActions"]
-    assert f"overwrite move destination: {tmp_path / 'moved.txt'}" in plan[
-        "destructiveActions"
-    ]
+    assert f"overwrite move destination: {tmp_path / 'moved.txt'}" in plan["destructiveActions"]
     assert f"recursive delete: {tmp_path / 'old'}" in plan["destructiveActions"]
     copy_node = next(
         node
@@ -213,15 +254,15 @@ def test_plan_command_script_file_agent_and_conditional_edges(
             "subscription": "codex",
             "workingDir": str(tmp_path),
             "binary": "codex",
+            "directApi": False,
+            "apiBaseUrl": None,
             "available": True,
             "extraPaths": [str(extra_dir.resolve())],
         }
     ]
     assert "command.inputs.prior=read.output" in plan["unresolvedDynamicValues"]
     command_node = plan["generations"][0]["nodes"][0]
-    assert command_node["unresolvedDynamicValues"] == [
-        "command.inputs.prior=read.output"
-    ]
+    assert command_node["unresolvedDynamicValues"] == ["command.inputs.prior=read.output"]
     assert {
         "from": "script",
         "to": "agent",
@@ -324,10 +365,12 @@ def test_plan_fan_out_sources_report_counts_samples_and_trigger_context(
             "path": str(files / "one.txt"),
             "event": "modified",
             "index": "1",
-            "event_json": json.dumps({
-                "path": str(files / "one.txt"),
-                "event": "modified",
-            }),
+            "event_json": json.dumps(
+                {
+                    "path": str(files / "one.txt"),
+                    "event": "modified",
+                }
+            ),
             "file_path": str(files / "one.txt"),
             "file_name": "one.txt",
             "file_stem": "one",
@@ -340,18 +383,13 @@ def test_plan_fan_out_sources_report_counts_samples_and_trigger_context(
         }
     ]
     assert "Skipped 1 non-object trigger event" in fan_outs["trigger"]["warnings"]
-    assert (
-        "Trigger event file content omitted from plan preview"
-        in fan_outs["trigger"]["warnings"]
-    )
+    assert "Trigger event file content omitted from plan preview" in fan_outs["trigger"]["warnings"]
     assert plan["triggerContext"]["watch"]["mode"] == "fanout"
     assert plan["triggerContext"]["provided"]["events"][1]["event"] == "modified"
 
 
 def test_plan_trigger_event_fan_out_without_events_is_unknown() -> None:
-    workflow = AgenticWorkflow(
-        WorkflowConfig(id="trigger-no-events", name="Trigger No Events")
-    )
+    workflow = AgenticWorkflow(WorkflowConfig(id="trigger-no-events", name="Trigger No Events"))
     workflow.add_operation(
         GraphNode(
             node_id="trigger",
@@ -405,9 +443,7 @@ def test_plan_count_fan_out_resolves_numeric_string_count() -> None:
 
 
 def test_plan_agent_dynamic_count_reports_fan_out_estimate() -> None:
-    workflow = AgenticWorkflow(
-        WorkflowConfig(id="agent-dynamic-count", name="Agent Dynamic Count")
-    )
+    workflow = AgenticWorkflow(WorkflowConfig(id="agent-dynamic-count", name="Agent Dynamic Count"))
     workflow.agents["reviewer"] = AgentConfig(
         agent_id="reviewer",
         subscription="codex",
@@ -442,9 +478,7 @@ def test_plan_agent_dynamic_count_reports_fan_out_estimate() -> None:
 
 
 def test_plan_loop_fan_out_projects_downstream_agent_usage() -> None:
-    workflow = AgenticWorkflow(
-        WorkflowConfig(id="loop-agent-usage", name="Loop Agent Usage")
-    )
+    workflow = AgenticWorkflow(WorkflowConfig(id="loop-agent-usage", name="Loop Agent Usage"))
     workflow.agents["reviewer"] = AgentConfig(
         agent_id="reviewer",
         subscription="codex",
@@ -510,9 +544,7 @@ def test_plan_agent_usage_falls_back_to_registered_prompt_path(tmp_path: Path) -
 
 
 def test_plan_common_llm_task_uses_runtime_prompt_template(tmp_path: Path) -> None:
-    workflow = AgenticWorkflow(
-        WorkflowConfig(id="common-task-prompt", name="Common Task Prompt")
-    )
+    workflow = AgenticWorkflow(WorkflowConfig(id="common-task-prompt", name="Common Task Prompt"))
     workflow.agents["reviewer"] = AgentConfig(
         agent_id="reviewer",
         subscription="codex",
@@ -540,9 +572,7 @@ def test_plan_common_llm_task_uses_runtime_prompt_template(tmp_path: Path) -> No
         "Focus on risks.",
     )
 
-    assert node_plan["projectedLlmUsage"]["input_tokens"] == (
-        len(expected_prompt) + 3
-    ) // 4
+    assert node_plan["projectedLlmUsage"]["input_tokens"] == (len(expected_prompt) + 3) // 4
 
 
 def test_plan_provider_requirements_report_missing_binary(
@@ -573,6 +603,8 @@ def test_plan_provider_requirements_report_missing_binary(
             "subscription": "codex",
             "workingDir": str(tmp_path),
             "binary": "codex",
+            "directApi": False,
+            "apiBaseUrl": None,
             "available": False,
             "extraPaths": [],
         }
@@ -607,9 +639,82 @@ def test_plan_http_request_reports_host_dynamic_values_and_missing_secret(
     assert node["sideEffectDetails"][0]["kind"] == "network"
     assert node["sideEffectDetails"][0]["host"] == "api.example.test"
     assert "API_TOKEN" in plan["requiredSecrets"]
-    assert "create.url=https://api.example.test/issues/{{trigger.issue_id}}" in plan[
-        "unresolvedDynamicValues"
+    assert {
+        "name": "API_TOKEN",
+        "status": "missing",
+        "present": False,
+        "sources": ["node:create"],
+        "envNames": ["GOFER_SECRET_API_TOKEN", "API_TOKEN"],
+    } in plan["secretReadiness"]
+    assert (
+        "create.url=https://api.example.test/issues/{{trigger.issue_id}}"
+        in plan["unresolvedDynamicValues"]
+    )
+
+
+def test_plan_reports_present_secret_readiness(monkeypatch: MonkeyPatch) -> None:
+    monkeypatch.setenv("GOFER_SECRET_API_TOKEN", "not-shown")
+    workflow = AgenticWorkflow(WorkflowConfig(id="secret-plan", name="Secret Plan"))
+    workflow.add_operation(
+        GraphNode(
+            node_id="notify",
+            operation=NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                title="Deploy",
+                body="Token {{secret.API_TOKEN}}",
+            ),
+        )
+    )
+
+    plan = build_execution_plan(workflow)
+
+    assert plan["requiredSecrets"] == ["API_TOKEN"]
+    assert plan["secretReadiness"] == [
+        {
+            "name": "API_TOKEN",
+            "status": "present",
+            "present": True,
+            "sources": ["node:notify"],
+            "envNames": ["GOFER_SECRET_API_TOKEN", "API_TOKEN"],
+            "maskedValue": "***",
+        }
     ]
+    assert "not-shown" not in json.dumps(plan)
+
+
+def test_plan_http_request_reports_network_policy_and_allowlist() -> None:
+    workflow = AgenticWorkflow(WorkflowConfig(id="http-plan", name="HTTP Plan"))
+    workflow.add_operation(
+        GraphNode(
+            node_id="internal",
+            operation=HttpRequestOperation(
+                type=OperationType.HTTP_REQUEST,
+                method="GET",
+                url="http://10.0.0.5/status",
+                network_allowlist=["10.0.0.0/8"],
+            ),
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="metadata",
+            operation=HttpRequestOperation(
+                type=OperationType.HTTP_REQUEST,
+                method="GET",
+                url="http://169.254.169.254/latest?token=secret",
+            ),
+        )
+    )
+
+    plan = build_execution_plan(workflow)
+    nodes = {node["id"]: node for generation in plan["generations"] for node in generation["nodes"]}
+
+    assert nodes["internal"]["sideEffectDetails"][0]["networkAllowlist"] == ["10.0.0.0/8"]
+    assert nodes["metadata"]["sideEffectDetails"][0]["networkAllowlist"] == []
+    assert any(
+        "blocked private or local address" in warning for warning in nodes["metadata"]["warnings"]
+    )
+    assert all("secret" not in warning for warning in nodes["metadata"]["warnings"])
 
 
 def test_plan_http_request_masks_secret_url_and_params() -> None:
@@ -663,8 +768,7 @@ def test_plan_http_request_masks_configured_secret_values_everywhere() -> None:
                 type=OperationType.HTTP_REQUEST,
                 method="POST",
                 url=(
-                    "https://api.example.test/hooks?"
-                    "password=cleartext-secret&echo=cleartext-secret"
+                    "https://api.example.test/hooks?password=cleartext-secret&echo=cleartext-secret"
                 ),
                 params={
                     "password": "cleartext-secret",
@@ -723,11 +827,65 @@ def test_plan_approval_gate_and_notification_side_effects() -> None:
     assert approval["type"] == "approval_gate"
     assert approval["sideEffects"] == ["pause for approval"]
     assert approval["sideEffectDetails"][0]["approvers"] == ["ops"]
-    assert "Approval message contains unresolved dynamic values" in " ".join(
-        approval["warnings"]
-    )
+    assert "Approval message contains unresolved dynamic values" in " ".join(approval["warnings"])
     assert notification["type"] == "notification"
     assert notification["sideEffectDetails"][0]["channel"] == "desktop"
+
+
+def test_plan_notification_masks_webhook_secret_details() -> None:
+    workflow = AgenticWorkflow(WorkflowConfig(id="notify-plan", name="Notify Plan"))
+    workflow.add_operation(
+        GraphNode(
+            node_id="notify",
+            operation=NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                channel="slack",
+                webhook_url="{{secret.SLACK_WEBHOOK_URL}}",
+                headers={"Authorization": "{{secret.API_TOKEN}}"},
+                payload={"password": "literal-password", "safe": "ok"},
+            ),
+        )
+    )
+
+    plan = build_execution_plan(workflow)
+    detail = plan["generations"][0]["nodes"][0]["sideEffectDetails"][0]
+
+    assert detail["channel"] == "slack"
+    assert detail["webhookUrl"] == "***"
+    assert detail["headers"] == {"Authorization": "***"}
+    assert detail["payload"] == {"password": "***", "safe": "ok"}
+    assert sorted(plan["generations"][0]["nodes"][0]["requiredSecrets"]) == [
+        "API_TOKEN",
+        "SLACK_WEBHOOK_URL",
+    ]
+    assert sorted(plan["requiredSecrets"]) == ["API_TOKEN", "SLACK_WEBHOOK_URL"]
+    assert "literal-password" not in json.dumps(plan)
+
+
+def test_plan_notification_masks_smtp_username() -> None:
+    workflow = AgenticWorkflow(WorkflowConfig(id="notify-email-plan", name="Notify Email Plan"))
+    workflow.add_operation(
+        GraphNode(
+            node_id="notify",
+            operation=NotificationOperation(
+                type=OperationType.NOTIFICATION,
+                channel="email",
+                email_from="gofer@example.test",
+                email_to=["ops@example.test"],
+                smtp_host="smtp.example.test",
+                smtp_username="smtp-user",
+                smtp_password="smtp-secret",
+            ),
+        )
+    )
+
+    plan = build_execution_plan(workflow)
+    serialized = json.dumps(plan)
+    detail = plan["generations"][0]["nodes"][0]["sideEffectDetails"][0]
+
+    assert detail["smtpUsername"] == "***"
+    assert "smtp-user" not in serialized
+    assert "smtp-secret" not in serialized
 
 
 def test_plan_directory_fan_out_scan_is_bounded(tmp_path: Path) -> None:
@@ -841,13 +999,9 @@ def test_plan_tabular_fan_out_over_limit_keeps_count_samples_and_warning(
         {"name": "two", "_row": '{"name": "two"}'},
     ]
     assert (
-        "Tabular fan-out count 3 exceeds limit 2; preview count is partial"
-        in fan_out["warnings"]
+        "Tabular fan-out count 3 exceeds limit 2; preview count is partial" in fan_out["warnings"]
     )
-    assert (
-        "Tabular fan-out count 3 exceeds limit 2; preview count is partial"
-        in plan["warnings"]
-    )
+    assert "Tabular fan-out count 3 exceeds limit 2; preview count is partial" in plan["warnings"]
 
 
 def test_plan_tabular_fan_out_xlsx_rows_with_dates_are_serializable(
@@ -859,10 +1013,12 @@ def test_plan_tabular_fan_out_xlsx_rows_with_dates_are_serializable(
 
     class Workbook:
         active = SimpleNamespace(
-            iter_rows=lambda values_only=True: iter([
-                ("name", "created"),
-                ("one", date(2026, 6, 24)),
-            ])
+            iter_rows=lambda values_only=True: iter(
+                [
+                    ("name", "created"),
+                    ("one", date(2026, 6, 24)),
+                ]
+            )
         )
 
         def close(self) -> None:
@@ -873,9 +1029,7 @@ def test_plan_tabular_fan_out_xlsx_rows_with_dates_are_serializable(
         "openpyxl",
         SimpleNamespace(load_workbook=lambda *_args, **_kwargs: Workbook()),
     )
-    workflow = AgenticWorkflow(
-        WorkflowConfig(id="xlsx-plan", name="XLSX Plan")
-    )
+    workflow = AgenticWorkflow(WorkflowConfig(id="xlsx-plan", name="XLSX Plan"))
     workflow.add_operation(
         GraphNode(
             node_id="tabular",
@@ -890,9 +1044,7 @@ def test_plan_tabular_fan_out_xlsx_rows_with_dates_are_serializable(
     fan_out = plan["generations"][0]["nodes"][0]["fanOut"]
 
     assert fan_out["count"] == 1
-    assert fan_out["sampleItems"][0]["_row"] == (
-        '{"name": "one", "created": "2026-06-24"}'
-    )
+    assert fan_out["sampleItems"][0]["_row"] == ('{"name": "one", "created": "2026-06-24"}')
 
 
 def test_plan_unresolved_dynamic_values_ignore_literal_dotted_strings(
@@ -1079,17 +1231,11 @@ def test_plan_resolves_relative_paths_from_workflow_path(tmp_path: Path) -> None
         for generation in plan["generations"]
         for node in generation["nodes"]
     }
-    nodes = {
-        node["id"]: node
-        for generation in plan["generations"]
-        for node in generation["nodes"]
-    }
+    nodes = {node["id"]: node for generation in plan["generations"] for node in generation["nodes"]}
 
     assert plan["pathResolutionBase"] == str(workflow_dir)
     assert plan["triggerContext"]["watch"]["path"] == str(inputs)
-    assert f"Missing read target: {workflow_dir / 'inputs/one.txt'}" not in plan[
-        "warnings"
-    ]
+    assert f"Missing read target: {workflow_dir / 'inputs/one.txt'}" not in plan["warnings"]
     assert f"python script: {script}" in nodes["script"]["sideEffects"]
     assert fan_outs["directory"]["path"] == str(inputs)
     assert fan_outs["directory"]["count"] == 1
@@ -1098,10 +1244,139 @@ def test_plan_resolves_relative_paths_from_workflow_path(tmp_path: Path) -> None
     assert fan_outs["tabular"]["count"] == 1
 
 
-def test_plan_reports_unregistered_agent() -> None:
+def test_plan_warns_for_ungranted_managed_paths_outside_workflow_project(
+    tmp_path: Path,
+) -> None:
+    workflow_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    workflow_dir.mkdir()
+    external_dir.mkdir()
+    (external_dir / "rows.csv").write_text("name\noutside\n")
+    (external_dir / "template.md").write_text("Hello")
+    (external_dir / "docs").mkdir()
+    (external_dir / "docs" / "one.txt").write_text("outside")
+    index_path = external_dir / "index.json"
     workflow = AgenticWorkflow(
-        WorkflowConfig(id="missing-agent", name="Missing Agent")
+        WorkflowConfig(
+            id="access-plan",
+            name="Access Plan",
+            filesystem_access=[
+                FilesystemAccessEntry(
+                    path=external_dir / "template.md",
+                    read=True,
+                    write=False,
+                )
+            ],
+        )
     )
+    workflow.add_operation(
+        GraphNode(
+            node_id="tabular",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=external_dir / "rows.csv"),
+            ),
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="prompt",
+            operation=PromptFileOperation(
+                type=OperationType.PROMPT_FILE,
+                template_path=external_dir / "template.md",
+                output_path=external_dir / "out.md",
+            ),
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="vectorize",
+            operation=LocalVectorizeOperation(
+                type=OperationType.LOCAL_VECTORIZE,
+                source_path=external_dir / "docs",
+                index_path=index_path,
+            ),
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="search",
+            operation=LocalSearchOperation(
+                type=OperationType.LOCAL_SEARCH,
+                index_path=index_path,
+                query="outside",
+            ),
+        )
+    )
+
+    plan = build_execution_plan(
+        workflow,
+        workflow_path=workflow_dir / "flow.toml",
+    )
+
+    warnings = "\n".join(plan["warnings"])
+    assert "Node 'tabular' tabular fan-out path requires read access" in warnings
+    assert "Node 'prompt' prompt output path requires write access" in warnings
+    assert "Node 'prompt' prompt template path requires read access" not in warnings
+    assert "Node 'vectorize' local_vectorize source path requires read access" in warnings
+    assert "Node 'vectorize' local_vectorize index path requires write access" in warnings
+    assert "Node 'search' local_search index path requires read access" in warnings
+
+
+def test_plan_skips_ungranted_outside_fanout_previews(tmp_path: Path) -> None:
+    workflow_dir = tmp_path / "project"
+    external_dir = tmp_path / "external"
+    workflow_dir.mkdir()
+    external_dir.mkdir()
+    rows = external_dir / "rows.csv"
+    rows.write_text("name\nleaked-row\n")
+    directory = external_dir / "docs"
+    directory.mkdir()
+    (directory / "leaked-file.txt").write_text("outside")
+    workflow = AgenticWorkflow(WorkflowConfig(id="access-plan", name="Access Plan"))
+    workflow.add_operation(
+        GraphNode(
+            node_id="tabular",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=rows),
+            ),
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="directory",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=directory),
+            ),
+        )
+    )
+
+    plan = build_execution_plan(
+        workflow,
+        workflow_path=workflow_dir / "flow.toml",
+    )
+    plan_nodes = {
+        node["id"]: node for generation in plan["generations"] for node in generation["nodes"]
+    }
+    tabular_fan_out = plan_nodes["tabular"]["fanOut"]
+    directory_fan_out = plan_nodes["directory"]["fanOut"]
+
+    assert tabular_fan_out["sampleItems"] == []
+    assert tabular_fan_out["count"] is None
+    assert directory_fan_out["sampleItems"] == []
+    assert directory_fan_out["count"] is None
+    assert "scannedPaths" not in directory_fan_out
+    plan_json = json.dumps(plan, default=str)
+    assert "leaked-row" not in plan_json
+    assert "leaked-file.txt" not in plan_json
+    assert "Tabular fan-out preview skipped because read access is not granted" in plan_json
+    assert "Directory fan-out preview skipped because read access is not granted" in plan_json
+
+
+def test_plan_reports_unregistered_agent() -> None:
+    workflow = AgenticWorkflow(WorkflowConfig(id="missing-agent", name="Missing Agent"))
     workflow.add_operation(
         GraphNode(
             node_id="agent",

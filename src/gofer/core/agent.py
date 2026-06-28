@@ -4,11 +4,15 @@ import inspect
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field
 
-from gofer.core.provider_profiles import ResolvedProviderSettings, resolved_provider_env
+from gofer.core.provider_profiles import (
+    ProfileSubscription,
+    ResolvedProviderSettings,
+    resolved_provider_env,
+)
 from gofer.core.usage import LlmPricing
 
 if TYPE_CHECKING:
@@ -17,7 +21,7 @@ if TYPE_CHECKING:
 
 class AgentConfig(BaseModel):
     agent_id: str
-    subscription: Literal["claude_code", "codex"]
+    subscription: ProfileSubscription
     working_dir: Path
     profile: str | None = None
     model: str | None = None

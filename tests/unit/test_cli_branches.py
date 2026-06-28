@@ -1,18 +1,23 @@
 from __future__ import annotations
 
+import json
 import signal
 import threading
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
+from rich.console import Console
 from typer.testing import CliRunner
 
 from gofer.cli.commands import schedule as schedule_cmd
 from gofer.cli.commands import watch as watch_cmd
+from gofer.cli.commands import workflow as workflow_cmd
 from gofer.cli.main import app
-from gofer.core.agent import AgentResult
-from gofer.core.workflow import AgenticWorkflow
+from gofer.core.agent import AgentConfig, AgentResult
+from gofer.core.graph import GraphNode
+from gofer.core.operations import BashCommandOperation, OperationType
+from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from gofer.ui.chat import workflow_chat_prompt_path
 
 runner = CliRunner()
@@ -100,6 +105,106 @@ class _CliSubscription:
         )
 
 
+def test_agent_create_prompts_for_required_fields(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        ["agent", "create", "--data-dir", str(tmp_path)],
+        input=f"Prompted Agent\ncodex\n{tmp_path}\nPrompt from stdin\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Created agent" in result.output
+    wf = AgenticWorkflow.from_file(tmp_path / "prompted-agent.toml")
+    cfg = wf.agents["prompted-agent"]
+    assert cfg.subscription == "codex"
+    assert cfg.working_dir == tmp_path.resolve()
+    assert cfg.prompt_path == tmp_path / "prompts" / "prompted-agent.md"
+    assert cfg.prompt_path.read_text(encoding="utf-8") == "Prompt from stdin"
+
+
+def test_agent_create_persists_all_optional_flags(tmp_path: Path) -> None:
+    extra_a = tmp_path / "shared-a"
+    extra_b = tmp_path / "shared-b"
+    extra_a.mkdir()
+    extra_b.mkdir()
+
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "create",
+            "--name",
+            "Flag Agent",
+            "--subscription",
+            "codex",
+            "--profile",
+            "work",
+            "--model",
+            "gpt-5-mini",
+            "--working-dir",
+            str(tmp_path),
+            "--prompt",
+            "flag prompt",
+            "--tools",
+            "read,write",
+            "--mcp-servers",
+            "fs,github",
+            "--extra-path",
+            str(extra_a),
+            "--extra-path",
+            str(extra_b),
+            "--env",
+            "API_KEY=secret",
+            "--env",
+            "MODE=test",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    wf = AgenticWorkflow.from_file(tmp_path / "flag-agent.toml")
+    cfg = wf.agents["flag-agent"]
+    assert cfg.profile == "work"
+    assert cfg.model == "gpt-5-mini"
+    assert cfg.tools == ["read", "write"]
+    assert cfg.mcp_servers == ["fs", "github"]
+    assert cfg.extra_paths == [extra_a.resolve(), extra_b.resolve()]
+    assert cfg.env == {"API_KEY": "secret", "MODE": "test"}
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (["--subscription", "missing"], "Invalid subscription"),
+        (["--subscription", "codex", "--env", "BROKEN"], "expected KEY=VALUE"),
+    ],
+)
+def test_agent_create_failure_does_not_write_agent_file(
+    tmp_path: Path, args: list[str], message: str
+) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "create",
+            "--name",
+            "Bad Agent",
+            *args,
+            "--working-dir",
+            str(tmp_path),
+            "--prompt",
+            "bad prompt",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert message in result.output
+    assert not (tmp_path / "bad-agent.toml").exists()
+
+
 def test_agent_list_filters_by_workflow_and_reports_missing(tmp_path: Path) -> None:
     agent_id = _create_agent(tmp_path)
 
@@ -114,6 +219,43 @@ def test_agent_list_filters_by_workflow_and_reports_missing(tmp_path: Path) -> N
     assert agent_id in filtered.output
     assert missing.exit_code == 1
     assert "not found" in missing.output
+
+
+def test_agent_list_empty_and_table_fields(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from gofer.cli.commands import agent as agent_cmd
+
+    monkeypatch.setattr(agent_cmd, "console", Console(width=240))
+    empty = runner.invoke(app, ["agent", "list", "--data-dir", str(tmp_path)])
+
+    assert empty.exit_code == 0, empty.output
+    assert "No agents found" in empty.output
+
+    agent_id = _create_agent(tmp_path, "Table Agent")
+    result = runner.invoke(
+        app,
+        [
+            "agent",
+            "edit",
+            agent_id,
+            "--profile",
+            "daily",
+            "--model",
+            "g5",
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+    listed = runner.invoke(app, ["agent", "list", "--data-dir", str(tmp_path)])
+
+    assert listed.exit_code == 0, listed.output
+    assert "table-agent" in listed.output
+    assert "daily" in listed.output
+    assert "g5" in listed.output
+    assert str(tmp_path / "prompts" / "table-agent.md") in listed.output
 
 
 def test_agent_edit_rejects_invalid_env_and_subscription(tmp_path: Path) -> None:
@@ -193,6 +335,54 @@ def test_agent_edit_updates_persisted_config(tmp_path: Path) -> None:
     assert cfg.env == {"A": "1", "B": "2"}
 
 
+def test_agent_edit_clears_profile_model_and_replaces_extra_paths(tmp_path: Path) -> None:
+    agent_id = _create_agent(tmp_path)
+    first_extra = tmp_path / "first-extra"
+    next_extra = tmp_path / "next-extra"
+    first_extra.mkdir()
+    next_extra.mkdir()
+
+    initial = runner.invoke(
+        app,
+        [
+            "agent",
+            "edit",
+            agent_id,
+            "--profile",
+            "fast",
+            "--model",
+            "gpt-5-mini",
+            "--extra-path",
+            str(first_extra),
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+    cleared = runner.invoke(
+        app,
+        [
+            "agent",
+            "edit",
+            agent_id,
+            "--profile",
+            "",
+            "--model",
+            "",
+            "--extra-path",
+            str(next_extra),
+            "--data-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert initial.exit_code == 0, initial.output
+    assert cleared.exit_code == 0, cleared.output
+    cfg = AgenticWorkflow.from_file(tmp_path / f"{agent_id}.toml").agents[agent_id]
+    assert cfg.profile is None
+    assert cfg.model is None
+    assert cfg.extra_paths == [next_extra.resolve()]
+
+
 def test_agent_edit_interactive_cancel_and_save(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -260,6 +450,62 @@ def test_agent_rm_confirmation_and_managed_prompt_cleanup(tmp_path: Path) -> Non
     assert not prompt_path.exists()
 
 
+def test_agent_rm_updates_workflow_without_deleting_unmanaged_prompt(
+    tmp_path: Path,
+) -> None:
+    unmanaged_prompt = tmp_path / "unmanaged.md"
+    unmanaged_prompt.write_text("keep me", encoding="utf-8")
+    managed_prompt = tmp_path / "prompts" / "primary.md"
+    managed_prompt.parent.mkdir()
+    managed_prompt.write_text("delete me", encoding="utf-8")
+
+    wf = AgenticWorkflow(WorkflowConfig(id="mixed-flow", name="Mixed Flow"))
+    wf.register_agent(
+        AgentConfig(
+            agent_id="primary",
+            subscription="codex",
+            working_dir=tmp_path,
+            prompt_path=managed_prompt,
+        )
+    )
+    wf.register_agent(
+        AgentConfig(
+            agent_id="secondary",
+            subscription="codex",
+            working_dir=tmp_path,
+            prompt_path=unmanaged_prompt,
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="hello",
+            operation=BashCommandOperation(
+                type=OperationType.BASH_COMMAND,
+                command="echo hello",
+            ),
+        )
+    )
+    wf.to_file(tmp_path / "mixed-flow.toml")
+
+    removed = runner.invoke(
+        app, ["agent", "rm", "primary", "--yes", "--data-dir", str(tmp_path)]
+    )
+    missing = runner.invoke(
+        app, ["agent", "rm", "missing", "--yes", "--data-dir", str(tmp_path)]
+    )
+
+    assert removed.exit_code == 0, removed.output
+    assert (tmp_path / "mixed-flow.toml").exists()
+    reloaded = AgenticWorkflow.from_file(tmp_path / "mixed-flow.toml")
+    assert "primary" not in reloaded.agents
+    assert "secondary" in reloaded.agents
+    assert "hello" in reloaded.graph._nodes
+    assert not managed_prompt.exists()
+    assert unmanaged_prompt.exists()
+    assert missing.exit_code == 1
+    assert "not found" in missing.output
+
+
 def test_agent_run_success_failure_and_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -290,6 +536,34 @@ def test_agent_run_success_failure_and_missing(
     assert "bad result" in failure.output
     assert missing.exit_code == 1
     assert "not found" in missing.output
+
+
+def test_agent_run_unknown_subscription_and_invalid_extra_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    agent_id = _create_agent(tmp_path)
+
+    from gofer.cli.commands import agent as agent_cmd
+
+    monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {})
+    unknown = runner.invoke(
+        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
+    )
+    assert unknown.exit_code == 1
+    assert "Unknown subscription 'codex'" in unknown.output
+
+    wf = AgenticWorkflow.from_file(tmp_path / f"{agent_id}.toml")
+    wf.agents[agent_id] = wf.agents[agent_id].model_copy(
+        update={"extra_paths": [tmp_path / "missing-extra"]}
+    )
+    wf.to_file(tmp_path / f"{agent_id}.toml")
+    monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {"codex": _CliSubscription()})
+    invalid_extra = runner.invoke(
+        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
+    )
+
+    assert invalid_extra.exit_code == 1
+    assert "extra_paths entry does not exist" in invalid_extra.output
 
 
 def test_agent_run_displays_external_extra_paths(
@@ -950,3 +1224,90 @@ def test_workflow_log_error_paths(tmp_path: Path) -> None:
     assert "Invalid run log id" in invalid_run_id.output
     assert list_empty.exit_code == 0, list_empty.output
     assert "No run logs found" in list_empty.output
+
+
+def test_workflow_list_uses_index_and_supports_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _create_workflow(tmp_path)
+
+    warmed = runner.invoke(app, ["workflow", "list", "--data-dir", str(tmp_path)])
+    assert warmed.exit_code == 0, warmed.output
+
+    def fail_parse(path: Path) -> object:
+        raise AssertionError(f"uncached workflow parse for {path.name}")
+
+    monkeypatch.setattr(workflow_cmd.AgenticWorkflow, "from_file", fail_parse)
+
+    result = runner.invoke(
+        app,
+        ["workflow", "list", "--data-dir", str(tmp_path), "--json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["workflows"][0]["id"] == "simple"
+
+
+def test_workflow_run_writes_summary_and_updates_run_index(tmp_path: Path) -> None:
+    _create_workflow(tmp_path)
+
+    result = runner.invoke(
+        app,
+        ["workflow", "run", "simple", "--data-dir", str(tmp_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    [log_path] = (tmp_path / "logs" / "simple").glob("*.log")
+    summary_path = log_path.with_suffix(".summary.json")
+    index_path = tmp_path / "indexes" / "runs-simple.json"
+
+    assert summary_path.exists()
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["id"] == log_path.name
+    assert summary["status"] == "success"
+
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert log_path.name in index["runs"]
+    assert index["runs"][log_path.name]["summary"]["status"] == "success"
+
+
+def test_workflow_logs_list_and_prune_support_json(tmp_path: Path) -> None:
+    _create_workflow(tmp_path)
+    log_dir = tmp_path / "logs" / "simple"
+    log_dir.mkdir(parents=True)
+    run = log_dir / "2020-01-01T10-00-00-0000.log"
+    run.write_text(
+        "2020-01-01T10:00:00+00:00 - simple started successfully\n"
+        "2020-01-01T10:00:01+00:00 - INFO - simple completed successfully\n",
+        encoding="utf-8",
+    )
+
+    listed = runner.invoke(
+        app,
+        ["workflow", "logs", "list", "simple", "--data-dir", str(tmp_path), "--json"],
+    )
+    pruned = runner.invoke(
+        app,
+        [
+            "workflow",
+            "logs",
+            "prune",
+            "simple",
+            "--keep-last",
+            "0",
+            "--keep-days",
+            "0",
+            "--data-dir",
+            str(tmp_path),
+            "--json",
+        ],
+    )
+
+    assert listed.exit_code == 0, listed.output
+    assert json.loads(listed.output)["runs"][0]["id"] == run.name
+    assert pruned.exit_code == 0, pruned.output
+    prune_payload = json.loads(pruned.output)
+    assert prune_payload["dryRun"] is True
+    assert prune_payload["runs"][0]["id"] == run.name

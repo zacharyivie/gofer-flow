@@ -8,7 +8,7 @@ The installed command is `gof`.
 
 - Run workflow nodes from start nodes through conditional edges, including recursive loops for improve/review or retry-until-output workflows.
 - Execute `bash_command`, `shell_script`, `python_script`, `http_request`, and `agent` nodes.
-- Use Claude Code or Codex as agent backends through their local CLIs.
+- Use Claude Code or Codex through local CLIs, or direct OpenAI/Anthropic-compatible API profiles.
 - Validate workflow structure while allowing cycles and self-loops.
 - Show workflow structure in the terminal.
 - Create workflow scaffolds and build workflows through an interactive wizard.
@@ -24,9 +24,12 @@ The installed command is `gof`.
 
 - Python 3.11 or newer
 - Node.js 20 or newer if you want to run the React workflow studio
-- One or both local agent CLIs if you want to run agent nodes:
+- One or both local agent CLIs if you want to run CLI-backed agent nodes:
   - `claude` for `claude_code` subscriptions
   - `codex` for `codex` subscriptions
+- API credentials if you want to run direct API-backed agent nodes:
+  - `OPENAI_API_KEY` or a configured Gofer secret for `openai_api`
+  - `ANTHROPIC_API_KEY` or a configured Gofer secret for `anthropic_api`
 
 Script and command nodes do not require an LLM provider CLI.
 
@@ -242,6 +245,21 @@ Agent subscriptions currently support:
 
 - `claude_code`, which runs `claude --print -p <prompt>`
 - `codex`, which runs `codex --quiet -p <prompt>`
+- `openai_api`, which calls an OpenAI-compatible Responses or chat API
+- `anthropic_api`, which calls an Anthropic-compatible Messages API
+
+Direct API subscriptions are selected with the same `subscription`, `profile`, and
+`model` fields as CLI-backed agents. Store API credentials outside workflow TOML:
+use the default `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variables, or
+create a provider profile with `--api-key-secret` so Gofer resolves
+`GOFER_SECRET_<NAME>` at runtime.
+
+```bash
+gof provider profile create ci-openai \
+  --subscription openai_api \
+  --model gpt-5-mini \
+  --api-key-secret OPENAI_CI_KEY
+```
 
 Agent prompts can be inline text or a path to a Markdown file. Inline prompts are written to the managed `prompts/` directory.
 
@@ -290,9 +308,20 @@ source = "github"
 token_env = "GOFER_GITHUB_WEBHOOK_TOKEN"
 fanout_path = "payload.items"
 concurrency_policy = "reject_if_running"
+sensitive_payload_fields = ["payload.installation.token"]
 ```
 
-The trigger ID is the table key (`github` above). `token` can be set directly for local testing, but `token_env` is preferred. If a token is configured, HTTP requests must send it with `X-Gofer-Webhook-Token` or `Authorization: Bearer <token>`.
+The trigger ID is the table key (`github` above). Enabled webhook triggers fail closed by default: every enabled trigger must configure `token_env`, configure an inline `token`, or explicitly opt in to unauthenticated local testing. `token_env` is preferred for production because the secret stays outside workflow TOML. `token` can be set directly for local testing. Authenticated HTTP requests must send the configured token with `X-Gofer-Webhook-Token` or `Authorization: Bearer <token>`.
+
+For short-lived local testing only, a trigger can opt in to unauthenticated requests:
+
+```toml
+[workflow.webhooks.local]
+enabled = true
+allow_unauthenticated = true
+```
+
+Gofer marks this as high risk in validation, plan previews, Studio payloads, and bundle import previews. Do not use it for workflows exposed outside loopback, through tunnels, or to other machines.
 
 Trigger payloads are available to nodes through the `trigger` namespace:
 
@@ -318,7 +347,9 @@ curl -X POST "http://127.0.0.1:8765/api/workflows/incident-response/webhooks/git
   -d '{"issue":{"number":42},"items":[{"title":"first"}]}'
 ```
 
-The request payload, normalized headers, source, received timestamp, request ID, and fan-out events are recorded with the run. Runs created from webhook triggers can be replayed from the CLI or UI run history:
+The request payload, normalized headers, source, received timestamp, request ID, and fan-out events are recorded with the run. Webhook payloads are sanitized by default before they are written to run logs or `.trigger.json` replay sidecars. Common sensitive field names such as `token`, `secret`, `password`, authorization fields, API keys, and entries listed in `sensitive_payload_fields` are masked recursively. Replay uses the saved sanitized payload, so masked fields replay as masked values.
+
+Runs created from webhook triggers can be replayed from the CLI or UI run history:
 
 ```bash
 gof workflow trigger incident-response \
@@ -329,6 +360,17 @@ gof workflow trigger incident-response \
 
 gof workflow trigger incident-response --trigger-id github --replay-run-id run-20260626.log
 ```
+
+If a workflow needs exact replay of sensitive payload fields, it must opt in explicitly:
+
+```toml
+[workflow.webhooks.github]
+enabled = true
+token_env = "GOFER_GITHUB_WEBHOOK_TOKEN"
+store_raw_payload = true
+```
+
+`store_raw_payload = true` keeps the original payload in the replay sidecar for exact replay and is shown as a high-risk setting in plan previews. Run logs and latest-run API responses still mask sensitive trigger payload values.
 
 For `trigger_events` fan-out nodes, `fanout_path` can point at a JSON array such as `payload.items`. Each array object becomes one trigger event.
 
@@ -551,6 +593,12 @@ max_files_scanned = 5000
 max_file_read_bytes = 1048576
 max_aggregate_read_bytes = 32000000
 max_vector_index_bytes = 50000000
+max_bundle_entries = 1000
+max_bundle_entry_bytes = 10000000
+max_bundle_total_uncompressed_bytes = 64000000
+max_bundle_compressed_bytes = 64000000
+max_bundle_metadata_bytes = 1048576
+max_bundle_compression_ratio = 100.0
 max_log_bytes_per_node = 1048576
 max_log_bytes_per_run = 20000000
 max_api_request_body_bytes = 1048576
@@ -560,6 +608,19 @@ max_subprocess_output_bytes = 2000000
 max_watcher_queue_depth = 1000
 max_watcher_concurrency = 4
 max_fanout_concurrency = 16
+```
+
+Workflow bundle import is validated before the bundled workflow TOML is trusted, so
+CLI/UI import and preview use host-side bundle limits. Configure those limits with
+environment variables on the `gof` or UI server process:
+
+```bash
+GOFER_BUNDLE_MAX_ENTRIES=1000
+GOFER_BUNDLE_MAX_ENTRY_BYTES=10000000
+GOFER_BUNDLE_MAX_TOTAL_UNCOMPRESSED_BYTES=64000000
+GOFER_BUNDLE_MAX_COMPRESSED_BYTES=64000000
+GOFER_BUNDLE_MAX_METADATA_BYTES=1048576
+GOFER_BUNDLE_MAX_COMPRESSION_RATIO=100
 ```
 
 Advanced local batch workflows can opt in to larger limits in TOML:
@@ -778,6 +839,16 @@ mypy src tests
 python -m pytest
 cd frontend && npm test && npm run check:build
 ```
+
+Frontend checks are split by runtime:
+
+- `npm test` runs the fast Node-based React/helper tests.
+- `npm run check:build` verifies the production Vite bundle.
+- `npm run test:browser` builds the Vite app, serves the built files with
+  mocked API responses, and drives the workflow studio in Electron/Chromium.
+  Use it for browser-level regressions around canvas pointer events, dialogs,
+  panels, responsive layout, and save payload serialization. In headless Linux
+  CI, run it under `xvfb-run -a`.
 
 Run focused tests while developing:
 
