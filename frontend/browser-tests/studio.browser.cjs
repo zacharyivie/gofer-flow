@@ -88,7 +88,7 @@ async function run() {
 
   await loadApp();
   await runDesktopGraphRegression();
-  await runMobileLayoutRegression();
+  await runCompactLayoutRegression();
 
   clearTimeout(timeout);
   console.log("Browser studio regression tests passed.");
@@ -164,8 +164,8 @@ async function runDesktopGraphRegression() {
   );
 }
 
-async function runMobileLayoutRegression() {
-  await windowRef.setSize(390, 820);
+async function runCompactLayoutRegression() {
+  await windowRef.setSize(1180, 820);
   await wait(250);
   const layout = await evaluate(() => {
     const viewport = { width: window.innerWidth, height: window.innerHeight };
@@ -459,11 +459,43 @@ function readBody(request) {
 }
 
 async function clickByTitle(title) {
-  await evaluate((targetTitle) => {
+  const clicked = await evaluate((targetTitle) => {
     const element = document.querySelector(`[title="${CSS.escape(targetTitle)}"]`);
-    if (!element) throw new Error(`Unable to find title: ${targetTitle}`);
+    if (!element) return false;
     element.click();
+    return true;
   }, title);
+  if (clicked) {
+    await wait(50);
+    return;
+  }
+
+  const openedOverflow = await evaluate(() => {
+    const overflowButton = document.querySelector('[title="More graph actions"]');
+    if (!overflowButton) return false;
+    overflowButton.click();
+    return true;
+  });
+
+  if (openedOverflow) {
+    await wait(50);
+  }
+
+  const clickedOverflowAction = openedOverflow
+    ? await evaluate((targetTitle) => {
+        const menu = document.querySelector("[data-testid='toolbar-overflow-menu']");
+        const item = [...(menu?.querySelectorAll("button") ?? [])].find(
+          (element) => element.textContent.trim() === targetTitle,
+        );
+        if (!item || item.disabled) return false;
+        item.click();
+        return true;
+      }, title)
+    : false;
+
+  if (!clickedOverflowAction) {
+    throw new Error(`Unable to find title: ${title}`);
+  }
   await wait(50);
 }
 
