@@ -9,6 +9,11 @@
   "private": true,
   "type": "module",
   "main": "electron/main.js",
+  "packageManager": "npm@10.9.0",
+  "engines": {
+    "node": ">=22.12.0",
+    "npm": ">=10.9.0"
+  },
   "scripts": {
     "backend:build": "node ../scripts/build-backend-binary.cjs",
     "dev": "vite",

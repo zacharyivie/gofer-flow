@@ -14,6 +14,7 @@ const TEST_TIMEOUT_MS = 45000;
 let server;
 let baseUrl;
 let windowRef;
+const rendererMessages = [];
 
 const state = {
   approvals: [
@@ -64,6 +65,23 @@ async function run() {
       sandbox: false,
     },
   });
+  windowRef.webContents.on("console-message", (_event, level, message, line, sourceId) => {
+    rendererMessages.push({ level, line, message, sourceId });
+    if (level >= 2) {
+      console.error(`Renderer console: ${message} (${sourceId}:${line})`);
+    }
+  });
+  windowRef.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, errorDescription, validatedURL) => {
+      rendererMessages.push({
+        level: 3,
+        line: 0,
+        message: `did-fail-load ${errorCode}: ${errorDescription}`,
+        sourceId: validatedURL,
+      });
+    },
+  );
 
   await loadApp();
   await runDesktopGraphRegression();
@@ -77,7 +95,12 @@ async function run() {
 async function loadApp() {
   await windowRef.loadURL(baseUrl);
   await waitFor(() => textIncludes("Demo workflow"), "workflow list loaded");
-  await waitFor(() => count("[data-testid='workflow-node']") >= 3, "workflow nodes rendered");
+  await waitFor(
+    () => count("[data-testid='workflow-node']") >= 3,
+    "workflow nodes rendered",
+    7000,
+    browserDiagnosticSnapshot,
+  );
 }
 
 async function runDesktopGraphRegression() {
@@ -677,7 +700,7 @@ async function elementRect(selector) {
   return rect;
 }
 
-async function waitFor(check, label, timeoutMs = 7000) {
+async function waitFor(check, label, timeoutMs = 7000, diagnostics) {
   const startedAt = Date.now();
   let lastError;
   while (Date.now() - startedAt < timeoutMs) {
@@ -688,7 +711,10 @@ async function waitFor(check, label, timeoutMs = 7000) {
     }
     await wait(100);
   }
-  throw new Error(`Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}`);
+  const details = diagnostics ? await diagnostics() : "";
+  throw new Error(
+    `Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}${details ? `\n${details}` : ""}`,
+  );
 }
 
 function wait(ms) {
@@ -698,6 +724,25 @@ function wait(ms) {
 async function evaluate(fn, arg) {
   const source = `(${fn.toString()})(${JSON.stringify(arg)})`;
   return windowRef.webContents.executeJavaScript(source, true);
+}
+
+async function browserDiagnosticSnapshot() {
+  const snapshot = await evaluate(() => {
+    const nodes = document.querySelectorAll("[data-testid='workflow-node']").length;
+    const canvas = Boolean(document.querySelector("[data-testid='dag-canvas']"));
+    const body = document.body.textContent.replace(/\s+/g, " ").trim().slice(0, 1200);
+    return { body, canvas, nodes, title: document.title, url: window.location.href };
+  });
+  const recentMessages = rendererMessages
+    .slice(-10)
+    .map((item) => `${item.message} (${item.sourceId}:${item.line})`)
+    .join("\n");
+  return [
+    `Browser snapshot: ${JSON.stringify(snapshot)}`,
+    recentMessages ? `Recent renderer messages:\n${recentMessages}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function cssEscape(value) {
