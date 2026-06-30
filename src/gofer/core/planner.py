@@ -41,6 +41,7 @@ from gofer.core.operations import (
     StartOperation,
     TabularFanSource,
     TriggerEventsFanSource,
+    WorkflowCallOperation,
     WriteFileOperation,
 )
 from gofer.core.provider_profiles import (
@@ -735,6 +736,8 @@ def _operation_detail(
         return f"approval gate{timeout}"
     if isinstance(op, NotificationOperation):
         return f"notify {op.channel}: {op.title}"
+    if isinstance(op, WorkflowCallOperation):
+        return f"run workflow {op.workflow_id}"
     if isinstance(op, AgentOperation):
         parts = [op.agent_id]
         if op.skill_name:
@@ -852,6 +855,18 @@ def _operation_impact(
         )
         if not path.exists():
             warnings.append(f"Missing read target: {path}")
+    elif isinstance(op, WorkflowCallOperation):
+        side_effects.append(f"run workflow: {op.workflow_id}")
+        side_effect_details.append(
+            {
+                "kind": "workflow",
+                "action": "run",
+                "workflow_id": op.workflow_id,
+                "destructive": True,
+                "effectsInferred": False,
+            }
+        )
+        warnings.append("Nested workflow effects depend on the target workflow")
     elif isinstance(op, WriteFileOperation):
         path = _resolve_path(op.path, path_base)
         side_effects.append(f"write file: {path}")

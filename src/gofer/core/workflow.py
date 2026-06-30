@@ -137,6 +137,7 @@ class WorkflowCanvasGroup(BaseModel):
     width: int = 360
     height: int = 240
     collapsed: bool = False
+    opacity: float = 0.08
 
     @field_validator("id")
     @classmethod
@@ -157,6 +158,13 @@ class WorkflowCanvasGroup(BaseModel):
     def _validate_size(cls, value: int) -> int:
         if value < 80:
             raise ValueError("Canvas group width and height must be at least 80")
+        return value
+
+    @field_validator("opacity")
+    @classmethod
+    def _validate_opacity(cls, value: float) -> float:
+        if value < 0 or value > 1:
+            raise ValueError("Canvas group opacity must be between 0 and 1")
         return value
 
 

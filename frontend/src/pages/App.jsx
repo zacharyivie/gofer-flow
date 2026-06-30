@@ -45,6 +45,39 @@ const DEFAULT_RETENTION_SETTINGS = {
   keepLast: 100,
 };
 const RUN_LOG_TAIL_BYTES = 64 * 1024;
+const WORKFLOW_UNDO_LIMIT = 100;
+
+function cloneWorkflowForEditHistory(workflow) {
+  return workflow ? JSON.parse(JSON.stringify(workflow)) : workflow;
+}
+
+function workflowEditSnapshotEquals(left, right) {
+  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
+}
+
+export function pushWorkflowEditHistory(history, workflowId, workflow, limit = WORKFLOW_UNDO_LIMIT) {
+  if (!workflowId || !workflow) return history;
+  const currentHistory = history[workflowId] ?? [];
+  const snapshot = cloneWorkflowForEditHistory(workflow);
+  if (workflowEditSnapshotEquals(currentHistory.at(-1), snapshot)) return history;
+  return {
+    ...history,
+    [workflowId]: [...currentHistory, snapshot].slice(-limit),
+  };
+}
+
+export function popWorkflowEditHistory(history, workflowId) {
+  const currentHistory = history[workflowId] ?? [];
+  if (!currentHistory.length) return { history, workflow: null };
+  const workflow = currentHistory.at(-1);
+  return {
+    history: {
+      ...history,
+      [workflowId]: currentHistory.slice(0, -1),
+    },
+    workflow,
+  };
+}
 
 function loadRetentionSettings() {
   if (typeof window === "undefined") return DEFAULT_RETENTION_SETTINGS;
@@ -237,6 +270,8 @@ export default function App() {
   const logRequestRef = useRef(0);
   const pendingDashboardMutationsRef = useRef(0);
   const pendingWorkflowPersistenceRef = useRef(new Set());
+  const workflowRedoHistoryRef = useRef({});
+  const workflowUndoHistoryRef = useRef({});
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
   const activeDashboard =
     dashboards.find((dashboard) => dashboard.id === activeDashboardId) ?? dashboards[0];
@@ -817,18 +852,93 @@ export default function App() {
     ];
   }, [promptAgentIds, workflows]);
 
+  function markWorkflowDirty(workflowId) {
+    saveRevisionRef.current += 1;
+    const nextDirtyWorkflow = { id: workflowId, revision: saveRevisionRef.current };
+    dirtyWorkflowRef.current = nextDirtyWorkflow;
+    setDirtyWorkflow(nextDirtyWorkflow);
+  }
+
   function updateActiveWorkflow(nextWorkflow) {
     const summarizedWorkflow = summarizeWorkflow(nextWorkflow, dataDir);
+    const previousWorkflow = workflows.find((workflow) => workflow.id === summarizedWorkflow.id);
+    if (!previousWorkflow || workflowEditSnapshotEquals(previousWorkflow, summarizedWorkflow)) {
+      return;
+    }
+    workflowUndoHistoryRef.current = pushWorkflowEditHistory(
+      workflowUndoHistoryRef.current,
+      summarizedWorkflow.id,
+      previousWorkflow,
+    );
+    workflowRedoHistoryRef.current = {
+      ...workflowRedoHistoryRef.current,
+      [summarizedWorkflow.id]: [],
+    };
     setWorkflows((current) =>
       current.map((workflow) =>
         workflow.id === summarizedWorkflow.id ? summarizedWorkflow : workflow,
       ),
     );
-    saveRevisionRef.current += 1;
-    const nextDirtyWorkflow = { id: summarizedWorkflow.id, revision: saveRevisionRef.current };
-    dirtyWorkflowRef.current = nextDirtyWorkflow;
-    setDirtyWorkflow(nextDirtyWorkflow);
+    markWorkflowDirty(summarizedWorkflow.id);
   }
+
+  function restoreWorkflowEdit(direction) {
+    if (!activeWorkflow?.id) return;
+    const workflowId = activeWorkflow.id;
+    const sourceRef = direction === "undo" ? workflowUndoHistoryRef : workflowRedoHistoryRef;
+    const targetRef = direction === "undo" ? workflowRedoHistoryRef : workflowUndoHistoryRef;
+    const { history: nextSourceHistory, workflow: restoredWorkflow } = popWorkflowEditHistory(
+      sourceRef.current,
+      workflowId,
+    );
+    if (!restoredWorkflow) return;
+
+    sourceRef.current = nextSourceHistory;
+    targetRef.current = pushWorkflowEditHistory(
+      targetRef.current,
+      workflowId,
+      activeWorkflow,
+    );
+
+    const summarizedWorkflow = summarizeWorkflow(restoredWorkflow, dataDir);
+    setWorkflows((current) =>
+      current.map((workflow) =>
+        workflow.id === workflowId ? summarizedWorkflow : workflow,
+      ),
+    );
+    markWorkflowDirty(workflowId);
+  }
+
+  useEffect(() => {
+    function handleKeyDown(event) {
+      if (event.defaultPrevented) return;
+      const target = event.target;
+      const tagName = target?.tagName?.toLowerCase?.();
+      if (
+        target?.isContentEditable ||
+        tagName === "input" ||
+        tagName === "textarea" ||
+        tagName === "select"
+      ) {
+        return;
+      }
+
+      const key = event.key.toLowerCase();
+      if ((event.ctrlKey || event.metaKey) && key === "z" && !event.shiftKey) {
+        event.preventDefault();
+        restoreWorkflowEdit("undo");
+      } else if (
+        (event.ctrlKey || event.metaKey) &&
+        (key === "y" || (key === "z" && event.shiftKey))
+      ) {
+        event.preventDefault();
+        restoreWorkflowEdit("redo");
+      }
+    }
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [activeWorkflow, dataDir]);
 
   async function saveWorkflow(workflow, revision) {
     setSaveState({ saving: true, error: "" });
@@ -1700,8 +1810,8 @@ export default function App() {
   }
 
   async function renameWorkflow(workflow, nextName) {
-    if (!workflow) return;
-    if (!nextName || nextName.trim() === workflow.name) return;
+    if (!workflow) return null;
+    if (!nextName || nextName.trim() === workflow.name) return workflow;
 
     try {
       if (dirtyWorkflowRef.current?.id === workflow.id) {
@@ -1736,11 +1846,13 @@ export default function App() {
         currentId === workflow.id ? renamed.id : currentId,
       );
       setTopBarNotice({ type: "success", message: `Renamed to ${renamed.name}` });
+      return renamed;
     } catch (error) {
       setTopBarNotice({
         type: "error",
         message: error instanceof Error ? error.message : "Unable to rename workflow",
       });
+      return null;
     }
   }
 
@@ -2119,6 +2231,7 @@ export default function App() {
               retentionSettings={retentionSettings}
               runState={runState}
               workflow={activeWorkflow}
+              workflows={workflows}
               usedAgentIds={usedAgentIds}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
@@ -2138,6 +2251,16 @@ export default function App() {
               onRunWorkflow={runWorkflowNow}
               onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
               onStopWorkflow={stopWorkflowRun}
+              onNavigateWorkflow={(workflowId) => {
+                if (workflowId) {
+                  setActiveWorkflowId(workflowId);
+                  setWorkspaceMode("workflows");
+                }
+              }}
+              onRenameWorkflow={(workflowId, nextName) => {
+                const targetWorkflow = workflows.find((candidate) => candidate.id === workflowId);
+                return renameWorkflow(targetWorkflow, nextName);
+              }}
               onDecideApproval={(approval, decision, notes, by) =>
                 decideApproval(activeWorkflow, approval, decision, notes, by)
               }

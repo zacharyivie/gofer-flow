@@ -88,6 +88,13 @@ to = "step2"
 - Keep CLI behavior covered by tests when changing command behavior.
 - Keep workflow parsing and execution behavior covered by unit or regression tests when changing operation, graph, executor, or scheduler logic.
 - Do not require real LLM provider CLIs in tests; use `FakeSubscription` or another test double.
+- Frontend controlled inputs: do not transform or normalize a user-editable value
+  on every keystroke when the displayed value is derived from the stored value,
+  such as percentages, parsed numbers, paths, JSON, units, or enum-like labels.
+  Keep a local draft string while the field is focused and commit on blur or
+  Enter, otherwise clearing/backspacing can snap the field back to the previous
+  normalized value. Add regression coverage for focus -> clear -> type -> blur
+  flows.
 - After code changes, run `ruff check src tests --fix`.
 - After code changes, run `mypy src tests`.
 - Run targeted pytest tests for the changed area; run the full suite when touching shared workflow execution, scheduling, or CLI behavior.

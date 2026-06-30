@@ -35,6 +35,7 @@ class OperationType(StrEnum):
     APPROVAL_GATE = "approval_gate"
     NOTIFICATION = "notification"
     DASHBOARD_ITEM = "dashboard_item"
+    WORKFLOW = "workflow"
 
 
 class CountFanSource(BaseModel):
@@ -318,6 +319,11 @@ class DashboardItemOperation(BaseModel):
     value: object | None = None
 
 
+class WorkflowCallOperation(BaseModel):
+    type: Literal[OperationType.WORKFLOW]
+    workflow_id: str
+
+
 class DashboardUpdateInstruction(BaseModel):
     action: Literal["add", "update", "delete", "move"]
     dashboard: str
@@ -373,6 +379,7 @@ Operation = Annotated[
     | ApprovalGateOperation
     | NotificationOperation
     | DashboardItemOperation
+    | WorkflowCallOperation
     | AgentOperation,
     Field(discriminator="type"),
 ]

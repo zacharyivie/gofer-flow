@@ -92,6 +92,7 @@ from gofer.core.operations import (
     StartOperation,
     TabularFanSource,
     TriggerEventsFanSource,
+    WorkflowCallOperation,
     WriteFileOperation,
 )
 from gofer.core.provider_profiles import (
@@ -1934,6 +1935,7 @@ class WorkflowExecutor:
         http_client: HttpClient | None = None,
         approval_store: ApprovalStore | None = None,
         notification_adapter: NotificationAdapter | None = None,
+        run_log_update_callback: Callable[[str, Path], None] | None = None,
     ) -> None:
         self._workflow = workflow
         self._subscriptions = subscriptions
@@ -1961,6 +1963,7 @@ class WorkflowExecutor:
         self._data_dir = store_data_dir
         self._approval_store = approval_store or ApprovalStore(store_data_dir)
         self._notification_adapter = notification_adapter or MultiChannelNotificationAdapter()
+        self._run_log_update_callback = run_log_update_callback
         self._resume_options: ResumeOptions | None = None
         self._resume_task_entries: dict[str, dict[str, object]] = {}
         self._resume_seed_outputs: dict[str, NodeOutput] = {}
@@ -1983,6 +1986,31 @@ class WorkflowExecutor:
         if self._run_log is None:
             raise RuntimeError("Workflow run log has not been initialized")
         return self._run_log
+
+    def _notify_run_log_update(self) -> None:
+        if self._run_log_update_callback is None or self._run_log is None:
+            return
+        try:
+            self._run_log_update_callback(self._workflow.config.id, self._run_log.path)
+        except Exception:
+            return
+
+    def _load_child_workflow(self, workflow_id: str) -> tuple[AgenticWorkflow, Path]:
+        target_id = workflow_id.strip()
+        if not target_id:
+            raise ValueError("Workflow node requires a target workflow")
+        base = self._data_dir or get_data_dir()
+        candidate = base / f"{target_id}.toml"
+        if candidate.exists():
+            return AgenticWorkflow.from_file(candidate), candidate
+        for path in sorted(base.glob("*.toml")):
+            try:
+                workflow = AgenticWorkflow.from_file(path)
+            except Exception:
+                continue
+            if workflow.config.id == target_id:
+                return workflow, path
+        raise ValueError(f"Workflow '{target_id}' not found in {base}")
 
     def _log_agent_result(
         self,
@@ -3518,6 +3546,7 @@ class WorkflowExecutor:
             self._limits,
             existing_path=self._run_log_path,
         )
+        self._notify_run_log_update()
         self._cleanup_resume_checkpoints_for_fresh_run()
         run_log = self._log()
         if self._stop_file is not None:
@@ -3861,6 +3890,7 @@ class WorkflowExecutor:
                 "stopped" if reason == "stopped by user" else None
             )
             run_log.complete(success, reason, terminal_status=terminal_status)
+            self._notify_run_log_update()
             return ExecutionResult(
                 workflow_id=self._workflow.config.id,
                 success=success,
@@ -3873,6 +3903,7 @@ class WorkflowExecutor:
             )
         except BaseException as exc:
             run_log.complete(False, str(exc))
+            self._notify_run_log_update()
             raise
         finally:
             self._stop_monitor_done.set()
@@ -3929,6 +3960,7 @@ class WorkflowExecutor:
             self._limits,
             existing_path=log_path,
         )
+        self._notify_run_log_update()
         run_log = self._log()
         checkpoint_trigger = checkpoint.get("trigger")
         checkpoint_params = checkpoint.get("params")
@@ -4188,6 +4220,7 @@ class WorkflowExecutor:
             "stopped" if reason == "stopped by user" else None
         )
         run_log.complete(success, reason, terminal_status=terminal_status)
+        self._notify_run_log_update()
         return ExecutionResult(
             workflow_id=self._workflow.config.id,
             success=success,
@@ -4933,6 +4966,52 @@ class WorkflowExecutor:
                 terminal_status="break",
                 type=str(op.type),
                 data={"message": message},
+            )
+
+        if op.type == OperationType.WORKFLOW:
+            assert isinstance(op, WorkflowCallOperation)
+            target_workflow, target_path = self._load_child_workflow(op.workflow_id)
+            if target_workflow.config.id == self._workflow.config.id:
+                raise ValueError("Workflow nodes cannot call their own workflow")
+            self._log().node(
+                node.node_id,
+                f"workflow call started: {target_workflow.config.name} ({target_workflow.config.id})",
+            )
+            child_result = await WorkflowExecutor(
+                target_workflow,
+                self._subscriptions,
+                dry_run=self._dry_run,
+                log_base_dir=(self._data_dir or target_path.parent) / "logs",
+                workflow_path=target_path,
+                data_dir=self._data_dir,
+                cancel_event=self._cancel_event if self._pass_cancel_event else None,
+                http_client=self._http_client,
+                approval_store=self._approval_store,
+                notification_adapter=self._notification_adapter,
+                run_log_update_callback=self._run_log_update_callback,
+            ).run()
+            message = (
+                f"workflow {target_workflow.config.name} "
+                f"{'succeeded' if child_result.success else 'failed'}"
+            )
+            self._log().node(
+                node.node_id,
+                f"workflow call finished: success={child_result.success} log={child_result.log_path}",
+            )
+            return NodeOutput(
+                node_id=node.node_id,
+                success=child_result.success,
+                output=message,
+                exit_code=0 if child_result.success else 1,
+                duration_seconds=time.monotonic() - start,
+                type=str(op.type),
+                data={
+                    "workflow_id": target_workflow.config.id,
+                    "workflow_name": target_workflow.config.name,
+                    "success": child_result.success,
+                    "log_path": str(child_result.log_path) if child_result.log_path else "",
+                    "duration_seconds": child_result.duration_seconds,
+                },
             )
 
         if op.type == OperationType.APPROVAL_GATE:

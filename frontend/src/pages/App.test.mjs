@@ -240,6 +240,26 @@ test("workflow refresh helpers preserve pending dashboard item loop sources", ()
   assert.equal(preserved.sourcePath, "/tmp/demo.toml");
 });
 
+test("workflow edit history helpers push and pop snapshots without duplicating restores", () => {
+  const first = workflowFixture({ id: "history", name: "History", label: "First" });
+  const second = {
+    ...first,
+    nodes: [{ ...first.nodes[0], label: "Second" }],
+  };
+  const duplicateFirst = appModule.pushWorkflowEditHistory({}, first.id, first);
+  const unchanged = appModule.pushWorkflowEditHistory(duplicateFirst, first.id, first);
+  assert.equal(unchanged[first.id].length, 1);
+
+  const withSecond = appModule.pushWorkflowEditHistory(unchanged, first.id, second);
+  assert.equal(withSecond[first.id].length, 2);
+  const poppedSecond = appModule.popWorkflowEditHistory(withSecond, first.id);
+  assert.equal(poppedSecond.workflow.nodes[0].label, "Second");
+  const poppedFirst = appModule.popWorkflowEditHistory(poppedSecond.history, first.id);
+  assert.equal(poppedFirst.workflow.nodes[0].label, "First");
+  const empty = appModule.popWorkflowEditHistory(poppedFirst.history, first.id);
+  assert.equal(empty.workflow, null);
+});
+
 test("workflow save payload keeps graph positions and serializes defaults", () => {
   const payload = appModule.workflowPayloadForSave(
     {
@@ -906,6 +926,39 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   await dom.unmount();
 });
 
+test("App supports workflow undo and redo without recording restore states", async () => {
+  const workflow = workflowFixture({ id: "undo", name: "Undo", label: "Original label" });
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([workflow])),
+      jsonResponse("/api/workflows/undo/logs/latest", {
+        log: { logText: "", logPath: "/tmp/undo.log" },
+      }),
+      jsonResponse("/api/workflows/undo/logs?limit=100", { runs: [] }),
+      jsonResponse("/api/workflows/undo", { workflow }, { method: "PUT" }),
+    ]),
+  );
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Label"), "Edited once");
+  assert.equal(dom.controlAfterLabel("Label").value, "Edited once");
+
+  await dom.keyDown("z", { ctrlKey: true });
+  await dom.flush();
+  assert.equal(dom.controlAfterLabel("Label").value, "Undo");
+
+  await dom.keyDown("y", { ctrlKey: true });
+  await dom.flush();
+  assert.equal(dom.controlAfterLabel("Label").value, "Edited once");
+
+  await dom.keyDown("z", { ctrlKey: true });
+  await dom.flush();
+  assert.equal(dom.controlAfterLabel("Label").value, "Undo");
+
+  await dom.unmount();
+});
+
 test("App renders run and stop state, opens the run preview, executes runs, and sends chat prompts", async () => {
   const chatStream = streamResponse([
     '{"type":"thought","text":"Inspecting graph"}\n',
@@ -1098,22 +1151,29 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
       desktop: {
         workspace: {
           getPathInfo: async () => ({ isDirectory: true, isFile: false }),
-          listDirectory: async ({ currentPath }) => ({
-            directory: currentPath === "/workspace/repo" ? "/workspace/repo" : "/workspace",
-            parent: currentPath === "/workspace/repo" ? "/workspace" : null,
-            entries: currentPath === "/workspace/repo"
-              ? []
-              : [{ name: "repo", path: "/workspace/repo", isDirectory: true, isFile: false }],
-          }),
+          selectPath: async () => "/outside/repo",
         },
       },
     },
   );
 
   await dom.flush();
+  const initialViewport = canvasModule.fitViewportToNodes(workflow.nodes, { width: 960, height: 640 });
+  const canvas = dom.byTestId("dag-canvas");
+  await dom.pointer(canvas, "onPointerDown", { button: 2, clientX: 100, clientY: 100 });
+  await dom.pointer(canvas, "onPointerMove", { movementX: 120, movementY: 80 });
+  await dom.pointer(canvas, "onPointerUp", { button: 2 });
   await dom.click(dom.byTitle("Add node"));
   assert.equal(changes.at(-1).nodes.length, 2);
   assert.equal(changes.at(-1).nodes[1].type, "agent");
+  assert.equal(
+    changes.at(-1).nodes[1].x,
+    Math.round((480 - (initialViewport.x + 120)) / initialViewport.scale - 110),
+  );
+  assert.equal(
+    changes.at(-1).nodes[1].y,
+    Math.round((320 - (initialViewport.y + 80)) / initialViewport.scale - 48),
+  );
 
   await dom.pointer(dom.ancestor(dom.byText("Initial command"), "ARTICLE"), "onPointerDown");
   await dom.flush();
@@ -1122,17 +1182,20 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
 
   await dom.click(dom.byTitle("Choose working directory"));
   await dom.flush();
-  await dom.click(dom.ancestor(dom.byText("repo"), "BUTTON"));
-  await dom.flush();
-  await dom.click(dom.byText("Choose current folder"));
-  assert.equal(changes.at(-1).nodes[0].operation.working_dir, "/workspace/repo");
+  assert.match(dom.text(), /Trust selected path/);
+  await dom.click(dom.byText("Trust and use path"));
+  await dom.flush(1);
+  assert.equal(changes.at(-1).nodes[0].operation.working_dir, "/outside/repo");
+  assert.deepEqual(changes.at(-1).filesystemAccess, [
+    { execute: false, path: "/outside/repo", read: true, write: true },
+  ]);
 
   const nodeCard = dom.ancestor(dom.byText("Initial command"), "ARTICLE");
   await dom.pointer(nodeCard, "onPointerDown", { clientX: 10, clientY: 10, pointerId: 7 });
   await dom.pointer(nodeCard, "onPointerMove", { clientX: 35, clientY: 45, movementX: 25, movementY: 35, pointerId: 7 });
   await dom.pointer(nodeCard, "onPointerUp", { clientX: 35, clientY: 45, pointerId: 7 });
-  assert.equal(changes.at(-1).nodes[0].x, 25);
-  assert.equal(changes.at(-1).nodes[0].y, 35);
+  assert.ok(Math.abs(changes.at(-1).nodes[0].x - 25 / 1.8) < 0.001);
+  assert.ok(Math.abs(changes.at(-1).nodes[0].y - 35 / 1.8) < 0.001);
 
   await dom.click(dom.byText("Add edge"));
   await dom.change(dom.selectWithOption("node-1"), "node-1");
@@ -1144,8 +1207,8 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   await dom.click(dom.byText("Duplicate node"));
   assert.equal(changes.at(-1).nodes.length, 3);
   assert.equal(changes.at(-1).nodes.at(-1).label, "Initial command copy");
-  assert.equal(changes.at(-1).nodes.at(-1).x, 53);
-  assert.equal(changes.at(-1).nodes.at(-1).y, 63);
+  assert.ok(Math.abs(changes.at(-1).nodes.at(-1).x - (25 / 1.8 + 28)) < 0.001);
+  assert.ok(Math.abs(changes.at(-1).nodes.at(-1).y - (35 / 1.8 + 28)) < 0.001);
 
   await dom.pointer(
     dom.ancestor(dom.byText("Initial command copy"), "ARTICLE"),
@@ -1182,6 +1245,64 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   await dom.click(dom.byText("Delete node"));
   assert.equal(changes.at(-1).nodes.some((node) => node.id === "step"), false);
   assert.deepEqual(changes.at(-1).edges, []);
+
+  await dom.unmount();
+});
+
+test("DagCanvas delete key confirms before deleting selected nodes", async () => {
+  let workflow = {
+    ...workflowFixture({ id: "delete-key", name: "Delete Key", label: "Delete keyboard" }),
+    nodes: [
+      {
+        id: "first",
+        type: "bash_command",
+        label: "First node",
+        x: 0,
+        y: 0,
+        operation: { type: "bash_command", command: "echo first", working_dir: "" },
+      },
+      {
+        id: "second",
+        type: "bash_command",
+        label: "Second node",
+        x: 260,
+        y: 0,
+        operation: { type: "bash_command", command: "echo second", working_dir: "" },
+      },
+    ],
+    edges: [{ id: "first-second", from: "first", to: "second", label: "always", condition: "always" }],
+  };
+  const changes = [];
+  const confirmMessages = [];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        workflow = nextWorkflow;
+        changes.push(nextWorkflow);
+      },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.pointer(dom.ancestor(dom.byText("First node"), "ARTICLE"), "onPointerDown");
+  globalThis.window.confirm = (message) => {
+    confirmMessages.push(message);
+    return false;
+  };
+  await dom.keyDown("Delete");
+  assert.equal(changes.length, 0);
+  assert.equal(confirmMessages.at(-1), 'Delete selected node "First node"?');
+
+  globalThis.window.confirm = (message) => {
+    confirmMessages.push(message);
+    return true;
+  };
+  await dom.keyDown("Delete");
+  assert.equal(changes.at(-1).nodes.some((node) => node.id === "first"), false);
+  assert.deepEqual(changes.at(-1).edges, []);
+  assert.match(confirmMessages.at(-1), /First node/);
 
   await dom.unmount();
 });
@@ -1817,6 +1938,7 @@ test("Electron IPC security confines file paths to data dir and explicit grants"
     () => security.resolveAllowedPath(path.join(outsideDir, "secret.txt"), { mustExist: true }),
     /outside the approved/,
   );
+  assert.equal(security.resolvePickerPath(path.join(outsideDir, "secret.txt")), outsideDir);
 
   const symlinkPath = path.join(dataDir, "leak.txt");
   try {
@@ -2048,6 +2170,11 @@ test("DagCanvas helpers create default agent nodes and serialize node edits", ()
   assert.equal(withHttpNode.nodes[0].operation.method, "GET");
   assert.equal(withHttpNode.nodes[0].operation.expected_statuses[0], 200);
   assert.match(withHttpNode.nodes[0].meta, /https:\/\/api\.example\.com\/resource/);
+
+  assert.deepEqual(canvasModule.defaultOperation("workflow"), {
+    type: "workflow",
+    workflow_id: "",
+  });
 });
 
 test("DagCanvas helper duplicates nodes with unique ids and agent configs", () => {
@@ -2128,6 +2255,20 @@ test("DagCanvas exposes dashboard item fields as selectable outputs", () => {
   assert(paths.has("data.selected"));
 });
 
+test("DagCanvas exposes workflow call fields as selectable outputs", () => {
+  const fields = canvasModule.nodeOutputFields({
+    id: "call-workflow",
+    type: "workflow",
+    operation: { type: "workflow", workflow_id: "child" },
+  });
+  const paths = new Set(fields.map(([pathValue]) => pathValue));
+
+  assert(paths.has("data.workflow_id"));
+  assert(paths.has("data.workflow_name"));
+  assert(paths.has("data.log_path"));
+  assert(paths.has("data.duration_seconds"));
+});
+
 test("DagCanvas creates dashboard item loop sources and exposes dashboard loop fields", () => {
   assert.deepEqual(canvasModule.defaultFanSource("dashboard_items"), {
     type: "dashboard_items",
@@ -2195,7 +2336,67 @@ test("DagCanvas creates dashboard item loop sources and exposes dashboard loop f
   assert(paths.has("loop.current.item.title"));
   assert(paths.has("loop.current.item.status"));
   assert(paths.has("loop.current.item.owner"));
+  assert(paths.has("loop.data.dashboard"));
+  assert(paths.has("loop.data.component"));
   assert(!paths.has("loop.current.file_path"));
+  assert(!paths.has("loop.data.glob"));
+
+  const sourceGroups = canvasModule.buildInputSourceGroups(
+    { id: "agent", type: "agent" },
+    [
+      {
+        id: "loop",
+        label: "Loop tickets",
+        type: "loop",
+        operation: {
+          type: "loop",
+          source: {
+            type: "dashboard_items",
+            dashboard: "development-dashboard",
+            component: "tickets",
+          },
+        },
+      },
+      { id: "agent", type: "agent" },
+    ],
+    [{ from: "loop", to: "agent" }],
+    [
+      {
+        id: "development-dashboard",
+        name: "Development Dashboard",
+        sections: [
+          {
+            id: "kanban",
+            title: "Kanban",
+            components: [
+              {
+                id: "tickets",
+                title: "Tickets",
+                schema: {
+                  title: { type: "string" },
+                  status: { type: "enum", values: ["backlog", "todo"] },
+                },
+                items: [
+                  {
+                    id: "ticket-1",
+                    title: "Write docs",
+                    owner: "Dana",
+                    status: "todo",
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  );
+  const loopGroup = sourceGroups.find((group) => group.id === "loop");
+  assert.equal(loopGroup.label, "Loop tickets");
+  assert.deepEqual(
+    loopGroup.options.filter(([pathValue]) => pathValue === "loop.current.item.title"),
+    [["loop.current.item.title", "dashboard item title"]],
+  );
 });
 
 test("DagCanvas only exposes loop inputs that match the parent loop source", () => {
@@ -2217,8 +2418,12 @@ test("DagCanvas only exposes loop inputs that match the parent loop source", () 
   );
   const countPaths = new Set(countOptions.map(([pathValue]) => pathValue));
   assert(countPaths.has("loop.current.index"));
+  assert(countPaths.has("loop.data.count"));
   assert(!countPaths.has("loop.current.file_path"));
   assert(!countPaths.has("loop.current.item_id"));
+  assert(!countPaths.has("loop.data.dashboard"));
+  assert(!countPaths.has("loop.data.component"));
+  assert(!countPaths.has("loop.data.glob"));
 
   const directoryOptions = canvasModule.buildInputSourceOptions(
     { id: "child", type: "bash_command" },
@@ -2238,7 +2443,10 @@ test("DagCanvas only exposes loop inputs that match the parent loop source", () 
   );
   const directoryPaths = new Set(directoryOptions.map(([pathValue]) => pathValue));
   assert(directoryPaths.has("loop.current.file_path"));
+  assert(directoryPaths.has("loop.data.source_path"));
+  assert(directoryPaths.has("loop.data.glob"));
   assert(!directoryPaths.has("loop.current.file_content"));
+  assert(!directoryPaths.has("loop.data.dashboard"));
 });
 
 test("DagCanvas exposes loop inputs to downstream iteration nodes", () => {
@@ -2279,6 +2487,48 @@ test("DagCanvas exposes loop inputs to downstream iteration nodes", () => {
   const afterLoopPaths = new Set(afterLoopOptions.map(([pathValue]) => pathValue));
   assert(!afterLoopPaths.has("loop.current.file_path"));
   assert(!afterLoopPaths.has("loop.current.file_content"));
+  assert(afterLoopPaths.has("loop.data.count"));
+});
+
+test("DagCanvas groups all ancestor outputs by node label for input mapping", () => {
+  const nodes = [
+    {
+      id: "collect",
+      label: "Collect files",
+      type: "read_file",
+      operation: { type: "read_file" },
+    },
+    {
+      id: "review",
+      label: "Review agent",
+      type: "agent",
+      operation: { type: "agent" },
+    },
+    {
+      id: "commit",
+      label: "Commit changes",
+      type: "bash_command",
+      operation: { type: "bash_command" },
+    },
+  ];
+  const edges = [
+    { from: "collect", to: "review" },
+    { from: "review", to: "commit" },
+  ];
+
+  const groups = canvasModule.buildInputSourceGroups(nodes[2], nodes, edges);
+  assert.deepEqual(
+    groups.map((group) => group.label),
+    ["Previous node", "Review agent", "Collect files"],
+  );
+  const reviewGroup = groups.find((group) => group.id === "review");
+  const collectGroup = groups.find((group) => group.id === "collect");
+  assert(
+    reviewGroup.options.some(
+      ([pathValue, label]) => pathValue === "review.data.message" && label === "agent message",
+    ),
+  );
+  assert(collectGroup.options.some(([pathValue, label]) => pathValue === "collect.data.content" && label === "content"));
 });
 
 test("DagCanvas exposes approval and notification fields as selectable outputs", () => {
@@ -2387,16 +2637,25 @@ test("DagCanvas canvas group helpers preserve metadata without changing graph se
   let group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.equal(group.label, "Group 1");
   assert.deepEqual(group.nodeIds, ["scan", "review"]);
+  assert.equal(group.opacity, 0.08);
   assert.deepEqual(workflow.edges, [{ id: "scan-review", from: "scan", to: "review" }]);
+  assert.equal(canvasModule.createCanvasGroup(workflow, []), workflow);
 
   workflow = canvasModule.updateCanvasGroup(workflow, group.id, {
     label: "Research",
     color: "#9333ea",
+    opacity: 0.22,
     collapsed: true,
   });
   group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.equal(group.label, "Research");
   assert.equal(group.color, "#9333ea");
+  assert.equal(group.opacity, 0.22);
+  workflow = canvasModule.updateCanvasGroup(workflow, group.id, { label: "" });
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.label, "");
+  workflow = canvasModule.updateCanvasGroup(workflow, group.id, { label: "Research" });
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.deepEqual(
     canvasModule.visibleNodesForGroups(workflow.nodes, [group]).map((node) => node.id),
     ["ship"],
@@ -2575,7 +2834,17 @@ test("selected nodes stack above overlapping nodes, including expanded folders",
   );
 });
 
-test("DagCanvas rendered navigation controls auto-layout, fit, zoom, and search to focus nodes", async () => {
+test("DagCanvas toolbar overflow calculation keeps every action visible until it runs out of width", () => {
+  const widths = Array.from({ length: 5 }, () => 32);
+  assert.equal(canvasModule.visibleToolbarActionCount(400, widths, 32), 5);
+  assert.equal(canvasModule.visibleToolbarActionCount(191, widths, 32), 3);
+  assert.equal(canvasModule.visibleToolbarActionCount(151, widths, 32), 2);
+  assert.equal(canvasModule.visibleToolbarActionCount(31, widths, 32), 0);
+  assert.equal(canvasModule.visibleToolbarActionCount(0, widths, 32), 0);
+  assert.equal(canvasModule.visibleToolbarActionCount(0, [0, 0, 0], 0), 3);
+});
+
+test("DagCanvas rendered navigation controls use one toolbar row and overflow menu", async () => {
   let workflow = {
     ...workflowFixture({ id: "nav", name: "Navigation", label: "Scan" }),
     nodes: [
@@ -2625,30 +2894,17 @@ test("DagCanvas rendered navigation controls auto-layout, fit, zoom, and search 
 
   const runSelector = dom.byTitle("Select workflow run");
   const toolbar = dom.ancestor(runSelector, (node) => node.getAttribute?.("data-toolbar") === "graph-editor");
-  const primaryToolbarRow = dom.ancestor(
+  const toolbarRow = dom.ancestor(
     runSelector,
     (node) => node.getAttribute?.("data-toolbar-row") === "primary",
   );
-  const secondaryToolbarRow = dom.ancestor(
-    dom.byTitle("Auto-layout graph"),
-    (node) => node.getAttribute?.("data-toolbar-row") === "secondary",
-  );
-  const validationButton = dom.byTitle("Validate workflow");
-  const validationToolbarRow = dom.ancestor(
-    validationButton,
-    (node) => node.getAttribute?.("data-toolbar-row") === "primary",
-  );
   assert.equal(toolbar.getAttribute("data-toolbar"), "graph-editor");
-  assert.equal(validationToolbarRow, primaryToolbarRow);
-  assert.equal(
-    dom.ancestor(dom.byLabel("Search nodes"), (node) => node.getAttribute?.("data-toolbar-row") === "secondary"),
-    secondaryToolbarRow,
-  );
-  assert.equal(primaryToolbarRow.contains(secondaryToolbarRow), false);
-  assert.match(secondaryToolbarRow.getAttribute("class"), /flex-wrap/);
+  assert.equal(toolbarRow, toolbar);
+  assert.ok(dom.byTitle("Validate workflow"));
+  assert.equal(dom.allByTitle("More graph actions").length, 0);
+  assert.throws(() => dom.byLabel("Search nodes"), /Unable to find aria-label/);
   assert.doesNotMatch(toolbar.getAttribute("class"), /overflow-x-auto|workflow-scrollbar/);
-  assert.match(dom.ancestor(dom.byLabel("Search nodes"), "FORM").getAttribute("class"), /flex-1/);
-  assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-0/);
+  assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-6/);
 
   await dom.flush();
   await dom.click(dom.byTitle("Auto-layout graph"));
@@ -2659,19 +2915,45 @@ test("DagCanvas rendered navigation controls auto-layout, fit, zoom, and search 
   await dom.click(dom.byTitle("Fit graph"));
   await dom.click(dom.byTitle("Zoom in"));
   await dom.click(dom.byTitle("Zoom out"));
-
-  await dom.change(dom.byLabel("Search nodes"), "reviewer");
-  await dom.click(dom.byTitle("Next search match"));
-  assert.match(dom.text(), /Agent ID/);
-  assert.match(dom.text(), /reviewer/);
-
   await dom.click(dom.byTitle("Fit selection"));
+  const actionGroup = dom.ancestor(dom.byTitle("Auto-layout graph"), (node) =>
+    node.getAttribute?.("class")?.includes("justify-start"),
+  );
+  await dom.click(dom.byTitle("Validate workflow"));
+
+  Object.defineProperty(actionGroup, "clientWidth", { configurable: true, value: 48 });
+  globalThis.window.dispatchEvent({ type: "resize" });
+  await dom.flush();
+  await dom.click(dom.byTitle("More graph actions"));
+  assert.ok(dom.byTestId("toolbar-overflow-menu"));
+  await dom.documentPointerDown(dom.byTestId("dag-canvas"));
+  await dom.flush();
+  assert.throws(() => dom.byTestId("toolbar-overflow-menu"), /Unable to find test id/);
+
   await dom.unmount();
 });
 
-test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and deleted", async () => {
+test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and ungrouped", async () => {
   let workflow = {
     ...workflowFixture({ id: "groups", name: "Groups", label: "Scan" }),
+    metadata: {
+      canvas: {
+        groups: [
+          {
+            id: "group-1",
+            label: "Group 1",
+            color: "#475569",
+            opacity: 0.08,
+            nodeIds: ["scan", "review"],
+            x: 0,
+            y: 40,
+            width: 640,
+            height: 184,
+            collapsed: false,
+          },
+        ],
+      },
+    },
     nodes: [
       {
         id: "scan",
@@ -2701,9 +2983,12 @@ test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and
     createFetchMock([]),
   );
 
-  await dom.click(dom.byTitle("Create canvas group"));
   let group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.deepEqual(group.nodeIds, ["scan", "review"]);
+  assert.ok(dom.byTitle("Select nodes to group"));
+  await dom.pointer(dom.byTitle("Move canvas group"), "onPointerDown");
+  await dom.flush();
+  assert.match(dom.text(), /Group settings/);
 
   await dom.change(dom.byLabel("Rename Group 1"), "Research phase");
   group = canvasModule.normalizeCanvasGroups(workflow)[0];
@@ -2713,17 +2998,97 @@ test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and
   group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.equal(group.color, "#dc2626");
 
-  await dom.click(dom.byTitle("Collapse group"));
+  const opacityInput = dom.controlAfterLabel("Background opacity (%)");
+  await dom.focus(opacityInput);
+  await dom.change(opacityInput, "");
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.opacity, 0.08);
+  assert.equal(opacityInput.value, "");
+
+  await dom.change(opacityInput, "18");
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.opacity, 0.18);
+
+  await dom.blur(opacityInput);
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.opacity, 0.18);
+
+  await dom.change(opacityInput, "19");
+  group = canvasModule.normalizeCanvasGroups(workflow)[0];
+  assert.equal(group.opacity, 0.19);
+
+  await dom.change(dom.controlAfterLabel("Collapsed"), true);
   group = canvasModule.normalizeCanvasGroups(workflow)[0];
   assert.equal(group.collapsed, true);
-  assert.doesNotMatch(dom.text(), /Review/);
 
-  await dom.click(dom.byTitle("Duplicate group"));
+  await dom.click(dom.byText("Duplicate"));
   assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 2);
 
-  await dom.click(dom.byTitle("Delete group"));
+  await dom.click(dom.byText("Ungroup"));
   assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 1);
   assert.equal(workflow.nodes.length, 2);
+
+  await dom.unmount();
+});
+
+test("DagCanvas dropped file trust prompt can be dismissed or confirmed", async () => {
+  let workflow = workflowFixture({ id: "drop-trust", name: "Drop Trust", label: "Initial command" });
+  const changes = [];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        workflow = nextWorkflow;
+        changes.push(nextWorkflow);
+      },
+    }),
+    createFetchMock([]),
+    {
+      desktop: {
+        getDroppedFilePath: (file) => file.path,
+        grantDroppedPath: async (file) => file.path,
+        workspace: {
+          getPathInfo: async (targetPath) => ({
+            basename: "ticket.md",
+            isDirectory: false,
+            isFile: true,
+            path: targetPath,
+          }),
+        },
+      },
+    },
+  );
+
+  const canvas = dom.byTestId("dag-canvas");
+  await dom.drop(canvas, {
+    clientX: 300,
+    clientY: 240,
+    dataTransfer: { files: [{ path: "/outside/ticket.md" }] },
+  });
+  await dom.flush();
+  assert.match(dom.text(), /Trust the files in/);
+
+  const prompt = dom.ancestor(dom.byText("Trust the files in"), "SECTION");
+  await dom.click(prompt.parentNode);
+  assert.doesNotMatch(dom.text(), /Trust the files in/);
+  assert.equal(changes.length, 0);
+
+  await dom.drop(canvas, {
+    clientX: 300,
+    clientY: 240,
+    dataTransfer: { files: [{ path: "/outside/ticket.md" }] },
+  });
+  await dom.flush();
+  await dom.pointer(dom.byText("Add access"), "onPointerDown");
+  await dom.click(dom.byText("Add access"));
+
+  assert.doesNotMatch(dom.text(), /Trust the files in/);
+  assert.equal(changes.at(-1).nodes.length, 2);
+  assert.equal(changes.at(-1).nodes.at(-1).type, "file");
+  assert.deepEqual(changes.at(-1).filesystemAccess, [
+    { execute: false, path: "/outside", read: true, write: true },
+  ]);
 
   await dom.unmount();
 });
@@ -3147,6 +3512,19 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
   globalThis.window.goferDesktop = desktop;
   globalThis.window.goferUpdates = undefined;
   globalThis.window.confirm = () => true;
+  const windowListeners = {};
+  globalThis.window.addEventListener = (type, listener) => {
+    windowListeners[type] = [...(windowListeners[type] ?? []), listener];
+  };
+  globalThis.window.removeEventListener = (type, listener) => {
+    windowListeners[type] = (windowListeners[type] ?? []).filter((candidate) => candidate !== listener);
+  };
+  globalThis.window.dispatchEvent = (event) => {
+    for (const listener of windowListeners[event.type] ?? []) {
+      listener(event);
+    }
+    return true;
+  };
   globalThis.window.requestAnimationFrame = (callback) => {
     callback();
     return 1;
@@ -3170,6 +3548,11 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
         reactProps(elementNode).onChange?.({ target: elementNode, currentTarget: elementNode });
       });
     },
+    async blur(elementNode) {
+      await React.act(async () => {
+        reactProps(elementNode).onBlur?.(testEvent(elementNode));
+      });
+    },
     async click(elementNode) {
       await React.act(async () => {
         reactProps(elementNode).onClick?.(testEvent(elementNode));
@@ -3187,6 +3570,41 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
     async pointer(elementNode, handlerName, patch = {}) {
       await React.act(async () => {
         reactProps(elementNode)[handlerName]?.(testEvent(elementNode, patch));
+      });
+    },
+    async documentPointerDown(targetNode) {
+      await React.act(async () => {
+        document.dispatchEvent({
+          bubbles: true,
+          cancelable: true,
+          target: targetNode,
+          type: "pointerdown",
+        });
+      });
+    },
+    async keyDown(key, patch = {}) {
+      await React.act(async () => {
+        const event = {
+          defaultPrevented: false,
+          key,
+          preventDefault() {
+            this.defaultPrevented = true;
+          },
+          target: document.body,
+          type: "keydown",
+          ...patch,
+        };
+        globalThis.window.dispatchEvent(event);
+      });
+    },
+    async drop(elementNode, patch = {}) {
+      await React.act(async () => {
+        reactProps(elementNode).onDrop?.(testEvent(elementNode, patch));
+      });
+    },
+    async focus(elementNode) {
+      await React.act(async () => {
+        reactProps(elementNode).onFocus?.(testEvent(elementNode));
       });
     },
     async unmount() {
@@ -3220,6 +3638,11 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
     byTitle(title) {
       const match = allElements(container).find((node) => node.getAttribute?.("title") === title);
       assert.ok(match, `Unable to find title: ${title}`);
+      return match;
+    },
+    byTestId(testId) {
+      const match = allElements(container).find((node) => node.getAttribute?.("data-testid") === testId);
+      assert.ok(match, `Unable to find test id: ${testId}`);
       return match;
     },
     byLabel(label) {
@@ -3383,6 +3806,13 @@ class TestNode {
 
   removeEventListener(type, listener) {
     this.listeners[type] = (this.listeners[type] ?? []).filter((candidate) => candidate !== listener);
+  }
+
+  dispatchEvent(event) {
+    for (const listener of this.listeners[event.type] ?? []) {
+      listener(event);
+    }
+    return true;
   }
 
   insertBefore(node, beforeNode) {

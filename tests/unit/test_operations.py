@@ -30,6 +30,7 @@ from gofer.core.operations import (
     PythonScriptOperation,
     ReadFileOperation,
     ShellScriptOperation,
+    WorkflowCallOperation,
     WriteFileOperation,
 )
 
@@ -175,6 +176,7 @@ def test_file_io_operations_roundtrip() -> None:
             smtp_username="{{secret.SMTP_USERNAME}}",
             smtp_password="{{secret.SMTP_PASSWORD}}",
         ),
+        WorkflowCallOperation(type=OperationType.WORKFLOW, workflow_id="child-workflow"),
     ]
 
     for operation in operations:

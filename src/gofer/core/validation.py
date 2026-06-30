@@ -32,6 +32,7 @@ from gofer.core.operations import (
     ShellScriptOperation,
     TabularFanSource,
     TriggerEventsFanSource,
+    WorkflowCallOperation,
     WriteFileOperation,
 )
 from gofer.core.secrets import workflow_secret_readiness
@@ -349,6 +350,10 @@ def _node_diagnostics(
             diagnostics.extend(_http_request_network_diagnostics(op, node.node_id))
         elif isinstance(op, NotificationOperation):
             diagnostics.extend(_notification_diagnostics(op, node.node_id))
+        elif isinstance(op, WorkflowCallOperation):
+            diagnostics.extend(
+                _workflow_call_diagnostics(op, node.node_id, workflow.config.id, path_base)
+            )
 
         if isinstance(op, (PythonScriptOperation, ShellScriptOperation)):
             diagnostics.extend(
@@ -403,6 +408,62 @@ def _node_diagnostics(
                 )
             )
     return diagnostics
+
+
+def _workflow_call_diagnostics(
+    op: WorkflowCallOperation,
+    node_id: str,
+    current_workflow_id: str,
+    path_base: Path | None,
+) -> list[ValidationDiagnostic]:
+    workflow_id = op.workflow_id.strip()
+    if not workflow_id:
+        return [
+            ValidationDiagnostic(
+                code="workflow.call_target_missing",
+                severity="error",
+                target_type="node",
+                target_id=node_id,
+                field="operation.workflow_id",
+                message=f"Node '{node_id}' runs another workflow but has no target workflow.",
+            )
+        ]
+    if workflow_id == current_workflow_id:
+        return [
+            ValidationDiagnostic(
+                code="workflow.call_self",
+                severity="error",
+                target_type="node",
+                target_id=node_id,
+                field="operation.workflow_id",
+                message=f"Node '{node_id}' cannot run its own workflow.",
+            )
+        ]
+    if path_base is None:
+        return []
+    candidate = path_base / f"{workflow_id}.toml"
+    if candidate.exists():
+        return []
+    for path in path_base.glob("*.toml"):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except OSError:
+            continue
+        except tomllib.TOMLDecodeError:
+            continue
+        config = data.get("workflow") if isinstance(data, dict) else None
+        if isinstance(config, dict) and str(config.get("id", "")).strip() == workflow_id:
+            return []
+    return [
+        ValidationDiagnostic(
+            code="workflow.call_target_not_found",
+            severity="error",
+            target_type="node",
+            target_id=node_id,
+            field="operation.workflow_id",
+            message=f"Node '{node_id}' references unknown workflow '{workflow_id}'.",
+        )
+    ]
 
 
 def _edge_diagnostics(workflow: AgenticWorkflow) -> list[ValidationDiagnostic]:

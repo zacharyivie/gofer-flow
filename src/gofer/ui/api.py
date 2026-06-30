@@ -1409,6 +1409,11 @@ async def run_workflow_payload(
             data_dir=base,
             cancel_event=cancel_event,
             stop_file=_workflow_stop_file(workflow_id, base, error_cls=WorkflowRunError),
+            run_log_update_callback=lambda updated_workflow_id, log_path: _write_run_summary_payload(
+                base,
+                updated_workflow_id,
+                log_path,
+            ),
         ).with_trigger_context(trigger_context or {})
         executor = executor.with_parameters(run_parameters)
         if resume_options is not None:
@@ -1865,6 +1870,11 @@ def _resume_decided_approval(
                 workflow_path=workflow_path,
                 data_dir=base,
                 approval_store=store,
+                run_log_update_callback=lambda updated_workflow_id, log_path: _write_run_summary_payload(
+                    base,
+                    updated_workflow_id,
+                    log_path,
+                ),
             ).resume_from_approval,
             request,
         )
@@ -3866,6 +3876,8 @@ def _clean_operation_data(data: dict[str, Any]) -> dict[str, Any]:
             data.pop("timeout", None)
     if op_type == OperationType.PROMPT_FILE and not data.get("template_path"):
         data.pop("template_path", None)
+    if op_type == OperationType.WORKFLOW:
+        data["workflow_id"] = str(data.get("workflow_id") or "").strip()
     return data
 
 
@@ -4030,6 +4042,8 @@ def _operation_meta(operation: dict[str, Any]) -> str:
         case OperationType.LOOP:
             source = operation.get("source") or {}
             return f"loop {source.get('type', 'items')}"
+        case OperationType.WORKFLOW:
+            return f"run workflow {operation.get('workflow_id', 'workflow')}"
         case OperationType.BREAK:
             return operation.get("message") or "break loop"
     return str(operation.get("type", "operation"))

@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bell,
@@ -25,6 +25,7 @@ import {
   LocateFixed,
   Loader2,
   Maximize2,
+  MoreVertical,
   MoveRight,
   PencilLine,
   Play,
@@ -52,6 +53,26 @@ const DEFAULT_RETENTION_SETTINGS = {
   keepFailedDays: 30,
   keepLast: 100,
 };
+const TOOLBAR_ACTION_GAP = 8;
+
+export function visibleToolbarActionCount(availableWidth, actionWidths, menuWidth, gap = TOOLBAR_ACTION_GAP) {
+  const widths = actionWidths.map((width) => Number(width) || 0);
+  const available = Number(availableWidth) || 0;
+  const overflowWidth = Number(menuWidth) || 0;
+  if (!widths.length) return 0;
+  if (widths.every((width) => width <= 0)) return widths.length;
+  if (available <= 0) return 0;
+
+  for (let count = widths.length; count >= 0; count -= 1) {
+    const visibleWidth = widths
+      .slice(0, count)
+      .reduce((total, width, index) => total + width + (index > 0 ? gap : 0), 0);
+    const needsOverflow = count < widths.length;
+    const totalWidth = visibleWidth + (needsOverflow ? overflowWidth + (count > 0 ? gap : 0) : 0);
+    if (totalWidth <= available) return count;
+  }
+  return 0;
+}
 
 const nodeStyles = {
   start: {
@@ -198,6 +219,12 @@ const nodeStyles = {
     border: "border-cyan-200",
     chip: "bg-cyan-50 text-cyan-700 border-cyan-100",
   },
+  workflow: {
+    icon: Route,
+    accent: "bg-teal-700",
+    border: "border-teal-200",
+    chip: "bg-teal-50 text-teal-700 border-teal-100",
+  },
 };
 
 const defaultSettings = {
@@ -221,7 +248,9 @@ const layoutColumnGap = 330;
 const layoutRowGap = 154;
 const minimapWidth = 124;
 const minimapHeight = 86;
-const canvasGroupColors = ["#0f766e", "#2563eb", "#9333ea", "#d97706", "#dc2626", "#475569"];
+const defaultCanvasGroupOpacity = 0.08;
+const canvasGroupColors = ["#475569", "#2563eb", "#0f766e", "#7c3aed", "#b45309", "#be123c"];
+const PathTrustContext = createContext(null);
 const nodeStack = {
   base: 10,
   selected: 30,
@@ -271,6 +300,11 @@ export function defaultOperation(type, nodeNumber = 1) {
       return {
         type,
         source: defaultFanSource("count"),
+      };
+    case "workflow":
+      return {
+        type,
+        workflow_id: "",
       };
     case "bash_command":
       return {
@@ -499,6 +533,8 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
         return `loop dashboard ${operation.source.dashboard || "dashboard"}/${operation.source.component || "component"}`;
       }
       return `loop ${operation.source?.type || "items"}`;
+    case "workflow":
+      return `run workflow ${operation.workflow_id || "workflow"}`;
     case "bash_command":
       return operation.command || commandNodeLabel.toLowerCase();
     case "python_script":
@@ -569,33 +605,89 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
 }
 
 export function buildInputSourceOptions(node, nodes, edges, dashboards = []) {
+  return flattenInputSourceGroups(buildInputSourceGroups(node, nodes, edges, dashboards));
+}
+
+export function buildInputSourceGroups(node, nodes, edges, dashboards = []) {
   const nodesById = Object.fromEntries(nodes.map((candidate) => [candidate.id, candidate]));
-  const upstreamNodes = edges
-    .filter((edge) => edge.to === node.id)
-    .map((edge) => nodesById[edge.from])
-    .filter(Boolean);
-  const loopAncestors = findLoopInputAncestors(node, nodesById, edges);
-  const options = [
-    ["previous.text", "Previous node text"],
-    ["previous.data.message", "Previous message"],
-    ["previous.data.stdout", "Previous stdout"],
-    ["previous.data.stderr", "Previous stderr"],
+  const ancestorNodes = findInputAncestorNodes(node, nodesById, edges);
+  const loopInputAncestorIds = new Set(
+    findLoopInputAncestors(node, nodesById, edges).map((ancestor) => ancestor.id),
+  );
+  const groups = [
+    {
+      id: "previous",
+      label: "Previous node",
+      options: [
+        ["previous.text", "text"],
+        ["previous.data.message", "message"],
+        ["previous.data.stdout", "stdout"],
+        ["previous.data.stderr", "stderr"],
+      ],
+    },
   ];
 
-  loopAncestors.forEach((loopNode) => {
-    loopSourceInputOptions(loopNode.operation?.source, dashboards).forEach((option) => {
-      options.push(option);
+  ancestorNodes.forEach((ancestor) => {
+    const label = ancestor.label || ancestor.id;
+    const options = [];
+    if (ancestor.operation?.type === "loop" && loopInputAncestorIds.has(ancestor.id)) {
+      loopSourceInputOptions(ancestor.operation?.source, dashboards).forEach(([path, fieldLabel]) => {
+        options.push([path, stripInputSourcePrefix(fieldLabel, "Loop current ")]);
+      });
+    }
+    nodeOutputFields(ancestor, dashboards).forEach(([path, fieldLabel]) => {
+      options.push([`${ancestor.id}.${path}`, fieldLabel]);
     });
+    const dedupedOptions = dedupeOptions(options);
+    if (dedupedOptions.length) {
+      groups.push({
+        id: ancestor.id,
+        label,
+        options: dedupedOptions,
+      });
+    }
   });
 
-  upstreamNodes.forEach((upstream) => {
-    const label = upstream.label || upstream.id;
-    nodeOutputFields(upstream).forEach(([path, fieldLabel]) => {
-      options.push([`${upstream.id}.${path}`, `${label} ${fieldLabel}`]);
+  return groups.filter((group) => group.options.length);
+}
+
+function flattenInputSourceGroups(groups = []) {
+  const options = [];
+  groups.forEach((group) => {
+    group.options.forEach(([value, label]) => {
+      options.push([value, group.id === "previous" ? label : `${group.label} ${label}`]);
     });
   });
-
   return dedupeOptions(options);
+}
+
+function stripInputSourcePrefix(label = "", prefix = "") {
+  return label.startsWith(prefix) ? label.slice(prefix.length) : label;
+}
+
+function findInputAncestorNodes(node, nodesById, edges) {
+  const ancestors = [];
+  const visitedNodeIds = new Set();
+  const stack = [node.id];
+
+  while (stack.length > 0) {
+    const currentNodeId = stack.pop();
+    if (visitedNodeIds.has(currentNodeId)) continue;
+    visitedNodeIds.add(currentNodeId);
+
+    edges
+      .filter((edge) => edge.to === currentNodeId)
+      .forEach((edge) => {
+        const upstream = nodesById[edge.from];
+        if (!upstream) return;
+        if (!ancestors.some((ancestor) => ancestor.id === upstream.id)) {
+          ancestors.push(upstream);
+        }
+        stack.push(upstream.id);
+      });
+  }
+
+  return ancestors;
 }
 
 function findLoopInputAncestors(node, nodesById, edges) {
@@ -615,12 +707,9 @@ function findLoopInputAncestors(node, nodesById, edges) {
       .forEach((edge) => {
         const upstream = nodesById[edge.from];
         if (!upstream) return;
-        if (upstream.operation?.type === "loop") {
-          if (!seenLoopIds.has(upstream.id)) {
-            seenLoopIds.add(upstream.id);
-            loopAncestors.push(upstream);
-          }
-          return;
+        if (upstream.operation?.type === "loop" && !seenLoopIds.has(upstream.id)) {
+          seenLoopIds.add(upstream.id);
+          loopAncestors.push(upstream);
         }
         stack.push(upstream.id);
       });
@@ -699,7 +788,42 @@ function dashboardLoopItemFieldOptions(source = {}, dashboards = []) {
   ]);
 }
 
-export function nodeOutputFields(node) {
+function loopOutputFields(source = {}, common = [], dashboards = []) {
+  const base = [
+    ...common,
+    ["items", "all items"],
+    ["data.count", "item count"],
+    ["data.source_type", "source type"],
+    ["data.max_concurrency", "max concurrency"],
+    ["data.fail_fast", "fail fast"],
+  ];
+  switch (source?.type) {
+    case "directory":
+      return [
+        ...base,
+        ["data.source_path", "source path"],
+        ["data.glob", "glob"],
+        ["data.include_content", "include file content"],
+      ];
+    case "tabular":
+      return [...base, ["data.source_path", "source path"]];
+    case "trigger_events":
+      return [...base, ["data.include_content", "include file content"]];
+    case "dashboard_items":
+      return [
+        ...base,
+        ["data.dashboard", "dashboard"],
+        ["data.component", "component"],
+        ["data.filter", "filter"],
+      ];
+    case "count":
+    case "infinite":
+    default:
+      return base;
+  }
+}
+
+export function nodeOutputFields(node, dashboards = []) {
   const type = node?.type || node?.operation?.type;
   const common = [
     ["text", "text"],
@@ -769,24 +893,22 @@ export function nodeOutputFields(node) {
         ["data.directory", "directory"],
       ];
     case "loop":
+      return loopOutputFields(node?.operation?.source, common, dashboards);
+    case "workflow":
       return [
         ...common,
-        ["items", "all items"],
-        ["data.count", "item count"],
-        ["data.source_type", "source type"],
-        ["data.source_path", "source path"],
-        ["data.dashboard", "dashboard"],
-        ["data.component", "component"],
-        ["data.filter", "filter"],
-        ["data.glob", "glob"],
+        ["data.workflow_id", "workflow ID"],
+        ["data.workflow_name", "workflow name"],
+        ["data.log_path", "run log"],
+        ["data.duration_seconds", "duration seconds"],
       ];
     case "agent":
     case "common_llm_task":
       return [
         ...common,
-        ["data.message", "message"],
+        ["data.message", "agent message"],
         ["data.agent_id", "agent ID"],
-        ["data.thoughts", "thoughts"],
+        ["data.thoughts", "agent thoughts"],
       ];
     case "local_vectorize":
       return [
@@ -1059,6 +1181,17 @@ function finiteNumber(value, fallback = 0) {
   return Number.isFinite(number) ? number : fallback;
 }
 
+function hexToRgba(hex, opacity = 1) {
+  const normalized = String(hex ?? "").replace("#", "");
+  if (!/^[0-9A-Fa-f]{6}$/.test(normalized)) {
+    return `rgba(71, 85, 105, ${clamp(opacity, 0, 1)})`;
+  }
+  const red = Number.parseInt(normalized.slice(0, 2), 16);
+  const green = Number.parseInt(normalized.slice(2, 4), 16);
+  const blue = Number.parseInt(normalized.slice(4, 6), 16);
+  return `rgba(${red}, ${green}, ${blue}, ${clamp(opacity, 0, 1)})`;
+}
+
 function nextAvailableGroupNumber(groups) {
   const usedNumbers = new Set(
     groups
@@ -1082,6 +1215,7 @@ export default function DagCanvas({
   retentionSettings = DEFAULT_RETENTION_SETTINGS,
   runState,
   workflow,
+  workflows = [],
   onExportWorkflow,
   onImportWorkflow,
   onLoadLatestLog,
@@ -1096,11 +1230,15 @@ export default function DagCanvas({
   onStopWorkflow,
   onValidateWorkflow,
   onWorkflowChange,
+  onNavigateWorkflow,
+  onRenameWorkflow,
   usedAgentIds = [],
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
-  const searchInputRef = useRef(null);
+  const toolbarActionGroupRef = useRef(null);
+  const toolbarMeasureRef = useRef(null);
+  const toolbarMenuRef = useRef(null);
   const nodeDragMovedRef = useRef(false);
   const nodeDragSelectionRef = useRef([]);
   const groupDragRef = useRef(null);
@@ -1137,11 +1275,11 @@ export default function DagCanvas({
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [draftEdge, setDraftEdge] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const [minimapDragging, setMinimapDragging] = useState(false);
   const [nodeContextMenu, setNodeContextMenu] = useState(null);
   const [nodeRenameDialog, setNodeRenameDialog] = useState(null);
+  const [toolbarMenuOpen, setToolbarMenuOpen] = useState(false);
+  const [visibleToolbarActions, setVisibleToolbarActions] = useState(null);
   const invalidWorkflow = Boolean(workflow.invalid);
   const validationDiagnostics = workflowValidationDiagnostics(workflow);
   const blockingValidationErrors = validationDiagnostics.filter(
@@ -1152,11 +1290,19 @@ export default function DagCanvas({
     () =>
       (workflow.nodes ?? []).map((node) => {
         const forcedLabel = specialNodeLabel(node.type);
-        return forcedLabel && node.label !== forcedLabel
-          ? { ...node, label: forcedLabel }
-          : node;
+        if (forcedLabel && node.label !== forcedLabel) {
+          return { ...node, label: forcedLabel };
+        }
+        if (node.type === "workflow") {
+          const targetWorkflow = workflows.find(
+            (candidate) => candidate.id === node.operation?.workflow_id,
+          );
+          const targetLabel = targetWorkflow?.name || node.label || "Workflow";
+          return targetLabel !== node.label ? { ...node, label: targetLabel } : node;
+        }
+        return node;
       }),
-    [workflow.nodes],
+    [workflow.nodes, workflows],
   );
   const workflowEdges = workflow.edges ?? [];
   const canvasGroups = useMemo(() => normalizeCanvasGroups(workflow), [workflow]);
@@ -1176,11 +1322,6 @@ export default function DagCanvas({
     () => diagnosticsByTarget(validationDiagnostics, "node"),
     [validationDiagnostics],
   );
-  const searchMatches = useMemo(
-    () => matchingNodeIds(workflowNodes, searchQuery),
-    [searchQuery, workflowNodes],
-  );
-
   const selectedNode = workflowNodes.find((node) => node.id === selectedNodeId);
   const selectedGroup = canvasGroups.find((group) => group.id === selectedGroupId);
   const selectedEdge = workflowEdges.find((edge) => edge.id === selectedEdgeId);
@@ -1258,9 +1399,8 @@ export default function DagCanvas({
     setDraggingNodeId(null);
     setPanningPointerId(null);
     setSelectionBox(null);
-    setViewport({ x: 0, y: 0, scale: 1 });
-    setSearchQuery("");
-    setSearchMatchIndex(0);
+    const schedule = window.requestAnimationFrame ?? ((callback) => callback());
+    schedule(() => fitGraph());
   }, [workflow.id]);
 
   useEffect(() => {
@@ -1283,12 +1423,6 @@ export default function DagCanvas({
       setSelectedEdgeId(null);
     }
   }, [selectedEdgeId, workflowEdges]);
-
-  useEffect(() => {
-    setSearchMatchIndex((currentIndex) =>
-      searchMatches.length ? Math.min(currentIndex, searchMatches.length - 1) : 0,
-    );
-  }, [searchMatches.length]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -1327,15 +1461,13 @@ export default function DagCanvas({
       if (event.key === "Escape") {
         setNodeRenameDialog(null);
         setNodeContextMenu(null);
+        setToolbarMenuOpen(false);
         setDraftEdge(null);
         setSelectedEdgeId(null);
         setSelectedNodeId(undefined);
         setSelectedNodeIds([]);
         setSelectedGroupId(null);
         setSelectionBox(null);
-        if (document.activeElement === searchInputRef.current) {
-          searchInputRef.current?.blur();
-        }
         return;
       }
 
@@ -1350,17 +1482,9 @@ export default function DagCanvas({
         return;
       }
 
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+      if ((event.key === "Delete" || event.key === "Backspace") && selectedNodeIds.length) {
         event.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select?.();
-        return;
-      }
-
-      if (event.key === "/") {
-        event.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select?.();
+        deleteSelectedNodesWithConfirmation();
         return;
       }
 
@@ -1451,6 +1575,16 @@ export default function DagCanvas({
       nextNodePatch.label = forcedLabel;
     }
     if (
+      operation.type === "workflow" &&
+      Object.hasOwn(patch, "workflow_id") &&
+      operation.workflow_id
+    ) {
+      const targetWorkflow = workflows.find((candidate) => candidate.id === operation.workflow_id);
+      if (targetWorkflow?.name) {
+        nextNodePatch.label = targetWorkflow.name;
+      }
+    }
+    if (
       (operation.type === "file" || operation.type === "folder") &&
       Object.hasOwn(patch, "path") &&
       operation.path
@@ -1522,9 +1656,20 @@ export default function DagCanvas({
         ? nextAgentNumber
         : workflowNodes.length + 1,
     );
+    if (type === "workflow") {
+      const targetWorkflow = workflows.find((candidate) => candidate.id !== workflow.id);
+      if (targetWorkflow) {
+        nextOperation.workflow_id = targetWorkflow.id;
+      }
+    }
     const nextNode = {
       type,
-      label: specialNodeLabel(type) ?? nodesById[nodeId].label,
+      label:
+        specialNodeLabel(type) ??
+        (type === "workflow"
+          ? workflows.find((candidate) => candidate.id === nextOperation.workflow_id)?.name ||
+            "Workflow"
+          : nodesById[nodeId].label),
       operation: nextOperation,
       settings: {
         ...defaultSettings,
@@ -1571,6 +1716,14 @@ export default function DagCanvas({
     return {
       width: rect?.width || 960,
       height: rect?.height || 640,
+    };
+  }
+
+  function viewportCenterNodePosition() {
+    const size = canvasViewportSize();
+    return {
+      x: (size.width / 2 - viewport.x) / viewport.scale - nodeWidth / 2,
+      y: (size.height / 2 - viewport.y) / viewport.scale - nodeHeight / 2,
     };
   }
 
@@ -1628,44 +1781,12 @@ export default function DagCanvas({
     });
   }
 
-  function focusSearchMatch(matchIndex = searchMatchIndex) {
-    if (!searchMatches.length) return;
-    const boundedIndex = ((matchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
-    const nodeId = searchMatches[boundedIndex];
-    const node = workflowNodes.find((candidate) => candidate.id === nodeId);
-    if (!node) return;
-    const collapsedGroup = canvasGroups.find(
-      (group) => group.collapsed && group.nodeIds.includes(nodeId),
-    );
-    if (collapsedGroup) {
-      onWorkflowChange(updateCanvasGroup(workflow, collapsedGroup.id, { collapsed: false }));
-      setSelectedGroupId(collapsedGroup.id);
-    } else {
-      setSelectedGroupId(null);
-    }
-    setSearchMatchIndex(boundedIndex);
-    setSelectedEdgeId(null);
-    setSelectedNodeId(nodeId);
-    setSelectedNodeIds([nodeId]);
-    fitNodes([node]);
-  }
-
-  function handleSearchSubmit(event) {
-    event.preventDefault();
-    focusSearchMatch(searchMatchIndex);
-  }
-
-  function moveSearchMatch(delta) {
-    if (!searchMatches.length) return;
-    focusSearchMatch(searchMatchIndex + delta);
-  }
-
   function addNode() {
-    const nextNumber = nextAvailableNodeNumber(workflowNodes);
+    const position = viewportCenterNodePosition();
     const nextWorkflow = addDefaultNodeToWorkflow(workflow, {
       usedAgentIds,
-      x: 180 + nextNumber * 34,
-      y: 180 + nextNumber * 24,
+      x: Math.round(position.x),
+      y: Math.round(position.y),
     });
     const newNode = nextWorkflow.nodes.at(-1);
     onWorkflowChange(nextWorkflow);
@@ -1675,7 +1796,9 @@ export default function DagCanvas({
   }
 
   function addGroup() {
+    if (!selectedNodeIds.length) return;
     const nextWorkflow = createCanvasGroup(workflow, selectedNodeIds);
+    if (nextWorkflow === workflow) return;
     const group = normalizeCanvasGroups(nextWorkflow).at(-1);
     onWorkflowChange(nextWorkflow);
     if (group) {
@@ -1959,6 +2082,33 @@ export default function DagCanvas({
     deleteNode(selectedNode.id);
   }
 
+  function deleteSelectedNodesWithConfirmation() {
+    const nodeIds = selectedNodeIds.filter((nodeId) => Boolean(nodesById[nodeId]));
+    if (!nodeIds.length) return;
+    const message =
+      nodeIds.length === 1
+        ? `Delete selected node "${nodesById[nodeIds[0]]?.label ?? nodeIds[0]}"?`
+        : `Delete ${nodeIds.length} selected nodes?`;
+    if (!window.confirm(message)) return;
+
+    const nodesToDelete = new Set(nodeIds);
+    const nextWorkflow = nodeIds.reduce(
+      (currentWorkflow, nodeId) => removeWorkflowNode(currentWorkflow, nodeId),
+      workflow,
+    );
+    const remainingNodes = nextWorkflow.nodes ?? [];
+    const nextSelectedId = remainingNodes.find((node) => !nodesToDelete.has(node.id))?.id;
+
+    onWorkflowChange(nextWorkflow);
+    setSelectedNodeId(nextSelectedId);
+    setSelectedNodeIds(nextSelectedId ? [nextSelectedId] : []);
+    setSelectedEdgeId(null);
+    setSelectedGroupId(null);
+    setNodeContextMenu((current) =>
+      current && nodesToDelete.has(current.nodeId) ? null : current,
+    );
+  }
+
   function deleteNode(nodeId) {
     const nextWorkflow = removeWorkflowNode(workflow, nodeId);
     const remainingNodes = nextWorkflow.nodes ?? [];
@@ -2005,6 +2155,16 @@ export default function DagCanvas({
     if (!trimmedLabel) {
       setNodeRenameDialog(null);
       return;
+    }
+    const node = nodesById[nodeId];
+    if (node?.type === "workflow" && node.operation?.workflow_id) {
+      Promise.resolve(onRenameWorkflow?.(node.operation.workflow_id, trimmedLabel)).then(
+        (renamedWorkflow) => {
+          if (renamedWorkflow?.id) {
+            updateNodeOperation(nodeId, { workflow_id: renamedWorkflow.id });
+          }
+        },
+      );
     }
     updateNode(nodeId, { label: trimmedLabel });
     setSelectedNodeId(nodeId);
@@ -2093,6 +2253,13 @@ export default function DagCanvas({
       const path = node.operation?.path;
       if (path) {
         setFilePreviewPath(resolveDisplayPath(path, dataDir));
+      }
+      return;
+    }
+
+    if (node.type === "workflow") {
+      if (node.operation?.workflow_id) {
+        onNavigateWorkflow?.(node.operation.workflow_id);
       }
       return;
     }
@@ -2460,18 +2627,158 @@ export default function DagCanvas({
     window.addEventListener("pointerup", handlePointerUp);
   }
 
+  const toolbarActions = [
+    {
+      disabled: invalidWorkflow,
+      icon: Plus,
+      label: "Add node",
+      onClick: addNode,
+    },
+    {
+      disabled: invalidWorkflow || !selectedNodeIds.length,
+      icon: Group,
+      label: selectedNodeIds.length ? "Create canvas group" : "Select nodes to group",
+      menuLabel: "Create canvas group",
+      onClick: addGroup,
+    },
+    {
+      icon: Route,
+      label: "Auto-layout graph",
+      onClick: applyAutoLayout,
+    },
+    {
+      icon: Maximize2,
+      label: "Fit graph",
+      onClick: fitGraph,
+    },
+    {
+      disabled: !selectedNodeIds.length,
+      icon: LocateFixed,
+      label: "Fit selection",
+      onClick: fitSelection,
+    },
+    {
+      icon: ZoomOut,
+      label: "Zoom out",
+      onClick: () => zoomViewport(0.88),
+    },
+    {
+      icon: ZoomIn,
+      label: "Zoom in",
+      onClick: () => zoomViewport(1.14),
+    },
+    {
+      icon: LocateFixed,
+      label: "Reset view",
+      onClick: () => setViewport({ x: 0, y: 0, scale: 1 }),
+    },
+    {
+      disabled: invalidWorkflow || (!selectedNode && !selectedGroup),
+      icon: Trash2,
+      label: "Delete selected item",
+      onClick: deleteSelectedItem,
+    },
+    {
+      icon: Upload,
+      label: "Import workflow TOML or bundle",
+      menuLabel: "Import workflow",
+      onClick: () => importInputRef.current?.click(),
+    },
+    {
+      disabled: invalidWorkflow,
+      icon: Download,
+      label: "Export workflow bundle",
+      onClick: onExportWorkflow,
+    },
+    {
+      disabled: invalidWorkflow,
+      icon: Check,
+      label: "Validate workflow",
+      onClick: onValidateWorkflow,
+    },
+  ];
+  const visibleToolbarActionCountValue = Math.min(
+    visibleToolbarActions ?? toolbarActions.length,
+    toolbarActions.length,
+  );
+  const visibleToolbarActionItems = toolbarActions.slice(0, visibleToolbarActionCountValue);
+  const overflowToolbarActionItems = toolbarActions.slice(visibleToolbarActionCountValue);
+
+  useEffect(() => {
+    let frameId = 0;
+
+    function updateToolbarOverflow() {
+      window.cancelAnimationFrame?.(frameId);
+      frameId = window.requestAnimationFrame?.(() => {
+        const actionGroup = toolbarActionGroupRef.current;
+        const measureRoot = toolbarMeasureRef.current;
+        if (!actionGroup || !measureRoot) {
+          setVisibleToolbarActions(toolbarActions.length);
+          return;
+        }
+        if (typeof actionGroup.clientWidth !== "number") {
+          setVisibleToolbarActions(toolbarActions.length);
+          return;
+        }
+        const measuredElements = Array.from(measureRoot.childNodes ?? []).filter(
+          (node) => node.nodeType === 1,
+        );
+        const actionWidths = measuredElements
+          .filter((element) => element.getAttribute?.("data-toolbar-measure-action") !== null)
+          .map((element) => element.getBoundingClientRect().width);
+        const menuWidth =
+          measuredElements
+            .find((element) => element.getAttribute?.("data-toolbar-measure-menu") !== null)
+            ?.getBoundingClientRect().width ?? 0;
+        const nextCount = visibleToolbarActionCount(
+          actionGroup.clientWidth,
+          actionWidths,
+          menuWidth,
+          TOOLBAR_ACTION_GAP,
+        );
+        setVisibleToolbarActions((current) => (current === nextCount ? current : nextCount));
+        if (nextCount >= toolbarActions.length) {
+          setToolbarMenuOpen(false);
+        }
+      }) ?? window.setTimeout(() => {
+        setVisibleToolbarActions(toolbarActions.length);
+      }, 0);
+    }
+
+    updateToolbarOverflow();
+    const resizeObserver =
+      typeof ResizeObserver === "function" ? new ResizeObserver(updateToolbarOverflow) : null;
+    if (resizeObserver && toolbarActionGroupRef.current) {
+      resizeObserver.observe(toolbarActionGroupRef.current);
+    }
+    window.addEventListener("resize", updateToolbarOverflow);
+
+    return () => {
+      window.cancelAnimationFrame?.(frameId);
+      resizeObserver?.disconnect();
+      window.removeEventListener("resize", updateToolbarOverflow);
+    };
+  }, [toolbarActions.length]);
+
+  useEffect(() => {
+    if (!toolbarMenuOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (toolbarMenuRef.current?.contains(event.target)) return;
+      setToolbarMenuOpen(false);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown);
+    return () => document.removeEventListener("pointerdown", handlePointerDown);
+  }, [toolbarMenuOpen]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="relative flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col">
         <div
-          className="relative z-20 flex shrink-0 flex-col gap-2 overflow-visible border-b border-line bg-white px-6 py-2"
+          className="relative z-20 flex shrink-0 items-center gap-2 overflow-visible border-b border-line bg-white px-6 py-2"
           data-toolbar="graph-editor"
+          data-toolbar-row="primary"
         >
-          <div
-            className="flex min-w-0 items-center gap-2 overflow-visible"
-            data-toolbar-row="primary"
-          >
             <input
               ref={importInputRef}
               accept=".toml,.zip,.gof"
@@ -2515,167 +2822,67 @@ export default function DagCanvas({
               onStopRun={onStopRunLog}
               selectedNodeId={selectedNodeId}
             />
-            <div className="relative ml-auto shrink-0">
-              <button
-                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-                disabled={invalidWorkflow}
-                title="Validate workflow"
-                type="button"
-                onClick={onValidateWorkflow}
-              >
-                <Check size={17} />
-              </button>
-              {notice?.message ? (
-                <div
-                  className={`validation-pop absolute right-0 top-10 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
-                    notice.type === "error"
-                      ? "border-red-200 bg-red-50 text-red-700"
-                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
-                  }`}
-                >
-                  {notice.message}
+            <div
+              ref={toolbarActionGroupRef}
+              className="relative flex min-w-0 flex-1 items-center justify-start gap-2"
+            >
+              {visibleToolbarActionItems.map((action) => (
+                <ToolbarActionButton key={action.label} action={action} />
+              ))}
+              {overflowToolbarActionItems.length ? (
+                <div ref={toolbarMenuRef} className="relative shrink-0">
+                  <button
+                    className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+                    title="More graph actions"
+                    type="button"
+                    onClick={() => setToolbarMenuOpen((current) => !current)}
+                  >
+                    <MoreVertical size={17} />
+                  </button>
+                  {toolbarMenuOpen ? (
+                    <ToolbarOverflowMenu
+                      actions={overflowToolbarActionItems.map((action) => ({
+                        ...action,
+                        label: action.menuLabel ?? action.label,
+                      }))}
+                      onClose={() => setToolbarMenuOpen(false)}
+                    />
+                  ) : null}
                 </div>
               ) : null}
+              <div
+                ref={toolbarMeasureRef}
+                aria-hidden="true"
+                className="pointer-events-none invisible absolute right-0 top-0 flex gap-2"
+              >
+                {toolbarActions.map((action) => (
+                  <ToolbarActionButton key={action.label} action={action} measure />
+                ))}
+                <button
+                  className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted"
+                  data-toolbar-measure-menu
+                  tabIndex={-1}
+                  type="button"
+                >
+                  <MoreVertical size={17} />
+                </button>
+              </div>
             </div>
-          </div>
-          <div
-            className="flex min-w-0 flex-wrap items-center gap-2 overflow-visible [&>button]:shrink-0"
-            data-toolbar-row="secondary"
-          >
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={invalidWorkflow}
-              title="Add node"
-              type="button"
-              onClick={addNode}
-            >
-              <Plus size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={invalidWorkflow || !workflowNodes.length}
-              title="Create canvas group"
-              type="button"
-              onClick={addGroup}
-            >
-              <Group size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Auto-layout graph"
-              type="button"
-              onClick={applyAutoLayout}
-            >
-              <Route size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Fit graph"
-              type="button"
-              onClick={fitGraph}
-            >
-              <Maximize2 size={16} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={!selectedNodeIds.length}
-              title="Fit selection"
-              type="button"
-              onClick={fitSelection}
-            >
-              <LocateFixed size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Zoom out"
-              type="button"
-              onClick={() => zoomViewport(0.88)}
-            >
-              <ZoomOut size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Zoom in"
-              type="button"
-              onClick={() => zoomViewport(1.14)}
-            >
-              <ZoomIn size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Reset view"
-              type="button"
-              onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
-            >
-              <LocateFixed size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={invalidWorkflow || (!selectedNode && !selectedGroup)}
-              title="Delete selected item"
-              type="button"
-              onClick={deleteSelectedItem}
-            >
-              <Trash2 size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Import workflow TOML or bundle"
-              type="button"
-              onClick={() => importInputRef.current?.click()}
-            >
-              <Upload size={17} />
-            </button>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-              disabled={invalidWorkflow}
-              title="Export workflow bundle"
-              type="button"
-              onClick={onExportWorkflow}
-            >
-              <Download size={17} />
-            </button>
-            <form
-              className="flex h-8 min-w-[9rem] max-w-[17rem] flex-1 items-center overflow-hidden rounded-lg border border-line bg-white text-xs text-muted shadow-sm"
-              onSubmit={handleSearchSubmit}
-            >
-              <Search size={15} className="ml-2 shrink-0" />
-              <input
-                ref={searchInputRef}
-                aria-label="Search nodes"
-                className="h-full w-28 border-0 bg-transparent px-2 text-xs text-ink outline-none placeholder:text-slate-400 sm:w-36 md:w-44"
-                placeholder="Search nodes"
-                value={searchQuery}
-                onChange={(event) => {
-                  setSearchQuery(event.target.value);
-                  setSearchMatchIndex(0);
-                }}
-              />
-              <span className="hidden w-12 shrink-0 text-center text-[11px] text-muted sm:block">
-                {searchQuery.trim() ? `${searchMatches.length ? searchMatchIndex + 1 : 0}/${searchMatches.length}` : ""}
-              </span>
-              <button
-                className="grid h-8 w-8 place-items-center border-l border-line text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
-                disabled={!searchMatches.length}
-                title="Previous search match"
-                type="button"
-                onClick={() => moveSearchMatch(-1)}
+            {notice?.message ? (
+              <div
+                className={`validation-pop absolute right-6 top-12 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
+                  notice.type === "error"
+                    ? "border-red-200 bg-red-50 text-red-700"
+                    : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                }`}
               >
-                <ChevronLeft size={15} />
-              </button>
-              <button
-                className="grid h-8 w-8 place-items-center border-l border-line text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
-                disabled={!searchMatches.length}
-                title="Next search match"
-                type="button"
-                onClick={() => moveSearchMatch(1)}
-              >
-                <ChevronRight size={15} />
-              </button>
-            </form>
-          </div>
+                {notice.message}
+              </div>
+            ) : null}
         </div>
 
+      <div className="relative flex min-h-0 flex-1">
+        <div className="flex min-w-0 flex-1 flex-col">
         <div
           ref={canvasRef}
           data-testid="dag-canvas"
@@ -2723,6 +2930,7 @@ export default function DagCanvas({
                   top: -graphWorldOffset,
                   width: graphWorldSize,
                   height: graphWorldSize,
+                  zIndex: 6,
                   pointerEvents: "none",
                 }}
                 viewBox={`0 0 ${graphWorldSize} ${graphWorldSize}`}
@@ -2833,10 +3041,13 @@ export default function DagCanvas({
                   key={group.id}
                   group={group}
                   selected={selectedGroupId === group.id}
-                  status={canvasGroupStatus(group, nodeStatuses, approvalState?.approvals ?? [])}
                   onChange={updateGroup}
-                  onDelete={deleteGroup}
-                  onDuplicate={duplicateGroup}
+                  onSelect={(groupId) => {
+                    setSelectedGroupId(groupId);
+                    setSelectedNodeId(undefined);
+                    setSelectedNodeIds([]);
+                    setSelectedEdgeId(null);
+                  }}
                   onPointerDown={handleGroupPointerDown}
                   onPointerMove={handleGroupPointerMove}
                   onPointerUp={handleGroupPointerUp}
@@ -2931,19 +3142,24 @@ export default function DagCanvas({
             edges={workflowEdges}
             collapsed={inspectorCollapsed}
             edge={selectedEdge}
+            group={selectedGroup}
             node={selectedNode}
             nodeRun={selectedRunNode}
             nodeOutput={selectedNodeOutput}
             nodes={workflowNodes}
             providerProfiles={providerProfiles}
+            workflows={workflows}
             workflow={workflow}
             dataDir={dataDir}
             width={inspectorWidth}
             onAddEdge={addEdge}
             onDeleteEdge={deleteEdge}
+            onDeleteGroup={deleteGroup}
+            onDuplicateGroup={duplicateGroup}
             onAgentChange={updateAgentConfig}
             onDecideApproval={onDecideApproval}
             onEdgeChange={updateEdge}
+            onGroupChange={updateGroup}
             onResizeStart={startInspectorResize}
             onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
             onOperationChange={(patch) => updateNodeOperation(selectedNode.id, patch)}
@@ -2951,6 +3167,8 @@ export default function DagCanvas({
             onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
             onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
             onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
+            onNavigateWorkflow={onNavigateWorkflow}
+            onRenameWorkflow={onRenameWorkflow}
             onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
             onApplyFix={applyValidationFix}
           />
@@ -3164,21 +3382,26 @@ function webhookAuthSummary(config = {}) {
 function WorkflowGroup({
   group,
   onChange,
-  onDelete,
-  onDuplicate,
+  onSelect,
   onPointerDown,
   onPointerMove,
   onPointerUp,
   selected,
-  status,
 }) {
   const height = group.collapsed ? collapsedGroupHeight : group.height;
-  const statusLabel = groupStatusLabel(status);
+  const generatedLabel = /^Group \d+$/.test(group.label);
+  const [editingGeneratedLabel, setEditingGeneratedLabel] = useState(false);
+  const displayedLabel = editingGeneratedLabel ? "" : group.label;
+  const backgroundOpacity = clamp(
+    group.collapsed ? Math.max(group.opacity, 0.12) : group.opacity,
+    0,
+    1,
+  );
 
   return (
     <section
-      className={`absolute rounded-lg border-2 bg-white/35 shadow-sm backdrop-blur-[1px] ${
-        selected ? "ring-2 ring-teal-500 ring-offset-2" : ""
+      className={`absolute rounded-lg border-2 shadow-sm ${
+        selected ? "ring-2 ring-teal-500 ring-offset-2 dark:ring-offset-[#1e1e1e]" : ""
       }`}
       data-testid={`canvas-group-${group.id}`}
       style={{
@@ -3187,79 +3410,62 @@ function WorkflowGroup({
         width: group.width,
         height,
         borderColor: group.color,
-        backgroundColor: `${group.color}18`,
-        zIndex: 4,
+        backgroundColor: hexToRgba(group.color, backgroundOpacity),
+        zIndex: group.collapsed ? 28 : 1,
+      }}
+      onPointerDown={(event) => {
+        event.stopPropagation();
+        if (event.button === 0) {
+          onPointerDown(event, group.id, "move");
+        }
       }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
     >
       <div
-        className="flex h-10 cursor-grab items-center gap-1 border-b border-white/70 bg-white/80 px-2 active:cursor-grabbing"
+        className="flex h-11 cursor-grab items-center gap-1.5 border-b bg-white/90 px-2.5 shadow-sm active:cursor-grabbing dark:bg-[#111113]"
         style={{ borderColor: `${group.color}55` }}
         title="Move canvas group"
         onPointerDown={(event) => onPointerDown(event, group.id, "move")}
       >
         <input
           aria-label={`Rename ${group.label}`}
-          className="min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 text-xs font-semibold text-ink outline-none transition focus:border-line focus:bg-white"
-          value={group.label}
-          onChange={(event) => onChange(group.id, { label: event.target.value })}
+          className={`min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 text-sm font-semibold outline-none transition placeholder:text-muted focus:border-line focus:bg-white dark:placeholder:text-[#a1a1aa] dark:focus:bg-[#1e1e1e] ${
+            generatedLabel
+              ? "text-slate-600 dark:text-[#f8fafc]"
+              : "text-ink dark:text-[#f4f4f5]"
+          }`}
+          placeholder={generatedLabel ? group.label : "Group name"}
+          value={displayedLabel}
+          onBlur={() => setEditingGeneratedLabel(false)}
+          onChange={(event) => {
+            setEditingGeneratedLabel(false);
+            onChange(group.id, { label: event.target.value });
+          }}
+          onFocus={() => {
+            onSelect(group.id);
+            if (generatedLabel) {
+              setEditingGeneratedLabel(true);
+            }
+          }}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              event.currentTarget.blur();
+            }
+          }}
           onPointerDown={(event) => event.stopPropagation()}
         />
-        <span
-          className={`shrink-0 rounded border px-1.5 py-0.5 text-[10px] font-semibold ${groupStatusClass(status)}`}
-          title={`Group status: ${statusLabel}`}
-        >
-          {statusLabel}
-        </span>
-        <input
-          aria-label={`Color ${group.label}`}
-          className="h-6 w-6 shrink-0 rounded border border-line bg-white p-0.5"
-          type="color"
-          value={group.color}
-          onChange={(event) => onChange(group.id, { color: event.target.value })}
-          onPointerDown={(event) => event.stopPropagation()}
-        />
-        <button
-          className="grid h-6 w-6 shrink-0 place-items-center rounded border border-line bg-white text-muted transition hover:bg-slate-50 hover:text-ink"
-          title={group.collapsed ? "Expand group" : "Collapse group"}
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onChange(group.id, { collapsed: !group.collapsed });
-          }}
-        >
-          {group.collapsed ? <ChevronDown size={13} /> : <ChevronUp size={13} />}
-        </button>
-        <button
-          className="grid h-6 w-6 shrink-0 place-items-center rounded border border-line bg-white text-muted transition hover:bg-slate-50 hover:text-ink"
-          title="Duplicate group"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onDuplicate(group.id);
-          }}
-        >
-          <Copy size={12} />
-        </button>
-        <button
-          className="grid h-6 w-6 shrink-0 place-items-center rounded border border-line bg-white text-muted transition hover:bg-red-50 hover:text-red-600"
-          title="Delete group"
-          type="button"
-          onClick={(event) => {
-            event.stopPropagation();
-            onDelete(group.id);
-          }}
-        >
-          <Trash2 size={12} />
-        </button>
       </div>
       {!group.collapsed ? (
         <div
           className="absolute bottom-0 right-0 h-4 w-4 cursor-nwse-resize rounded-tl-md border-l border-t border-white/70 bg-white/80"
           title="Resize canvas group"
-          onPointerDown={(event) => onPointerDown(event, group.id, "resize")}
+          onPointerDown={(event) => {
+            event.stopPropagation();
+            onPointerDown(event, group.id, "resize");
+          }}
         />
       ) : null}
     </section>
@@ -4774,6 +4980,54 @@ function NodeContextMenu({ onDelete, onDuplicate, onRename, x, y }) {
   );
 }
 
+function ToolbarActionButton({ action, measure = false }) {
+  const Icon = action.icon;
+  return (
+    <button
+      className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+      data-toolbar-measure-action={measure ? "" : undefined}
+      disabled={Boolean(action.disabled)}
+      tabIndex={measure ? -1 : undefined}
+      title={measure ? undefined : action.label}
+      type="button"
+      onClick={measure ? undefined : action.onClick}
+    >
+      <Icon size={17} />
+    </button>
+  );
+}
+
+function ToolbarOverflowMenu({ actions, onClose }) {
+  return (
+    <div
+      className="absolute right-0 top-10 z-50 w-56 rounded-lg border border-line bg-white p-1 text-sm shadow-panel"
+      data-testid="toolbar-overflow-menu"
+      onClick={(event) => event.stopPropagation()}
+      onPointerDown={(event) => event.stopPropagation()}
+      onContextMenu={(event) => event.preventDefault()}
+    >
+      {actions.map((action) => {
+        const Icon = action.icon;
+        return (
+          <button
+            key={action.label}
+            className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-45 ${action.hiddenClassName ?? ""}`}
+            disabled={Boolean(action.disabled)}
+            type="button"
+            onClick={() => {
+              action.onClick?.();
+              onClose?.();
+            }}
+          >
+            <Icon size={15} />
+            <span>{action.label}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
   const [label, setLabel] = useState(initialLabel || "");
 
@@ -4852,8 +5106,20 @@ function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
 function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
   const [trustParent, setTrustParent] = useState(true);
   return (
-    <div className="absolute inset-0 z-50 grid place-items-center bg-slate-950/20 px-4 backdrop-blur-sm">
-      <section className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel">
+    <div
+      className="absolute inset-0 z-50 grid place-items-center bg-slate-950/20 px-4 backdrop-blur-sm"
+      role="presentation"
+      onClick={onCancel}
+      onPointerDown={(event) => event.stopPropagation()}
+      onPointerMove={(event) => event.stopPropagation()}
+      onPointerUp={(event) => event.stopPropagation()}
+    >
+      <section
+        className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel"
+        role="dialog"
+        aria-modal="true"
+        onClick={(event) => event.stopPropagation()}
+      >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-base font-semibold text-ink">Trust the files in</h2>
@@ -4892,6 +5158,66 @@ function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
           >
             <Check size={15} />
             Add access
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PathSelectionTrustPrompt({ parentPath, path, onCancel, onConfirm }) {
+  const [trustParent, setTrustParent] = useState(false);
+  return (
+    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/30 px-4 backdrop-blur-sm">
+      <section className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h2 className="text-base font-semibold text-ink">Trust selected path?</h2>
+            <p className="mt-1 text-sm leading-6 text-muted">
+              This path is outside the project folder and current trusted directories.
+            </p>
+            <p className="mt-2 break-all rounded-md border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
+              {path}
+            </p>
+          </div>
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-muted transition hover:bg-slate-50 hover:text-ink"
+            title="Cancel"
+            type="button"
+            onClick={onCancel}
+          >
+            <X size={15} />
+          </button>
+        </div>
+        <label className="mt-4 flex items-start gap-3 rounded-md border border-line bg-slate-50 px-3 py-2 text-sm text-ink">
+          <input
+            checked={trustParent}
+            className="mt-0.5 h-4 w-4 rounded border-slate-300"
+            type="checkbox"
+            onChange={(event) => setTrustParent(event.target.checked)}
+          />
+          <span>
+            Trust parent folder instead
+            {parentPath ? (
+              <span className="mt-1 block break-all text-xs text-muted">{parentPath}</span>
+            ) : null}
+          </span>
+        </label>
+        <div className="mt-5 flex justify-end gap-2">
+          <button
+            className="inline-flex h-9 items-center justify-center rounded-md border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-slate-50"
+            type="button"
+            onClick={onCancel}
+          >
+            Cancel
+          </button>
+          <button
+            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-brand px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-dark"
+            type="button"
+            onClick={() => onConfirm(trustParent)}
+          >
+            <Check size={15} />
+            Trust and use path
           </button>
         </div>
       </section>
@@ -4997,17 +5323,22 @@ function Inspector({
   dataDir,
   edge,
   edges,
+  group,
   node,
   nodeRun,
   nodeOutput,
   nodes,
   providerProfiles = [],
+  workflows = [],
   workflow,
   onAddEdge,
   onAgentChange,
   onDecideApproval,
   onDeleteEdge,
+  onDeleteGroup,
+  onDuplicateGroup,
   onEdgeChange,
+  onGroupChange,
   onNodeChange,
   onOperationChange,
   onApplyFix,
@@ -5016,16 +5347,20 @@ function Inspector({
   onSettingsChange,
   onToggleCollapsed,
   onTypeChange,
+  onNavigateWorkflow,
+  onRenameWorkflow,
   onWorkflowChange,
   width,
 }) {
-  const [workflowSettingsOpen, setWorkflowSettingsOpen] = useState(!node && !edge);
+  const [workflowSettingsOpen, setWorkflowSettingsOpen] = useState(!node && !edge && !group);
   const [edgeInspectorOpen, setEdgeInspectorOpen] = useState(Boolean(edge));
+  const [groupInspectorOpen, setGroupInspectorOpen] = useState(Boolean(group));
   const [nodeInspectorOpen, setNodeInspectorOpen] = useState(Boolean(node));
   const [cronPickerOpen, setCronPickerOpen] = useState(false);
   const [draftEdge, setDraftEdge] = useState(null);
   const [addingFilesystemPath, setAddingFilesystemPath] = useState(false);
   const [filesystemPathDraft, setFilesystemPathDraft] = useState("");
+  const latestWorkflowRef = useRef(workflow);
   const operation = node?.operation ?? defaultOperation(node?.type ?? "agent");
   const settings = { ...defaultSettings, ...(node?.settings ?? {}) };
   const existingSpecialTypes = new Set(
@@ -5039,6 +5374,7 @@ function Inspector({
     ["fail", "FAIL"],
     ["break", "BREAK"],
     ["loop", "Loop"],
+    ["workflow", "Workflow"],
     ["agent", "Agent"],
     ["bash_command", commandNodeLabel],
     ["python_script", "Python script"],
@@ -5060,6 +5396,15 @@ function Inspector({
     ["notification", "Notification"],
     ["dashboard_item", "Dashboard item"],
   ].filter(([type]) => type === node?.type || !existingSpecialTypes.has(type));
+  const workflowTargetOptions = [
+    ["", "Choose workflow"],
+    ...workflows
+      .filter(
+        (candidate) =>
+          candidate.id !== workflow.id || candidate.id === operation.workflow_id,
+      )
+      .map((candidate) => [candidate.id, candidate.name || candidate.id]),
+  ];
   const agentConfig =
     operation.type === "agent" || operation.type === "common_llm_task"
       ? agents[operation.agent_id] ?? defaultAgentConfig(operation.agent_id || "agent")
@@ -5074,7 +5419,8 @@ function Inspector({
   const connectedEdges = node
     ? edges.filter((edge) => edge.from === node.id || edge.to === node.id)
     : [];
-  const inputSourceOptions = node ? buildInputSourceOptions(node, nodes, edges, dashboards) : [];
+  const inputSourceGroups = node ? buildInputSourceGroups(node, nodes, edges, dashboards) : [];
+  const inputSourceOptions = flattenInputSourceGroups(inputSourceGroups);
   const workflowDiagnostics = workflowDiagnosticsForDisplay(workflow);
   const nodeDiagnostics = node
     ? diagnosticsForNode(workflowDiagnostics, node, agentConfig)
@@ -5089,11 +5435,16 @@ function Inspector({
   const edgeFieldDiagnostics = (...fields) => diagnosticsForField(edgeDiagnostics, ...fields);
 
   useEffect(() => {
-    setWorkflowSettingsOpen(!node && !edge);
+    latestWorkflowRef.current = workflow;
+  }, [workflow]);
+
+  useEffect(() => {
+    setWorkflowSettingsOpen(!node && !edge && !group);
     setEdgeInspectorOpen(Boolean(edge));
+    setGroupInspectorOpen(Boolean(group));
     setNodeInspectorOpen(Boolean(node));
     setDraftEdge(null);
-  }, [edge?.id, node?.id]);
+  }, [edge?.id, group?.id, node?.id]);
 
   function updateWorkflowSchedule(patch) {
     const currentSchedule = schedule ?? { cron_expression: "0 9 * * *", timezone: "UTC" };
@@ -5155,12 +5506,23 @@ function Inspector({
     });
   }
 
+  function addTrustedPath(pathValue) {
+    const path = String(pathValue ?? "").trim();
+    if (!path) return;
+    const currentWorkflow = latestWorkflowRef.current ?? workflow;
+    onWorkflowChange({
+      ...currentWorkflow,
+      filesystemAccess: uniqueAccessEntries([
+        ...(currentWorkflow.filesystemAccess ?? []),
+        { path },
+      ]),
+    });
+  }
+
   function addFilesystemAccess(pathValue = filesystemPathDraft) {
     const path = String(pathValue ?? "").trim();
     if (!path) return;
-    onWorkflowChange({
-      filesystemAccess: uniqueAccessEntries([...filesystemAccess, { path }]),
-    });
+    addTrustedPath(path);
     setFilesystemPathDraft("");
     setAddingFilesystemPath(false);
   }
@@ -5204,6 +5566,12 @@ function Inspector({
           collapsed ? "pointer-events-none opacity-0" : "opacity-100 delay-100"
         }`}
       >
+        <PathTrustContext.Provider
+          value={{
+            isTrustedPath: (targetPath) => workflowAccessCoversPath(workflow, targetPath, dataDir),
+            trustPath: addTrustedPath,
+          }}
+        >
         <InspectorPanel
           open={workflowSettingsOpen}
           subtitle={workflow.id}
@@ -5267,6 +5635,7 @@ function Inspector({
                           pathBasePath={dataDir}
                           pathLink
                           placeholder="/absolute/path"
+                          promptForTrust={false}
                         />
                       </div>
                       <button
@@ -5289,6 +5658,7 @@ function Inspector({
                       pathPicker
                       pathBasePath={dataDir}
                       placeholder="/absolute/path"
+                      promptForTrust={false}
                     />
                     <div className="mt-3 flex justify-end gap-2">
                       <button
@@ -5551,11 +5921,115 @@ function Inspector({
           </div>
         </InspectorPanel>
 
+        {group ? (
+          <InspectorPanel
+            open={groupInspectorOpen}
+            subtitle={`${group.nodeIds.length} node${group.nodeIds.length === 1 ? "" : "s"}`}
+            title="Group settings"
+            onToggle={() => setGroupInspectorOpen((current) => !current)}
+          >
+            <div className="space-y-4 p-4">
+              <InspectorSection title="Group">
+                <TextField
+                  label="Label"
+                  value={group.label}
+                  onChange={(value) => onGroupChange(group.id, { label: value })}
+                  placeholder="Group name"
+                />
+                <label className="block">
+                  <span className="text-xs font-medium text-muted">Color</span>
+                  <input
+                    aria-label={`Color ${group.label}`}
+                    className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-2 py-1"
+                    type="color"
+                    value={group.color}
+                    onChange={(event) => onGroupChange(group.id, { color: event.target.value })}
+                  />
+                </label>
+                <GroupOpacityField
+                  value={Math.round(group.opacity * 100)}
+                  onCommit={(value) => onGroupChange(group.id, { opacity: value / 100 })}
+                />
+                <ToggleField
+                  checked={Boolean(group.collapsed)}
+                  label="Collapsed"
+                  onChange={(checked) => onGroupChange(group.id, { collapsed: checked })}
+                />
+              </InspectorSection>
+
+              <InspectorSection title="Layout">
+                <div className="grid grid-cols-2 gap-3">
+                  <NumberField
+                    label="X"
+                    value={Math.round(group.x)}
+                    onChange={(value) => onGroupChange(group.id, { x: value || 0 })}
+                  />
+                  <NumberField
+                    label="Y"
+                    value={Math.round(group.y)}
+                    onChange={(value) => onGroupChange(group.id, { y: value || 0 })}
+                  />
+                  <NumberField
+                    label="Width"
+                    min={groupMinWidth}
+                    value={Math.round(group.width)}
+                    onChange={(value) => onGroupChange(group.id, { width: value || groupMinWidth })}
+                  />
+                  <NumberField
+                    label="Height"
+                    min={groupMinHeight}
+                    value={Math.round(group.height)}
+                    onChange={(value) =>
+                      onGroupChange(group.id, { height: value || groupMinHeight })
+                    }
+                  />
+                </div>
+              </InspectorSection>
+
+              <InspectorSection title="Members">
+                <div className="space-y-2">
+                  {group.nodeIds.map((nodeId) => {
+                    const member = nodes.find((candidate) => candidate.id === nodeId);
+                    return (
+                      <div
+                        key={nodeId}
+                        className="rounded-md border border-line bg-slate-50 px-3 py-2 text-sm"
+                      >
+                        <div className="font-medium text-ink">{member?.label || nodeId}</div>
+                        <div className="text-xs text-muted">{nodeId}</div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </InspectorSection>
+
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
+                  type="button"
+                  onClick={() => onDuplicateGroup(group.id)}
+                >
+                  <Copy size={14} />
+                  Duplicate
+                </button>
+                <button
+                  className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
+                  type="button"
+                  onClick={() => onDeleteGroup(group.id)}
+                >
+                  <Trash2 size={14} />
+                  Ungroup
+                </button>
+              </div>
+            </div>
+          </InspectorPanel>
+        ) : null}
+
         {edge ? (
           <InspectorPanel
             open={edgeInspectorOpen}
             subtitle={`${edge.from} -> ${edge.to}`}
-            title="Edge inspector"
+            title="Edge settings"
             onToggle={() => setEdgeInspectorOpen((current) => !current)}
           >
             <div className="space-y-4 p-4">
@@ -5615,18 +6089,32 @@ function Inspector({
           <InspectorPanel
             open={nodeInspectorOpen}
             subtitle={node.id}
-            title="Node inspector"
+            title="Node settings"
             onToggle={() => setNodeInspectorOpen((current) => !current)}
           >
             <div className="space-y-4 p-4">
           <InspectorSection title="Node">
             <TextField label="ID" value={node.id} readOnly />
-            <TextField
-              label="Label"
-              value={specialNodeLabel(node.type) ?? node.label}
-              onChange={(value) => onNodeChange({ label: value })}
-              readOnly={isSpecialNodeType(node.type)}
-            />
+            {node.type === "workflow" ? (
+              <WorkflowNodeLabelField
+                node={node}
+                workflows={workflows}
+                onChange={(value) => onNodeChange({ label: value })}
+                onRenameWorkflow={onRenameWorkflow}
+                onTargetWorkflowRenamed={(renamedWorkflow) => {
+                  if (renamedWorkflow?.id) {
+                    onOperationChange({ workflow_id: renamedWorkflow.id });
+                  }
+                }}
+              />
+            ) : (
+              <TextField
+                label="Label"
+                value={specialNodeLabel(node.type) ?? node.label}
+                onChange={(value) => onNodeChange({ label: value })}
+                readOnly={isSpecialNodeType(node.type)}
+              />
+            )}
             <SelectField
               label="Type"
               value={node.type}
@@ -5686,6 +6174,7 @@ function Inspector({
 
           <InspectorSection title="Inputs">
             <InputMappingField
+              sourceGroups={inputSourceGroups}
               sourceOptions={inputSourceOptions}
               value={node.inputs ?? {}}
               onChange={(value) => onNodeChange({ inputs: value })}
@@ -5730,6 +6219,30 @@ function Inspector({
                 value={operation.message ?? ""}
                 onChange={(value) => onOperationChange({ message: value })}
               />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "workflow" ? (
+            <InspectorSection title="Workflow">
+              <SelectField
+                label="Target workflow"
+                value={operation.workflow_id ?? ""}
+                options={workflowTargetOptions}
+                onChange={(value) => onOperationChange({ workflow_id: value })}
+              />
+              <button
+                type="button"
+                className="inline-flex items-center gap-2 rounded-lg border border-subtle px-3 py-2 text-sm font-medium text-primary transition hover:bg-subtle disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={!operation.workflow_id}
+                onClick={() => operation.workflow_id && onNavigateWorkflow?.(operation.workflow_id)}
+              >
+                <ExternalLink className="h-4 w-4" />
+                Open workflow
+              </button>
+              <p className="text-sm leading-6 text-muted">
+                Runs the selected workflow when this node fires. The target workflow name is used as
+                this node label.
+              </p>
             </InspectorSection>
           ) : null}
 
@@ -6233,6 +6746,7 @@ function Inspector({
                 />
                 <InputMappingField
                   label="Input mapping"
+                  sourceGroups={inputSourceGroups}
                   sourceOptions={inputSourceOptions}
                   value={operation.input_mapping ?? {}}
                   onChange={(value) => onOperationChange({ input_mapping: value })}
@@ -6847,6 +7361,7 @@ function Inspector({
                 />
                 <InputMappingField
                   label="Input mapping"
+                  sourceGroups={inputSourceGroups}
                   sourceOptions={inputSourceOptions}
                   value={operation.input_mapping ?? {}}
                   onChange={(value) => onOperationChange({ input_mapping: value })}
@@ -6940,6 +7455,7 @@ function Inspector({
             </div>
           </InspectorPanel>
         ) : null}
+        </PathTrustContext.Provider>
       </div>
     </aside>
   );
@@ -7964,7 +8480,7 @@ export function normalizeCanvasGroups(workflow) {
         : canvasGroupColors[index % canvasGroupColors.length];
       return {
         id: String(group.id || `group-${index + 1}`),
-        label: String(group.label || `Group ${index + 1}`),
+        label: group.label == null ? `Group ${index + 1}` : String(group.label),
         color,
         nodeIds: [...new Set(group.nodeIds ?? group.node_ids ?? [])]
           .map(String)
@@ -7973,6 +8489,7 @@ export function normalizeCanvasGroups(workflow) {
         y: finiteNumber(group.y, 80),
         width: Math.max(groupMinWidth, finiteNumber(group.width, 360)),
         height: Math.max(groupMinHeight, finiteNumber(group.height, 240)),
+        opacity: clamp(finiteNumber(group.opacity, defaultCanvasGroupOpacity), 0, 1),
         collapsed: Boolean(group.collapsed),
       };
     });
@@ -7994,6 +8511,7 @@ function setWorkflowGroups(workflow, groups) {
           y: Math.round(group.y),
           width: Math.round(group.width),
           height: Math.round(group.height),
+          opacity: clamp(finiteNumber(group.opacity, defaultCanvasGroupOpacity), 0, 1),
           collapsed: Boolean(group.collapsed),
         })),
       },
@@ -8004,7 +8522,8 @@ function setWorkflowGroups(workflow, groups) {
 export function createCanvasGroup(workflow, nodeIds = []) {
   const nodes = workflow.nodes ?? [];
   const selected = nodes.filter((node) => nodeIds.includes(node.id));
-  const members = selected.length ? selected : nodes;
+  const members = selected;
+  if (!members.length) return workflow;
   const existing = normalizeCanvasGroups(workflow);
   const nextNumber = nextAvailableGroupNumber(existing);
   const bounds = graphBounds(members, 48);
@@ -8019,6 +8538,7 @@ export function createCanvasGroup(workflow, nodeIds = []) {
     y: members.length ? bounds.top : fallbackY,
     width: Math.max(groupMinWidth, members.length ? bounds.width : 360),
     height: Math.max(groupMinHeight, members.length ? bounds.height : 240),
+    opacity: defaultCanvasGroupOpacity,
     collapsed: false,
   };
   return setWorkflowGroups(workflow, [...existing, group]);
@@ -8768,6 +9288,68 @@ function HttpResponsePreview({ output }) {
   );
 }
 
+function WorkflowNodeLabelField({
+  node,
+  workflows = [],
+  onChange,
+  onRenameWorkflow,
+  onTargetWorkflowRenamed,
+}) {
+  const targetWorkflow = workflows.find(
+    (candidate) => candidate.id === node.operation?.workflow_id,
+  );
+  const currentLabel = targetWorkflow?.name || node.label || "";
+  const [draft, setDraft] = useState(currentLabel);
+
+  useEffect(() => {
+    setDraft(currentLabel);
+  }, [currentLabel, node.operation?.workflow_id]);
+
+  function commit() {
+    const nextLabel = draft.trim();
+    if (!nextLabel) {
+      setDraft(currentLabel);
+      return;
+    }
+    if (targetWorkflow && nextLabel !== targetWorkflow.name) {
+      Promise.resolve(onRenameWorkflow?.(targetWorkflow.id, nextLabel))
+        .then((renamedWorkflow) => {
+          if (renamedWorkflow?.id) {
+            onTargetWorkflowRenamed?.(renamedWorkflow);
+          }
+        })
+        .catch(() => {
+          setDraft(currentLabel);
+        });
+    } else if (!targetWorkflow) {
+      onChange?.(nextLabel);
+    }
+  }
+
+  return (
+    <label className="block">
+      <span className="text-xs font-medium text-muted">Label</span>
+      <input
+        className="mt-1 h-10 w-full rounded-lg border border-subtle bg-white px-3 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
+        value={draft}
+        onBlur={commit}
+        onChange={(event) => setDraft(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            event.currentTarget.blur();
+          }
+          if (event.key === "Escape") {
+            setDraft(currentLabel);
+            event.currentTarget.blur();
+          }
+        }}
+      />
+      <p className="mt-1 text-xs leading-5 text-muted">Renames the target workflow.</p>
+    </label>
+  );
+}
+
 function TextField({
   diagnostics = [],
   label,
@@ -8776,12 +9358,15 @@ function TextField({
   pathLink = false,
   pathPicker = false,
   placeholder,
+  promptForTrust = true,
   readOnly = false,
   value,
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [pendingTrustSelection, setPendingTrustSelection] = useState(null);
   const [pathInfo, setPathInfo] = useState(null);
   const [textFileDialog, setTextFileDialog] = useState(null);
+  const pathTrust = useContext(PathTrustContext);
   const isPathField = pathPicker || pathLink;
   const canPickPath = pathPicker && !readOnly && typeof onChange === "function";
   const displayValue = isPathField ? resolveDisplayPath(value ?? "", pathBasePath) : value ?? "";
@@ -8816,21 +9401,37 @@ function TextField({
     };
   }, [canOpenPath, displayValue]);
 
+  function applySelectedPath(selectedPath) {
+    if (!selectedPath) return;
+    if (
+      promptForTrust &&
+      pathTrust?.isTrustedPath &&
+      pathTrust?.trustPath &&
+      !pathTrust.isTrustedPath(selectedPath)
+    ) {
+      setPendingTrustSelection({
+        parentPath: pathParent(selectedPath) || selectedPath,
+        path: selectedPath,
+      });
+      return;
+    }
+    onChange(selectedPath);
+  }
+
   async function handlePathPick(event) {
     event.preventDefault();
     event.stopPropagation();
 
-    if (window.goferDesktop?.workspace?.listDirectory) {
-      setPickerOpen(true);
-      return;
-    }
-
     try {
-      const selectedPath = await window.goferDesktop?.workspace?.selectPath?.({
-        currentPath: displayValue,
-      });
-      if (selectedPath) {
-        onChange(selectedPath);
+      if (window.goferDesktop?.workspace?.selectPath) {
+        const selectedPath = await window.goferDesktop.workspace.selectPath({
+          currentPath: displayValue,
+        });
+        applySelectedPath(selectedPath);
+        return;
+      }
+      if (window.goferDesktop?.workspace?.listDirectory) {
+        setPickerOpen(true);
       }
     } catch (error) {
       console.error("Failed to select path", error);
@@ -8924,8 +9525,23 @@ function TextField({
           label={label}
           onClose={() => setPickerOpen(false)}
           onSelect={(selectedPath) => {
-            onChange(selectedPath);
+            applySelectedPath(selectedPath);
             setPickerOpen(false);
+          }}
+        />
+      ) : null}
+      {pendingTrustSelection ? (
+        <PathSelectionTrustPrompt
+          parentPath={pendingTrustSelection.parentPath}
+          path={pendingTrustSelection.path}
+          onCancel={() => setPendingTrustSelection(null)}
+          onConfirm={(trustParent) => {
+            const trustedPath = trustParent
+              ? pendingTrustSelection.parentPath
+              : pendingTrustSelection.path;
+            onChange(pendingTrustSelection.path);
+            setPendingTrustSelection(null);
+            window.setTimeout(() => pathTrust?.trustPath?.(trustedPath), 0);
           }}
         />
       ) : null}
@@ -9741,6 +10357,79 @@ function NumberField({ diagnostics = [], label, min, onChange, placeholder, step
   );
 }
 
+function GroupOpacityField({ onCommit, value }) {
+  const [editing, setEditing] = useState(false);
+  const [draftValue, setDraftValue] = useState(String(value ?? ""));
+  const skipCommitOnBlurRef = useRef(false);
+
+  useEffect(() => {
+    if (!editing) {
+      setDraftValue(String(value ?? ""));
+    }
+  }, [editing, value]);
+
+  function restoreValue() {
+    setDraftValue(String(value ?? ""));
+  }
+
+  function commitValue(rawValue = draftValue, { restoreEmpty = true } = {}) {
+    const trimmed = rawValue.trim();
+    if (trimmed === "") {
+      if (restoreEmpty) {
+        restoreValue();
+      }
+      return;
+    }
+    const parsedValue = Number(trimmed);
+    if (!Number.isFinite(parsedValue)) {
+      restoreValue();
+      return;
+    }
+    const nextValue = clamp(Math.round(parsedValue), 0, 100);
+    setDraftValue(String(nextValue));
+    onCommit(nextValue);
+  }
+
+  return (
+    <label className="block">
+      <span className="text-xs font-medium text-muted">Background opacity (%)</span>
+      <input
+        className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition"
+        max="100"
+        min="0"
+        step="1"
+        type="number"
+        value={draftValue}
+        onBlur={() => {
+          if (skipCommitOnBlurRef.current) {
+            skipCommitOnBlurRef.current = false;
+            restoreValue();
+            setEditing(false);
+            return;
+          }
+          commitValue();
+          setEditing(false);
+        }}
+        onChange={(event) => {
+          const nextValue = event.target.value;
+          setDraftValue(nextValue);
+          commitValue(nextValue, { restoreEmpty: false });
+        }}
+        onFocus={() => setEditing(true)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.currentTarget.blur();
+          }
+          if (event.key === "Escape") {
+            skipCommitOnBlurRef.current = true;
+            event.currentTarget.blur();
+          }
+        }}
+      />
+    </label>
+  );
+}
+
 function SelectField({ diagnostics = [], label, onChange, options, value }) {
   const diagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
@@ -9926,9 +10615,11 @@ const inputTargetOptions = [
   ["stdin", "stdin"],
 ];
 
-function InputMappingField({ onChange, sourceOptions, value }) {
+function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }) {
   const targetListId = useId();
   const entries = Object.entries(value ?? {});
+  const [openSourcePicker, setOpenSourcePicker] = useState(null);
+  const [expandedGroups, setExpandedGroups] = useState(() => new Set());
   const targetOptions = useMemo(() => {
     const usedTargets = new Set(inputTargetOptions.map(([optionValue]) => optionValue));
     const customTargets = Object.keys(value ?? {})
@@ -9943,6 +10634,40 @@ function InputMappingField({ onChange, sourceOptions, value }) {
       .map((source) => [source, source]);
     return [...sourceOptions, ...customSources];
   }, [sourceOptions, value]);
+  const sourceGroupsWithCustom = useMemo(() => {
+    const usedSources = new Set(sourceGroups.flatMap((group) => group.options.map(([optionValue]) => optionValue)));
+    const customSources = Object.values(value ?? {})
+      .filter((source) => source && !usedSources.has(source))
+      .map((source) => [source, source]);
+    return customSources.length
+      ? [...sourceGroups, { id: "custom", label: "Custom paths", options: customSources }]
+      : sourceGroups;
+  }, [sourceGroups, value]);
+  const sourceGroupIds = useMemo(
+    () => sourceGroupsWithCustom.map((group) => group.id).join("\n"),
+    [sourceGroupsWithCustom],
+  );
+
+  useEffect(() => {
+    setExpandedGroups(new Set(sourceGroupIds ? sourceGroupIds.split("\n") : []));
+  }, [sourceGroupIds]);
+
+  function toggleSourceGroup(groupId) {
+    setExpandedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
+  }
+
+  function selectSource(index, key, nextSource) {
+    updateEntry(index, key, nextSource);
+    setOpenSourcePicker(null);
+  }
 
   function updateEntry(index, nextKey, nextValue) {
     const next = {};
@@ -9958,6 +10683,7 @@ function InputMappingField({ onChange, sourceOptions, value }) {
 
   function removeEntry(index) {
     onChange(Object.fromEntries(entries.filter((_, entryIndex) => entryIndex !== index)));
+    setOpenSourcePicker(null);
   }
 
   function addEntry() {
@@ -9990,17 +10716,16 @@ function InputMappingField({ onChange, sourceOptions, value }) {
                 <option key={optionValue} label={label} value={optionValue} />
               ))}
             </datalist>
-            <select
-              className="h-9 min-w-0 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
-              value={source}
-              onChange={(event) => updateEntry(index, key, event.target.value)}
-            >
-              {sourceOptionsWithCustom.map(([optionValue, label]) => (
-                <option key={optionValue} value={optionValue}>
-                  {label}
-                </option>
-              ))}
-            </select>
+            <InputSourcePicker
+              expandedGroups={expandedGroups}
+              groups={sourceGroupsWithCustom}
+              open={openSourcePicker === index}
+              source={source}
+              sourceOptions={sourceOptionsWithCustom}
+              onOpenChange={(open) => setOpenSourcePicker(open ? index : null)}
+              onSelect={(nextSource) => selectSource(index, key, nextSource)}
+              onToggleGroup={toggleSourceGroup}
+            />
             <button
               className="grid h-9 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-red-600 dark:hover:bg-[#2a2a2a]"
               title="Remove input"
@@ -10033,6 +10758,76 @@ function InputMappingField({ onChange, sourceOptions, value }) {
           Add input
         </button>
       </div>
+    </div>
+  );
+}
+
+function InputSourcePicker({
+  expandedGroups,
+  groups,
+  onOpenChange,
+  onSelect,
+  onToggleGroup,
+  open,
+  source,
+  sourceOptions,
+}) {
+  const sourceLabel = sourceOptions.find(([optionValue]) => optionValue === source)?.[1] ?? source;
+  return (
+    <div className="relative min-w-0">
+      <button
+        className="flex h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg border border-line bg-white px-2 text-left text-xs text-slate-700 outline-none transition hover:bg-slate-50 focus:border-teal-500 dark:bg-[#1f1f1f] dark:text-slate-100 dark:hover:bg-[#272727]"
+        title={sourceLabel || "Choose source output"}
+        type="button"
+        onClick={() => onOpenChange(!open)}
+      >
+        <span className="min-w-0 truncate">{sourceLabel || "Choose source output"}</span>
+        <ChevronDown size={14} className="shrink-0 text-muted" />
+      </button>
+      {open ? (
+        <div className="absolute left-0 right-0 top-10 z-50 max-h-72 overflow-auto rounded-xl border border-line bg-white p-1.5 shadow-xl dark:bg-[#181818]">
+          {groups.length ? (
+            groups.map((group) => {
+              const expanded = expandedGroups.has(group.id);
+              return (
+                <div key={group.id} className="rounded-lg">
+                  <button
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-semibold text-slate-700 transition hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-[#262626]"
+                    title={group.label}
+                    type="button"
+                    onClick={() => onToggleGroup(group.id)}
+                  >
+                    {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+                    <span className="min-w-0 truncate">{group.label}</span>
+                  </button>
+                  {expanded ? (
+                    <div className="ml-3 border-l border-line py-1 pl-2">
+                      {group.options.map(([optionValue, label]) => (
+                        <button
+                          key={`${group.id}-${optionValue}`}
+                          className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition ${
+                            optionValue === source
+                              ? "bg-teal-50 text-teal-800 dark:bg-teal-500/15 dark:text-teal-200"
+                              : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-[#262626]"
+                          }`}
+                          title={`${group.id === "previous" ? label : `${group.label} ${label}`} (${optionValue})`}
+                          type="button"
+                          onClick={() => onSelect(optionValue)}
+                        >
+                          <span className="min-w-0 truncate">{label}</span>
+                          {optionValue === source ? <Check size={13} className="shrink-0" /> : null}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })
+          ) : (
+            <p className="px-2 py-2 text-xs text-muted">No ancestor outputs available.</p>
+          )}
+        </div>
+      ) : null}
     </div>
   );
 }

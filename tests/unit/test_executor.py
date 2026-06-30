@@ -67,6 +67,7 @@ from gofer.core.operations import (
     StartOperation,
     TabularFanSource,
     TriggerEventsFanSource,
+    WorkflowCallOperation,
     WriteFileOperation,
 )
 from gofer.core.planner import build_execution_plan
@@ -817,6 +818,51 @@ async def test_single_bash_node_succeeds(tmp_path: Path) -> None:
     result = await executor.run()
     assert result.success
     assert "echo" in result.node_outputs
+
+
+async def test_workflow_node_runs_child_workflow(tmp_path: Path) -> None:
+    child = AgenticWorkflow(WorkflowConfig(id="child", name="Child workflow"))
+    child.add_operation(_bash_node("echo", "echo child"))
+    child_path = tmp_path / "child.toml"
+    child.to_file(child_path)
+
+    parent = AgenticWorkflow(WorkflowConfig(id="parent", name="Parent workflow"))
+    parent.add_operation(
+        GraphNode(
+            node_id="call-child",
+            operation=WorkflowCallOperation(
+                type=OperationType.WORKFLOW,
+                workflow_id="child",
+            ),
+        )
+    )
+    parent_path = tmp_path / "parent.toml"
+    parent.to_file(parent_path)
+    log_updates: list[tuple[str, Path]] = []
+
+    executor = WorkflowExecutor(
+        parent,
+        {},
+        log_base_dir=tmp_path / "logs",
+        workflow_path=parent_path,
+        data_dir=tmp_path,
+        run_log_update_callback=lambda workflow_id, log_path: log_updates.append(
+            (workflow_id, log_path)
+        ),
+    )
+
+    result = await executor.run()
+
+    assert result.success
+    output = result.node_outputs["call-child"]
+    assert output.success
+    assert output.exit_code == 0
+    assert output.data["workflow_id"] == "child"
+    assert output.data["workflow_name"] == "Child workflow"
+    assert "succeeded" in output.output
+    updated_workflow_ids = [workflow_id for workflow_id, _ in log_updates]
+    assert updated_workflow_ids.count("parent") >= 2
+    assert updated_workflow_ids.count("child") >= 2
 
 
 async def test_workflow_executor_writes_structured_run_events(tmp_path: Path) -> None:

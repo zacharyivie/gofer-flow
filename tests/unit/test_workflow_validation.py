@@ -39,6 +39,7 @@ x = 12
 y = 24
 width = 420
 height = 220
+opacity = 0.18
 collapsed = true
 
 [[nodes]]
@@ -54,6 +55,7 @@ command = "echo hi"
 
     data = workflow.read_text(encoding="utf-8")
     assert "[[workflow.metadata.canvas.groups]]" in data
+    assert "opacity = 0.18" in data
     assert "node_ids = [" in data
     assert '"step"' in data
 
@@ -103,6 +105,59 @@ script_path = "missing.py"
     assert any(item.code == "workflow.script_path_missing" for item in report.errors)
     assert any(fix.action == "create_agent" for item in report.errors for fix in item.fixes)
     assert any(fix.action == "create_prompt_file" for item in report.errors for fix in item.fixes)
+
+
+def test_validation_reports_invalid_workflow_call_targets(tmp_path: Path) -> None:
+    _write_workflow(
+        tmp_path,
+        """
+[workflow]
+id = "child"
+name = "Child"
+
+[[nodes]]
+id = "start"
+type = "start"
+""",
+        name="child.toml",
+    )
+    workflow = _write_workflow(
+        tmp_path,
+        """
+[workflow]
+id = "parent"
+name = "Parent"
+
+[[nodes]]
+id = "missing"
+type = "workflow"
+workflow_id = ""
+
+[[nodes]]
+id = "self"
+type = "workflow"
+workflow_id = "parent"
+
+[[nodes]]
+id = "unknown"
+type = "workflow"
+workflow_id = "unknown"
+
+[[nodes]]
+id = "child"
+type = "workflow"
+workflow_id = "child"
+""",
+    )
+
+    report = validate_workflow_file(workflow, data_dir=tmp_path)
+    codes_by_node = {(item.target_id, item.code) for item in report.errors}
+
+    assert report.ok is False
+    assert ("missing", "workflow.call_target_missing") in codes_by_node
+    assert ("self", "workflow.call_self") in codes_by_node
+    assert ("unknown", "workflow.call_target_not_found") in codes_by_node
+    assert not any(item.target_id == "child" for item in report.errors)
 
 
 def test_validation_warns_for_ungranted_managed_paths_outside_workflow_project(

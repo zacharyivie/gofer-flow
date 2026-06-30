@@ -90,7 +90,15 @@ function createIpcSecurity({
   }
 
   function resolvePickerPath(currentPath, { grantId = "" } = {}) {
-    const candidate = resolveAllowedPath(currentPath, { grantId, mustExist: false });
+    const candidate = resolveCandidatePath(currentPath, getDataDir());
+    if (grantId) {
+      try {
+        return resolveAllowedPath(currentPath, { grantId, mustExist: false });
+      } catch {
+        // The picker is allowed to start outside approved roots; selecting a path
+        // creates an explicit grant before any read/write operation can use it.
+      }
+    }
     if (fs.existsSync(candidate)) {
       try {
         return fs.statSync(candidate).isDirectory() ? candidate : path.dirname(candidate);
@@ -102,12 +110,12 @@ function createIpcSecurity({
     let parent = path.dirname(candidate);
     while (parent && parent !== path.dirname(parent)) {
       if (fs.existsSync(parent)) {
-        return resolveAllowedPath(parent, { grantId, mustExist: true });
+        return realpathIfPossible(parent);
       }
       parent = path.dirname(parent);
     }
 
-    return resolveAllowedPath("", { grantId, mustExist: false });
+    return path.resolve(getDataDir());
   }
 
   function grantForPath(targetPath) {
