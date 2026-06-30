@@ -98,3 +98,4 @@ to = "step2"
 - After code changes, run `ruff check src tests --fix`.
 - After code changes, run `mypy src tests`.
 - Run targeted pytest tests for the changed area; run the full suite when touching shared workflow execution, scheduling, or CLI behavior.
+- To run any npm commands make sure you first use nvm to select the correct version of npm for the project.

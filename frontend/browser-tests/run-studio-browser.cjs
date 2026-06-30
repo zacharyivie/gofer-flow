@@ -3,24 +3,18 @@
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const electronPath = require("electron");
+const childEnv = {
+  ...process.env,
+  ELECTRON_DISABLE_SANDBOX: "1",
+  LIBGL_ALWAYS_SOFTWARE: process.env.LIBGL_ALWAYS_SOFTWARE || "1",
+};
+delete childEnv.ELECTRON_RUN_AS_NODE;
 
 const child = spawn(
   electronPath,
-  [
-    "--no-sandbox",
-    "--disable-setuid-sandbox",
-    "--disable-gpu",
-    "--disable-gpu-compositing",
-    "--disable-gpu-rasterization",
-    "--disable-dev-shm-usage",
-    path.join(__dirname, "studio.browser.cjs"),
-  ],
+  [path.join(__dirname, "studio.browser.cjs")],
   {
-    env: {
-      ...process.env,
-      ELECTRON_DISABLE_SANDBOX: "1",
-      LIBGL_ALWAYS_SOFTWARE: process.env.LIBGL_ALWAYS_SOFTWARE || "1",
-    },
+    env: childEnv,
     stdio: "inherit",
   },
 );

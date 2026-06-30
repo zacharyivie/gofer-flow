@@ -3713,7 +3713,7 @@ function installTestDom() {
     fetch: globalThis.fetch,
     HTMLElement: globalThis.HTMLElement,
     HTMLIFrameElement: globalThis.HTMLIFrameElement,
-    navigator: globalThis.navigator,
+    navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator"),
     Node: globalThis.Node,
     SVGElement: globalThis.SVGElement,
     window: globalThis.window,
@@ -3746,11 +3746,27 @@ function installTestDom() {
   globalThis.HTMLIFrameElement = TestElement;
   globalThis.Node = TestNode;
   globalThis.SVGElement = TestElement;
-  globalThis.navigator = windowObject.navigator;
+  Object.defineProperty(globalThis, "navigator", {
+    configurable: true,
+    enumerable: true,
+    value: windowObject.navigator,
+    writable: true,
+  });
 
   return {
     restore() {
-      Object.assign(globalThis, previous);
+      globalThis.document = previous.document;
+      globalThis.fetch = previous.fetch;
+      globalThis.HTMLElement = previous.HTMLElement;
+      globalThis.HTMLIFrameElement = previous.HTMLIFrameElement;
+      globalThis.Node = previous.Node;
+      globalThis.SVGElement = previous.SVGElement;
+      globalThis.window = previous.window;
+      if (previous.navigator) {
+        Object.defineProperty(globalThis, "navigator", previous.navigator);
+      } else {
+        delete globalThis.navigator;
+      }
     },
     runTimers(ms) {
       const runnable = timers.filter((timer) => timer.delay <= ms);
