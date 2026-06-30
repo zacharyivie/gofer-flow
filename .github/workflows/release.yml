@@ -99,7 +99,7 @@ jobs:
         working-directory: frontend
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
-        run: npm run ${{ matrix.package-script }} -- --publish never
+        run: npm run ${{ matrix.package-script }} -- --publish=never
 
       - name: Copy Linux CLI artifact
         if: runner.os == 'Linux'
