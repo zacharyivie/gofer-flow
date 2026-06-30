@@ -2902,7 +2902,7 @@ test("DagCanvas rendered navigation controls use one toolbar row and overflow me
   assert.equal(toolbarRow, toolbar);
   assert.ok(dom.byTitle("Validate workflow"));
   assert.equal(dom.allByTitle("More graph actions").length, 0);
-  assert.throws(() => dom.byLabel("Search nodes"), /Unable to find aria-label/);
+  assert.ok(dom.byLabel("Search nodes"));
   assert.doesNotMatch(toolbar.getAttribute("class"), /overflow-x-auto|workflow-scrollbar/);
   assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-6/);
 
@@ -2916,6 +2916,10 @@ test("DagCanvas rendered navigation controls use one toolbar row and overflow me
   await dom.click(dom.byTitle("Zoom in"));
   await dom.click(dom.byTitle("Zoom out"));
   await dom.click(dom.byTitle("Fit selection"));
+  await dom.change(dom.byLabel("Search nodes"), "reviewer");
+  await dom.click(dom.byTitle("Next search match"));
+  assert.match(dom.text(), /Agent ID/);
+  assert.match(dom.text(), /reviewer/);
   const actionGroup = dom.ancestor(dom.byTitle("Auto-layout graph"), (node) =>
     node.getAttribute?.("class")?.includes("justify-start"),
   );

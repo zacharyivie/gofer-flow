@@ -1237,6 +1237,7 @@ export default function DagCanvas({
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
+  const searchInputRef = useRef(null);
   const toolbarActionGroupRef = useRef(null);
   const toolbarMeasureRef = useRef(null);
   const toolbarMenuRef = useRef(null);
@@ -1276,6 +1277,8 @@ export default function DagCanvas({
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [draftEdge, setDraftEdge] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const [minimapDragging, setMinimapDragging] = useState(false);
   const [nodeContextMenu, setNodeContextMenu] = useState(null);
   const [nodeRenameDialog, setNodeRenameDialog] = useState(null);
@@ -1322,6 +1325,10 @@ export default function DagCanvas({
   const nodeDiagnostics = useMemo(
     () => diagnosticsByTarget(validationDiagnostics, "node"),
     [validationDiagnostics],
+  );
+  const searchMatches = useMemo(
+    () => matchingNodeIds(workflowNodes, searchQuery),
+    [searchQuery, workflowNodes],
   );
   const selectedNode = workflowNodes.find((node) => node.id === selectedNodeId);
   const selectedGroup = canvasGroups.find((group) => group.id === selectedGroupId);
@@ -1400,9 +1407,17 @@ export default function DagCanvas({
     setDraggingNodeId(null);
     setPanningPointerId(null);
     setSelectionBox(null);
+    setSearchQuery("");
+    setSearchMatchIndex(0);
     const schedule = window.requestAnimationFrame ?? ((callback) => callback());
     schedule(() => fitGraph());
   }, [workflow.id]);
+
+  useEffect(() => {
+    setSearchMatchIndex((currentIndex) =>
+      searchMatches.length ? Math.min(currentIndex, searchMatches.length - 1) : 0,
+    );
+  }, [searchMatches.length]);
 
   useEffect(() => {
     if (selectedGroupId && !canvasGroups.some((group) => group.id === selectedGroupId)) {
@@ -1476,10 +1491,27 @@ export default function DagCanvas({
         setSelectedNodeIds([]);
         setSelectedGroupId(null);
         setSelectionBox(null);
+        if (document.activeElement === searchInputRef.current) {
+          searchInputRef.current?.blur();
+        }
         return;
       }
 
       if (editingText) return;
+
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select?.();
+        return;
+      }
+
+      if (event.key === "/") {
+        event.preventDefault();
+        searchInputRef.current?.focus();
+        searchInputRef.current?.select?.();
+        return;
+      }
 
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
         event.preventDefault();
@@ -1749,6 +1781,38 @@ export default function DagCanvas({
 
   function fitGraph() {
     fitNodes(currentFitItems());
+  }
+
+  function focusSearchMatch(matchIndex = searchMatchIndex) {
+    if (!searchMatches.length) return;
+    const boundedIndex = ((matchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
+    const nodeId = searchMatches[boundedIndex];
+    const node = workflowNodes.find((candidate) => candidate.id === nodeId);
+    if (!node) return;
+    const collapsedGroup = canvasGroups.find(
+      (group) => group.collapsed && group.nodeIds.includes(nodeId),
+    );
+    if (collapsedGroup) {
+      onWorkflowChange(updateCanvasGroup(workflow, collapsedGroup.id, { collapsed: false }));
+      setSelectedGroupId(collapsedGroup.id);
+    } else {
+      setSelectedGroupId(null);
+    }
+    setSearchMatchIndex(boundedIndex);
+    setSelectedEdgeId(null);
+    setSelectedNodeId(nodeId);
+    setSelectedNodeIds([nodeId]);
+    fitNodes([node]);
+  }
+
+  function handleSearchSubmit(event) {
+    event.preventDefault();
+    focusSearchMatch(searchMatchIndex);
+  }
+
+  function moveSearchMatch(delta) {
+    if (!searchMatches.length) return;
+    focusSearchMatch(searchMatchIndex + delta);
   }
 
   function fitSelection() {
@@ -2876,6 +2940,43 @@ export default function DagCanvas({
                 </button>
               </div>
             </div>
+            <form
+              className="flex h-8 min-w-[8.5rem] max-w-[13rem] shrink items-center gap-1 rounded-lg border border-line bg-white px-2 text-xs focus-within:border-teal-500"
+              onSubmit={handleSearchSubmit}
+            >
+              <Search size={14} className="shrink-0 text-muted" />
+              <input
+                ref={searchInputRef}
+                aria-label="Search nodes"
+                className="min-w-0 flex-1 bg-transparent text-xs outline-none"
+                placeholder="Search nodes"
+                value={searchQuery}
+                onChange={(event) => setSearchQuery(event.target.value)}
+              />
+              {searchQuery ? (
+                <span className="shrink-0 text-[11px] text-muted">
+                  {searchMatches.length ? searchMatchIndex + 1 : 0}/{searchMatches.length}
+                </span>
+              ) : null}
+              <button
+                className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-slate-100 hover:text-ink disabled:opacity-30"
+                disabled={!searchMatches.length}
+                title="Previous search match"
+                type="button"
+                onClick={() => moveSearchMatch(-1)}
+              >
+                <ChevronUp size={13} />
+              </button>
+              <button
+                className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-slate-100 hover:text-ink disabled:opacity-30"
+                disabled={!searchMatches.length}
+                title="Next search match"
+                type="button"
+                onClick={() => moveSearchMatch(1)}
+              >
+                <ChevronDown size={13} />
+              </button>
+            </form>
             {notice?.message ? (
               <div
                 className={`validation-pop absolute right-6 top-12 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
