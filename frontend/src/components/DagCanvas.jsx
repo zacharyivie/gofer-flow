@@ -53,6 +53,7 @@ const DEFAULT_RETENTION_SETTINGS = {
   keepFailedDays: 30,
   keepLast: 100,
 };
+const EMPTY_ARRAY = Object.freeze([]);
 const TOOLBAR_ACTION_GAP = 8;
 
 export function visibleToolbarActionCount(availableWidth, actionWidths, menuWidth, gap = TOOLBAR_ACTION_GAP) {
@@ -1208,14 +1209,14 @@ function nextAvailableGroupNumber(groups) {
 
 export default function DagCanvas({
   approvalState,
-  dashboards = [],
+  dashboards = EMPTY_ARRAY,
   dataDir = "",
   logState,
   notice,
   retentionSettings = DEFAULT_RETENTION_SETTINGS,
   runState,
   workflow,
-  workflows = [],
+  workflows = EMPTY_ARRAY,
   onExportWorkflow,
   onImportWorkflow,
   onLoadLatestLog,
@@ -1232,7 +1233,7 @@ export default function DagCanvas({
   onWorkflowChange,
   onNavigateWorkflow,
   onRenameWorkflow,
-  usedAgentIds = [],
+  usedAgentIds = EMPTY_ARRAY,
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
@@ -1413,9 +1414,16 @@ export default function DagCanvas({
     if (selectedNodeId && !nodesById[selectedNodeId]) {
       setSelectedNodeId(undefined);
     }
-    setSelectedNodeIds((currentIds) =>
-      currentIds.filter((nodeId) => Boolean(nodesById[nodeId])),
-    );
+    setSelectedNodeIds((currentIds) => {
+      const nextIds = currentIds.filter((nodeId) => Boolean(nodesById[nodeId]));
+      if (
+        nextIds.length === currentIds.length &&
+        nextIds.every((nodeId, index) => nodeId === currentIds[index])
+      ) {
+        return currentIds;
+      }
+      return nextIds;
+    });
   }, [nodesById, selectedNodeId]);
 
   useEffect(() => {
