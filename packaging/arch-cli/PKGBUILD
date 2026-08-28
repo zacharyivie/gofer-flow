@@ -1,8 +1,8 @@
-# Maintainer: Gofer Flow <maintainers@goferflow.local>
+# Maintainer: Taskurotta <maintainers@goferflow.local>
 pkgname=gofer-flow-cli
 pkgver=0.1.2
 pkgrel=1
-pkgdesc="Command line workflow automation tool for Gofer Flow"
+pkgdesc="Command line workflow automation tool for Taskurotta"
 arch=("x86_64")
 url="https://github.com/doonk/gofer-flow"
 license=("Apache-2.0")

@@ -110,6 +110,7 @@ async def run_subprocess(
             if event["stream"] is None:
                 returncode = event["returncode"] if event["returncode"] is not None else 1
         return returncode, "".join(stdout_chunks), "".join(stderr_chunks)
+
     return await _run()
 
 
@@ -154,9 +155,7 @@ async def stream_subprocess(
             else b""
         )
         content_limit = (
-            max(0, max_output_bytes - len(suffix))
-            if max_output_bytes is not None
-            else None
+            max(0, max_output_bytes - len(suffix)) if max_output_bytes is not None else None
         )
 
         async def bounded_chunk(chunk: bytes) -> bytes | None:
@@ -170,9 +169,7 @@ async def stream_subprocess(
                 remaining_content = content_limit - emitted_output_bytes
                 if len(chunk) > remaining_content:
                     output_truncated = True
-                    emitted = (chunk[:max(0, remaining_content)] + suffix)[
-                        :max_output_bytes
-                    ]
+                    emitted = (chunk[: max(0, remaining_content)] + suffix)[:max_output_bytes]
                     emitted_output_bytes += len(emitted)
                     return emitted
                 emitted_output_bytes += len(chunk)
@@ -182,24 +179,28 @@ async def stream_subprocess(
             chunk = await bounded_chunk(text.encode())
             if chunk is None:
                 return
-            await send.send({
-                "type": "chunk",
-                "stream": "stderr",
-                "text": chunk.decode(errors="replace"),
-                "returncode": None,
-            })
+            await send.send(
+                {
+                    "type": "chunk",
+                    "stream": "stderr",
+                    "text": chunk.decode(errors="replace"),
+                    "returncode": None,
+                }
+            )
 
         async def read_stream(
             stream_name: Literal["stdout", "stderr"],
             stream: anyio.abc.ByteReceiveStream | None,
         ) -> None:
             if stream is None:
-                await send.send({
-                    "type": "exit",
-                    "stream": stream_name,
-                    "text": "",
-                    "returncode": None,
-                })
+                await send.send(
+                    {
+                        "type": "exit",
+                        "stream": stream_name,
+                        "text": "",
+                        "returncode": None,
+                    }
+                )
                 return
             while True:
                 try:
@@ -211,18 +212,22 @@ async def stream_subprocess(
                 bounded = await bounded_chunk(chunk)
                 if bounded is None:
                     continue
-                await send.send({
-                    "type": "chunk",
+                await send.send(
+                    {
+                        "type": "chunk",
+                        "stream": stream_name,
+                        "text": bounded.decode(errors="replace"),
+                        "returncode": None,
+                    }
+                )
+            await send.send(
+                {
+                    "type": "exit",
                     "stream": stream_name,
-                    "text": bounded.decode(errors="replace"),
+                    "text": "",
                     "returncode": None,
-                })
-            await send.send({
-                "type": "exit",
-                "stream": stream_name,
-                "text": "",
-                "returncode": None,
-            })
+                }
+            )
 
         async def wait_for_process() -> None:
             nonlocal returncode
@@ -249,12 +254,14 @@ async def stream_subprocess(
                 await send_stderr_text("Process stopped by user\n")
             if timed_out:
                 await send_stderr_text(f"Process timed out after {timeout:g} seconds\n")
-            await send.send({
-                "type": "exit",
-                "stream": None,
-                "text": "",
-                "returncode": returncode,
-            })
+            await send.send(
+                {
+                    "type": "exit",
+                    "stream": None,
+                    "text": "",
+                    "returncode": returncode,
+                }
+            )
 
         async with anyio.create_task_group() as tg:
             tg.start_soon(read_stream, "stdout", process.stdout)

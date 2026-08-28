@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
+from gofer.core import provider_capabilities
+from gofer.core.provider_capabilities import ProviderCapability, ProviderCapabilityService
 from gofer.core.resources import ResourceLimits
 from gofer.ui import chat
 from gofer.ui.chat import (
@@ -36,7 +39,7 @@ def test_chat_prompt_includes_gofer_flow_skill_and_workflow_context() -> None:
         gofer_cli_path=Path("/tmp/gofer/bin/gof"),
     )
 
-    assert "Gofer Flow Workflow Builder" in prompt
+    assert "Taskurotta Workflow Builder" in prompt
     assert "use this exact executable path" in prompt
     assert "/tmp/gofer/bin/gof" in prompt
     assert "gof workflow validate" in prompt
@@ -100,15 +103,27 @@ def test_chat_prompt_handles_empty_workflow_context() -> None:
 
     assert "Selected workflow: none" in prompt
     assert "Existing workflows: none" in prompt
-    assert "create new Gofer Flow workflows" in prompt
+    assert "create new Taskurotta workflows" in prompt
 
 
-def test_provider_payload_lists_codex_and_claude_code() -> None:
+def test_provider_payload_returns_shared_capability_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = {
+        "providers": [
+            {
+                "id": "codex",
+                "displayName": "Codex",
+                "available": True,
+                "models": [{"id": "gpt-5.6-sol", "efforts": [{"id": "high"}]}],
+            }
+        ]
+    }
+    monkeypatch.setattr(chat, "provider_capabilities_payload", lambda: expected)
+
     providers = provider_payload()["providers"]
 
-    assert {provider["id"] for provider in providers} == {"codex", "claude_code"}
-    assert all("available" in provider for provider in providers)
-    assert all(provider["models"] for provider in providers)
+    assert providers == expected["providers"]
 
 
 def test_ensure_local_gofer_cli_copies_source_binary(monkeypatch, tmp_path) -> None:
@@ -159,10 +174,7 @@ def test_ensure_local_gofer_cli_does_not_reuse_existing_helper_without_source(
 
     assert copied is None
     assert old_data_dir_helper.read_text(encoding="utf-8") == "#!/bin/sh\necho planted\n"
-    assert (
-        planted_trusted_helper.read_text(encoding="utf-8")
-        == "#!/bin/sh\necho trusted-planted\n"
-    )
+    assert planted_trusted_helper.read_text(encoding="utf-8") == "#!/bin/sh\necho trusted-planted\n"
 
 
 def test_ensure_local_gofer_cli_does_not_reuse_helper_when_source_is_unknown(
@@ -375,11 +387,12 @@ def test_build_chat_prompt_reports_cli_unavailable_when_helper_is_unverified() -
     assert "Do not run a stale helper" in prompt
 
 
-def test_build_chat_command_passes_model_flags() -> None:
+def test_build_chat_command_passes_model_and_effort_flags() -> None:
     codex = _build_chat_command(
         "codex",
         "gpt-5",
         "hello",
+        effort="high",
         data_dir=Path("/tmp/gofer-data"),
         working_dir=Path("/tmp/project"),
     )
@@ -387,27 +400,45 @@ def test_build_chat_command_passes_model_flags() -> None:
         "claude_code",
         "sonnet",
         "hello",
+        effort="medium",
         data_dir=Path("/tmp/gofer-data"),
     )
 
     assert codex[:2] == ["codex", "exec"]
     assert "--ask-for-approval" not in codex
     assert "--skip-git-repo-check" in codex
+    assert "--json" in codex
+    assert ["-c", 'model_reasoning_summary="concise"'] == codex[
+        codex.index("--json") + 1 : codex.index("--json") + 3
+    ]
     assert option_value(codex, "--sandbox") == "workspace-write"
     assert option_value(codex, "--cd") == "/tmp/project"
     assert option_value(codex, "--add-dir") == "/tmp/gofer-data"
     assert str(trusted_gofer_cli_dir(Path("/tmp/gofer-data"))) not in codex
-    assert ["--model", "gpt-5"] == codex[-3:-1]
+    assert ["--model", "gpt-5"] == codex[-5:-3]
+    assert ["-c", 'model_reasoning_effort="high"'] == codex[-3:-1]
     assert codex[-1] == "hello"
     assert claude == [
         "claude",
         "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--include-partial-messages",
+        "--permission-mode",
+        "dontAsk",
+        "--allowedTools",
+        "Read",
+        "Edit",
+        "Write",
         "--add-dir",
         "/tmp/gofer-data",
         "-p",
         "hello",
         "--model",
         "sonnet",
+        "--effort",
+        "medium",
     ]
 
 
@@ -473,6 +504,73 @@ async def test_run_workflow_chat_adds_trusted_workflow_paths_to_provider_sandbox
         captured_command,
         "--add-dir",
     )
+
+
+@pytest.mark.asyncio
+async def test_run_workflow_chat_awaits_selection_validation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def validate(*_args) -> None:
+        return None
+
+    async def fake_run_subprocess(*_args, **_kwargs):
+        return 0, "done", ""
+
+    monkeypatch.setattr(chat, "validate_provider_selection_async", validate)
+    monkeypatch.setattr(chat, "run_subprocess", fake_run_subprocess)
+
+    response = await run_workflow_chat(
+        provider="codex",
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "body": "hello"}],
+        workflow=None,
+        working_dir=tmp_path,
+        data_dir=tmp_path,
+    )
+
+    assert response["message"]["body"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_workflow_assistant_validation_does_not_nest_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    service = ProviderCapabilityService()
+
+    async def discover(_executable: str | None = None) -> ProviderCapability:
+        return ProviderCapability.model_validate(
+            {
+                "id": "codex",
+                "display_name": "Codex",
+                "available": True,
+                "discovery_status": "ready",
+                "default_model": "gpt-5.6-sol",
+                "models": [{"id": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol"}],
+            }
+        )
+
+    async def fake_run_subprocess(*_args, **_kwargs):
+        return 0, "done", ""
+
+    monkeypatch.setattr(provider_capabilities.shutil, "which", lambda _name: "/usr/bin/codex")
+    monkeypatch.setattr(provider_capabilities, "provider_capability_service", lambda: service)
+    monkeypatch.setattr(service._probes["codex"], "discover", discover)
+    monkeypatch.setattr(chat, "run_subprocess", fake_run_subprocess)
+
+    response = await run_workflow_chat(
+        provider="codex",
+        model="gpt-5.6-sol",
+        messages=[{"role": "user", "body": "Update my workflow"}],
+        workflow={"id": "workflow-assistant", "workflows": []},
+        working_dir=tmp_path,
+        data_dir=tmp_path,
+    )
+
+    assert response["message"]["body"] == "done"
 
 
 @pytest.mark.asyncio
@@ -609,14 +707,14 @@ async def test_run_workflow_chat_uses_prompt_file_for_windows_codex_shim(
 
     assert captured_command is not None
     prompt_arg = captured_command[-1]
-    assert "Read the complete Gofer Flow assistant prompt" in prompt_arg
+    assert "Read the complete Taskurotta assistant prompt" in prompt_arg
     assert "Create workflow with two nodes" in prompt_arg
     assert "\n" not in prompt_arg
 
     prompt_files = list((tmp_path / ".gofer-chat-prompts").glob("*.md"))
     assert len(prompt_files) == 1
     prompt_text = prompt_files[0].read_text(encoding="utf-8")
-    assert "You are the Gofer Flow workflow assistant." in prompt_text
+    assert "You are the Taskurotta workflow assistant." in prompt_text
     assert "USER: Create workflow\nwith two nodes" in prompt_text
 
     await run_workflow_chat(
@@ -636,7 +734,9 @@ async def test_run_workflow_chat_uses_prompt_file_for_windows_codex_shim(
 
 
 @pytest.mark.asyncio
-async def test_stream_workflow_chat_yields_thoughts_and_final(monkeypatch, tmp_path) -> None:
+async def test_stream_workflow_chat_ignores_unstructured_provider_diagnostics(
+    monkeypatch, tmp_path
+) -> None:
     monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
 
     async def fake_stream_subprocess(*_args, **_kwargs):
@@ -658,10 +758,353 @@ async def test_stream_workflow_chat_yields_thoughts_and_final(monkeypatch, tmp_p
         )
     ]
 
-    assert [event["type"] for event in events] == ["thought", "thought", "final"]
-    assert events[0]["text"] == "working\n"
-    assert events[1]["stream"] == "stderr"
-    assert events[2]["message"]["body"] == "working\n"
+    assert [event["type"] for event in events] == ["final"]
+    assert events[0]["message"]["body"] == "working\n"
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_chat_preserves_claude_tool_trace(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/claude")
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": (
+                '{"type":"assistant","message":{"content":['
+                '{"type":"text","text":"Inspect the workflow"},'
+                '{"type":"tool_use","id":"tool-1","name":"Read",'
+                '"input":{"file_path":"workflow.toml"}}]}}\n'
+            ),
+            "returncode": None,
+        }
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": (
+                '{"type":"user","message":{"content":['
+                '{"type":"tool_result","tool_use_id":"tool-1",'
+                '"content":"[workflow]\\nname = \\"Demo\\""}]}}\n'
+            ),
+            "returncode": None,
+        }
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": '{"type":"result","result":"Workflow inspected"}\n',
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream_subprocess)
+
+    events = [
+        event
+        async for event in stream_workflow_chat(
+            provider="claude_code",
+            model="sonnet",
+            messages=[{"role": "user", "body": "inspect"}],
+            workflow=None,
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+        )
+    ]
+
+    assert [event["type"] for event in events] == ["thought", "thought", "thought", "final"]
+    assert events[0]["trace"] == {
+        "kind": "summary",
+        "title": "Summary",
+        "body": "Inspect the workflow",
+    }
+    assert events[1]["trace"]["title"] == "Read"
+    assert events[1]["trace"]["detail"] == "workflow.toml"
+    assert events[2]["trace"]["id"] == "tool-1"
+    assert events[2]["trace"]["output"].startswith("[workflow]")
+    assert events[-1]["message"]["body"] == "Workflow inspected"
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_chat_surfaces_partial_claude_trace_without_duplicates(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/claude")
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        payloads = [
+            {
+                "type": "stream_event",
+                "event": {"type": "message_start", "message": {}},
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": "Inspecting the workflow"},
+                },
+            },
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": 0},
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_start",
+                    "index": 1,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {},
+                    },
+                },
+            },
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 1,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": '{"file_path":"workflow.toml"}',
+                    },
+                },
+            },
+            {
+                "type": "stream_event",
+                "event": {"type": "content_block_stop", "index": 1},
+            },
+            {
+                "type": "stream_event",
+                "event": {"type": "message_stop"},
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "content": [
+                        {"type": "text", "text": "Inspecting the workflow"},
+                        {
+                            "type": "tool_use",
+                            "id": "tool-1",
+                            "name": "Read",
+                            "input": {"file_path": "workflow.toml"},
+                        },
+                    ]
+                },
+            },
+            {
+                "type": "user",
+                "message": {
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "tool-1",
+                            "content": [{"type": "text", "text": "[workflow]"}],
+                        }
+                    ]
+                },
+            },
+            {"type": "result", "result": "Workflow inspected"},
+        ]
+        yield {
+            "type": "chunk",
+            "stream": "stdout",
+            "text": "".join(f"{json.dumps(payload)}\n" for payload in payloads),
+            "returncode": None,
+        }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream_subprocess)
+
+    events = [
+        event
+        async for event in stream_workflow_chat(
+            provider="claude_code",
+            model="sonnet",
+            messages=[{"role": "user", "body": "inspect"}],
+            workflow=None,
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+        )
+    ]
+    traces = [event["trace"] for event in events if event["type"] == "thought"]
+
+    assert [trace["kind"] for trace in traces] == ["summary", "tool", "tool", "tool"]
+    assert traces[0]["body"] == "Inspecting the workflow"
+    assert traces[1]["phase"] == "start"
+    assert traces[2]["phase"] == "update"
+    assert traces[2]["detail"] == "workflow.toml"
+    assert traces[3]["phase"] == "result"
+    assert traces[3]["output"] == "[workflow]"
+    assert events[-1]["message"]["body"] == "Workflow inspected"
+
+
+def test_claude_partial_trace_reports_activity_without_exposing_raw_thinking() -> None:
+    state = chat._ClaudeTraceState()
+
+    assert (
+        chat._claude_trace_entries(
+            {
+                "type": "stream_event",
+                "event": {"type": "message_start", "message": {}},
+            },
+            state,
+        )
+        == []
+    )
+    started = chat._claude_trace_entries(
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "thinking", "thinking": "private"},
+            },
+        },
+        state,
+    )
+    assert started == [
+        {
+            "id": "claude-thinking-1-0",
+            "kind": "summary",
+            "title": "Thinking",
+            "status": "running",
+            "phase": "start",
+        }
+    ]
+    assert (
+        chat._claude_trace_entries(
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "thinking_delta", "thinking": "private"},
+                },
+            },
+            state,
+        )
+        == []
+    )
+    completed = chat._claude_trace_entries(
+        {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 0},
+        },
+        state,
+    )
+    assert completed[0]["id"] == "claude-thinking-1-0"
+    assert completed[0]["title"] == "Thought"
+    assert completed[0]["detail"].startswith("for ")
+    assert "private" not in str(started + completed)
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_chat_preserves_codex_reasoning_and_command_trace(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        lines = [
+            {
+                "type": "item.completed",
+                "item": {"type": "reasoning", "summary_text": "tokens used\n15,930"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "type": "reasoning",
+                    "summary_text": ["Find the relevant tests", "Check the chat parser"],
+                    "raw_content": "private chain of thought",
+                },
+            },
+            {
+                "type": "item.started",
+                "item": {"id": "cmd-1", "type": "command_execution", "command": "rg tests"},
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "cmd-1",
+                    "type": "command_execution",
+                    "command": "rg tests",
+                    "aggregated_output": "tests/unit/test_ui_chat.py",
+                    "status": "completed",
+                },
+            },
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Done"}},
+        ]
+        for line in lines:
+            yield {
+                "type": "chunk",
+                "stream": "stdout",
+                "text": json.dumps(line) + "\n",
+                "returncode": None,
+            }
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream_subprocess)
+
+    events = [
+        event
+        async for event in stream_workflow_chat(
+            provider="codex",
+            model="gpt-5",
+            messages=[{"role": "user", "body": "inspect"}],
+            workflow=None,
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+        )
+    ]
+
+    traces = [event["trace"] for event in events if event["type"] == "thought"]
+    assert traces[0]["body"] == "Find the relevant tests\nCheck the chat parser"
+    assert all("private chain of thought" not in str(trace) for trace in traces)
+    assert traces[1]["title"] == "Bash"
+    assert traces[1]["id"] == "cmd-1"
+    assert traces[2]["output"] == "tests/unit/test_ui_chat.py"
+    assert events[-1]["message"]["body"] == "Done"
+
+
+@pytest.mark.asyncio
+async def test_stream_workflow_chat_awaits_selection_validation(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setattr(chat.shutil, "which", lambda _binary: "/usr/bin/codex")
+
+    async def validate(*_args) -> None:
+        return None
+
+    async def fake_stream_subprocess(*_args, **_kwargs):
+        yield {"type": "exit", "stream": None, "text": "", "returncode": 0}
+
+    monkeypatch.setattr(chat, "validate_provider_selection_async", validate)
+    monkeypatch.setattr(chat, "stream_subprocess", fake_stream_subprocess)
+
+    events = [
+        event
+        async for event in stream_workflow_chat(
+            provider="codex",
+            model="gpt-5.6-sol",
+            messages=[{"role": "user", "body": "hello"}],
+            workflow=None,
+            working_dir=tmp_path,
+            data_dir=tmp_path,
+        )
+    ]
+
+    assert events[-1]["type"] == "final"
 
 
 @pytest.mark.asyncio
@@ -721,7 +1164,7 @@ async def test_stream_workflow_chat_compacts_long_context(monkeypatch, tmp_path)
         )
     ]
 
-    assert [event["type"] for event in events] == ["compaction", "thought", "final"]
+    assert [event["type"] for event in events] == ["compaction", "final"]
     assert events[0]["message"] == "Compacting workflow assistant context"
     compacted_messages = events[0]["messages"]
     assert compacted_messages[0]["kind"] == "system"
@@ -782,7 +1225,7 @@ async def test_stream_workflow_chat_yields_error_on_nonzero_exit(monkeypatch, tm
         )
     ]
 
-    assert [event["type"] for event in events] == ["thought", "error"]
+    assert [event["type"] for event in events] == ["error"]
     assert events[-1]["error"] == "nope\n"
 
 

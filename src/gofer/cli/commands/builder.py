@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 from typing import Literal, cast
@@ -24,7 +25,6 @@ from gofer.core.operations import (
     BashCommandOperation,
     CopyFileOperation,
     CountFanSource,
-    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FanSource,
@@ -59,6 +59,7 @@ class WorkflowBuilder:
         if config is None:
             return None
         self._workflow = AgenticWorkflow(config)
+        self._ask_output_schemas()
         self._ask_nodes()
         if len(self._workflow.graph) >= 2:
             self._ask_edges()
@@ -122,6 +123,64 @@ class WorkflowBuilder:
                 )
 
         return WorkflowConfig(id=wf_id, name=name, schedule=schedule, watch=watch)
+
+    def _ask_output_schemas(self) -> None:
+        assert self._workflow is not None
+        while questionary.confirm("Define a named output schema?", default=False).ask():
+            name = questionary.text("Schema name:").ask()
+            if not name:
+                return
+            raw_schema = questionary.text("JSON Schema (JSON object):").ask()
+            try:
+                schema = json.loads(raw_schema or "")
+            except json.JSONDecodeError:
+                console.print("  [red]✗[/red] Output schema must be valid JSON")
+                continue
+            if not isinstance(schema, dict):
+                console.print("  [red]✗[/red] Output schema must be a JSON object")
+                continue
+            self._workflow.config.output_schemas[name.strip()] = schema
+            console.print(f"  [green]✓[/green] Added output schema '{name.strip()}'")
+
+    def _ask_structured_output(self) -> tuple[str | dict[str, object] | None, int]:
+        assert self._workflow is not None
+        if not questionary.confirm("Require structured JSON output?", default=False).ask():
+            return None, 0
+
+        schema_source = questionary.select(
+            "Output schema source:", choices=["named schema", "inline JSON Schema"]
+        ).ask()
+        if schema_source == "named schema":
+            names = sorted(self._workflow.config.output_schemas)
+            if not names:
+                console.print(
+                    "  [yellow]No named schemas are defined; using an inline schema.[/yellow]"
+                )
+                schema_source = "inline JSON Schema"
+            else:
+                output_schema = questionary.select("Output schema:", choices=names).ask()
+                if output_schema is None:
+                    return None, 0
+        if schema_source == "inline JSON Schema":
+            raw_schema = questionary.text("JSON Schema (JSON object):").ask()
+            try:
+                output_schema = json.loads(raw_schema or "")
+            except json.JSONDecodeError:
+                console.print("  [red]✗[/red] Output schema must be valid JSON")
+                return None, 0
+            if not isinstance(output_schema, dict):
+                console.print("  [red]✗[/red] Output schema must be a JSON object")
+                return None, 0
+
+        raw_attempts = questionary.text(
+            "Structured output repair attempts (0-3):", default="0"
+        ).ask()
+        try:
+            repair_attempts = int(raw_attempts or "0")
+        except ValueError:
+            repair_attempts = 0
+        repair_attempts = min(3, max(0, repair_attempts))
+        return output_schema, repair_attempts
 
     def _ask_nodes(self) -> None:
         console.print("\n[bold]Add nodes[/bold]")
@@ -244,7 +303,7 @@ class WorkflowBuilder:
             path_str = questionary.text("Path to delete:").ask()
             if not path_str:
                 return
-            use_trash = questionary.confirm("Move to Gofer trash?", default=True).ask()
+            use_trash = questionary.confirm("Move to Taskurotta trash?", default=True).ask()
             recursive = questionary.confirm("Allow recursive folder delete?", default=False).ask()
             missing_ok = questionary.confirm("Succeed if missing?", default=False).ask()
             op = DeleteFileOperation(
@@ -285,9 +344,7 @@ class WorkflowBuilder:
                     console.print("[yellow]No existing agents found. Creating a new one.[/yellow]")
                     agent_source = "new"
                 else:
-                    choices = [
-                        f"{cfg.agent_id} ({wf.config.id})" for wf, cfg in all_agents
-                    ]
+                    choices = [f"{cfg.agent_id} ({wf.config.id})" for wf, cfg in all_agents]
                     chosen = questionary.select("Select an agent:", choices=choices).ask()
                     if chosen is None:
                         return
@@ -300,6 +357,7 @@ class WorkflowBuilder:
                         prompt_path=agent_config.prompt_path,
                         working_dir=agent_config.working_dir,
                     )
+                    op.output_schema, op.repair_attempts = self._ask_structured_output()
                     pipe_output = questionary.confirm(
                         "Pipe output to next node?", default=False
                     ).ask()
@@ -355,6 +413,7 @@ class WorkflowBuilder:
                     prompt_path=prompt_path,
                     working_dir=working_dir,
                 )
+                op.output_schema, op.repair_attempts = self._ask_structured_output()
                 pipe_output = questionary.confirm("Pipe output to next node?", default=False).ask()
                 node = GraphNode(node_id=node_id, operation=op, pipe_output=pipe_output)
 
@@ -372,9 +431,12 @@ class WorkflowBuilder:
             console.print(f"  [green]✓[/green] Added node '{node_id}'")
 
     def _ask_fan_source(self, required: bool = False) -> FanSource | None:
-        if not required and not questionary.confirm(
-            "Loop once for each item in a collection?", default=False
-        ).ask():
+        if (
+            not required
+            and not questionary.confirm(
+                "Loop once for each item in a collection?", default=False
+            ).ask()
+        ):
             return None
 
         source_type = questionary.select(
@@ -384,7 +446,6 @@ class WorkflowBuilder:
                 "Row in a JSONL/CSV file",
                 "File in a directory",
                 "File watcher trigger event",
-                "Dashboard items",
                 "Indefinitely until BREAK",
             ],
         ).ask()
@@ -435,19 +496,6 @@ class WorkflowBuilder:
                 include_content=include_content,
             )
 
-        if source_type == "Dashboard items":
-            dashboard = questionary.text("Dashboard name or ID:").ask()
-            component = questionary.text("Component ID:").ask()
-            if not dashboard or not component:
-                return None
-            filter_rule = questionary.text("Filter (example: status=todo, optional):").ask()
-            return DashboardItemsFanSource(
-                type="dashboard_items",
-                dashboard=dashboard,
-                component=component,
-                filter=filter_rule or None,
-            )
-
         if source_type == "Indefinitely until BREAK":
             return InfiniteFanSource(type="infinite")
 
@@ -469,9 +517,7 @@ class WorkflowBuilder:
                 console.print(f"  [red]✗[/red] Edge would create a self-loop: {from_id}")
                 continue
             if nx.has_path(self._workflow.graph._graph, to_id, from_id):
-                console.print(
-                    f"  [red]✗[/red] Edge would create a cycle: {from_id} → {to_id}"
-                )
+                console.print(f"  [red]✗[/red] Edge would create a cycle: {from_id} → {to_id}")
                 continue
 
             condition_str = questionary.select(
@@ -481,19 +527,46 @@ class WorkflowBuilder:
                     "on_success",
                     "on_failure",
                     "output_matches",
+                    "output_field",
                     "after_loop",
                 ],
             ).ask()
 
             output_pattern = None
+            field = None
+            operator = None
+            value = None
             if condition_str == "output_matches":
                 output_pattern = questionary.text("Regex pattern:").ask()
+            elif condition_str == "output_field":
+                field = questionary.text("Structured result field:").ask()
+                operator = questionary.select(
+                    "Operator:",
+                    choices=[
+                        "equals",
+                        "not_equals",
+                        "in",
+                        "not_in",
+                        "greater_than",
+                        "greater_than_or_equal",
+                        "less_than",
+                        "less_than_or_equal",
+                        "exists",
+                        "matches",
+                    ],
+                ).ask()
+                if operator != "exists":
+                    raw_value = questionary.text("Comparison value (JSON):").ask()
+                    value = json.loads(raw_value)
 
             edge_config = EdgeConfig(
                 from_node=from_id,
                 to_node=to_id,
                 condition=EdgeConditionType(condition_str),
                 output_pattern=output_pattern,
+                field=field,
+                operator=operator,
+                value=value,
             )
 
             try:

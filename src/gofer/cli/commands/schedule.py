@@ -115,8 +115,16 @@ def start(
         except (ProcessLookupError, PermissionError):
             pid_path.unlink(missing_ok=True)
 
-    cmd = [sys.executable, "-m", "gofer.cli.main", "schedule", "start",
-           "--foreground", "--db", str(db_path)]
+    cmd = [
+        sys.executable,
+        "-m",
+        "gofer.cli.main",
+        "schedule",
+        "start",
+        "--foreground",
+        "--db",
+        str(db_path),
+    ]
 
     proc = subprocess.Popen(
         cmd,

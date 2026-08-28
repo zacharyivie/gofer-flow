@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydantic import TypeAdapter, ValidationError
@@ -33,6 +34,7 @@ from gofer.core.operations import (
     WorkflowCallOperation,
     WriteFileOperation,
 )
+from gofer.core.workflow import AgenticWorkflow
 
 adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 
@@ -72,6 +74,37 @@ def test_agent_operation_defaults() -> None:
     assert op.input_mapping == {}
 
 
+@pytest.mark.parametrize(
+    "document, field",
+    [
+        (
+            {
+                "workflow": {"id": "retired", "name": "Retired", "llm_budget": {}},
+                "nodes": [],
+            },
+            "workflow.llm_budget",
+        ),
+        (
+            {
+                "workflow": {"id": "retired", "name": "Retired"},
+                "nodes": [
+                    {
+                        "id": "agent",
+                        "type": "agent",
+                        "agent_id": "agent",
+                        "change_tracking": {"allowed_paths": ["src"]},
+                    }
+                ],
+            },
+            "change_tracking",
+        ),
+    ],
+)
+def test_removed_runtime_controls_are_rejected(document: dict[str, Any], field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        AgenticWorkflow.from_dict(document)
+
+
 def test_agent_operation_allows_skill_without_prompt_path() -> None:
     op = AgentOperation(
         type=OperationType.AGENT,
@@ -91,7 +124,7 @@ def test_agent_operation_dynamic_count_string() -> None:
         working_dir=Path("/tmp"),
         dynamic_count="{{prev.output.count}}",
     )
-    assert op.dynamic_count == "{{prev.output.count}}"
+    assert str(op.dynamic_count) == "{{prev.output.count}}"
 
 
 def test_file_io_operations_roundtrip() -> None:

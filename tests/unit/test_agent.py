@@ -29,9 +29,7 @@ def agent_config(prompt_file: Path, tmp_path: Path) -> AgentConfig:
     )
 
 
-async def test_agent_delegates_to_subscription(
-    agent_config: AgentConfig, tmp_path: Path
-) -> None:
+async def test_agent_delegates_to_subscription(agent_config: AgentConfig, tmp_path: Path) -> None:
     sub = FakeSubscription(output="summary output")
     agent = Agent(agent_config, sub)
     result = await agent.run({"repo": "myrepo"})
@@ -66,6 +64,7 @@ async def test_agent_includes_memory_in_prompt(agent_config: AgentConfig) -> Non
     assert "Current request:" in prompt
     assert "awesome-project" in prompt
     assert result.prompt == prompt
+    assert result.current_prompt == "Summarize awesome-project."
 
 
 async def test_agent_context_paths_do_not_expand_subscription_sandbox(
@@ -80,11 +79,13 @@ async def test_agent_context_paths_do_not_expand_subscription_sandbox(
     sub = FakeSubscription()
     agent = Agent(agent_config, sub)
 
-    await agent.run({
-        "repo": "awesome-project",
-        "_piped_input": str(external_dir),
-        "file_path": str(external_file),
-    })
+    await agent.run(
+        {
+            "repo": "awesome-project",
+            "_piped_input": str(external_dir),
+            "file_path": str(external_file),
+        }
+    )
 
     assert str(external_dir) in str(sub.calls[0]["prompt"])
     assert sub.calls[0]["extra_paths"] == []
@@ -118,20 +119,20 @@ async def test_workflow_filesystem_access_is_passed_to_agent_subscription(
         WorkflowConfig(
             id="workflow-access",
             name="Workflow Access",
-            filesystem_access=[
-                FilesystemAccessEntry(path=outside_file, read=True, write=True)
-            ],
+            filesystem_access=[FilesystemAccessEntry(path=outside_file, read=True, write=True)],
         )
     )
     wf.register_agent(agent_config.model_copy(update={"working_dir": tmp_path}))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id=agent_config.agent_id,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id=agent_config.agent_id,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     sub = FakeSubscription()
 
     await WorkflowExecutor(wf, {"claude_code": sub}, workflow_path=tmp_path / "flow.toml").run()
@@ -151,20 +152,20 @@ async def test_read_only_workflow_filesystem_access_is_not_passed_to_agent_subsc
         WorkflowConfig(
             id="workflow-read-only-access",
             name="Workflow Read Only Access",
-            filesystem_access=[
-                FilesystemAccessEntry(path=outside_file, read=True, write=False)
-            ],
+            filesystem_access=[FilesystemAccessEntry(path=outside_file, read=True, write=False)],
         )
     )
     wf.register_agent(agent_config.model_copy(update={"working_dir": tmp_path}))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id=agent_config.agent_id,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id=agent_config.agent_id,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     sub = FakeSubscription()
 
     await WorkflowExecutor(wf, {"claude_code": sub}, workflow_path=tmp_path / "flow.toml").run()
@@ -182,20 +183,20 @@ async def test_write_only_workflow_filesystem_access_is_not_passed_to_agent_subs
         WorkflowConfig(
             id="workflow-write-only-access",
             name="Workflow Write Only Access",
-            filesystem_access=[
-                FilesystemAccessEntry(path=outside_dir, read=False, write=True)
-            ],
+            filesystem_access=[FilesystemAccessEntry(path=outside_dir, read=False, write=True)],
         )
     )
     wf.register_agent(agent_config.model_copy(update={"working_dir": tmp_path}))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id=agent_config.agent_id,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id=agent_config.agent_id,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     sub = FakeSubscription()
 
     await WorkflowExecutor(wf, {"claude_code": sub}, workflow_path=tmp_path / "flow.toml").run()
@@ -268,14 +269,16 @@ def test_workflow_resource_warnings_use_agent_node_working_dir_override(
     wf.register_agent(
         agent_config.model_copy(update={"working_dir": repo_dir, "extra_paths": [extra_dir]})
     )
-    wf.add_operation(GraphNode(
-        node_id="review",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id=agent_config.agent_id,
-            working_dir=node_working_dir,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="review",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id=agent_config.agent_id,
+                working_dir=node_working_dir,
+            ),
+        )
+    )
 
     warnings = wf.resource_warnings()
 

@@ -1,6 +1,6 @@
-# Gofer Flow
+# Taskurotta
 
-Gofer Flow is a Python CLI tool for defining and running graph-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, structured HTTP requests, and LLM agent calls into directed graphs that may include recursive loops.
+Taskurotta is a Python CLI tool for defining and running graph-based agentic workflows. Workflows are written in TOML and can combine shell commands, scripts, structured HTTP requests, and LLM agent calls into directed graphs that may include recursive loops.
 
 The installed command is `gof`.
 
@@ -28,8 +28,8 @@ The installed command is `gof`.
   - `claude` for `claude_code` subscriptions
   - `codex` for `codex` subscriptions
 - API credentials if you want to run direct API-backed agent nodes:
-  - `OPENAI_API_KEY` or a configured Gofer secret for `openai_api`
-  - `ANTHROPIC_API_KEY` or a configured Gofer secret for `anthropic_api`
+  - `OPENAI_API_KEY` or a configured Taskurotta secret for `openai_api`
+  - `ANTHROPIC_API_KEY` or a configured Taskurotta secret for `anthropic_api`
 
 Script and command nodes do not require an LLM provider CLI.
 
@@ -68,7 +68,7 @@ npm run dev
 
 Linux and macOS desktop packages are built from the Electron app in
 `frontend/release`.
-Arch users will be able to install Gofer Flow from AUR after publication:
+Arch users will be able to install Taskurotta from AUR after publication:
 
 ```bash
 yay -S gofer-flow
@@ -94,7 +94,7 @@ mode allows the configured local Vite origin for that frame, while packaged
 builds allow only the bundled `frontend/dist` app entry and the bundled backend
 error page.
 
-Desktop file operations are confined to the active Gofer data directory unless
+Desktop file operations are confined to the active Taskurotta data directory unless
 the user explicitly selects another file or folder through the native picker.
 Selected paths are represented by short-lived session grants tracked by the
 preload bridge and checked by the main process. Deletes use the operating system
@@ -155,7 +155,7 @@ node scripts/bump-version.cjs 0.1.1 --appimage-sha256 <appimage-sha256> --cli-sh
 
 ## Data Directory
 
-By default, Gofer Flow stores workflows, agent files, prompts, scheduler state, and scheduler PID files in the OS user data directory:
+By default, Taskurotta stores workflows, agent files, prompts, scheduler state, and scheduler PID files in the OS user data directory:
 
 - Linux: `$XDG_DATA_HOME/gofer` or `~/.local/share/gofer`
 - macOS: `~/Library/Application Support/gofer`
@@ -165,7 +165,7 @@ Many commands also include a hidden `--data-dir` option used by tests and automa
 
 ## License
 
-Gofer Flow is licensed under the Apache License, Version 2.0. See `LICENSE`
+Taskurotta is licensed under the Apache License, Version 2.0. See `LICENSE`
 and `NOTICE` for details.
 
 ## Workflow Commands
@@ -186,6 +186,10 @@ gof workflow list
 # Validate a stored workflow ID or TOML path
 gof workflow validate daily-analysis
 gof workflow validate ./daily-analysis.toml
+
+# Explain where references come from and when they resolve
+gof workflow validate daily-analysis --explain-bindings
+gof workflow validate daily-analysis --explain-bindings --json
 
 # Show the workflow graph
 gof workflow show daily-analysis
@@ -251,7 +255,7 @@ Agent subscriptions currently support:
 Direct API subscriptions are selected with the same `subscription`, `profile`, and
 `model` fields as CLI-backed agents. Store API credentials outside workflow TOML:
 use the default `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` environment variables, or
-create a provider profile with `--api-key-secret` so Gofer resolves
+create a provider profile with `--api-key-secret` so Taskurotta resolves
 `GOFER_SECRET_<NAME>` at runtime.
 
 ```bash
@@ -295,7 +299,7 @@ gof schedule start --foreground
 gof schedule stop
 ```
 
-The default scheduler database is `schedules.db` in the Gofer data directory. You can override it with `--db`.
+The default scheduler database is `schedules.db` in the Taskurotta data directory. You can override it with `--db`.
 
 ## Webhook and API Triggers
 
@@ -321,7 +325,7 @@ enabled = true
 allow_unauthenticated = true
 ```
 
-Gofer marks this as high risk in validation, plan previews, Studio payloads, and bundle import previews. Do not use it for workflows exposed outside loopback, through tunnels, or to other machines.
+Taskurotta marks this as high risk in validation, plan previews, Studio payloads, and bundle import previews. Do not use it for workflows exposed outside loopback, through tunnels, or to other machines.
 
 Trigger payloads are available to nodes through the `trigger` namespace:
 
@@ -434,9 +438,85 @@ to = "review"
 
 Prompt files support `{{var}}` interpolation from the context passed to an agent. When a predecessor node has `pipe_output = true`, its output is prepended to downstream agent prompts and sent to downstream script or command nodes as stdin.
 
+### Workflow inputs and run-scoped variables
+
+Declare immutable invocation values under `workflow.inputs` and mutable state under
+`workflow.variables`. Each workflow or subflow invocation receives a fresh scope;
+values cross a call boundary only through `input_bindings` and declared outputs.
+Legacy `workflow.parameters`, `parameter_bindings`, `--param`, and `{{params.*}}`
+remain supported aliases.
+
+```toml
+[workflow]
+id = "development-checks"
+name = "Development checks"
+
+[workflow.inputs.project_dir]
+type = "path"
+required = true
+
+[workflow.variables]
+attempt = 1
+
+[[nodes]]
+id = "test"
+type = "bash_command"
+command = "python -m pytest"
+working_dir = "{{inputs.project_dir}}"
+
+[[nodes]]
+id = "report"
+type = "bash_command"
+command = "echo {{nodes.test.exit_code}}"
+```
+
+Pass inputs with `gof workflow run development-checks --input project_dir=/work/repo`
+or `--inputs-json`. Exact references preserve booleans, numbers, arrays, and objects;
+embedded references are converted to text. Use `set`, `update`, or `clear` for ordered
+mutations. Concurrent writers must all use `merge`, which stores values by invocation
+ID, or validation rejects the workflow as nondeterministic.
+
+#### Resume, checkpoint, and replay semantics
+
+- Inputs and variables belong to one invocation. A fresh run starts from supplied/default
+  inputs and declared variable initializers; it never inherits mutable state from another run.
+- Resume and approval checkpoints save the invocation's current inputs and variables. Resume
+  loads that snapshot before validating required inputs, then applies any newly supplied input
+  values as explicit overrides.
+- Non-secret values are stored directly in the local checkpoint. Declared secret inputs,
+  declared secret variables, and secret-bearing node outputs are shown as `***` in the public
+  checkpoint and stored in an authenticated encrypted scope using a local key. If that key is
+  unavailable, explicitly resupply every redacted secret input. A normal resume then rebuilds
+  redacted variable/output state by rerunning the affected nodes and their descendants. An
+  approval checkpoint that contains additional unrebuildable secret state instead asks you to
+  restart the workflow from the beginning.
+- Logs, plans, API/UI run metadata, and cache records contain redacted public values. Execution
+  keeps an internal raw value so a downstream node can consume a token without receiving `***`.
+- Webhook replay saves the sanitized trigger payload plus the explicit invocation inputs used by
+  the original request. Secret explicit inputs use the same encrypted local scope. Configured
+  webhook `input_bindings` are evaluated again against the saved replay payload.
+- Subflows and workflow calls create new scope frames. Only explicit `input_bindings` enter the
+  child, and only declared outputs return to the caller.
+
+### Runtime bindings and shell expansion
+
+`gof workflow plan` and `gof workflow validate --explain-bindings` show each explicit
+Taskurotta reference with its producer, source and destination types, resolution phase,
+status, secret readiness, and any string coercion. Exact references, including
+`workflow.*`, `run.*`, and `secret.*` inputs, resolve without becoming templates.
+They retain the producer's native value when the destination supports it; process
+environment, argument, and standard-input boundaries report their string coercion.
+References embedded in a larger string, such as `"item={{loop.current.value}}"`, are
+converted to text.
+
+Taskurotta resolves `{{...}}` references before starting an operation. Node input mappings
+then provide typed operation inputs, while `env.*` mappings and `operation.env` become
+process environment variables. Expressions such as `${FILE_NAME}` belong to the shell;
+Taskurotta deliberately does not parse or validate arbitrary shell expansion.
+
 ### HTTP request nodes
 
-Use `http_request` when a workflow needs a structured API call without shelling out to `curl`. URL, headers, query params, JSON body fields, raw body, and output mappings support `{{node.data.path}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation. Secret references use `{{secret.NAME}}` or `secret:NAME`; at runtime Gofer reads `GOFER_SECRET_NAME` or `NAME` from the environment and masks configured secret fields in logs.
+Use `http_request` when a workflow needs a structured API call without shelling out to `curl`. URL, headers, query params, JSON body fields, raw body, and output mappings support `{{node.data.path}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation. Secret references use `{{secret.NAME}}` or `secret:NAME`; at runtime Taskurotta reads `GOFER_SECRET_NAME` or `NAME` from the environment and masks configured secret fields in logs.
 
 API polling:
 
@@ -515,7 +595,7 @@ retry_on_statuses = [429, 500, 502, 503, 504]
 
 ### Approval gates and notifications
 
-Use `approval_gate` when a workflow should pause before continuing. The node writes a pending approval request under the Gofer data directory, records the run ID and node ID in the run log, and resumes when a user approves or rejects it from the CLI. Approval messages support the same `{{node.output}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation used by other nodes.
+Use `approval_gate` when a workflow should pause before continuing. The node writes a pending approval request under the Taskurotta data directory, records the run ID and node ID in the run log, and resumes when a user approves or rejects it from the CLI. Approval messages support the same `{{node.output}}`, `{{previous.output}}`, `{{trigger.value}}`, and loop interpolation used by other nodes.
 
 ```toml
 [[nodes]]
@@ -643,7 +723,7 @@ max_watcher_concurrency = 4
 max_fanout_concurrency = 16
 ```
 
-File watcher queues are bounded by `max_watcher_queue_depth`. When a hot watcher produces more events than fit, Gofer Flow keeps the newest queued batches/events and drops the oldest overflow before starting more runs. `max_watcher_concurrency` is also capped by the trusted server-wide limit, so a workflow override cannot raise host-wide watcher or continuous-run concurrency.
+File watcher queues are bounded by `max_watcher_queue_depth`. When a hot watcher produces more events than fit, Taskurotta keeps the newest queued batches/events and drops the oldest overflow before starting more runs. `max_watcher_concurrency` is also capped by the trusted server-wide limit, so a workflow override cannot raise host-wide watcher or continuous-run concurrency.
 
 ## Node Types
 
@@ -730,7 +810,7 @@ pipe_output = true
 - `retry_count`: number of retries after the first failed attempt.
 - `retry_delay_seconds`: delay between retry attempts.
 - `timeout_seconds`: subprocess timeout. When a subprocess node is stopped or
-  times out, Gofer Flow terminates the subprocess tree: POSIX platforms signal
+  times out, Taskurotta terminates the subprocess tree: POSIX platforms signal
   the started process group, and Windows uses `taskkill /T` with a forced
   fallback. Descendants that deliberately detach into a separate session,
   process group, service, or job may outlive the workflow and should clean up

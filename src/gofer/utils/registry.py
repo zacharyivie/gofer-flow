@@ -27,9 +27,7 @@ def list_all_agents(data_dir: Path | None = None) -> list[tuple[AgenticWorkflow,
     return results
 
 
-def find_agent(
-    agent_id: str, data_dir: Path | None = None
-) -> tuple[AgenticWorkflow, AgentConfig]:
+def find_agent(agent_id: str, data_dir: Path | None = None) -> tuple[AgenticWorkflow, AgentConfig]:
     """Find an agent by ID across all workflow files. Raises KeyError if not found."""
     for wf, cfg in list_all_agents(data_dir):
         if cfg.agent_id == agent_id:

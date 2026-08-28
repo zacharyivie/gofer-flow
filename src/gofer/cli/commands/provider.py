@@ -53,7 +53,12 @@ def create_profile(
     ),
     model: str | None = typer.Option(None, "--model", help="Provider model"),
     timeout: float | None = typer.Option(None, "--timeout", help="Default timeout in seconds"),
-    reasoning: str | None = typer.Option(None, "--reasoning", help="Reasoning/effort setting"),
+    effort: str | None = typer.Option(
+        None,
+        "--effort",
+        "--reasoning",
+        help="Model effort setting (--reasoning is deprecated)",
+    ),
     approval_mode: str | None = typer.Option(
         None,
         "--approval-mode",
@@ -104,7 +109,7 @@ def create_profile(
         subscription=subscription,
         model=model,
         timeout=timeout,
-        reasoning=reasoning,
+        effort=effort,
         approval_mode=approval_mode,
         sandbox_mode=sandbox_mode,
         extra_arg=extra_arg,
@@ -128,7 +133,12 @@ def edit_profile(
     name: str = typer.Argument(..., help="Profile name"),
     model: str | None = typer.Option(None, "--model", help="Provider model"),
     timeout: float | None = typer.Option(None, "--timeout", help="Default timeout in seconds"),
-    reasoning: str | None = typer.Option(None, "--reasoning", help="Reasoning/effort setting"),
+    effort: str | None = typer.Option(
+        None,
+        "--effort",
+        "--reasoning",
+        help="Model effort setting (--reasoning is deprecated)",
+    ),
     approval_mode: str | None = typer.Option(
         None,
         "--approval-mode",
@@ -169,7 +179,7 @@ def edit_profile(
         for key, value in {
             "model": model,
             "timeout": timeout,
-            "reasoning": reasoning,
+            "effort": effort,
             "approval_mode": approval_mode,
             "sandbox_mode": sandbox_mode,
             "api_base_url": api_base_url,
@@ -247,7 +257,7 @@ def _profile_from_options(
     subscription: str,
     model: str | None,
     timeout: float | None,
-    reasoning: str | None,
+    effort: str | None,
     approval_mode: str | None,
     sandbox_mode: str | None,
     extra_arg: list[str] | None,
@@ -274,7 +284,7 @@ def _profile_from_options(
             subscription=subscription,  # type: ignore[arg-type]
             model=model,
             timeout=timeout,
-            reasoning=reasoning,
+            effort=effort,
             approval_mode=approval_mode,  # type: ignore[arg-type]
             sandbox_mode=sandbox_mode,  # type: ignore[arg-type]
             extra_args=list(extra_arg or []),

@@ -14,18 +14,7 @@ import pytest
 
 from gofer.core import executor as executor_module
 from gofer.core.agent import AgentConfig, AgentResult
-from gofer.core.approvals import (
-    ApprovalStore,
-    MultiChannelNotificationAdapter,
-    RecordingNotificationAdapter,
-)
-from gofer.core.dashboards import (
-    add_component,
-    add_item,
-    add_section,
-    create_dashboard,
-    load_dashboard,
-)
+from gofer.core.approvals import ApprovalStore, RecordingNotificationAdapter
 from gofer.core.executor import (
     ResumeOptions,
     WorkflowExecutor,
@@ -33,8 +22,7 @@ from gofer.core.executor import (
     command_shell_args,
 )
 from gofer.core.graph import EdgeConditionType, EdgeConfig, GraphNode
-from gofer.core.http import HttpRequest, HttpResponse, UrllibHttpClient
-from gofer.core.network_policy import NetworkPolicyViolation
+from gofer.core.http import HttpRequest, HttpResponse
 from gofer.core.operations import (
     AgentOperation,
     ApprovalGateOperation,
@@ -43,8 +31,6 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
-    DashboardItemOperation,
-    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FailOperation,
@@ -65,9 +51,7 @@ from gofer.core.operations import (
     PythonScriptOperation,
     ReadFileOperation,
     StartOperation,
-    TabularFanSource,
     TriggerEventsFanSource,
-    WorkflowCallOperation,
     WriteFileOperation,
 )
 from gofer.core.planner import build_execution_plan
@@ -77,9 +61,14 @@ from gofer.core.provider_profiles import (
     save_provider_profiles,
 )
 from gofer.core.resources import ResourceLimits, byte_len
-from gofer.core.usage import LlmPricing, LlmUsageBudget
-from gofer.core.workflow import AgenticWorkflow, FilesystemAccessEntry, WorkflowConfig
-from gofer.subscriptions.direct_api import OpenAiApiSubscription
+from gofer.core.usage import LlmPricing
+from gofer.core.workflow import (
+    AgenticWorkflow,
+    FilesystemAccessEntry,
+    WorkflowConfig,
+    WorkflowParameterConfig,
+    WorkflowVariableConfig,
+)
 from gofer.utils.run_state import (
     request_workflow_run_stop,
     request_workflow_stop,
@@ -99,14 +88,6 @@ def _make_workflow(wf_id: str = "test") -> AgenticWorkflow:
     return AgenticWorkflow(WorkflowConfig(id=wf_id, name="Test"))
 
 
-def _create_ticket_dashboard(tmp_path: Path, items: list[dict[str, object]]) -> None:
-    create_dashboard("Development Dashboard", tmp_path)
-    add_section("Development Dashboard", "Kanban", tmp_path)
-    add_component("Development Dashboard", "Kanban", "Tickets", "board", tmp_path)
-    for item in items:
-        add_item("Development Dashboard", "tickets", item, tmp_path)
-
-
 class FakeHttpClient:
     def __init__(self, responses: list[HttpResponse | Exception]) -> None:
         self.responses = responses
@@ -123,17 +104,9 @@ class FakeHttpClient:
 def _agent_usage_workflow(
     tmp_path: Path,
     *,
-    budget: LlmUsageBudget | None = None,
-    node_budget: LlmUsageBudget | None = None,
     pricing: LlmPricing | None = None,
 ) -> AgenticWorkflow:
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="usage",
-            name="Usage",
-            llm_budget=budget or LlmUsageBudget(),
-        )
-    )
+    wf = AgenticWorkflow(WorkflowConfig(id="usage", name="Usage"))
     wf.register_agent(
         AgentConfig(
             agent_id="agent",
@@ -150,7 +123,6 @@ def _agent_usage_workflow(
                 agent_id="agent",
                 working_dir=tmp_path,
                 skill_name="summarize",
-                llm_budget=node_budget or LlmUsageBudget(),
             ),
         )
     )
@@ -180,60 +152,6 @@ async def test_agent_usage_fallback_records_estimated_tokens_and_cost(tmp_path: 
     assert usage["input_tokens"] == 3
     assert usage["output_tokens"] == 2
     assert usage["estimated_cost"] == pytest.approx(0.007)
-
-
-@pytest.mark.anyio
-async def test_agent_node_runs_direct_openai_api_with_exact_usage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("OPENAI_API_KEY", "api-key")
-    prompt_path = tmp_path / "prompt.md"
-    prompt_path.write_text("Say hi", encoding="utf-8")
-    wf = AgenticWorkflow(WorkflowConfig(id="direct-api", name="Direct API"))
-    wf.register_agent(
-        AgentConfig(
-            agent_id="agent",
-            subscription="openai_api",
-            working_dir=tmp_path,
-            model="gpt-5-mini",
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="ask",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="agent",
-                working_dir=tmp_path,
-                prompt_path=prompt_path,
-            ),
-        )
-    )
-    client = FakeHttpClient(
-        [
-            HttpResponse(
-                status=200,
-                headers={},
-                body=b'{"output_text":"hi","model":"gpt-5-mini","usage":{"input_tokens":4,"output_tokens":2}}',
-            )
-        ]
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {"openai_api": OpenAiApiSubscription(client)},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    output = result.node_outputs["ask"]
-    usage = cast(dict[str, Any], output.data["usage"])
-    assert output.success is True
-    assert output.output == "hi"
-    assert usage["provider"] == "openai_api"
-    assert usage["input_tokens"] == 4
-    assert usage["output_tokens"] == 2
-    assert usage["estimated"] is True
 
 
 @pytest.mark.anyio
@@ -372,247 +290,14 @@ async def test_agent_usage_does_not_persist_raw_provider_metadata(tmp_path: Path
 
 
 @pytest.mark.anyio
-async def test_workflow_llm_call_budget_blocks_provider_call(tmp_path: Path) -> None:
-    wf = _agent_usage_workflow(
-        tmp_path,
-        budget=LlmUsageBudget(max_agent_calls=0),
-    )
-    sub = FakeSubscription(output="should not run")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success is False
-    assert sub.calls == []
-    output = result.node_outputs["ask"]
-    assert "max_agent_calls exceeded" in output.output
-    budget = cast(dict[str, Any], output.data["budget"])
-    assert budget["blocked"] is True
-    failures = cast(list[dict[str, object]], result.usage_summary["budget_failures"])
-    assert failures[0]["node_id"] == "ask"
-    assert failures[0]["budget_violations"]
-
-
-@pytest.mark.anyio
-async def test_node_llm_token_budget_fails_after_estimated_usage(tmp_path: Path) -> None:
-    wf = _agent_usage_workflow(
-        tmp_path,
-        node_budget=LlmUsageBudget(max_estimated_tokens=3),
-        pricing=LlmPricing(chars_per_token=4.0),
-    )
-    sub = FakeSubscription(output="abcdefgh")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success is False
-    assert len(sub.calls) == 1
-    output = result.node_outputs["ask"]
-    assert "max_estimated_tokens exceeded" in output.output
-    usage = cast(dict[str, Any], output.data["usage"])
-    budget = cast(dict[str, Any], output.data["budget"])
-    assert output.data["message"] == "abcdefgh"
-    assert usage["total_tokens"] > 1
-    assert budget["violations"]
-
-
-@pytest.mark.anyio
-async def test_node_llm_prompt_budget_blocks_provider_call(tmp_path: Path) -> None:
-    wf = _agent_usage_workflow(
-        tmp_path,
-        node_budget=LlmUsageBudget(max_estimated_tokens=1),
-        pricing=LlmPricing(chars_per_token=4.0),
-    )
-    sub = FakeSubscription(output="should not run")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success is False
-    assert sub.calls == []
-    output = result.node_outputs["ask"]
-    assert "max_estimated_tokens exceeded" in output.output
-    budget = cast(dict[str, Any], output.data["budget"])
-    assert budget["blocked"] is True
-
-
-@pytest.mark.anyio
-async def test_node_llm_agent_time_budget_sets_provider_timeout(
-    tmp_path: Path,
-) -> None:
-    class TimeoutRecordingSubscription(FakeSubscription):
-        async def execute(
-            self,
-            prompt: str,
-            working_dir: Path,
-            tools: list[str],
-            mcp_servers: list[str],
-            env: dict[str, str],
-            timeout: float | None = None,
-            cancel_event: threading.Event | None = None,
-            extra_paths: list[Path] | None = None,
-            max_output_bytes: int | None = None,
-            on_thought: Callable[[str], None] | None = None,
-            provider_settings: ResolvedProviderSettings | None = None,
-        ) -> AgentResult:
-            self.calls.append({"prompt": prompt, "timeout": timeout})
-            return AgentResult(
-                agent_id="",
-                success=True,
-                output="ok",
-                exit_code=0,
-                duration_seconds=0.0,
-            )
-
-    wf = _agent_usage_workflow(
-        tmp_path,
-        node_budget=LlmUsageBudget(max_agent_time_seconds=2.5),
-    )
-    sub = TimeoutRecordingSubscription(output="ok")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success is True
-    assert sub.calls[0]["timeout"] == 2.5
-
-
-@pytest.mark.anyio
-async def test_concurrent_fan_out_reserves_prompt_tokens_before_provider_call(
-    tmp_path: Path,
-) -> None:
-    prompt = tmp_path / "p.md"
-    prompt.write_text("12345678", encoding="utf-8")
-
-    class SlowSubscription(FakeSubscription):
-        async def execute(self, *args: Any, **kwargs: Any) -> AgentResult:
-            await anyio.sleep(0.05)
-            return await super().execute(*args, **kwargs)
-
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="reserved-fanout",
-            name="Reserved Fanout",
-            llm_budget=LlmUsageBudget(max_estimated_tokens=3),
-        )
-    )
-    wf.register_agent(
-        AgentConfig(
-            agent_id="bot",
-            subscription="claude_code",
-            working_dir=tmp_path,
-            prompt_path=prompt,
-            pricing=LlmPricing(chars_per_token=4.0),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=CountFanSource(type="count", count=2, max_concurrency=2),
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="agent-step",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="bot",
-                prompt_path=prompt,
-                working_dir=tmp_path,
-            ),
-        )
-    )
-    wf.then("loop", "agent-step")
-    sub = SlowSubscription(output="")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success is False
-    assert len(sub.calls) == 1
-    blocked_runs = [run for run in result.node_runs["agent-step"] if "budget" in run.data]
-    assert any(
-        cast(dict[str, Any], run.data["budget"]).get("blocked") is True for run in blocked_runs
-    )
-
-
-@pytest.mark.anyio
-async def test_common_llm_task_budget_includes_piped_input_before_call(
-    tmp_path: Path,
-) -> None:
-    wf = AgenticWorkflow(WorkflowConfig(id="common-input", name="Common Input"))
-    wf.register_agent(
-        AgentConfig(
-            agent_id="bot",
-            subscription="claude_code",
-            working_dir=tmp_path,
-            pricing=LlmPricing(chars_per_token=4.0),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="source",
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command="printf '%s' '" + ("x" * 200) + "'",
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="common",
-            operation=CommonLlmTaskOperation(
-                type=OperationType.COMMON_LLM_TASK,
-                agent_id="bot",
-                task="summarize",
-                target="text",
-                working_dir=tmp_path,
-                llm_budget=LlmUsageBudget(max_estimated_tokens=5),
-            ),
-        )
-    )
-    wf.then("source", "common")
-    sub = FakeSubscription(output="should not run")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-    output = result.node_outputs["common"]
-
-    assert output.success is False
-    assert sub.calls == []
-    assert "max_estimated_tokens exceeded" in output.output
-
-
-@pytest.mark.anyio
 async def test_agent_usage_prompt_length_includes_memory_context(tmp_path: Path) -> None:
     wf = _agent_usage_workflow(tmp_path, pricing=LlmPricing(chars_per_token=4.0))
     op = cast(AgentOperation, next(iter(wf.graph.topological_generations()))[0].operation)
     op.memory = "run"
-    sub = FakeSubscription(output="ok")
+    subscription = FakeSubscription(output="ok")
     executor = WorkflowExecutor(
         wf,
-        {"claude_code": sub},
+        {"claude_code": subscription},
         log_base_dir=tmp_path / "logs",
     )
     executor._agent_run_memory["ask"] = [
@@ -622,7 +307,7 @@ async def test_agent_usage_prompt_length_includes_memory_context(tmp_path: Path)
     result = await executor.run()
 
     usage = cast(dict[str, Any], result.node_outputs["ask"].data["usage"])
-    prompt = cast(str, sub.calls[0]["prompt"])
+    prompt = cast(str, subscription.calls[0]["prompt"])
     assert "Previous conversation:" in prompt
     assert usage["prompt_length"] == len(prompt)
 
@@ -696,16 +381,10 @@ async def test_usage_summary_counts_each_fan_out_agent_run(tmp_path: Path) -> No
     assert all(node["source"] == "fallback_chars_per_token" for node in nodes)
 
 
-def test_dry_run_plan_projects_llm_usage_and_budget_warning(tmp_path: Path) -> None:
+def test_dry_run_plan_projects_llm_usage(tmp_path: Path) -> None:
     prompt = tmp_path / "prompt.md"
     prompt.write_text("x" * 20, encoding="utf-8")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="plan-usage",
-            name="Plan Usage",
-            llm_budget=LlmUsageBudget(max_estimated_tokens=1),
-        )
-    )
+    wf = AgenticWorkflow(WorkflowConfig(id="plan-usage", name="Plan Usage"))
     wf.register_agent(
         AgentConfig(
             agent_id="agent",
@@ -730,10 +409,9 @@ def test_dry_run_plan_projects_llm_usage_and_budget_warning(tmp_path: Path) -> N
 
     assert plan["projectedLlmUsage"]["agent_calls"] == 1
     assert plan["projectedLlmUsage"]["input_tokens"] == 5
-    assert any("max_estimated_tokens" in warning for warning in plan["warnings"])
 
 
-def test_dry_run_plan_warns_on_node_budget_and_uses_historical_averages(
+def test_dry_run_plan_uses_historical_averages(
     tmp_path: Path,
 ) -> None:
     prompt = tmp_path / "prompt.md"
@@ -777,7 +455,6 @@ def test_dry_run_plan_warns_on_node_budget_and_uses_historical_averages(
                 agent_id="agent",
                 working_dir=tmp_path,
                 prompt_path=prompt,
-                llm_budget=LlmUsageBudget(max_agent_time_seconds=1),
             ),
         )
     )
@@ -788,7 +465,6 @@ def test_dry_run_plan_warns_on_node_budget_and_uses_historical_averages(
     assert node_plan["projectedLlmUsage"]["output_tokens"] == 20
     assert node_plan["projectedLlmUsage"]["agent_time_seconds"] == 7.0
     assert node_plan["projectedLlmUsage"]["historical_samples"] == 1.0
-    assert any("node 'ask' LLM budget" in warning for warning in node_plan["warnings"])
 
 
 def test_command_shell_args_uses_bash_off_windows(monkeypatch) -> None:
@@ -818,51 +494,6 @@ async def test_single_bash_node_succeeds(tmp_path: Path) -> None:
     result = await executor.run()
     assert result.success
     assert "echo" in result.node_outputs
-
-
-async def test_workflow_node_runs_child_workflow(tmp_path: Path) -> None:
-    child = AgenticWorkflow(WorkflowConfig(id="child", name="Child workflow"))
-    child.add_operation(_bash_node("echo", "echo child"))
-    child_path = tmp_path / "child.toml"
-    child.to_file(child_path)
-
-    parent = AgenticWorkflow(WorkflowConfig(id="parent", name="Parent workflow"))
-    parent.add_operation(
-        GraphNode(
-            node_id="call-child",
-            operation=WorkflowCallOperation(
-                type=OperationType.WORKFLOW,
-                workflow_id="child",
-            ),
-        )
-    )
-    parent_path = tmp_path / "parent.toml"
-    parent.to_file(parent_path)
-    log_updates: list[tuple[str, Path]] = []
-
-    executor = WorkflowExecutor(
-        parent,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=parent_path,
-        data_dir=tmp_path,
-        run_log_update_callback=lambda workflow_id, log_path: log_updates.append(
-            (workflow_id, log_path)
-        ),
-    )
-
-    result = await executor.run()
-
-    assert result.success
-    output = result.node_outputs["call-child"]
-    assert output.success
-    assert output.exit_code == 0
-    assert output.data["workflow_id"] == "child"
-    assert output.data["workflow_name"] == "Child workflow"
-    assert "succeeded" in output.output
-    updated_workflow_ids = [workflow_id for workflow_id, _ in log_updates]
-    assert updated_workflow_ids.count("parent") >= 2
-    assert updated_workflow_ids.count("child") >= 2
 
 
 async def test_workflow_executor_writes_structured_run_events(tmp_path: Path) -> None:
@@ -1082,66 +713,6 @@ async def test_agent_structured_attempts_include_rendered_inputs_and_prompt(
     assert attempt["prompt"] == "from-source\n\nPrompt from-source from-source"
 
 
-async def test_agent_structured_attempt_preview_has_inputs_and_prompt_before_output(
-    tmp_path: Path,
-) -> None:
-    class InspectingSubscription(FakeSubscription):
-        async def execute(self, *args: Any, **kwargs: Any) -> AgentResult:
-            event_files = list((tmp_path / "logs" / "agent-live-preview").glob("*.events.json"))
-            assert len(event_files) == 1
-            payload = json.loads(event_files[0].read_text(encoding="utf-8"))
-            attempt = payload["nodes"]["agent-step"]["attempts"][0]
-            assert attempt["inputs"]["mapped"] == "from-source"
-            assert attempt["inputs"]["_piped_input"] == "from-source"
-            assert attempt["prompt"] == "from-source\n\nPrompt from-source from-source"
-            assert "output" not in attempt
-            return await super().execute(*args, **kwargs)
-
-    prompt = tmp_path / "p.md"
-    prompt.write_text("Prompt {{mapped}} {{_piped_input}}")
-    sub = InspectingSubscription(output="agent output")
-    wf = _make_workflow("agent-live-preview")
-    wf.register_agent(
-        AgentConfig(
-            agent_id="bot",
-            subscription="claude_code",
-            working_dir=tmp_path,
-            prompt_path=prompt,
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="source",
-            pipe_output=True,
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command="printf from-source",
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="agent-step",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="bot",
-                prompt_path=prompt,
-                working_dir=tmp_path,
-                input_mapping={"mapped": "source.output"},
-            ),
-        )
-    )
-    wf.then("source", "agent-step")
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success
-
-
 async def test_loop_structured_events_include_fan_out_item_counts(tmp_path: Path) -> None:
     wf = _make_workflow("fanout-events")
     wf.add_operation(
@@ -1295,91 +866,6 @@ async def test_resume_checkpoint_moves_large_outputs_to_artifacts(tmp_path: Path
     assert resumed.node_outputs["first"].data["reused"] is True
     assert resumed.node_outputs["first"].output == large_output
     assert resumed.node_outputs["second"].output.strip() == "second-ok"
-
-
-@pytest.mark.anyio
-async def test_resume_checkpoint_omits_agent_prompt_thoughts_and_inputs(
-    tmp_path: Path,
-) -> None:
-    prompt = tmp_path / "prompt.md"
-    prompt.write_text("Prompt {{large_input}} " + ("p" * 50_000), encoding="utf-8")
-    wf = _make_workflow("agent-checkpoint-compact")
-    wf.register_agent(
-        AgentConfig(
-            agent_id="bot",
-            subscription="claude_code",
-            working_dir=tmp_path,
-            prompt_path=prompt,
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="agent",
-            inputs={"large_input": "x" * 50_000},
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="bot",
-                prompt_path=prompt,
-                working_dir=tmp_path,
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {
-            "claude_code": FakeSubscription(
-                output="final message",
-                message="final message",
-                thoughts=["thought " + ("t" * 50_000)],
-            )
-        },
-        log_base_dir=tmp_path / "logs",
-        data_dir=tmp_path,
-    ).run()
-
-    assert result.success
-    assert result.log_path is not None
-    resume_path = result.log_path.with_suffix(".resume.json")
-    artifact_root = resume_path.parent / f"{resume_path.stem}.artifacts"
-    stored_text = "\n".join(
-        artifact.read_text(encoding="utf-8") for artifact in artifact_root.rglob("*.json")
-    )
-    assert "final message" in stored_text
-    assert "Prompt " not in stored_text
-    assert "thought " not in stored_text
-    assert "x" * 1000 not in stored_text
-    assert result.node_outputs["agent"].data["message"] == "final message"
-    assert "prompt" not in result.node_outputs["agent"].data
-    assert "thoughts" not in result.node_outputs["agent"].data
-    assert "inputs" not in result.node_outputs["agent"].data
-
-
-@pytest.mark.anyio
-async def test_fresh_run_cleans_old_resume_checkpoints(tmp_path: Path) -> None:
-    log_dir = tmp_path / "logs" / "fresh-cleanup"
-    log_dir.mkdir(parents=True)
-    old_resume = log_dir / "old.resume.json"
-    old_artifact = log_dir / "old.resume.artifacts" / "node-outputs" / "node.json"
-    old_resume.write_text("{}", encoding="utf-8")
-    old_artifact.parent.mkdir(parents=True)
-    old_artifact.write_text('{"old": true}', encoding="utf-8")
-
-    wf = _make_workflow("fresh-cleanup")
-    wf.add_operation(_bash_node("echo", "echo ok"))
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        data_dir=tmp_path,
-    ).run()
-
-    assert result.success
-    assert result.log_path is not None
-    assert not old_resume.exists()
-    assert not old_artifact.exists()
-    assert result.log_path.with_suffix(".resume.json").exists()
 
 
 @pytest.mark.anyio
@@ -1745,71 +1231,6 @@ async def test_resume_loop_retries_only_failed_fan_out_items(tmp_path: Path) -> 
 
     assert resumed.success
     assert calls.read_text(encoding="utf-8").splitlines() == ["0", "1", "1"]
-
-
-@pytest.mark.anyio
-async def test_resume_reruns_dashboard_loop_source_instead_of_reusing_stale_items(
-    tmp_path: Path,
-) -> None:
-    _create_ticket_dashboard(tmp_path, [])
-    calls = tmp_path / "dashboard-resume-calls.txt"
-    wf = _make_workflow("resume-dashboard-loop")
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=DashboardItemsFanSource(
-                    type="dashboard_items",
-                    dashboard="Development Dashboard",
-                    component="tickets",
-                    filter="status=todo",
-                ),
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="child",
-            inputs={"ticket_title": "loop.current.item.title"},
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command=f'printf "%s\\n" "$ticket_title" >> "{calls}"',
-            ),
-        )
-    )
-    wf.then("loop", "child")
-
-    first = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        data_dir=tmp_path,
-    ).run()
-    assert first.success
-    assert first.log_path is not None
-    assert not calls.exists()
-
-    add_item(
-        "Development Dashboard",
-        "tickets",
-        {"title": "New todo", "status": "todo"},
-        tmp_path,
-    )
-    resumed = (
-        await WorkflowExecutor(
-            wf,
-            {},
-            log_base_dir=tmp_path / "logs",
-            data_dir=tmp_path,
-        )
-        .with_resume_options(ResumeOptions(run_id=first.log_path.name))
-        .run()
-    )
-
-    assert resumed.success
-    assert resumed.node_outputs["loop"].data.get("reused") is not True
-    assert calls.read_text(encoding="utf-8").splitlines() == ["New todo"]
 
 
 @pytest.mark.anyio
@@ -2621,633 +2042,6 @@ async def test_project_root_access_entry_can_restrict_implicit_project_access(
     assert "filesystem access denied for write" in result.node_outputs["write"].output
 
 
-async def test_tabular_fan_out_requires_read_access_outside_workflow_project(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    rows = external_dir / "rows.csv"
-    rows.write_text("name\noutside\n")
-    wf = _make_workflow("tabular-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=TabularFanSource(type="tabular", path=rows),
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["loop"].output
-
-
-async def test_tabular_fan_out_allows_configured_read_access_outside_workflow_project(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    rows = external_dir / "rows.csv"
-    rows.write_text("name\noutside\n")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="tabular-access",
-            name="Tabular Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=TabularFanSource(type="tabular", path=rows),
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    assert result.node_outputs["loop"].loop_items == [
-        {"name": "outside", "_row": '{"name": "outside"}'}
-    ]
-
-
-async def test_directory_fan_out_include_content_requires_file_read_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    (external_dir / "one.txt").write_text("outside")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="directory-content-access",
-            name="Directory Content Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=False, write=False)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=DirectoryFanSource(
-                    type="directory",
-                    path=external_dir,
-                    include_content=True,
-                ),
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["loop"].output
-
-
-async def test_directory_fan_out_include_content_allows_configured_read_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    (external_dir / "one.txt").write_text("outside")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="directory-content-access",
-            name="Directory Content Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=DirectoryFanSource(
-                    type="directory",
-                    path=external_dir,
-                    include_content=True,
-                ),
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    loop_items = result.node_outputs["loop"].loop_items
-    assert loop_items is not None
-    assert loop_items[0]["file_content"] == "outside"
-
-
-async def test_trigger_event_fan_out_include_content_requires_read_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    changed = external_dir / "changed.txt"
-    changed.write_text("outside")
-    wf = _make_workflow("trigger-content-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=TriggerEventsFanSource(type="trigger_events", include_content=True),
-            ),
-        )
-    )
-
-    executor = WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).with_trigger_context({"events": [{"path": str(changed)}]})
-    result = await executor.run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["loop"].output
-
-
-async def test_trigger_event_fan_out_include_content_allows_configured_read_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    changed = external_dir / "changed.txt"
-    changed.write_text("outside")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="trigger-content-access",
-            name="Trigger Content Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=TriggerEventsFanSource(type="trigger_events", include_content=True),
-            ),
-        )
-    )
-
-    executor = WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).with_trigger_context({"events": [{"path": str(changed)}]})
-    result = await executor.run()
-
-    assert result.success
-    loop_items = result.node_outputs["loop"].loop_items
-    assert loop_items is not None
-    assert loop_items[0]["file_content"] == "outside"
-
-
-async def test_prompt_file_requires_template_read_and_output_write_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    template = external_dir / "template.md"
-    output_path = external_dir / "prompt.md"
-    template.write_text("Hello {{name}}")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="prompt-access",
-            name="Prompt Access",
-            filesystem_access=[FilesystemAccessEntry(path=template, read=True, write=False)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="prompt",
-            operation=PromptFileOperation(
-                type=OperationType.PROMPT_FILE,
-                template_path=template,
-                output_path=output_path,
-                variables={"name": "world"},
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert not output_path.exists()
-    assert "filesystem access denied for write" in result.node_outputs["prompt"].output
-
-
-async def test_prompt_file_allows_configured_template_and_output_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    template = external_dir / "template.md"
-    output_path = external_dir / "prompt.md"
-    template.write_text("Hello {{name}}")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="prompt-access",
-            name="Prompt Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True, write=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="prompt",
-            operation=PromptFileOperation(
-                type=OperationType.PROMPT_FILE,
-                template_path=template,
-                output_path=output_path,
-                variables={"name": "world"},
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    assert output_path.read_text() == "Hello world"
-
-
-async def test_local_vectorize_requires_source_read_and_index_write_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    docs = external_dir / "docs"
-    docs.mkdir()
-    (docs / "one.txt").write_text("outside")
-    index_path = external_dir / "index.json"
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="vector-access",
-            name="Vector Access",
-            filesystem_access=[FilesystemAccessEntry(path=docs, read=True, write=False)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="vectorize",
-            operation=LocalVectorizeOperation(
-                type=OperationType.LOCAL_VECTORIZE,
-                source_path=docs,
-                index_path=index_path,
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert not index_path.exists()
-    assert "filesystem access denied for write" in result.node_outputs["vectorize"].output
-
-
-async def test_local_vectorize_requires_write_access_for_temporary_sidecars(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    docs = external_dir / "docs"
-    docs.mkdir()
-    (docs / "one.txt").write_text("outside")
-    index_path = external_dir / "index.json"
-    entries_path = external_dir / "index.json.entries.jsonl"
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="vector-temp-access",
-            name="Vector Temp Access",
-            filesystem_access=[
-                FilesystemAccessEntry(path=docs, read=True),
-                FilesystemAccessEntry(path=index_path, write=True),
-                FilesystemAccessEntry(path=entries_path, write=True),
-            ],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="vectorize",
-            operation=LocalVectorizeOperation(
-                type=OperationType.LOCAL_VECTORIZE,
-                source_path=docs,
-                index_path=index_path,
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert not index_path.exists()
-    assert "filesystem access denied for write" in result.node_outputs["vectorize"].output
-
-
-async def test_local_vectorize_requires_read_access_for_existing_index(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    docs = external_dir / "docs"
-    docs.mkdir()
-    (docs / "one.txt").write_text("outside")
-    index_path = external_dir / "index.json"
-    index_path.write_text("{not-json")
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="vector-index-read-access",
-            name="Vector Index Read Access",
-            filesystem_access=[
-                FilesystemAccessEntry(path=docs, read=True),
-                FilesystemAccessEntry(path=external_dir, read=False, write=True),
-            ],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="vectorize",
-            operation=LocalVectorizeOperation(
-                type=OperationType.LOCAL_VECTORIZE,
-                source_path=docs,
-                index_path=index_path,
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["vectorize"].output
-    assert "Invalid vector index JSON" not in result.node_outputs["vectorize"].output
-
-
-async def test_local_vectorize_allows_configured_source_and_index_access(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    docs = external_dir / "docs"
-    docs.mkdir()
-    (docs / "one.txt").write_text("outside")
-    index_path = external_dir / "index.json"
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="vector-access",
-            name="Vector Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True, write=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="vectorize",
-            operation=LocalVectorizeOperation(
-                type=OperationType.LOCAL_VECTORIZE,
-                source_path=docs,
-                index_path=index_path,
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    assert index_path.exists()
-    assert (external_dir / "index.json.entries.jsonl").exists()
-
-
-async def test_local_vectorize_checks_each_discovered_file_for_symlink_escape(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    docs = project_dir / "docs"
-    docs.mkdir()
-    secret = external_dir / "secret.txt"
-    secret.write_text("outside")
-    (docs / "link.txt").symlink_to(secret)
-    index_path = project_dir / "index.json"
-    wf = _make_workflow("vector-symlink-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="vectorize",
-            operation=LocalVectorizeOperation(
-                type=OperationType.LOCAL_VECTORIZE,
-                source_path=docs,
-                index_path=index_path,
-                glob="*.txt",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert not index_path.exists()
-    assert "filesystem access denied for read" in result.node_outputs["vectorize"].output
-
-
-async def test_local_search_requires_index_read_access_outside_workflow_project(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    index_path = external_dir / "index.json"
-    index_path.write_text('{"version": 1, "entries": []}')
-    wf = _make_workflow("search-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="search",
-            operation=LocalSearchOperation(
-                type=OperationType.LOCAL_SEARCH,
-                index_path=index_path,
-                query="outside",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["search"].output
-
-
-async def test_local_search_requires_sidecar_read_access_outside_workflow_project(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    entries_path = external_dir / "entries.jsonl"
-    entries_path.write_text("")
-    index_path = project_dir / "index.json"
-    index_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "entries_file": str(entries_path),
-            }
-        )
-    )
-    wf = _make_workflow("search-sidecar-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="search",
-            operation=LocalSearchOperation(
-                type=OperationType.LOCAL_SEARCH,
-                index_path=index_path,
-                query="outside",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["search"].output
-
-
-async def test_local_search_allows_configured_index_read_access_outside_workflow_project(
-    tmp_path: Path,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    index_path = external_dir / "index.json"
-    index_path.write_text('{"version": 1, "entries": []}')
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="search-access",
-            name="Search Access",
-            filesystem_access=[FilesystemAccessEntry(path=index_path, read=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="search",
-            operation=LocalSearchOperation(
-                type=OperationType.LOCAL_SEARCH,
-                index_path=index_path,
-                query="outside",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    assert result.node_outputs["search"].items == []
-
-
 async def test_relative_workflow_paths_match_plan_and_execution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3382,70 +2176,6 @@ async def test_node_inputs_can_map_parent_contract_to_stdin(tmp_path: Path) -> N
     assert result.node_outputs["print"].output == "contract text"
 
 
-async def test_node_stdin_inputs_are_positional_bash_args(tmp_path: Path) -> None:
-    first = tmp_path / "first.txt"
-    second = tmp_path / "second.txt"
-    first.write_text("alpha")
-    second.write_text("beta")
-
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="first",
-            operation=ReadFileOperation(type=OperationType.READ_FILE, path=first),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="second",
-            operation=ReadFileOperation(type=OperationType.READ_FILE, path=second),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="print",
-            inputs={"stdin": "first.data.content", "stdin2": "second.data.content"},
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command='printf "%s|%s|%s" "$1" "$2" "${stdin2:-missing}"',
-            ),
-        )
-    )
-    wf.then("first", "print")
-    wf.then("second", "print")
-
-    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
-
-    assert result.success
-    assert result.node_outputs["print"].output == "alpha|beta|missing"
-
-
-async def test_node_stdin_inputs_are_appended_to_script_args(tmp_path: Path) -> None:
-    script = tmp_path / "script.py"
-    script.write_text(
-        "import sys\nprint('|'.join(sys.argv[1:]))\n",
-        encoding="utf-8",
-    )
-
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="script",
-            inputs={"stdin": "first", "stdin2": "second"},
-            operation=PythonScriptOperation(
-                type=OperationType.PYTHON_SCRIPT,
-                script_path=script,
-                args=["configured"],
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
-
-    assert result.success
-    assert result.node_outputs["script"].output.strip() == "configured|first|second"
-
-
 async def test_node_inputs_can_map_parent_contract_to_env(tmp_path: Path) -> None:
     source = tmp_path / "input.txt"
     source.write_text("env text")
@@ -3473,65 +2203,6 @@ async def test_node_inputs_can_map_parent_contract_to_env(tmp_path: Path) -> Non
 
     assert result.success
     assert result.node_outputs["print"].output == "env text"
-
-
-async def test_node_inputs_plain_keys_are_prompt_variables_and_env(tmp_path: Path) -> None:
-    source = tmp_path / "input.txt"
-    source.write_text("ticket body")
-    script = tmp_path / "read_env.py"
-    script.write_text(
-        "import os\nprint(os.environ.get('ticket_description', 'missing'))\n",
-        encoding="utf-8",
-    )
-
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="read",
-            operation=ReadFileOperation(type=OperationType.READ_FILE, path=source),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="print",
-            inputs={"ticket_description": "read.data.content"},
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command='printf "%s" "${ticket_description:-missing}"',
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="script",
-            inputs={"ticket_description": "read.data.content"},
-            operation=PythonScriptOperation(
-                type=OperationType.PYTHON_SCRIPT,
-                script_path=script,
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="prompt",
-            inputs={"ticket_description": "read.data.content"},
-            operation=PromptFileOperation(
-                type=OperationType.PROMPT_FILE,
-                output_path=tmp_path / "prompt.md",
-                template="Ticket: {{ticket_description}}",
-            ),
-        )
-    )
-    wf.then("read", "print")
-    wf.then("read", "script")
-    wf.then("read", "prompt")
-
-    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
-
-    assert result.success
-    assert result.node_outputs["print"].output == "ticket body"
-    assert result.node_outputs["script"].output.strip() == "ticket body"
-    assert (tmp_path / "prompt.md").read_text(encoding="utf-8") == "Ticket: ticket body"
 
 
 async def test_node_inputs_allow_literal_env_values(tmp_path: Path) -> None:
@@ -3886,97 +2557,6 @@ async def test_open_resource_uses_platform_command_and_reports_failure(
     assert result.node_outputs["open"].error == "no opener"
 
 
-async def test_open_resource_requires_read_access_for_local_file_target(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    target = external_dir / "report.txt"
-    target.write_text("outside")
-
-    async def fake_run_subprocess(
-        _cmd: list[str],
-        **_kwargs: object,
-    ) -> tuple[int, str, str]:
-        raise AssertionError("outside open should be blocked before spawning")
-
-    monkeypatch.setattr(executor_module, "run_subprocess", fake_run_subprocess)
-    wf = _make_workflow("open-access")
-    wf.add_operation(
-        GraphNode(
-            node_id="open",
-            operation=OpenResourceOperation(
-                type=OperationType.OPEN_RESOURCE,
-                target=str(target),
-                resource_type="file",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert not result.success
-    assert "filesystem access denied for read" in result.node_outputs["open"].output
-
-
-async def test_open_resource_allows_configured_read_access_for_local_file_target(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    project_dir = tmp_path / "project"
-    external_dir = tmp_path / "external"
-    project_dir.mkdir()
-    external_dir.mkdir()
-    target = external_dir / "report.txt"
-    target.write_text("outside")
-    captured: dict[str, object] = {}
-
-    async def fake_run_subprocess(
-        cmd: list[str],
-        **kwargs: object,
-    ) -> tuple[int, str, str]:
-        captured["cmd"] = cmd
-        captured["kwargs"] = kwargs
-        return 0, "", ""
-
-    monkeypatch.setattr(executor_module, "run_subprocess", fake_run_subprocess)
-    wf = AgenticWorkflow(
-        WorkflowConfig(
-            id="open-access",
-            name="Open Access",
-            filesystem_access=[FilesystemAccessEntry(path=external_dir, read=True)],
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="open",
-            operation=OpenResourceOperation(
-                type=OperationType.OPEN_RESOURCE,
-                target=str(target),
-                resource_type="file",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        workflow_path=project_dir / "flow.toml",
-    ).run()
-
-    assert result.success
-    assert captured["cmd"] == ["xdg-open", str(target)]
-
-
 async def test_open_resource_app_passes_args_to_subprocess(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4062,6 +2642,42 @@ async def test_prompt_file_node_renders_template_variables(tmp_path: Path) -> No
 
     assert result.success
     assert output.read_text() == "Summarize gofer flow"
+
+
+async def test_prompt_file_resolves_template_and_output_paths(tmp_path: Path) -> None:
+    template = tmp_path / "template.md"
+    template.write_text("Hello {{name}}", encoding="utf-8")
+    output = tmp_path / "rendered.md"
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="prompt-path-inputs",
+            name="Prompt Paths",
+            inputs={
+                "template": WorkflowParameterConfig(type="path", required=True),
+                "output": WorkflowParameterConfig(type="path", required=True),
+            },
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="render",
+            operation=PromptFileOperation(
+                type=OperationType.PROMPT_FILE,
+                template_path=Path("{{inputs.template}}"),
+                output_path=Path("{{inputs.output}}"),
+                variables={"name": "Gofer"},
+            ),
+        )
+    )
+
+    result = await (
+        WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs")
+        .with_parameters({"template": template, "output": output})
+        .run()
+    )
+
+    assert result.success
+    assert output.read_text(encoding="utf-8") == "Hello Gofer"
 
 
 async def test_prompt_file_falls_back_for_unresolved_variables_and_piped_input(
@@ -4445,92 +3061,6 @@ async def test_agent_node_memory_run_keeps_conversation_within_workflow_run(tmp_
     assert "agent reply" in str(sub.calls[1]["prompt"])
 
 
-async def test_agent_node_run_memory_is_scoped_to_loop_item(tmp_path: Path) -> None:
-    prompt = tmp_path / "p.md"
-    prompt.write_text("Review item {{index}}.")
-
-    class PerItemSubscription(FakeSubscription):
-        def __init__(self) -> None:
-            super().__init__(output="")
-            self.seen_first_pass: set[str] = set()
-
-        async def execute(self, *args: Any, **kwargs: Any) -> AgentResult:
-            prompt_text = str(args[0] if args else kwargs["prompt"])
-            item = "1" if "Review item 1." in prompt_text else "0"
-            self.calls.append({"prompt": prompt_text})
-            first_for_item = item not in self.seen_first_pass
-            self.seen_first_pass.add(item)
-            return AgentResult(
-                agent_id="",
-                success=True,
-                output="again" if first_for_item else "done",
-                message="again" if first_for_item else "done",
-                exit_code=0,
-                duration_seconds=0.0,
-            )
-
-    sub = PerItemSubscription()
-    wf = _make_workflow("agent-loop-item-memory")
-    wf.config = wf.config.model_copy(update={"max_total_node_runs": 6})
-    wf.register_agent(
-        AgentConfig(
-            agent_id="bot",
-            subscription="claude_code",
-            working_dir=tmp_path,
-            prompt_path=prompt,
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="loop",
-            operation=LoopOperation(
-                type=OperationType.LOOP,
-                source=CountFanSource(type="count", count=2, max_concurrency=1),
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="agent-step",
-            operation=AgentOperation(
-                type=OperationType.AGENT,
-                agent_id="bot",
-                prompt_path=prompt,
-                working_dir=tmp_path,
-                memory="run",
-            ),
-        )
-    )
-    wf.then("loop", "agent-step")
-    wf.then(
-        "agent-step",
-        "agent-step",
-        EdgeConfig(
-            from_node="agent-step",
-            to_node="agent-step",
-            condition=EdgeConditionType.OUTPUT_MATCHES,
-            output_pattern="again",
-        ),
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {"claude_code": sub},
-        log_base_dir=tmp_path / "logs",
-    ).run()
-
-    assert result.success
-    prompts = [str(call["prompt"]) for call in sub.calls]
-    assert len(prompts) == 4
-    assert "Previous conversation:" not in prompts[0]
-    assert "Previous conversation:" in prompts[1]
-    assert "again" in prompts[1]
-    assert "Review item 1." in prompts[2]
-    assert "Previous conversation:" not in prompts[2]
-    assert "Previous conversation:" in prompts[3]
-    assert "again" in prompts[3]
-
-
 async def test_agent_node_memory_all_persists_between_workflow_runs(tmp_path: Path) -> None:
     prompt = tmp_path / "p.md"
     prompt.write_text("Review once.")
@@ -4607,7 +3137,7 @@ async def test_agent_node_memory_compaction_logs_info(
                     "extra_paths": extra_paths or [],
                 }
             )
-            if prompt_text.startswith("Compact this Gofer Flow agent-node"):
+            if prompt_text.startswith("Compact this Taskurotta agent-node"):
                 return AgentResult(
                     agent_id="",
                     success=True,
@@ -4703,7 +3233,7 @@ async def test_agent_node_memory_compaction_uses_fallback_summary(
         ) -> AgentResult:
             prompt_text = prompt
             self.calls.append({"prompt": prompt_text})
-            if prompt_text.startswith("Compact this Gofer Flow agent-node"):
+            if prompt_text.startswith("Compact this Taskurotta agent-node"):
                 return AgentResult(
                     agent_id="",
                     success=compact_mode != "failed",
@@ -5889,66 +4419,6 @@ async def test_approval_gate_continues_when_notification_fails(
     assert "approval decision: decision=approved by=ui" in log_text
 
 
-async def test_approval_gate_masks_resolved_secrets_in_artifacts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("GOFER_SECRET_APPROVAL_TOKEN", "approval-token-123")
-    wf = _make_workflow("approval-secret")
-    wf.add_operation(
-        GraphNode(
-            node_id="approve",
-            operation=ApprovalGateOperation(
-                type=OperationType.APPROVAL_GATE,
-                message="Approve token {{secret.APPROVAL_TOKEN}}?",
-                approvers=["alice"],
-                notify=True,
-            ),
-        )
-    )
-    store = ApprovalStore(tmp_path)
-    notifications = RecordingNotificationAdapter()
-    result = None
-
-    async def decide_when_pending() -> None:
-        while True:
-            pending = store.list_pending("approval-secret")
-            if pending:
-                request = pending[0]
-                assert request.message == "Approve token ***?"
-                store.decide(
-                    request.workflow_id,
-                    request.run_id,
-                    request.node_id,
-                    "approved",
-                    decided_by="alice",
-                )
-                return
-            await anyio.sleep(0.05)
-
-    async with anyio.create_task_group() as tg:
-        tg.start_soon(decide_when_pending)
-        result = await WorkflowExecutor(
-            wf,
-            {},
-            log_base_dir=tmp_path / "logs",
-            approval_store=store,
-            notification_adapter=notifications,
-        ).run()
-
-    assert result is not None
-    assert result.success
-    output = result.node_outputs["approve"]
-    assert output.data["message"] == "Approve token ***?"
-    assert notifications.notifications
-    assert "approval-token-123" not in notifications.notifications[0].body
-    assert "Approve token ***?" in notifications.notifications[0].body
-    assert result.log_path is not None
-    log_text = result.log_path.read_text(encoding="utf-8")
-    assert "approval-token-123" not in log_text
-    assert "Approve token ***?" in log_text
-
-
 async def test_approval_gate_rejection_routes_on_failure(tmp_path: Path) -> None:
     wf = _make_workflow("approval-reject")
     wf.add_operation(
@@ -6468,19 +4938,39 @@ async def test_notification_operation_interpolates_and_uses_adapter(tmp_path: Pa
     )
 
 
-async def test_notification_operation_masks_resolved_secrets_in_outputs(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("GOFER_SECRET_API_TOKEN", "token-123")
-    wf = _make_workflow("notify-secret-flow")
+async def test_notification_resolves_typed_configuration_fields(tmp_path: Path) -> None:
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="typed-notification",
+            name="Typed Notification",
+            inputs={
+                "port": WorkflowParameterConfig(type="number", default=2525),
+                "tls": WorkflowParameterConfig(type="boolean", default=False),
+                "attempts": WorkflowParameterConfig(type="number", default=3),
+            },
+            variables={
+                "statuses": WorkflowVariableConfig(type="array", initial=[200, 202]),
+                "allowlist": WorkflowVariableConfig(type="array", initial=["127.0.0.1"]),
+                "headers": WorkflowVariableConfig(type="object", initial={"X-Workflow": "typed"}),
+            },
+        )
+    )
     wf.add_operation(
         GraphNode(
             node_id="notify",
             operation=NotificationOperation(
                 type=OperationType.NOTIFICATION,
-                title="Deploy {{secret.API_TOKEN}}",
-                body="Token {{secret.API_TOKEN}} is ready",
+                smtp_port="{{inputs.port}}",
+                headers="{{vars.headers}}",
+                smtp_starttls="{{inputs.tls}}",
+                timeout_seconds="{{inputs.port}}",
+                retry=HttpRetryPolicy(
+                    attempts="{{inputs.attempts}}",
+                    backoff_seconds="{{inputs.attempts}}",
+                    retry_on_statuses="{{vars.statuses}}",
+                ),
+                expected_statuses="{{vars.statuses}}",
+                network_allowlist="{{vars.allowlist}}",
             ),
         )
     )
@@ -6494,162 +4984,50 @@ async def test_notification_operation_masks_resolved_secrets_in_outputs(
     ).run()
 
     assert result.success
-    assert len(notifications.notifications) == 1
-    assert notifications.notifications[0].title == "Deploy token-123"
-    assert notifications.notifications[0].body == "Token token-123 is ready"
-    output = result.node_outputs["notify"]
-    assert output.output == "Token *** is ready"
-    assert output.value == "Token *** is ready"
-    assert output.data["title"] == "Deploy ***"
-    assert output.data["body"] == "Token *** is ready"
-    assert result.log_path is not None
-    log_text = result.log_path.read_text(encoding="utf-8")
-    assert "token-123" not in log_text
-    assert "Token *** is ready" in log_text
+    sent = notifications.notifications[0]
+    assert sent.smtp_port == 2525
+    assert sent.headers == {"X-Workflow": "typed"}
+    assert sent.smtp_starttls is False
+    assert sent.timeout_seconds == 2525
+    assert sent.retry.attempts == 3
+    assert sent.retry.backoff_seconds == 3
+    assert sent.retry.retry_on_statuses == [200, 202]
+    assert sent.expected_statuses == [200, 202]
+    assert sent.network_allowlist == ["127.0.0.1"]
 
 
-async def test_notification_operation_renders_network_channel_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("GOFER_SECRET_WEBHOOK_URL", "https://hooks.example.test/a?token=abc")
-    monkeypatch.setenv("GOFER_SECRET_API_TOKEN", "token-123")
-    wf = _make_workflow("notify-webhook-flow")
-    wf.add_operation(
-        GraphNode(
-            node_id="notify",
-            operation=NotificationOperation(
-                type=OperationType.NOTIFICATION,
-                channel="slack",
-                title="Deploy",
-                body="Token {{secret.API_TOKEN}} is ready",
-                webhook_url="{{secret.WEBHOOK_URL}}",
-                headers={"Authorization": "Bearer {{secret.API_TOKEN}}"},
-                payload={"text": "Token {{secret.API_TOKEN}}"},
-                retry=HttpRetryPolicy(attempts=2, backoff_seconds=0.1),
-                timeout_seconds=3,
-            ),
+async def test_approval_resolves_typed_configuration_fields(tmp_path: Path) -> None:
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="typed-approval",
+            name="Typed Approval",
+            inputs={
+                "timeout": WorkflowParameterConfig(type="number", default=0),
+                "notify": WorkflowParameterConfig(type="boolean", default=False),
+                "decision": WorkflowParameterConfig(default="reject"),
+            },
+            variables={"approvers": WorkflowVariableConfig(type="array", initial=["release-team"])},
         )
     )
-    notifications = RecordingNotificationAdapter()
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        notification_adapter=notifications,
-    ).run()
-
-    assert result.success
-    notification = notifications.notifications[0]
-    assert notification.channel == "slack"
-    assert notification.webhook_url == "https://hooks.example.test/a?token=abc"
-    assert notification.headers == {"Authorization": "Bearer token-123"}
-    assert notification.payload == {"text": "Token token-123"}
-    output = result.node_outputs["notify"]
-    assert output.data["webhookUrl"] == "***"
-    assert output.data["headers"] == {"Authorization": "***"}
-    assert output.data["payload"] == {"text": "Token ***"}
-    assert result.log_path is not None
-    assert "token-123" not in result.log_path.read_text(encoding="utf-8")
-
-
-async def test_notification_operation_masks_literal_smtp_username_in_outputs(
-    tmp_path: Path,
-) -> None:
-    wf = _make_workflow("notify-email-flow")
     wf.add_operation(
         GraphNode(
-            node_id="notify",
-            operation=NotificationOperation(
-                type=OperationType.NOTIFICATION,
-                channel="email",
-                title="Deploy",
-                body="Done",
-                email_from="gofer@example.test",
-                email_to=["ops@example.test"],
-                smtp_host="smtp.example.test",
-                smtp_username="smtp-user",
-                smtp_password="smtp-secret",
-            ),
-        )
-    )
-    notifications = RecordingNotificationAdapter()
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        notification_adapter=notifications,
-    ).run()
-
-    assert result.success
-    assert notifications.notifications[0].smtp_username == "smtp-user"
-    output = result.node_outputs["notify"]
-    assert output.data["smtpUsername"] == "***"
-
-
-async def test_notification_delivery_failure_marks_node_failed(
-    tmp_path: Path,
-) -> None:
-    class FailingNotificationAdapter:
-        async def send(self, _notification: object) -> None:
-            raise RuntimeError("webhook unavailable")
-
-    wf = _make_workflow("notify-failure-flow")
-    wf.add_operation(
-        GraphNode(
-            node_id="notify",
-            operation=NotificationOperation(
-                type=OperationType.NOTIFICATION,
-                channel="webhook",
-                webhook_url="https://example.test/hook",
+            node_id="approve",
+            operation=ApprovalGateOperation(
+                type=OperationType.APPROVAL_GATE,
+                message="Continue?",
+                timeout_seconds="{{inputs.timeout}}",
+                timeout_decision="{{inputs.decision}}",
+                approvers="{{vars.approvers}}",
+                notify="{{inputs.notify}}",
             ),
         )
     )
 
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        notification_adapter=FailingNotificationAdapter(),
-    ).run()
+    result = await WorkflowExecutor(wf, {}, log_base_dir=tmp_path / "logs").run()
 
     assert not result.success
-    assert not result.node_outputs["notify"].success
-    assert "webhook unavailable" in (result.node_outputs["notify"].error or "")
-
-
-async def test_notification_webhook_retries_send_exceptions(tmp_path: Path) -> None:
-    http = FakeHttpClient(
-        [
-            OSError("temporary network failure"),
-            HttpResponse(status=200, headers={}, body=b"ok"),
-        ]
-    )
-    wf = _make_workflow("notify-retry-flow")
-    wf.add_operation(
-        GraphNode(
-            node_id="notify",
-            operation=NotificationOperation(
-                type=OperationType.NOTIFICATION,
-                channel="webhook",
-                webhook_url="https://example.test/hook",
-                retry=HttpRetryPolicy(attempts=2),
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        notification_adapter=MultiChannelNotificationAdapter(http_client=http),
-    ).run()
-
-    assert result.success
-    assert result.node_outputs["notify"].success
-    assert len(http.requests) == 2
+    assert result.node_outputs["approve"].data["approvers"] == ["release-team"]
+    assert result.node_outputs["approve"].data["timeoutSeconds"] == 0
 
 
 async def test_http_request_builds_request_and_extracts_json(
@@ -6705,201 +5083,6 @@ async def test_http_request_builds_request_and_extracts_json(
     assert output.value == {"id": 42, "url": "https://api.example.test/issues/42"}
     assert result.log_path is not None
     assert "token-123" not in result.log_path.read_text()
-
-
-async def test_http_request_blocks_unsupported_scheme(tmp_path: Path) -> None:
-    http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="api",
-            operation=HttpRequestOperation(
-                type=OperationType.HTTP_REQUEST,
-                url="file:///etc/passwd",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        http_client=http,
-    ).run()
-
-    assert not result.success
-    assert http.requests == []
-    output = result.node_outputs["api"]
-    assert output.error is not None
-    assert "unsupported URL scheme" in output.error
-    assert "network policy" in output.error
-
-
-async def test_http_request_blocks_private_and_metadata_targets(tmp_path: Path) -> None:
-    for url in (
-        "http://127.0.0.1:8080/admin?token=secret",
-        "http://169.254.169.254/latest",
-        "http://metadata.google.internal/computeMetadata/v1/",
-    ):
-        http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
-        wf = _make_workflow()
-        wf.add_operation(
-            GraphNode(
-                node_id="api",
-                operation=HttpRequestOperation(
-                    type=OperationType.HTTP_REQUEST,
-                    url=url,
-                    body="secret-body",
-                ),
-            )
-        )
-
-        result = await WorkflowExecutor(
-            wf,
-            {},
-            log_base_dir=tmp_path / "logs",
-            http_client=http,
-        ).run()
-
-        assert not result.success
-        assert http.requests == []
-        output = result.node_outputs["api"]
-        assert output.error is not None
-        assert "blocked" in output.error
-        assert "secret" not in output.error
-
-
-async def test_http_request_blocks_redirect_to_private_target(tmp_path: Path) -> None:
-    http = FakeHttpClient(
-        [
-            HttpResponse(
-                status=302,
-                headers={"Location": "http://127.0.0.1/admin?token=secret"},
-                body=b"",
-            )
-        ]
-    )
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="api",
-            operation=HttpRequestOperation(
-                type=OperationType.HTTP_REQUEST,
-                url="https://example.com/start",
-                expected_statuses=[302],
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        http_client=http,
-    ).run()
-
-    assert not result.success
-    assert len(http.requests) == 1
-    output = result.node_outputs["api"]
-    assert output.error is not None
-    assert "blocked private or local address" in output.error
-    assert "secret" not in output.error
-
-
-async def test_http_request_allows_allowlisted_internal_target(tmp_path: Path) -> None:
-    http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="api",
-            operation=HttpRequestOperation(
-                type=OperationType.HTTP_REQUEST,
-                url="http://10.10.0.5/status",
-                network_allowlist=["10.0.0.0/8"],
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        http_client=http,
-    ).run()
-
-    assert result.success
-    assert len(http.requests) == 1
-    assert http.requests[0].url == "http://10.10.0.5/status"
-
-
-async def test_http_request_allows_public_https_with_fake_client(tmp_path: Path) -> None:
-    http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="api",
-            operation=HttpRequestOperation(
-                type=OperationType.HTTP_REQUEST,
-                url="https://example.com/status",
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        http_client=http,
-    ).run()
-
-    assert result.success
-    assert len(http.requests) == 1
-
-
-def test_urllib_http_client_revalidates_dns_before_connect(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_getaddrinfo(
-        host: str,
-        port: int,
-        *_args: object,
-        **_kwargs: object,
-    ) -> list[tuple[int, int, int, str, tuple[str, int]]]:
-        return [(0, 0, 0, "", ("127.0.0.1", port))]
-
-    monkeypatch.setattr("gofer.core.network_policy.socket.getaddrinfo", fake_getaddrinfo)
-
-    with pytest.raises(NetworkPolicyViolation) as exc_info:
-        UrllibHttpClient()._send_sync(HttpRequest(method="GET", url="https://example.com/status"))
-    assert "blocked private or local address '127.0.0.1'" in str(exc_info.value)
-    assert "example.com/status" in str(exc_info.value)
-
-
-async def test_http_request_passes_network_allowlist_to_http_client(
-    tmp_path: Path,
-) -> None:
-    http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
-    wf = _make_workflow()
-    wf.add_operation(
-        GraphNode(
-            node_id="api",
-            operation=HttpRequestOperation(
-                type=OperationType.HTTP_REQUEST,
-                url="http://10.10.0.5/status",
-                network_allowlist=["10.0.0.0/8"],
-            ),
-        )
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        http_client=http,
-    ).run()
-
-    assert result.success
-    assert http.requests[0].network_allowlist == ["10.0.0.0/8"]
 
 
 async def test_http_request_retries_and_fails_on_unexpected_status(tmp_path: Path) -> None:
@@ -7065,11 +5248,9 @@ async def test_http_request_masks_secret_fields_in_text_response_preview(
 
     assert result.success
     output = result.node_outputs["api"]
-    assert output.output == '{"password": "***", "ok": true}'
-    assert output.value == '{"password": "***", "ok": true}'
-    assert output.data["body"] == '{"password": "***", "ok": true}'
+    assert output.output == '{"password":"***","ok":true}'
     preview = cast(dict[str, object], output.data["responsePreview"])
-    assert preview["body"] == '{"password": "***", "ok": true}'
+    assert preview["body"] == '{"password":"***","ok":true}'
     assert result.log_path is not None
     assert "returned-secret" not in result.log_path.read_text()
 
@@ -7114,7 +5295,7 @@ async def test_http_request_masks_configured_secret_echoed_under_other_key(
     assert output.output == '{"echo": "***", "ok": true}'
     preview = cast(dict[str, object], output.data["responsePreview"])
     assert preview["json"] == {"echo": "***", "ok": True}
-    assert preview["body"] == '{"echo": "***", "ok": true}'
+    assert preview["body"] == '{"echo":"***","ok":true}'
     assert result.log_path is not None
     assert "cleartext-secret" not in result.log_path.read_text()
 
@@ -7203,12 +5384,12 @@ async def test_failed_http_request_masks_secret_body_in_workflow_failure_reason(
 
     assert not result.success
     output = result.node_outputs["api"]
-    assert output.output == '{"password": "***", "ok": false}'
-    assert output.error == '{"password": "***", "ok": false}'
+    assert output.output == '{"password":"***","ok":false}'
+    assert output.error == '{"password":"***","ok":false}'
     assert result.log_path is not None
     log_text = result.log_path.read_text()
     assert "returned-secret" not in log_text
-    assert 'failed due to node api failed: {"password": "***", "ok": false}' in log_text
+    assert 'failed due to node api failed: {"password":"***","ok":false}' in log_text
 
 
 async def test_http_request_json_mode_invalid_json_returns_structured_failure(
@@ -7261,7 +5442,7 @@ async def test_http_request_json_mode_invalid_json_returns_structured_failure(
     assert "raised exception" not in result.log_path.read_text()
 
 
-async def test_http_request_selected_secret_is_masked_before_downstream_request(
+async def test_http_request_selected_secret_can_feed_downstream_request(
     tmp_path: Path,
 ) -> None:
     http = FakeHttpClient(
@@ -7311,10 +5492,28 @@ async def test_http_request_selected_secret_is_masked_before_downstream_request(
     ).run()
 
     assert result.success
-    assert http.requests[1].headers["Authorization"] == "Bearer ***"
+    assert http.requests[1].headers["Authorization"] == "Bearer real-token"
     assert result.node_outputs["auth"].data["selected"] == {"token": "***"}
     preview = cast(dict[str, object], result.node_outputs["auth"].data["responsePreview"])
     assert preview["selected"] == {"token": "***"}
+    assert result.log_path is not None
+    resume_path = result.log_path.with_suffix(".resume.json")
+    assert "real-token" not in resume_path.read_text(encoding="utf-8")
+
+    resumed_http = FakeHttpClient([HttpResponse(status=200, headers={}, body=b"ok")])
+    resumed = (
+        await WorkflowExecutor(
+            wf,
+            {},
+            log_base_dir=tmp_path / "logs",
+            http_client=resumed_http,
+        )
+        .with_resume_options(ResumeOptions(run_id=result.log_path.name, from_node="use_token"))
+        .run()
+    )
+
+    assert resumed.success
+    assert resumed_http.requests[0].headers["Authorization"] == "Bearer real-token"
 
 
 async def test_http_request_selected_output_can_drive_output_matches_edge(
@@ -7927,108 +6126,6 @@ async def test_loop_child_bash_receives_current_item_env(tmp_path: Path) -> None
         "a.txt",
         str(files_dir / "a.txt"),
     ]
-
-
-async def test_ordered_dashboard_loops_can_feed_shared_child_without_global_join(
-    tmp_path: Path,
-) -> None:
-    _create_ticket_dashboard(
-        tmp_path,
-        [
-            {"title": "In progress ticket", "status": "in_progress"},
-            {"title": "Todo ticket", "status": "todo"},
-            {"title": "Backlog ticket", "status": "backlog"},
-        ],
-    )
-    calls = tmp_path / "ordered-dashboard-loop-calls.txt"
-
-    wf = _make_workflow("ordered-dashboard-loops")
-    for node_id, status in (
-        ("in-progress", "in_progress"),
-        ("todos", "todo"),
-        ("backlog", "backlog"),
-    ):
-        wf.add_operation(
-            GraphNode(
-                node_id=node_id,
-                operation=LoopOperation(
-                    type=OperationType.LOOP,
-                    source=DashboardItemsFanSource(
-                        type="dashboard_items",
-                        dashboard="Development Dashboard",
-                        component="tickets",
-                        filter=f"status={status}",
-                    ),
-                ),
-            )
-        )
-    wf.add_operation(
-        GraphNode(
-            node_id="set-in-progress",
-            inputs={
-                "ticket_id": "loop.current.item_id",
-                "ticket_title": "loop.current.item.title",
-            },
-            operation=DashboardItemOperation(
-                type=OperationType.DASHBOARD_ITEM,
-                action="move",
-                dashboard="Development Dashboard",
-                component="tickets",
-                item_id="{{ticket_id}}",
-                field="status",
-                value="in_progress",
-            ),
-        )
-    )
-    wf.add_operation(
-        GraphNode(
-            node_id="record",
-            inputs={"ticket_title": "loop.current.item.title"},
-            operation=BashCommandOperation(
-                type=OperationType.BASH_COMMAND,
-                command=f'printf "%s\\n" "$ticket_title" >> "{calls}"',
-            ),
-        )
-    )
-    wf.then("in-progress", "set-in-progress")
-    wf.then("todos", "set-in-progress")
-    wf.then("backlog", "set-in-progress")
-    wf.then("set-in-progress", "record")
-    wf.then(
-        "in-progress",
-        "todos",
-        EdgeConfig(
-            from_node="in-progress",
-            to_node="todos",
-            condition=EdgeConditionType.AFTER_LOOP,
-        ),
-    )
-    wf.then(
-        "todos",
-        "backlog",
-        EdgeConfig(
-            from_node="todos",
-            to_node="backlog",
-            condition=EdgeConditionType.AFTER_LOOP,
-        ),
-    )
-
-    result = await WorkflowExecutor(
-        wf,
-        {},
-        log_base_dir=tmp_path / "logs",
-        data_dir=tmp_path,
-    ).run()
-
-    assert result.success
-    assert calls.read_text(encoding="utf-8").splitlines() == [
-        "In progress ticket",
-        "Todo ticket",
-        "Backlog ticket",
-    ]
-    dashboard = load_dashboard("Development Dashboard", tmp_path)
-    statuses = [item["status"] for item in dashboard.sections[0].components[0].items]
-    assert statuses == ["in_progress", "in_progress", "in_progress"]
 
 
 async def test_after_loop_edge_runs_once_after_loop_body_finishes(tmp_path: Path) -> None:

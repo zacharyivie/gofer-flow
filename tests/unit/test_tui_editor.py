@@ -55,7 +55,6 @@ from gofer.core.operations import (
     StartOperation,
     WriteFileOperation,
 )
-from gofer.core.usage import LlmUsageBudget
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WatchConfig, WorkflowConfig
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -253,9 +252,7 @@ def test_workflow_to_sections_id_readonly() -> None:
 def test_workflow_to_sections_schedule_optional() -> None:
     wf = _bash_workflow()
     sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
+    cron_fd = next(fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression")
     assert cron_fd.optional is True
     assert cron_fd.value is None
 
@@ -269,9 +266,7 @@ def test_workflow_to_sections_with_schedule() -> None:
         )
     )
     sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
+    cron_fd = next(fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression")
     assert cron_fd.value == "0 9 * * *"
 
 
@@ -311,9 +306,7 @@ def test_sections_to_workflow_name_change() -> None:
 def test_sections_to_workflow_adds_schedule() -> None:
     wf = _bash_workflow()
     sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
+    cron_fd = next(fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression")
     cron_fd.value = "0 8 * * 1"
     sections_to_workflow(sections, wf)
     assert wf.config.schedule is not None
@@ -335,9 +328,7 @@ def test_sections_to_workflow_clears_schedule() -> None:
         )
     )
     sections = workflow_to_sections(wf)
-    cron_fd = next(
-        fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression"
-    )
+    cron_fd = next(fd for fd in sections[0].fields if fd.key == "config.schedule.cron_expression")
     cron_fd.value = None
     sections_to_workflow(sections, wf)
     assert wf.config.schedule is None
@@ -639,7 +630,7 @@ def test_sections_to_workflow_updates_open_resource_and_agent_branches() -> None
     assert agent_op.agent_id == "new-agent"
     assert agent_op.prompt_path == Path("/new/prompt.md")
     assert agent_op.working_dir == Path("/new/work")
-    assert agent_op.dynamic_count == "{{fanout.count}}"
+    assert str(agent_op.dynamic_count) == "{{fanout.count}}"
     assert agent_op.memory == "run"
     assert agent_op.input_mapping == {"source": "read.output"}
     assert agent_node.timeout_seconds == 45.0
@@ -879,7 +870,6 @@ def test_sections_to_workflow_updates_llm_approval_and_notification_branches() -
                 agent_id="old-agent",
                 target="old target",
                 working_dir=Path("/old/work"),
-                llm_budget=LlmUsageBudget(max_agent_calls=1),
             ),
         )
     )
@@ -914,10 +904,6 @@ def test_sections_to_workflow_updates_llm_approval_and_notification_branches() -
     _set_field(sections, "nodes.common.timeout", 12.5)
     _set_field(sections, "nodes.common.memory", "run")
     _set_field(sections, "nodes.common.input_mapping", {"diff": "build.output"})
-    _set_field(sections, "nodes.common.llm_budget.max_agent_calls", 3)
-    _set_field(sections, "nodes.common.llm_budget.max_estimated_tokens", 1000)
-    _set_field(sections, "nodes.common.llm_budget.max_estimated_cost", 0.25)
-    _set_field(sections, "nodes.common.llm_budget.max_agent_time_seconds", 60.0)
     _set_field(sections, "nodes.approval.message", "new approval")
     _set_field(sections, "nodes.approval.approval_timeout_seconds", 30.0)
     _set_field(sections, "nodes.approval.timeout_decision", "reject")
@@ -944,10 +930,6 @@ def test_sections_to_workflow_updates_llm_approval_and_notification_branches() -
     assert common_op.timeout == 12.5
     assert common_op.memory == "run"
     assert common_op.input_mapping == {"diff": "build.output"}
-    assert common_op.llm_budget.max_agent_calls == 3
-    assert common_op.llm_budget.max_estimated_tokens == 1000
-    assert common_op.llm_budget.max_estimated_cost == 0.25
-    assert common_op.llm_budget.max_agent_time_seconds == 60.0
     assert isinstance(approval_op, ApprovalGateOperation)
     assert approval_op.message == "new approval"
     assert approval_op.timeout_seconds == 30.0
@@ -1086,13 +1068,19 @@ def test_sections_to_agent_updates_tools() -> None:
 
 def test_field_editor_flat_count() -> None:
     sections = [
-        Section("A", [
-            FieldDescriptor("a.x", "X", FieldKind.STRING, "foo"),
-            FieldDescriptor("a.y", "Y", FieldKind.INT, 1),
-        ]),
-        Section("B", [
-            FieldDescriptor("b.z", "Z", FieldKind.BOOL, True),
-        ]),
+        Section(
+            "A",
+            [
+                FieldDescriptor("a.x", "X", FieldKind.STRING, "foo"),
+                FieldDescriptor("a.y", "Y", FieldKind.INT, 1),
+            ],
+        ),
+        Section(
+            "B",
+            [
+                FieldDescriptor("b.z", "Z", FieldKind.BOOL, True),
+            ],
+        ),
     ]
     app = FieldEditorApp(sections, title="Test")
     assert len(app._flat) == 3
@@ -1152,11 +1140,7 @@ def test_field_editor_run_edit_loop_saves_without_real_tty(
             key = next(keys)
             event_app = _EventApp()
             event = SimpleNamespace(app=event_app)
-            binding = next(
-                binding
-                for binding in self.key_bindings.bindings
-                if key in binding.keys
-            )
+            binding = next(binding for binding in self.key_bindings.bindings if key in binding.keys)
             binding.handler(event)
 
     monkeypatch.setattr("gofer.cli.tui_editor.Application", FakeApplication)
@@ -1244,8 +1228,7 @@ def test_field_editor_rendering_scrolls_cursor_into_view(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     fields = [
-        FieldDescriptor(f"field{i}", f"Field {i}", FieldKind.STRING, str(i))
-        for i in range(20)
+        FieldDescriptor(f"field{i}", f"Field {i}", FieldKind.STRING, str(i)) for i in range(20)
     ]
     app = FieldEditorApp([Section("Many", fields)], title="Scroll")
     app._cursor = 19

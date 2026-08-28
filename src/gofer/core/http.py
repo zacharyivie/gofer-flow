@@ -118,6 +118,4 @@ def append_query_params(url: str, params: dict[str, str]) -> str:
     parsed = urllib.parse.urlsplit(url)
     query_pairs = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
     query_pairs.extend((key, value) for key, value in params.items())
-    return urllib.parse.urlunsplit(
-        parsed._replace(query=urllib.parse.urlencode(query_pairs))
-    )
+    return urllib.parse.urlunsplit(parsed._replace(query=urllib.parse.urlencode(query_pairs)))

@@ -123,11 +123,7 @@ async def test_stream_subprocess_cancel_event_terminates_process() -> None:
                     sys.executable,
                     "-u",
                     "-c",
-                    (
-                        "import time\n"
-                        "print('ready', flush=True)\n"
-                        "time.sleep(5)\n"
-                    ),
+                    ("import time\nprint('ready', flush=True)\ntime.sleep(5)\n"),
                 ],
                 cancel_event=cancel_event,
             )
@@ -147,9 +143,7 @@ async def test_stream_subprocess_cancel_event_terminates_process_group(
     marker = tmp_path / "child-survived.txt"
     cancel_event = threading.Event()
     child_code = (
-        "import pathlib, time\n"
-        "time.sleep(1)\n"
-        f"pathlib.Path({str(marker)!r}).write_text('alive')\n"
+        f"import pathlib, time\ntime.sleep(1)\npathlib.Path({str(marker)!r}).write_text('alive')\n"
     )
     parent_code = (
         "import subprocess, sys, time\n"
@@ -201,9 +195,7 @@ async def test_run_subprocess_returns_timeout_stderr() -> None:
 async def test_run_subprocess_timeout_terminates_process_group(tmp_path) -> None:
     marker = tmp_path / "timeout-child-survived.txt"
     child_code = (
-        "import pathlib, time\n"
-        "time.sleep(1)\n"
-        f"pathlib.Path({str(marker)!r}).write_text('alive')\n"
+        f"import pathlib, time\ntime.sleep(1)\npathlib.Path({str(marker)!r}).write_text('alive')\n"
     )
     parent_code = (
         "import subprocess, sys, time\n"
@@ -280,11 +272,7 @@ async def test_run_subprocess_cancel_event_returns_stopped_status() -> None:
                 sys.executable,
                 "-u",
                 "-c",
-                (
-                    "import time\n"
-                    "print('ready', flush=True)\n"
-                    "time.sleep(5)\n"
-                ),
+                ("import time\nprint('ready', flush=True)\ntime.sleep(5)\n"),
             ],
             cancel_event=cancel_event,
         )
@@ -314,11 +302,7 @@ async def test_run_subprocess_bounds_many_small_chunks() -> None:
             sys.executable,
             "-u",
             "-c",
-            (
-                "import sys\n"
-                "for _ in range(100):\n"
-                " sys.stdout.write('x'); sys.stdout.flush()"
-            ),
+            ("import sys\nfor _ in range(100):\n sys.stdout.write('x'); sys.stdout.flush()"),
         ],
         max_output_bytes=80,
     )

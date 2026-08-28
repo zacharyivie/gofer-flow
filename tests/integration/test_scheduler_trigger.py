@@ -10,11 +10,13 @@ def test_add_list_remove_lifecycle(tmp_path: Path) -> None:
     db = tmp_path / "sched.db"
     scheduler = WorkflowScheduler(db_path=db)
 
-    wf = AgenticWorkflow(WorkflowConfig(
-        id="lifecycle",
-        name="Lifecycle Test",
-        schedule=ScheduleConfig(cron_expression="*/5 * * * *"),
-    ))
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="lifecycle",
+            name="Lifecycle Test",
+            schedule=ScheduleConfig(cron_expression="*/5 * * * *"),
+        )
+    )
     wf_path = tmp_path / "lifecycle.toml"
     wf_path.write_text("")
 

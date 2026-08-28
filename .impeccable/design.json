@@ -1,0 +1,49 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-20T00:00:00Z",
+  "title": "Design System: Gofer Flow Studio",
+  "extensions": {
+    "colorMeta": {
+      "primary": { "role": "primary", "displayName": "Studio Indigo", "canonical": "#4f46e5" },
+      "canvas": { "role": "neutral", "displayName": "Canvas Zinc", "canonical": "#fafafa" },
+      "ink": { "role": "neutral", "displayName": "Graphite Ink", "canonical": "#1c1c1f" }
+    },
+    "shadows": [
+      { "name": "popover", "value": "0 16px 40px rgba(24,24,27,0.16), 0 4px 10px rgba(24,24,27,0.06)", "purpose": "Menus, map, model picker, and floating inspectors." }
+    ],
+    "motion": [
+      { "name": "state", "value": "120ms ease", "purpose": "Hover, selection, and compact control transitions." }
+    ],
+    "breakpoints": [
+      { "name": "desktop-min", "value": "1180px" }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary workflow actions.",
+      "html": "<button class=\"ds-primary\">Create workflow</button>",
+      "css": ".ds-primary{height:34px;padding:0 12px;border:0;border-radius:6px;background:#4f46e5;color:#fff;font:600 13px system-ui;transition:background .12s ease}.ds-primary:hover{background:#4338ca}.ds-primary:focus-visible{outline:2px solid #4f46e5;outline-offset:2px}"
+    },
+    {
+      "name": "Model Trigger",
+      "kind": "custom",
+      "description": "Combined provider, model, and effort picker.",
+      "html": "<button class=\"ds-model\"><span class=\"ds-mark\">✦</span>Codex · GPT-5.6<span class=\"ds-effort\">High</span></button>",
+      "css": ".ds-model{display:flex;align-items:center;gap:8px;height:36px;padding:0 10px;border:1px solid #e4e4e7;border-radius:999px;background:#f4f4f5;color:#1c1c1f;font:600 12px system-ui}.ds-model:hover{border-color:#d4d4d8;background:#fff}.ds-model:focus-visible{outline:2px solid #4f46e5;outline-offset:2px}.ds-mark{display:grid;place-items:center;width:16px;height:16px;border-radius:5px;background:#10a37f;color:#fff}.ds-effort{padding:2px 7px;border-radius:999px;background:#eef2ff;color:#4338ca;font-size:10px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Local Workflow Cockpit",
+    "overview": "The graph is the workspace. Compact navigation and assistance frame it with predictable tools, while indigo marks selection, focus, and primary action.",
+    "keyCharacteristics": ["Dominant center canvas", "Contextual floating tools", "One accent plus semantic state colors", "Matched light and dark hierarchy"],
+    "rules": [
+      { "name": "The One Accent Rule", "body": "Use indigo for selection, focus, and primary actions.", "section": "colors" },
+      { "name": "The Flat Frame Rule", "body": "Fixed navigation and headers use tonal separation or a border.", "section": "elevation" }
+    ],
+    "dos": ["Do keep the graph readable before adding secondary controls.", "Do keep the assistant composer available even when no thread is open."],
+    "donts": ["Don't stack multiple permanent panels over the canvas.", "Don't add explanatory wireframe notes to the product UI."]
+  }
+}

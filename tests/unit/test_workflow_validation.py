@@ -104,7 +104,69 @@ script_path = "missing.py"
     assert any(item.code == "workflow.prompt_path_missing" for item in report.errors)
     assert any(item.code == "workflow.script_path_missing" for item in report.errors)
     assert any(fix.action == "create_agent" for item in report.errors for fix in item.fixes)
-    assert any(fix.action == "create_prompt_file" for item in report.errors for fix in item.fixes)
+    assert not any(
+        fix.action == "create_prompt_file" for item in report.errors for fix in item.fixes
+    )
+
+
+def test_validation_reports_prompt_path_directory_as_not_file(tmp_path: Path) -> None:
+    (tmp_path / "prompts").mkdir()
+    workflow = _write_workflow(
+        tmp_path,
+        """
+[workflow]
+id = "prompt-directory"
+name = "Prompt Directory"
+
+[[nodes]]
+id = "agent"
+type = "agent"
+agent_id = "writer"
+working_dir = "."
+prompt_path = "prompts"
+
+[agents.writer]
+subscription = "codex"
+working_dir = "."
+""",
+    )
+
+    report = validate_workflow_file(workflow, data_dir=tmp_path)
+
+    assert report.ok is False
+    assert any(item.code == "workflow.prompt_path_not_file" for item in report.errors)
+    assert not any(item.code == "workflow.prompt_path_missing" for item in report.errors)
+
+
+def test_validation_ignores_stale_agent_prompt_when_node_overrides_it(tmp_path: Path) -> None:
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (tmp_path / "node-prompt.md").write_text("Use this prompt.", encoding="utf-8")
+    workflow = _write_workflow(
+        tmp_path,
+        """
+[workflow]
+id = "node-prompt-override"
+name = "Node Prompt Override"
+
+[agents.writer]
+subscription = "codex"
+working_dir = "."
+prompt_path = "prompts"
+
+[[nodes]]
+id = "agent"
+type = "agent"
+agent_id = "writer"
+working_dir = "."
+prompt_path = "node-prompt.md"
+""",
+    )
+
+    report = validate_workflow_file(workflow, data_dir=tmp_path)
+
+    assert report.ok is True
+    assert not any(item.code == "workflow.prompt_path_not_file" for item in report.errors)
 
 
 def test_validation_reports_invalid_workflow_call_targets(tmp_path: Path) -> None:

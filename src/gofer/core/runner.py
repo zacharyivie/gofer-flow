@@ -541,7 +541,12 @@ async def execute_queued_run(
             stop_file=workflow_run_stop_path(workflow.config.id, queued_run.id, base),
         ).with_trigger_context(dict(queued_run.parameters.get("triggerContext") or {}))
         executor = executor.with_parameters(
-            dict(queued_run.parameters.get("workflowParams") or {})
+            dict(
+                queued_run.parameters.get(
+                    "workflowInputs", queued_run.parameters.get("workflowParams")
+                )
+                or {}
+            )
         )
         result = await executor.run()
         return store.finish_run(

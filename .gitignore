@@ -22,11 +22,20 @@ env/
 # Hatch
 .hatch/
 
+# impeccable critique
+.impeccable/critique*
+
+# local dev reporting
+reports*
+
 # Testing
 .pytest_cache/
 .coverage
 htmlcov/
 .tox/
+
+# Wireframes for demo
+wireframes/
 
 # Type checking
 .mypy_cache/

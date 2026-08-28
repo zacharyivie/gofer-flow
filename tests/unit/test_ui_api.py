@@ -13,6 +13,7 @@ from gofer.core.executor import NodeOutput
 from gofer.core.operations import OperationType
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits, byte_len
 from gofer.core.runner import RunnerQueueStore
+from gofer.radish.editor import RadishRevisionConflict
 from gofer.ui import api as api_module
 from gofer.ui.api import (
     WorkflowAlreadyExistsError,
@@ -20,7 +21,10 @@ from gofer.ui.api import (
     WorkflowLogError,
     WorkflowRunError,
     WorkflowUpdateError,
+    analyze_radish_document_payload,
+    apply_workflow_validation_fix_payload,
     cancel_queued_run_payload,
+    create_registered_workflow_payload,
     create_workflow_payload,
     decide_workflow_approval_payload,
     delete_workflow_chat_payload,
@@ -31,6 +35,8 @@ from gofer.ui.api import (
     list_workflow_approvals_payload,
     list_workflow_payloads,
     list_workflow_run_logs_payload,
+    mutate_radish_document_payload,
+    open_radish_document_payload,
     prune_workflow_run_logs_payload,
     queue_workflow_run_payload,
     rename_workflow_payload,
@@ -38,6 +44,8 @@ from gofer.ui.api import (
     retention_settings_payload,
     run_workflow_payload,
     runner_queue_payload,
+    save_radish_document_payload,
+    save_radish_metadata_payload,
     stop_workflow_run_payload,
     update_retention_settings_payload,
     update_workflow_payload,
@@ -98,6 +106,326 @@ condition = "on_success"
             "outputPattern": None,
         }
     ]
+
+
+def test_ui_creation_registers_radish_workflow_under_selected_project(tmp_path: Path) -> None:
+    app_data = tmp_path / "app-data"
+    project = tmp_path / "project"
+    project.mkdir()
+
+    created = create_registered_workflow_payload(
+        "Review PR",
+        project,
+        registry_dir=app_data,
+    )
+    listed = list_workflow_payloads(app_data)
+
+    assert created["id"] == "review-pr"
+    assert created["projectRoot"] == str(project)
+    assert created["sourcePath"] == str(project / ".taskurotta" / "review-pr" / "workflow.rad")
+    assert created["sourceFormat"] == "radish"
+    assert [workflow["id"] for workflow in listed["workflows"]] == ["review-pr"]
+
+
+def test_radish_document_api_analyzes_and_saves_with_revisions(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    create_registered_workflow_payload("Editor API", project, registry_dir=tmp_path)
+    opened = open_radish_document_payload("editor-api", tmp_path)
+    source = (
+        opened["source"]
+        + """Node prepare:
+  type: bash-command
+  command: echo ready
+"""
+    )
+
+    analyzed = analyze_radish_document_payload("editor-api", source, tmp_path)
+    saved = save_radish_document_payload(
+        "editor-api",
+        source,
+        opened["sourceRevision"],
+        tmp_path,
+    )
+
+    assert analyzed["dirty"] is True
+    assert analyzed["graph"]["nodes"][0]["id"] == "prepare"
+    assert saved["dirty"] is False
+    with pytest.raises(RadishRevisionConflict):
+        save_radish_document_payload(
+            "editor-api",
+            source,
+            opened["sourceRevision"],
+            tmp_path,
+        )
+
+    metadata = saved["metadata"]
+    metadata["canvas"]["nodes"]["prepare"] = {"x": 12, "y": 24}
+    metadata_saved = save_radish_metadata_payload(
+        "editor-api",
+        metadata,
+        saved["metadataRevision"],
+        tmp_path,
+    )
+    assert metadata_saved["metadata"]["canvas"]["nodes"]["prepare"] == {
+        "x": 12,
+        "y": 24,
+    }
+
+
+def test_radish_document_mutations_preserve_unrelated_source_and_update_references(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = create_registered_workflow_payload("Mutation API", project, registry_dir=tmp_path)
+    source_path = Path(registered["sourcePath"])
+    source_path.write_text(
+        """Radish: 1
+
+# Keep this workflow comment.
+Workflow:
+  name: Mutation API
+
+Node prepare:
+  type: bash-command
+  command: echo ready # keep this comment
+  to: review
+
+Node review:
+  type: agent
+  provider: codex
+  prompt: node.prepare.output.stdout
+  needs: prepare
+""",
+        encoding="utf-8",
+    )
+    opened = open_radish_document_payload("mutation-api", tmp_path)
+    mutated = mutate_radish_document_payload(
+        "mutation-api",
+        [
+            {
+                "kind": "set_field",
+                "target": {"node": "prepare"},
+                "field": "command",
+                "value": "echo changed",
+            },
+            {"kind": "rename_node", "node": "prepare", "name": "build"},
+            {"kind": "set_needs", "node": "review", "nodes": ["build"]},
+        ],
+        opened["sourceRevision"],
+        tmp_path,
+    )
+
+    assert "# Keep this workflow comment." in mutated["source"]
+    assert 'command: "echo changed" # keep this comment' in mutated["source"]
+    assert "Node build:" in mutated["source"]
+    assert "to: review" in mutated["source"]
+    assert "needs: build" in mutated["source"]
+    assert "node.build.output.stdout" in mutated["source"]
+    assert mutated["dirty"] is False
+    assert mutated["sourceEdits"]
+
+
+def test_radish_document_mutations_add_delete_and_rewrite_routes(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    create_registered_workflow_payload("Graph API", project, registry_dir=tmp_path)
+    opened = open_radish_document_payload("graph-api", tmp_path)
+    added = mutate_radish_document_payload(
+        "graph-api",
+        [
+            {"kind": "add_node", "node": "first", "node_type": "bash-command"},
+            {"kind": "add_node", "node": "second", "node_type": "bash-command"},
+            {"kind": "set_routes", "node": "first", "routes": ["second"]},
+            {"kind": "set_needs", "node": "second", "nodes": ["first"]},
+        ],
+        opened["sourceRevision"],
+        tmp_path,
+    )
+    deleted = mutate_radish_document_payload(
+        "graph-api",
+        [{"kind": "delete_node", "node": "first"}],
+        added["sourceRevision"],
+        tmp_path,
+    )
+
+    assert "Node first:" not in deleted["source"]
+    assert "needs:" not in deleted["source"]
+    assert [node["id"] for node in deleted["graph"]["nodes"]] == ["second"]
+
+
+def test_radish_change_node_type_removes_only_previous_contract_fields(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = create_registered_workflow_payload(
+        "Type Change",
+        project,
+        registry_dir=tmp_path,
+    )
+    source_path = Path(registered["sourcePath"])
+    source_path.write_text(
+        """Radish: 1
+
+Workflow:
+  name: Something proper
+
+Node asdf:
+  type: agent
+  provider: codex
+  model: gpt-5.6-sol
+  prompt: |
+    Do some stuff and say the word cat!
+  to:
+    - things
+
+Node things:
+  type: agent
+  provider: codex
+  model: gpt-5.6-sol
+  prompt: |
+    Do some stuff and say the word cat!
+  needs:
+    - asdf
+""",
+        encoding="utf-8",
+    )
+    opened = open_radish_document_payload("type-change", tmp_path)
+
+    mutated = mutate_radish_document_payload(
+        "type-change",
+        [{"kind": "change_node_type", "node": "asdf", "node_type": "approval-gate"}],
+        opened["sourceRevision"],
+        tmp_path,
+    )
+
+    assert """Node asdf:
+  type: approval-gate
+  to:
+    - things
+
+Node things:
+  type: agent
+  provider: codex
+  model: gpt-5.6-sol
+  prompt: |
+    Do some stuff and say the word cat!
+  needs:
+    - asdf
+""" in mutated["source"]
+    assert [node["id"] for node in mutated["graph"]["nodes"]] == ["asdf", "things"]
+    assert mutated["graph"]["nodes"][0]["type"] == "approval-gate"
+    assert mutated["graph"]["edges"][0]["from"] == "asdf"
+    assert mutated["graph"]["edges"][0]["to"] == "things"
+
+
+def test_workflow_payload_includes_valid_node_binding_explanations(tmp_path: Path) -> None:
+    (tmp_path / "bindings.toml").write_text(
+        """
+[workflow]
+id = "bindings"
+name = "Bindings"
+
+[[nodes]]
+id = "command"
+type = "bash_command"
+command = "echo {{trigger.name}}"
+""".strip()
+    )
+
+    payload = list_workflow_payloads(tmp_path)
+    workflow = payload["workflows"][0]
+
+    assert workflow["validationBindings"][0]["destinationNode"] == "command"
+    assert workflow["validationBindings"][0]["status"] == "optional"
+    assert workflow["validationBindings"][0]["resolutionPhase"] == "run-start"
+
+
+def test_workflow_payload_treats_agent_run_memory_as_a_literal(tmp_path: Path) -> None:
+    (tmp_path / "memory.toml").write_text(
+        """
+[workflow]
+id = "memory"
+name = "Memory"
+
+[agents.reviewer]
+subscription = "codex"
+working_dir = "."
+
+[[nodes]]
+id = "agent"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+memory = "run"
+
+[[nodes]]
+id = "common-task"
+type = "common_llm_task"
+agent_id = "reviewer"
+working_dir = "."
+memory = "run"
+""".strip()
+    )
+
+    workflow = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert workflow["validationBindings"] == []
+    assert all(
+        diagnostic.get("field") != "operation.memory"
+        for diagnostic in workflow["validationDiagnostics"]
+    )
+
+
+def test_workflow_payload_rebuilds_cached_memory_literal_diagnostics(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "memory.toml").write_text(
+        """
+[workflow]
+id = "memory"
+name = "Memory"
+
+[agents.reviewer]
+subscription = "codex"
+working_dir = "."
+
+[[nodes]]
+id = "agent"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+memory = "run"
+""".strip()
+    )
+    list_workflow_payloads(tmp_path)
+    index_path = tmp_path / "indexes" / "workflows.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    entry = index["workflows"]["memory.toml"]
+    stale_diagnostic = {
+        "code": "workflow.binding_invalid",
+        "severity": "error",
+        "targetType": "node",
+        "targetId": "agent",
+        "field": "operation.memory",
+        "message": ("Invalid binding at operation.memory: Unknown run field '<missing>'."),
+    }
+    entry["payloadVersion"] = 3
+    entry["payload"]["validationDiagnostics"] = [stale_diagnostic]
+    entry["payload"]["validationErrors"] = [stale_diagnostic]
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    workflow = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert workflow["validationDiagnostics"] == []
+    assert workflow["validationErrors"] == []
+    rebuilt_index = json.loads(index_path.read_text(encoding="utf-8"))
+    assert (
+        rebuilt_index["workflows"]["memory.toml"]["payloadVersion"]
+        == api_module.WORKFLOW_INDEX_PAYLOAD_VERSION
+    )
 
 
 def test_runner_queue_payload_round_trip(tmp_path: Path) -> None:
@@ -274,6 +602,153 @@ smtp_password = "smtp-secret"
     assert "smtp-secret" in stored
 
 
+def test_workflow_payload_masks_secret_declarations_and_preserves_autosave(
+    tmp_path: Path,
+) -> None:
+    workflow_path = tmp_path / "secret-scope-ui.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "secret-scope-ui"
+name = "Secret Scope UI"
+
+[workflow.inputs.token]
+type = "secret"
+default = "input-secret-314"
+
+[workflow.inputs.label]
+type = "string"
+default = "visible-label"
+
+[workflow.parameters.legacy_token]
+type = "secret"
+default = "legacy-secret-653"
+
+[workflow.variables.copy]
+type = "string"
+initial = "variable-secret-271"
+secret = true
+
+[workflow.schedule]
+cron_expression = "0 9 * * *"
+inputs = { token = "schedule-secret-111", label = "scheduled-label" }
+
+[workflow.watch]
+path = "."
+inputs = { token = "watch-secret-222", label = "watched-label" }
+
+[workflow.webhooks.default]
+input_bindings = { token = "webhook-secret-333", label = "webhook-label" }
+
+[component]
+id = "secret-component"
+
+[component.inputs.component_token]
+type = "secret"
+default = "component-secret-159"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    listed = list_workflow_payloads(tmp_path)["workflows"][0]
+    serialized = json.dumps(listed)
+    assert "input-secret-314" not in serialized
+    assert "variable-secret-271" not in serialized
+    assert "component-secret-159" not in serialized
+    assert "legacy-secret-653" not in serialized
+    assert "schedule-secret-111" not in serialized
+    assert "watch-secret-222" not in serialized
+    assert "webhook-secret-333" not in serialized
+    assert listed["inputs"]["token"]["default"] == "***"
+    assert listed["parameters"]["legacy_token"]["default"] == "***"
+    assert listed["inputs"]["legacy_token"]["default"] == "***"
+    assert listed["variables"]["copy"]["initial"] == "***"
+    assert listed["component"]["inputs"]["component_token"]["default"] == "***"
+    assert listed["schedule"]["inputs"] == {
+        "token": "***",
+        "label": "scheduled-label",
+    }
+    assert listed["watch"]["inputs"] == {
+        "token": "***",
+        "label": "watched-label",
+    }
+    assert listed["webhooks"]["default"]["input_bindings"] == {
+        "token": "***",
+        "label": "webhook-label",
+    }
+
+    index_path = tmp_path / "indexes" / "workflows.json"
+    index = json.loads(index_path.read_text(encoding="utf-8"))
+    serialized_index = json.dumps(index)
+    assert "input-secret-314" not in serialized_index
+    assert "variable-secret-271" not in serialized_index
+    assert "component-secret-159" not in serialized_index
+    assert "schedule-secret-111" not in serialized_index
+    assert "watch-secret-222" not in serialized_index
+    assert "webhook-secret-333" not in serialized_index
+    indexed_entry = index["workflows"]["secret-scope-ui.toml"]
+    indexed_entry["payloadVersion"] = 2
+    indexed_entry["payload"]["inputs"]["token"]["default"] = "input-secret-314"
+    indexed_entry["payload"]["variables"]["copy"]["initial"] = "variable-secret-271"
+    indexed_entry["payload"]["schedule"]["inputs"]["token"] = "schedule-secret-111"
+    indexed_entry["payload"]["watch"]["inputs"]["token"] = "watch-secret-222"
+    indexed_entry["payload"]["webhooks"]["default"]["input_bindings"]["token"] = (
+        "webhook-secret-333"
+    )
+    index_path.write_text(json.dumps(index), encoding="utf-8")
+
+    rebuilt = list_workflow_payloads(tmp_path)["workflows"][0]
+    assert "input-secret-314" not in json.dumps(rebuilt)
+    assert "variable-secret-271" not in json.dumps(rebuilt)
+    assert "schedule-secret-111" not in json.dumps(rebuilt)
+    assert "watch-secret-222" not in json.dumps(rebuilt)
+    assert "webhook-secret-333" not in json.dumps(rebuilt)
+
+    saved = update_workflow_payload("secret-scope-ui", rebuilt, tmp_path)
+    stored = workflow_path.read_text(encoding="utf-8")
+    assert "input-secret-314" in stored
+    assert "variable-secret-271" in stored
+    assert "component-secret-159" in stored
+    assert "legacy-secret-653" in stored
+    assert "schedule-secret-111" in stored
+    assert "watch-secret-222" in stored
+    assert "webhook-secret-333" in stored
+    assert saved["inputs"]["token"]["default"] == "***"
+    assert saved["variables"]["copy"]["initial"] == "***"
+    assert saved["schedule"]["inputs"]["token"] == "***"
+    assert saved["watch"]["inputs"]["token"] == "***"
+    assert saved["webhooks"]["default"]["input_bindings"]["token"] == "***"
+
+    rebuilt["inputs"]["token"]["default"] = "replacement-input-secret"
+    rebuilt["variables"]["copy"]["initial"] = "replacement-variable-secret"
+    rebuilt["schedule"]["inputs"]["token"] = "replacement-schedule-secret"
+    rebuilt["watch"]["inputs"]["token"] = "replacement-watch-secret"
+    rebuilt["webhooks"]["default"]["input_bindings"]["token"] = "replacement-webhook-secret"
+    replaced = update_workflow_payload("secret-scope-ui", rebuilt, tmp_path)
+    replaced_stored = workflow_path.read_text(encoding="utf-8")
+    assert "replacement-input-secret" in replaced_stored
+    assert "replacement-variable-secret" in replaced_stored
+    assert "replacement-schedule-secret" in replaced_stored
+    assert "replacement-watch-secret" in replaced_stored
+    assert "replacement-webhook-secret" in replaced_stored
+    assert replaced["inputs"]["token"]["default"] == "***"
+    assert replaced["variables"]["copy"]["initial"] == "***"
+    assert replaced["schedule"]["inputs"]["token"] == "***"
+    assert replaced["watch"]["inputs"]["token"] == "***"
+    assert replaced["webhooks"]["default"]["input_bindings"]["token"] == "***"
+
+    replaced["inputs"]["token"]["type"] = "string"
+    declassified = update_workflow_payload("secret-scope-ui", replaced, tmp_path)
+    declassified_stored = workflow_path.read_text(encoding="utf-8")
+    assert "replacement-schedule-secret" not in declassified_stored
+    assert "replacement-watch-secret" not in declassified_stored
+    assert "replacement-webhook-secret" not in declassified_stored
+    assert declassified["schedule"]["inputs"]["token"] == "***"
+    assert declassified["watch"]["inputs"]["token"] == "***"
+    assert declassified["webhooks"]["default"]["input_bindings"]["token"] == "***"
+
+
 def test_http_workflow_payload_preserves_masked_url_query_secrets_on_save(
     tmp_path: Path,
 ) -> None:
@@ -309,6 +784,40 @@ secret_fields = ["token"]
         'url = "https://api.example.test/issues?token=real-token&project=demo"'
         in workflow_path.read_text()
     )
+
+
+def test_workflow_payload_round_trips_runtime_fanout_fields(
+    tmp_path: Path,
+) -> None:
+    workflow = create_workflow_payload("Runtime Settings", tmp_path)
+    workflow["inputs"] = {
+        "workers": {"type": "number", "required": True},
+        "stop_early": {"type": "boolean", "required": True},
+        "project_dir": {"type": "path", "required": True},
+    }
+    workflow["variables"] = {
+        "items": {"type": "array", "initial": ["a", "b"]},
+    }
+    workflow["nodes"] = [
+        {
+            "id": "visit",
+            "type": "pass",
+            "operation": {"type": "pass", "message": "{{loop.value}}"},
+            "settings": {
+                "forEach": "{{vars.items}}",
+                "maxConcurrency": "{{inputs.workers}}",
+                "failFast": "{{inputs.stop_early}}",
+            },
+        },
+    ]
+
+    saved = update_workflow_payload("runtime-settings", workflow, tmp_path)
+
+    assert saved["nodes"][0]["settings"]["maxConcurrency"] == "{{inputs.workers}}"
+    assert saved["nodes"][0]["settings"]["failFast"] == "{{inputs.stop_early}}"
+    stored = (tmp_path / "runtime-settings.toml").read_text(encoding="utf-8")
+    assert 'max_concurrency = "{{inputs.workers}}"' in stored
+    assert 'fail_fast = "{{inputs.stop_early}}"' in stored
 
 
 def test_list_workflow_payloads_reports_invalid_workflows(tmp_path: Path) -> None:
@@ -806,6 +1315,39 @@ def test_update_workflow_payload_persists_nodes_edges_and_agents(tmp_path: Path)
     assert 'summary = "collect.text"' in text
 
 
+def test_update_workflow_payload_edits_nested_source_path(tmp_path: Path) -> None:
+    components_dir = tmp_path / "components"
+    components_dir.mkdir()
+    (components_dir / "review.toml").write_text(
+        """
+[workflow]
+id = "review-workflow"
+name = "Review Workflow"
+
+[[nodes]]
+id = "summarize"
+type = "bash_command"
+command = "echo summarize"
+""".strip(),
+        encoding="utf-8",
+    )
+    workflow = list_workflow_payloads(tmp_path)["workflows"][0]
+    assert workflow["sourcePath"] == "components/review.toml"
+
+    workflow["name"] = "Edited Review Workflow"
+    workflow["nodes"][0]["label"] = "Summarize Changes"
+    saved = update_workflow_payload("review-workflow", workflow, tmp_path)
+
+    assert saved["sourcePath"] == "components/review.toml"
+    assert not (tmp_path / "review-workflow.toml").exists()
+    text = (components_dir / "review.toml").read_text(encoding="utf-8")
+    assert 'name = "Edited Review Workflow"' in text
+    assert 'label = "Summarize Changes"' in text
+    index = json.loads((tmp_path / "indexes" / "workflows.json").read_text(encoding="utf-8"))
+    assert "components/review.toml" in index["workflows"]
+    assert "review.toml" not in index["workflows"]
+
+
 def test_update_workflow_payload_records_chat_patch_revision_metadata(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Chat Patch", tmp_path)
     workflow["nodes"] = [
@@ -1027,6 +1569,22 @@ def test_update_workflow_payload_allows_empty_agent_prompt_path(tmp_path: Path) 
     assert reloaded["nodes"][0]["operation"].get("prompt_path") is None
 
 
+def test_apply_workflow_validation_fix_creates_prompt_file(tmp_path: Path) -> None:
+    create_workflow_payload("Prompt Fix", tmp_path)
+
+    result = apply_workflow_validation_fix_payload(
+        "prompt-fix",
+        {
+            "action": "create_prompt_file",
+            "payload": {"path": "prompts/reviewer.md"},
+        },
+        tmp_path,
+    )
+
+    assert result == {"applied": True, "path": "prompts/reviewer.md"}
+    assert (tmp_path / "prompts" / "reviewer.md").read_text(encoding="utf-8") == ""
+
+
 def test_update_workflow_payload_persists_file_watcher(tmp_path: Path) -> None:
     workflow = create_workflow_payload("Watched", tmp_path)
     workflow["watch"] = {
@@ -1086,6 +1644,60 @@ def test_update_workflow_payload_persists_run_continuously(tmp_path: Path) -> No
     assert saved["runContinuously"] is True
     assert reloaded["runContinuously"] is True
     assert "run_continuously = true" in text
+
+
+@pytest.mark.parametrize(
+    ("read", "write", "execute"),
+    [
+        (False, False, False),
+        (False, False, True),
+        (False, True, False),
+        (False, True, True),
+        (True, False, False),
+        (True, False, True),
+        (True, True, False),
+        (True, True, True),
+    ],
+)
+def test_update_workflow_payload_round_trips_filesystem_permissions(
+    tmp_path: Path,
+    read: bool,
+    write: bool,
+    execute: bool,
+) -> None:
+    workflow = create_workflow_payload("Filesystem Permissions", tmp_path)
+    expected = {
+        "path": str(tmp_path / "shared"),
+        "read": read,
+        "write": write,
+        "execute": execute,
+    }
+    workflow["filesystemAccess"] = [expected]
+
+    saved = update_workflow_payload("filesystem-permissions", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+
+    assert saved["filesystemAccess"] == [expected]
+    assert reloaded["filesystemAccess"] == [expected]
+
+
+def test_update_workflow_payload_applies_filesystem_permission_defaults(
+    tmp_path: Path,
+) -> None:
+    workflow = create_workflow_payload("Filesystem Defaults", tmp_path)
+    workflow["filesystemAccess"] = [{"path": str(tmp_path / "shared")}]
+
+    saved = update_workflow_payload("filesystem-defaults", workflow, tmp_path)
+    reloaded = list_workflow_payloads(tmp_path)["workflows"][0]
+    expected = {
+        "path": str(tmp_path / "shared"),
+        "read": True,
+        "write": True,
+        "execute": False,
+    }
+
+    assert saved["filesystemAccess"] == [expected]
+    assert reloaded["filesystemAccess"] == [expected]
 
 
 def test_run_workflow_payload_supports_dry_run(tmp_path: Path) -> None:

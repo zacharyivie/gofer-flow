@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 import tomllib
 import urllib.parse
@@ -12,6 +13,7 @@ from typing import Any, cast
 
 import tomli_w
 
+from gofer.core.operations import SubflowOperation
 from gofer.core.resources import ResourceLimits, bundle_resource_limits_from_env
 from gofer.core.workflow import AgenticWorkflow, WebhookTriggerConfig, validate_workflow_id
 
@@ -249,6 +251,12 @@ def import_workflow_bundle(
     with zipfile.ZipFile(bundle_path) as archive:
         validated = _validate_archive_entries(archive, active_limits)
         workflow_data = _workflow_data_for_import(archive, plan, validated, active_limits)
+        rewritten_components = _rewritten_subflow_components(
+            archive,
+            plan,
+            validated,
+            active_limits,
+        )
         archived_names = validated.names
         for item in plan.manifest.included_paths:
             archive_path = item["archivePath"]
@@ -267,7 +275,26 @@ def import_workflow_bundle(
                         nested.as_posix() if nested is not None else None,
                     )
                     destination.parent.mkdir(parents=True, exist_ok=True)
-                    destination.write_bytes(archive.read(name))
+                    payload = archive.read(name)
+                    destination_rel = (
+                        _safe_archive_join(
+                            target_rel,
+                            nested.as_posix(),
+                        )
+                        if nested is not None
+                        else target_rel
+                    )
+                    if (
+                        item.get("kind") == "subflow"
+                        and name.endswith(".toml")
+                        and rewritten_components
+                    ):
+                        payload = _rewrite_imported_workflow_bytes(
+                            payload,
+                            rewritten_components,
+                            destination_rel,
+                        )
+                    destination.write_bytes(payload)
         plan.workflow_path.parent.mkdir(parents=True, exist_ok=True)
         plan.workflow_path.write_bytes(tomli_w.dumps(workflow_data).encode())
     AgenticWorkflow.from_file(plan.workflow_path).validate(plan.workflow_path, base)
@@ -292,6 +319,12 @@ def _build_import_plan(
             raise BundleError(f"Unsupported bundle format version {manifest.format_version}")
         raw = tomllib.loads(_read_archive_text(archive, WORKFLOW_PATH, validated, limits))
         archived_asset_files = _archived_asset_files(validated, manifest)
+        bundled_components = _bundled_subflow_components(
+            archive,
+            manifest,
+            validated,
+            limits,
+        )
     workflow = AgenticWorkflow.from_dict(raw)
     requested_id = workflow.config.id
     workflow_id = requested_id if replace else _available_workflow_id(requested_id, base)
@@ -316,6 +349,30 @@ def _build_import_plan(
                     action=f"rename to {path_rewrites[item['path']]}",
                 )
             )
+    if not replace:
+        for component_id, bundled in bundled_components.items():
+            item_path = bundled.get("path", "")
+            version = bundled.get("version", "")
+            if not item_path or not version or item_path in path_rewrites:
+                continue
+            for existing_path, existing_version in _existing_subflow_component_versions(
+                base,
+                component_id,
+            ):
+                if existing_version == version:
+                    continue
+                path_rewrites[item_path] = f"{IMPORTED_ASSET_PREFIX}/{workflow_id}/{item_path}"
+                conflicts.append(
+                    ImportConflict(
+                        path=existing_path.relative_to(base).as_posix(),
+                        action=(
+                            f"component version conflict: existing {existing_version}, "
+                            f"bundle requires {version}; rename bundled component to "
+                            f"{path_rewrites[item_path]}"
+                        ),
+                    )
+                )
+                break
     if workflow_path.exists() and not replace:
         conflicts.append(
             ImportConflict(
@@ -323,6 +380,18 @@ def _build_import_plan(
                 action=f"rename to {workflow_id}.toml",
             )
         )
+    conflicts.extend(
+        _subflow_version_conflicts(
+            archive_payload=raw,
+            manifest=manifest,
+            base=base,
+            bundled_component_versions={
+                component_id: data["version"]
+                for component_id, data in bundled_components.items()
+                if data.get("version")
+            },
+        )
+    )
 
     files_to_create: list[str] = []
     files_to_overwrite: list[str] = []
@@ -350,6 +419,106 @@ def _build_import_plan(
         path_rewrites=path_rewrites,
         risk_warnings=_import_risk_warnings(workflow),
     )
+
+
+def _subflow_version_conflicts(
+    *,
+    archive_payload: dict[str, Any],
+    manifest: BundleManifest,
+    base: Path,
+    bundled_component_versions: dict[str, str],
+) -> list[ImportConflict]:
+    conflicts: list[ImportConflict] = []
+    referenced_versions: dict[str, str] = dict(bundled_component_versions)
+    for node in archive_payload.get("nodes", []):
+        if not isinstance(node, dict) or node.get("type") != "subflow":
+            continue
+        component_id = str(node.get("component_id") or "").strip()
+        version = str(node.get("version") or "").strip()
+        if component_id and version:
+            referenced_versions[component_id] = version
+    if not referenced_versions:
+        return conflicts
+    for item in manifest.included_paths:
+        if item.get("kind") != "subflow":
+            continue
+        target = _safe_destination(base, item["path"])
+        if not target.exists():
+            continue
+        try:
+            existing = AgenticWorkflow.from_file(target)
+        except Exception:
+            continue
+        if existing.component is None:
+            continue
+        requested = referenced_versions.get(existing.component.id)
+        if requested and existing.component.version != requested:
+            conflicts.append(
+                ImportConflict(
+                    path=item["path"],
+                    action=(
+                        f"component version conflict: existing {existing.component.version}, "
+                        f"bundle requires {requested}"
+                    ),
+                )
+            )
+    return conflicts
+
+
+def _bundled_subflow_components(
+    archive: zipfile.ZipFile,
+    manifest: BundleManifest,
+    validated: _ValidatedBundleArchive,
+    limits: ResourceLimits,
+) -> dict[str, dict[str, str]]:
+    components: dict[str, dict[str, str]] = {}
+    for item in manifest.included_paths:
+        if item.get("kind") != "subflow":
+            continue
+        archive_path = item.get("archivePath")
+        if not isinstance(archive_path, str):
+            continue
+        try:
+            data = tomllib.loads(_read_archive_text(archive, archive_path, validated, limits))
+        except Exception:
+            continue
+        component = data.get("component")
+        if not isinstance(component, dict):
+            continue
+        component_id = str(component.get("id") or "").strip()
+        version = str(component.get("version") or "").strip()
+        if component_id and version:
+            components[component_id] = {
+                "path": item["path"],
+                "version": version,
+            }
+    return components
+
+
+def _existing_subflow_component_versions(
+    base: Path,
+    component_id: str,
+) -> list[tuple[Path, str]]:
+    matches: list[tuple[Path, str]] = []
+    paths: list[Path] = []
+    candidate = base / f"{component_id}.toml"
+    if candidate.exists():
+        paths.append(candidate)
+    paths.extend(path for path in sorted(base.rglob("*.toml")) if path != candidate)
+    seen: set[Path] = set()
+    for path in paths:
+        resolved = path.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            workflow = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        if workflow.component is None or workflow.component.id != component_id:
+            continue
+        matches.append((path, workflow.component.version))
+    return matches
 
 
 def _archived_asset_files(
@@ -387,7 +556,81 @@ def _workflow_data_for_import(
     raw["workflow"]["name"] = plan.workflow_name
     if plan.path_rewrites:
         _rewrite_workflow_paths(raw, plan.path_rewrites)
+        _rewrite_subflow_component_paths(
+            raw,
+            _rewritten_subflow_components(archive, plan, validated, limits),
+            f"{plan.workflow_id}.toml",
+        )
     return raw
+
+
+def _rewritten_subflow_components(
+    archive: zipfile.ZipFile,
+    plan: BundleImportPlan,
+    validated: _ValidatedBundleArchive,
+    limits: ResourceLimits,
+) -> dict[str, str]:
+    rewritten_components: dict[str, str] = {}
+    for item in plan.manifest.included_paths:
+        original_path = item.get("path")
+        if item.get("kind") != "subflow" or original_path not in plan.path_rewrites:
+            continue
+        archive_path = item.get("archivePath")
+        if not isinstance(archive_path, str):
+            continue
+        try:
+            component_data = tomllib.loads(
+                _read_archive_text(archive, archive_path, validated, limits)
+            )
+        except Exception:
+            continue
+        component = component_data.get("component")
+        workflow = component_data.get("workflow")
+        component_id = ""
+        if isinstance(component, dict):
+            component_id = str(component.get("id") or "").strip()
+        if not component_id and isinstance(workflow, dict):
+            component_id = str(workflow.get("id") or "").strip()
+        if not component_id:
+            component_id = Path(str(original_path)).stem
+        rewritten_components[component_id] = plan.path_rewrites[original_path]
+    return rewritten_components
+
+
+def _rewrite_imported_workflow_bytes(
+    payload: bytes,
+    rewritten_components: dict[str, str],
+    destination_rel: str,
+) -> bytes:
+    try:
+        data = tomllib.loads(payload.decode())
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return payload
+    if not isinstance(data, dict):
+        return payload
+    _rewrite_subflow_component_paths(data, rewritten_components, destination_rel)
+    return tomli_w.dumps(data).encode()
+
+
+def _rewrite_subflow_component_paths(
+    data: dict[str, Any],
+    rewritten_components: dict[str, str],
+    owner_path: str,
+) -> None:
+    if not rewritten_components:
+        return
+    for node in data.get("nodes", []):
+        if not isinstance(node, dict) or node.get("type") != "subflow":
+            continue
+        component_id = str(node.get("component_id") or "").strip()
+        source_path = rewritten_components.get(component_id)
+        if source_path:
+            node["source_path"] = _relative_import_source_path(owner_path, source_path)
+
+
+def _relative_import_source_path(owner_path: str, source_path: str) -> str:
+    owner_dir = posixpath.dirname(owner_path) or "."
+    return posixpath.relpath(source_path, owner_dir)
 
 
 def _collect_bundle_paths(
@@ -396,8 +639,17 @@ def _collect_bundle_paths(
 ) -> tuple[list[BundlePath], list[ExternalRequirement]]:
     included: dict[str, BundlePath] = {}
     external: dict[str, ExternalRequirement] = {}
+    visited_workflows: set[Path] = set()
+    root_base = path_base.resolve()
 
-    def add(path: Path | None, owner: str, kind: str, *, copy_dir: bool = False) -> None:
+    def add(
+        path: Path | None,
+        owner: str,
+        kind: str,
+        *,
+        current_base: Path,
+        copy_dir: bool = False,
+    ) -> None:
         if path is None:
             return
         if path.is_absolute() or str(path).startswith("~"):
@@ -408,7 +660,7 @@ def _collect_bundle_paths(
             )
             return
         rel = _safe_relative_path(str(path))
-        source = (path_base / rel).resolve()
+        source = (current_base / rel).resolve()
         if not source.exists():
             external[rel] = ExternalRequirement(
                 path=rel,
@@ -423,25 +675,34 @@ def _collect_bundle_paths(
                 owner=owner,
             )
             return
-        included[rel] = BundlePath(
+        try:
+            workflow_rel = source.relative_to(root_base).as_posix()
+        except ValueError:
+            external[str(source)] = ExternalRequirement(
+                path=str(source),
+                reason="referenced path is outside the workflow directory",
+                owner=owner,
+            )
+            return
+        included[workflow_rel] = BundlePath(
             source=source,
-            workflow_path=rel,
-            archive_path=f"{ASSET_PREFIX}{rel}",
+            workflow_path=workflow_rel,
+            archive_path=f"{ASSET_PREFIX}{workflow_rel}",
             kind=kind,
         )
 
-    def add_vector_index_sidecar(index_path: Path, owner: str) -> None:
+    def add_vector_index_sidecar(index_path: Path, owner: str, *, current_base: Path) -> None:
         if index_path.is_absolute() or str(index_path).startswith("~"):
             return
         rel = _safe_relative_path(str(index_path))
-        source = (path_base / rel).resolve()
+        source = (current_base / rel).resolve()
         if not source.exists() or source.is_dir():
             return
 
-        entries_path, entries_rel, explicit = _vector_index_entries_path(source, rel, path_base)
+        entries_path, entries_rel, explicit = _vector_index_entries_path(source, rel, current_base)
         if entries_path is None or entries_rel is None:
             return
-        if entries_path.is_absolute() and not entries_path.is_relative_to(path_base.resolve()):
+        if entries_path.is_absolute() and not entries_path.is_relative_to(root_base):
             external[str(entries_path)] = ExternalRequirement(
                 path=str(entries_path),
                 reason="absolute or user-relative path is machine-specific",
@@ -456,44 +717,156 @@ def _collect_bundle_paths(
                     owner=f"{owner}.entries_file",
                 )
             return
-        included[entries_rel] = BundlePath(
+        try:
+            workflow_rel = entries_path.resolve().relative_to(root_base).as_posix()
+        except ValueError:
+            external[str(entries_path)] = ExternalRequirement(
+                path=str(entries_path),
+                reason="referenced path is outside the workflow directory",
+                owner=f"{owner}.entries_file",
+            )
+            return
+        included[workflow_rel] = BundlePath(
             source=entries_path,
-            workflow_path=entries_rel,
-            archive_path=f"{ASSET_PREFIX}{entries_rel}",
+            workflow_path=workflow_rel,
+            archive_path=f"{ASSET_PREFIX}{workflow_rel}",
             kind="index_entries",
         )
 
-    if workflow.config.watch is not None:
-        add(workflow.config.watch.path, "workflow.watch", "watch", copy_dir=False)
-    for agent_id, agent in workflow.agents.items():
-        add(agent.prompt_path, f"agent:{agent_id}.prompt_path", "prompt")
-        add(agent.working_dir, f"agent:{agent_id}.working_dir", "working_dir", copy_dir=False)
-        for index, extra_path in enumerate(agent.extra_paths):
-            add(extra_path, f"agent:{agent_id}.extra_paths[{index}]", "extra_path", copy_dir=False)
-    for node in workflow.graph.nodes_in_order():
-        op = node.operation
-        for field_name, kind, copy_dir in (
-            ("prompt_path", "prompt", False),
-            ("script_path", "script", False),
-            ("template_path", "prompt_template", False),
-            ("index_path", "index", False),
-            ("source_path", "sample_asset", True),
-            ("path", "sample_asset", False),
-        ):
-            value = getattr(op, field_name, None)
-            if isinstance(value, Path):
-                owner = f"node:{node.node_id}.{field_name}"
-                add(value, owner, kind, copy_dir=copy_dir)
-                if field_name == "index_path":
-                    add_vector_index_sidecar(value, owner)
-        source = getattr(op, "source", None)
-        source_path = getattr(source, "path", None)
-        if isinstance(source_path, Path):
-            add(source_path, f"node:{node.node_id}.source.path", "sample_asset", copy_dir=False)
+    def collect_workflow_paths(
+        current_workflow: AgenticWorkflow,
+        current_base: Path,
+        owner_prefix: str,
+    ) -> None:
+        if current_workflow.config.watch is not None:
+            add(
+                current_workflow.config.watch.path,
+                f"{owner_prefix}workflow.watch",
+                "watch",
+                current_base=current_base,
+                copy_dir=False,
+            )
+        for agent_id, agent in current_workflow.agents.items():
+            add(
+                agent.prompt_path,
+                f"{owner_prefix}agent:{agent_id}.prompt_path",
+                "prompt",
+                current_base=current_base,
+            )
+            add(
+                agent.working_dir,
+                f"{owner_prefix}agent:{agent_id}.working_dir",
+                "working_dir",
+                current_base=current_base,
+                copy_dir=False,
+            )
+            for index, extra_path in enumerate(agent.extra_paths):
+                add(
+                    extra_path,
+                    f"{owner_prefix}agent:{agent_id}.extra_paths[{index}]",
+                    "extra_path",
+                    current_base=current_base,
+                    copy_dir=False,
+                )
+        for node in current_workflow.graph.nodes_in_order():
+            op = node.operation
+            if isinstance(op, SubflowOperation):
+                component_path = _resolve_bundle_subflow_path(op, current_base)
+                if component_path is not None:
+                    owner = f"{owner_prefix}node:{node.node_id}.component"
+                    resolved_component = component_path.resolve()
+                    try:
+                        rel_component = resolved_component.relative_to(root_base)
+                    except ValueError:
+                        external[str(component_path)] = ExternalRequirement(
+                            path=str(component_path),
+                            reason="subflow component is outside the workflow directory",
+                            owner=owner,
+                        )
+                    else:
+                        workflow_path = rel_component.as_posix()
+                        included[workflow_path] = BundlePath(
+                            source=component_path,
+                            workflow_path=workflow_path,
+                            archive_path=f"{ASSET_PREFIX}{workflow_path}",
+                            kind="subflow",
+                        )
+                        if resolved_component not in visited_workflows:
+                            visited_workflows.add(resolved_component)
+                            try:
+                                component_workflow = AgenticWorkflow.from_file(component_path)
+                            except Exception:
+                                component_workflow = None
+                            if component_workflow is not None:
+                                collect_workflow_paths(
+                                    component_workflow,
+                                    component_path.parent,
+                                    f"{owner}.",
+                                )
+                else:
+                    external[op.component_id] = ExternalRequirement(
+                        path=op.component_id,
+                        reason="referenced subflow component was missing during export",
+                        owner=f"{owner_prefix}node:{node.node_id}.component",
+                    )
+            for field_name, kind, copy_dir in (
+                ("prompt_path", "prompt", False),
+                ("script_path", "script", False),
+                ("template_path", "prompt_template", False),
+                ("index_path", "index", False),
+                ("source_path", "sample_asset", True),
+                ("path", "sample_asset", False),
+            ):
+                if isinstance(op, SubflowOperation) and field_name == "source_path":
+                    continue
+                value = getattr(op, field_name, None)
+                if isinstance(value, Path):
+                    owner = f"{owner_prefix}node:{node.node_id}.{field_name}"
+                    add(value, owner, kind, current_base=current_base, copy_dir=copy_dir)
+                    if field_name == "index_path":
+                        add_vector_index_sidecar(value, owner, current_base=current_base)
+            source = getattr(op, "source", None)
+            source_path = getattr(source, "path", None)
+            if isinstance(source_path, Path):
+                add(
+                    source_path,
+                    f"{owner_prefix}node:{node.node_id}.source.path",
+                    "sample_asset",
+                    current_base=current_base,
+                    copy_dir=False,
+                )
+
+    collect_workflow_paths(workflow, path_base, "")
     return sorted(included.values(), key=lambda item: item.workflow_path), sorted(
         external.values(),
         key=lambda item: item.path,
     )
+
+
+def _resolve_bundle_subflow_path(op: SubflowOperation, path_base: Path) -> Path | None:
+    if op.source_path is not None:
+        source = op.source_path.expanduser()
+        candidate = source if source.is_absolute() else path_base / source
+        return candidate if candidate.exists() else None
+    component_id = op.component_id.strip()
+    candidate = path_base / f"{component_id}.toml"
+    if candidate.exists():
+        try:
+            workflow = AgenticWorkflow.from_file(candidate)
+        except Exception:
+            workflow = None
+        if workflow is not None and (
+            workflow.component is None or workflow.component.id == component_id
+        ):
+            return candidate
+    for path in sorted(path_base.rglob("*.toml")):
+        try:
+            workflow = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        if workflow.component is not None and workflow.component.id == component_id:
+            return path
+    return None
 
 
 def _required_secrets(

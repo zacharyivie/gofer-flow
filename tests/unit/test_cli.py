@@ -722,6 +722,93 @@ def test_workflow_add_node_persists_common_inputs(tmp_path: Path) -> None:
     }
 
 
+def test_workflow_commands_author_structured_output_workflow(tmp_path: Path) -> None:
+    prompt_path = tmp_path / "review.md"
+    prompt_path.write_text("Review the result", encoding="utf-8")
+    result = runner.invoke(
+        app, ["workflow", "create", "--name", "Structured Flow", "--output", str(tmp_path)]
+    )
+    assert result.exit_code == 0, result.output
+
+    commands = [
+        [
+            "workflow",
+            "add-agent",
+            "structured-flow",
+            "--id",
+            "reviewer",
+            "--subscription",
+            "codex",
+            "--working-dir",
+            str(tmp_path),
+            "--prompt-path",
+            str(prompt_path),
+        ],
+        [
+            "workflow",
+            "add-node",
+            "structured-flow",
+            "--id",
+            "review",
+            "--type",
+            "agent",
+            "--agent-id",
+            "reviewer",
+            "--working-dir",
+            str(tmp_path),
+            "--prompt-path",
+            str(prompt_path),
+            "--output-schema",
+            '{"type":"object","properties":{"score":{"type":"number"}},"required":["score"]}',
+            "--repair-attempts",
+            "2",
+        ],
+        [
+            "workflow",
+            "add-node",
+            "structured-flow",
+            "--id",
+            "publish",
+            "--type",
+            "bash_command",
+            "--command",
+            "echo published",
+        ],
+        [
+            "workflow",
+            "add-edge",
+            "structured-flow",
+            "--from",
+            "review",
+            "--to",
+            "publish",
+            "--condition",
+            "output_field",
+            "--field",
+            "score",
+            "--operator",
+            "greater_than",
+            "--value",
+            "7",
+        ],
+    ]
+    for command in commands:
+        result = runner.invoke(app, [*command, "--data-dir", str(tmp_path)])
+        assert result.exit_code == 0, result.output
+
+    workflow = AgenticWorkflow.from_file(tmp_path / "structured-flow.toml")
+    workflow.validate(tmp_path / "structured-flow.toml")
+    operation = workflow.graph._nodes["review"].operation
+    assert isinstance(operation, AgentOperation)
+    assert operation.output_schema == {
+        "type": "object",
+        "properties": {"score": {"type": "number"}},
+        "required": ["score"],
+    }
+    assert operation.repair_attempts == 2
+    assert workflow.graph._edges[("review", "publish")].value == 7
+
+
 def test_workflow_add_notification_node_persists_network_channel(tmp_path: Path) -> None:
     result = runner.invoke(
         app, ["workflow", "create", "--name", "Notify Flow", "--output", str(tmp_path)]
@@ -1955,9 +2042,6 @@ max_fanout_items = 4
 max_fanout_concurrency = 2
 max_files_scanned = 9
 
-[workflow.llm_budget]
-max_agent_calls = 1
-
 [[nodes]]
 id = "first"
 type = "bash_command"
@@ -1986,8 +2070,6 @@ condition = "on_success"
     assert "first" in result.output
     assert "Resource limits:" in result.output
     assert "fanout_items=4" in result.output
-    assert "Usage budget:" in result.output
-    assert "max_agent_calls=1" in result.output
     assert "Conditional branches:" in result.output
     assert "first -> second when on_success" in result.output
     assert "retries=2 delay=3.0s" in result.output

@@ -6,21 +6,20 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Code2,
   Copy,
-  Database,
   Download,
   FolderOpen,
   GitBranch,
   History,
-  ListFilter,
   Loader2,
-  MessageSquare,
   Moon,
   MoreVertical,
   Plus,
   PencilLine,
   Play,
   RefreshCw,
+  Save,
   Search,
   Send,
   Square,
@@ -29,54 +28,28 @@ import {
   Waypoints,
   X,
 } from "lucide-react";
-import DagCanvas from "../components/DagCanvas.jsx";
-import { apiUrl } from "../lib/api.js";
+import DagCanvas, { autoLayoutWorkflow } from "../components/DagCanvas.jsx";
+import { Dialog } from "../components/Dialog.jsx";
+import CodeFileExplorer from "../components/CodeFileExplorer.jsx";
+import CodeWorkspace, { applyCodeFilesystemChange } from "../components/CodeWorkspace.jsx";
 import {
-  applyWorkflowPatch,
-  buildPatchReview,
-  extractWorkflowPatch,
-  selectedPatchOperations,
-} from "../lib/workflowPatch.js";
+  ProviderModelEffortFields,
+  useProviderCapabilities,
+} from "../components/ProviderModelEffortFields.jsx";
+import { apiUrl } from "../lib/api.js";
 
 const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
+const PROJECT_LABELS_STORAGE_KEY = "gofer.projectLabels";
 const DEFAULT_RETENTION_SETTINGS = {
   keepDays: 14,
   keepFailedDays: 30,
   keepLast: 100,
 };
 const RUN_LOG_TAIL_BYTES = 64 * 1024;
-const WORKFLOW_UNDO_LIMIT = 100;
 
-function cloneWorkflowForEditHistory(workflow) {
-  return workflow ? JSON.parse(JSON.stringify(workflow)) : workflow;
-}
-
-function workflowEditSnapshotEquals(left, right) {
-  return JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
-}
-
-export function pushWorkflowEditHistory(history, workflowId, workflow, limit = WORKFLOW_UNDO_LIMIT) {
-  if (!workflowId || !workflow) return history;
-  const currentHistory = history[workflowId] ?? [];
-  const snapshot = cloneWorkflowForEditHistory(workflow);
-  if (workflowEditSnapshotEquals(currentHistory.at(-1), snapshot)) return history;
-  return {
-    ...history,
-    [workflowId]: [...currentHistory, snapshot].slice(-limit),
-  };
-}
-
-export function popWorkflowEditHistory(history, workflowId) {
-  const currentHistory = history[workflowId] ?? [];
-  if (!currentHistory.length) return { history, workflow: null };
-  const workflow = currentHistory.at(-1);
-  return {
-    history: {
-      ...history,
-      [workflowId]: currentHistory.slice(0, -1),
-    },
-    workflow,
-  };
+export function prefersReducedMotion() {
+  return typeof window !== "undefined" &&
+    (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false);
 }
 
 function loadRetentionSettings() {
@@ -117,7 +90,7 @@ async function fileToBase64(file) {
   return window.btoa(binary);
 }
 
-export function formatBundleImportPreview(plan) {
+function formatBundleImportPreview(plan) {
   const manifest = plan.manifest ?? {};
   const promptPaths = (manifest.includedPaths ?? [])
     .filter((item) => item.kind === "prompt" || item.kind === "prompt_template")
@@ -140,9 +113,6 @@ export function formatBundleImportPreview(plan) {
     "Triggers:",
     ...previewTriggerLines(manifest.triggers),
   ];
-  if (plan.riskWarnings?.length) {
-    lines.push("", "High-risk configuration:", ...plan.riskWarnings.map((item) => `- ${item}`));
-  }
   if (plan.conflicts?.length) {
     lines.push("", "Conflicts:", ...plan.conflicts.map((item) => `- ${item.path}: ${item.action}`));
   }
@@ -185,9 +155,6 @@ function previewTriggerLines(items = []) {
     if (item.type === "webhook") {
       const details = [item.source, item.enabled === "true" ? "enabled" : "disabled"];
       if (item.tokenEnv) details.push(`secret ${item.tokenEnv}`);
-      if (item.allowUnauthenticated === "true") details.push("allows unauthenticated requests");
-      if (item.risk === "high") details.push("high risk");
-      if (item.riskReasons) details.push(`risk ${item.riskReasons}`);
       if (item.fanoutPath) details.push(`fanout ${item.fanoutPath}`);
       return `- webhook ${item.id}: ${details.join(", ")}`;
     }
@@ -197,11 +164,13 @@ function previewTriggerLines(items = []) {
 
 export default function App() {
   const [workflows, setWorkflows] = useState([]);
-  const [dashboards, setDashboards] = useState([]);
   const [promptAgentIds, setPromptAgentIds] = useState([]);
   const [activeWorkflowId, setActiveWorkflowId] = useState();
-  const [activeDashboardId, setActiveDashboardId] = useState();
-  const [workspaceMode, setWorkspaceMode] = useState("workflows");
+  const [studioView, setStudioView] = useState("graph");
+  const [codeEditorOpened, setCodeEditorOpened] = useState(false);
+  const [codeOpenPaths, setCodeOpenPaths] = useState([]);
+  const [activeCodePath, setActiveCodePath] = useState("");
+  const [radishEditorState, setRadishEditorState] = useState(null);
   const [query, setQuery] = useState("");
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
@@ -227,8 +196,8 @@ export default function App() {
     open: false,
     revisions: [],
   });
-  const [dirtyWorkflow, setDirtyWorkflow] = useState();
-  const [, setSaveState] = useState({ saving: false, error: "" });
+  const [dirtyWorkflowsById, setDirtyWorkflowsById] = useState({});
+  const [saveStatesByWorkflowId, setSaveStatesByWorkflowId] = useState({});
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
   const [runPreview, setRunPreview] = useState(null);
   const [executionMode, setExecutionMode] = useState("local");
@@ -241,7 +210,6 @@ export default function App() {
     info: null,
   });
   const [runState, setRunState] = useState({ running: false, error: "", result: null });
-  const [chatPatchReview, setChatPatchReview] = useState(null);
   const [logState, setLogState] = useState({
     loading: false,
     error: "",
@@ -262,19 +230,254 @@ export default function App() {
     loading: false,
   });
   const [theme, setTheme] = useState(getInitialTheme);
-  const [workflowPaneWidth, setWorkflowPaneWidth] = useState(292);
-  const [chatPaneWidth, setChatPaneWidth] = useState(356);
-  const saveRevisionRef = useRef(0);
-  const dirtyWorkflowRef = useRef();
+  const [workflowPaneWidth, setWorkflowPaneWidth] = useState(272);
+  const [chatPaneWidth, setChatPaneWidth] = useState(380);
+  const workflowRevisionsRef = useRef(new Map());
+  const dirtyWorkflowsRef = useRef(new Map());
+  const saveTimersRef = useRef(new Map());
+  const inFlightSavesRef = useRef(new Map());
   const deletedWorkflowIdsRef = useRef(new Set());
   const logRequestRef = useRef(0);
-  const pendingDashboardMutationsRef = useRef(0);
-  const pendingWorkflowPersistenceRef = useRef(new Set());
-  const workflowRedoHistoryRef = useRef({});
-  const workflowUndoHistoryRef = useRef({});
+  const radishEditorRef = useRef(null);
+  const radishEditorStateRef = useRef(null);
+  const radishMetadataSaveTimerRef = useRef(null);
+  const radishMetadataPendingRef = useRef(false);
   const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
-  const activeDashboard =
-    dashboards.find((dashboard) => dashboard.id === activeDashboardId) ?? dashboards[0];
+  const graphWorkflow = useMemo(
+    () => radishGraphWorkflow(activeWorkflow, radishEditorState?.document),
+    [activeWorkflow, radishEditorState?.document],
+  );
+
+  useEffect(() => {
+    radishEditorStateRef.current = radishEditorState;
+  }, [radishEditorState]);
+
+  useEffect(() => {
+    radishMetadataPendingRef.current = false;
+    window.clearTimeout(radishMetadataSaveTimerRef.current);
+  }, [activeWorkflow?.id]);
+
+  useEffect(() => {
+    const sourcePath = activeWorkflow?.sourceFormat === "radish"
+      ? activeWorkflow.sourcePath ?? ""
+      : "";
+    setCodeOpenPaths(sourcePath ? [sourcePath] : []);
+    setActiveCodePath(sourcePath);
+  }, [activeWorkflow?.id, activeWorkflow?.sourceFormat, activeWorkflow?.sourcePath]);
+
+  useEffect(() => {
+    if (studioView === "code" && activeWorkflow?.sourceFormat !== "radish") {
+      setStudioView("graph");
+    }
+  }, [activeWorkflow?.sourceFormat, studioView]);
+
+  useEffect(() => {
+    if (codeEditorOpened || activeWorkflow?.sourceFormat !== "radish") return undefined;
+    const controller = new AbortController();
+    setRadishEditorState({ document: null, error: "", loading: true, saving: false });
+    fetch(apiUrl(`/workflows/${encodeURIComponent(activeWorkflow.id)}/document`), {
+      signal: controller.signal,
+    })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Editor API returned ${response.status}`);
+        setRadishEditorState({
+          document: payload.document,
+          error: "",
+          loading: false,
+          saving: false,
+        });
+      })
+      .catch((error) => {
+        if (error?.name === "AbortError") return;
+        setRadishEditorState({
+          document: null,
+          error: error instanceof Error ? error.message : "Unable to load the Radish graph",
+          loading: false,
+          saving: false,
+        });
+      });
+    return () => controller.abort();
+  }, [activeWorkflow?.id, activeWorkflow?.sourceFormat, codeEditorOpened]);
+
+  function changeStudioView(nextView) {
+    if (nextView === "code" && activeWorkflow?.sourceFormat !== "radish") return;
+    setQuery("");
+    setStudioView(nextView);
+    if (nextView === "code") setCodeEditorOpened(true);
+  }
+
+  function openCodeFile(path) {
+    if (!path || activeWorkflow?.sourceFormat !== "radish") return;
+    setCodeOpenPaths((current) => current.includes(path) ? current : [...current, path]);
+    setActiveCodePath(path);
+    setCodeEditorOpened(true);
+    setStudioView("code");
+  }
+
+  function closeCodeFile(path) {
+    if (!path || path === activeWorkflow?.sourcePath) return;
+    setCodeOpenPaths((current) => {
+      const index = current.indexOf(path);
+      const next = current.filter((candidate) => candidate !== path);
+      if (activeCodePath === path) {
+        setActiveCodePath(next[Math.max(0, index - 1)] ?? activeWorkflow?.sourcePath ?? "");
+      }
+      return next;
+    });
+  }
+
+  function handleCodeFilesystemChange(change) {
+    applyCodeFilesystemChange(change);
+    void loadWorkflows({ silent: true });
+    if (!change?.path) return;
+    if (change.kind === "rename" && change.sourcePath) {
+      setCodeOpenPaths((current) => current.map((path) =>
+        replacePathPrefix(path, change.sourcePath, change.path, change.isDirectory),
+      ));
+      setActiveCodePath((current) =>
+        replacePathPrefix(current, change.sourcePath, change.path, change.isDirectory));
+    }
+    if (change.kind === "delete") {
+      setCodeOpenPaths((current) => {
+        const next = current.filter((path) => !pathMatchesChange(path, change.path, change.isDirectory));
+        if (pathMatchesChange(activeCodePath, change.path, change.isDirectory)) {
+          setActiveCodePath(next.at(-1) ?? activeWorkflow?.sourcePath ?? "");
+        }
+        return next;
+      });
+    }
+  }
+
+  async function mutateActiveRadish(mutations) {
+    if (activeWorkflow?.sourceFormat !== "radish" || !mutations?.length) return null;
+    if (radishMetadataPendingRef.current) {
+      const metadataSaved = await saveRadishMetadataNow(activeWorkflow.id);
+      if (!metadataSaved) return null;
+    }
+    let currentDocument = radishEditorStateRef.current?.document;
+    if (!currentDocument) return null;
+    if (currentDocument.dirty) {
+      currentDocument = await radishEditorRef.current?.save?.();
+      if (!currentDocument) {
+        setTopBarNotice({
+          type: "error",
+          message: "Save the current code changes before editing the graph.",
+        });
+        return null;
+      }
+    }
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(activeWorkflow.id)}/document/mutate`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            mutations,
+            expectedRevision: currentDocument.savedRevision,
+          }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          response.status === 409
+            ? "workflow.rad changed on disk. Reload it before editing the graph."
+            : payload.error || `Graph edit returned ${response.status}`,
+        );
+      }
+      const nextState = {
+        document: payload.document,
+        error: "",
+        loading: false,
+        saving: false,
+      };
+      radishEditorStateRef.current = nextState;
+      setRadishEditorState(nextState);
+      radishEditorRef.current?.acceptDocument?.(payload.document);
+      setTopBarNotice({ type: "success", message: "Updated workflow.rad" });
+      void loadWorkflows({ silent: true });
+      return payload.document;
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to edit workflow.rad",
+      });
+      return null;
+    }
+  }
+
+  function updateRadishGraphMetadata(nextWorkflow) {
+    const currentState = radishEditorStateRef.current;
+    const document = currentState?.document;
+    if (!document || activeWorkflow?.sourceFormat !== "radish") return;
+    const nodes = Object.fromEntries(
+      (nextWorkflow.nodes ?? []).map((node) => [node.id, { x: node.x ?? 0, y: node.y ?? 0 }]),
+    );
+    const metadata = {
+      ...document.metadata,
+      canvas: {
+        ...document.metadata.canvas,
+        nodes,
+      },
+    };
+    const nextState = {
+      ...currentState,
+      document: { ...document, metadata },
+    };
+    radishEditorStateRef.current = nextState;
+    setRadishEditorState(nextState);
+    radishMetadataPendingRef.current = true;
+    window.clearTimeout(radishMetadataSaveTimerRef.current);
+    radishMetadataSaveTimerRef.current = window.setTimeout(
+      () => void saveRadishMetadataNow(activeWorkflow.id),
+      250,
+    );
+  }
+
+  async function saveRadishMetadataNow(workflowId) {
+    window.clearTimeout(radishMetadataSaveTimerRef.current);
+    const latestState = radishEditorStateRef.current;
+    const latest = latestState?.document;
+    if (!latest || !radishMetadataPendingRef.current) return true;
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(workflowId)}/metadata`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            metadata: latest.metadata,
+            expectedRevision: latest.metadataRevision,
+          }),
+        },
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `Metadata save returned ${response.status}`);
+      radishMetadataPendingRef.current = false;
+      setRadishEditorState((state) => {
+        if (!state?.document) return state;
+        const saved = {
+          ...state,
+          document: {
+            ...state.document,
+            metadata: payload.metadata,
+            metadataRevision: payload.metadataRevision,
+          },
+        };
+        radishEditorStateRef.current = saved;
+        return saved;
+      });
+      return true;
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to save graph layout",
+      });
+      return false;
+    }
+  }
 
   const loadWorkflows = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
@@ -288,7 +491,12 @@ export default function App() {
       const payload = await response.json();
       const payloadDataDir = payload.dataDir ?? "";
       setPromptAgentIds(payload.promptAgentIds ?? []);
-      const nextWorkflows = (payload.workflows ?? [])
+      const listedWorkflows = payload.workflows ?? [];
+      const nextWorkflows = listedWorkflows
+        .filter(
+          (workflow) =>
+            payload.authoringLanguage !== "radish" || workflow.sourceFormat === "radish",
+        )
         .filter((workflow) => !deletedWorkflowIdsRef.current.has(workflow.id))
         .map((workflow) => summarizeWorkflow(workflow, payloadDataDir));
       setWorkflows((current) => {
@@ -298,22 +506,15 @@ export default function App() {
             ? summarizeWorkflow(mergeSavedWorkflow(localWorkflow, workflow), payloadDataDir)
             : workflow;
         });
-        const workflowIdsToPreserve = new Set(pendingWorkflowPersistenceRef.current);
-        if (dirtyWorkflowRef.current?.id) {
-          workflowIdsToPreserve.add(dirtyWorkflowRef.current.id);
-        }
-        const mergedWorkflows =
-          silent && workflowIdsToPreserve.size
-            ? preserveLocalWorkflows(
-                refreshedWorkflows,
-                current.filter(
-                  (workflow) =>
-                    workflowIdsToPreserve.has(workflow.id) &&
-                    !deletedWorkflowIdsRef.current.has(workflow.id),
-                ),
-                payloadDataDir,
-              )
-            : refreshedWorkflows;
+        const mergedWorkflows = silent
+          ? [...dirtyWorkflowsRef.current.keys()].reduce((workflowsToMerge, workflowId) => {
+              if (deletedWorkflowIdsRef.current.has(workflowId)) return workflowsToMerge;
+              const localDirtyWorkflow = current.find((workflow) => workflow.id === workflowId);
+              return localDirtyWorkflow
+                ? preserveLocalWorkflow(workflowsToMerge, localDirtyWorkflow, payloadDataDir)
+                : workflowsToMerge;
+            }, refreshedWorkflows)
+          : refreshedWorkflows;
 
         return silent && JSON.stringify(current) === JSON.stringify(mergedWorkflows)
           ? current
@@ -334,31 +535,6 @@ export default function App() {
           error: error instanceof Error ? error.message : "Unable to load workflows",
         });
       }
-    }
-  }, []);
-
-  const loadDashboards = useCallback(async () => {
-    if (pendingDashboardMutationsRef.current > 0) {
-      return;
-    }
-    try {
-      const response = await fetch(apiUrl("/dashboards"));
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || `Dashboard API returned ${response.status}`);
-      }
-      const nextDashboards = payload.dashboards ?? [];
-      setDashboards(nextDashboards);
-      setActiveDashboardId((currentId) =>
-        nextDashboards.some((dashboard) => dashboard.id === currentId)
-          ? currentId
-          : nextDashboards[0]?.id,
-      );
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to load dashboards",
-      });
     }
   }, []);
 
@@ -427,8 +603,7 @@ export default function App() {
 
   useEffect(() => {
     loadWorkflows();
-    loadDashboards();
-  }, [loadDashboards, loadWorkflows]);
+  }, [loadWorkflows]);
 
   useEffect(() => {
     loadWorkflowTemplates();
@@ -442,13 +617,12 @@ export default function App() {
   useEffect(() => {
     const intervalId = window.setInterval(() => {
       loadWorkflows({ silent: true });
-      loadDashboards();
       loadDoctor({ silent: true });
       loadQueue({ silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [loadDashboards, loadDoctor, loadQueue, loadWorkflows]);
+  }, [loadDoctor, loadQueue, loadWorkflows]);
 
   useEffect(() => {
     window.localStorage.setItem("gofer-ui-theme", theme);
@@ -522,10 +696,10 @@ export default function App() {
         setTopBarNotice({
           type: info?.available ? "success" : "success",
           message: info?.available
-            ? `Gofer Flow ${info.info?.version ?? "update"} is available`
+            ? `Taskurotta ${info.info?.version ?? "update"} is available`
             : info?.info?.noReleases
-              ? "No published Gofer Flow releases yet"
-            : "Gofer Flow is up to date",
+              ? "No published Taskurotta releases yet"
+            : "Taskurotta is up to date",
         });
       }
     } catch (error) {
@@ -812,30 +986,40 @@ export default function App() {
   ]);
 
   useEffect(() => {
-    if (!dirtyWorkflow) return undefined;
+    const saveTimers = saveTimersRef.current;
+    let pendingEditsPreserved = false;
 
-    const workflow = workflows.find((candidate) => candidate.id === dirtyWorkflow.id);
-    if (!workflow) return undefined;
+    function preservePendingEdits() {
+      if (pendingEditsPreserved) return;
+      pendingEditsPreserved = true;
+      for (const { workflow } of dirtyWorkflowsRef.current.values()) {
+        void fetch(apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`), {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(workflowPayloadForSave(workflow)),
+          keepalive: true,
+        }).catch(() => {});
+      }
+    }
 
-    const timeoutId = window.setTimeout(() => {
-      saveWorkflow(workflow, dirtyWorkflow.revision);
-    }, 650);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [dirtyWorkflow, workflows]);
+    window.addEventListener("beforeunload", preservePendingEdits);
+    window.addEventListener("pagehide", preservePendingEdits);
+    return () => {
+      window.removeEventListener("beforeunload", preservePendingEdits);
+      window.removeEventListener("pagehide", preservePendingEdits);
+      for (const timerId of saveTimers.values()) {
+        window.clearTimeout(timerId);
+      }
+      saveTimers.clear();
+    };
+  }, []);
 
   const filteredWorkflows = useMemo(() => {
     return workflows.filter((workflow) => {
-      const text = `${workflow.name} ${workflow.description} ${workflow.tags.join(" ")}`;
+      const text = `${workflow.name} ${workflow.description} ${workflow.tags.join(" ")} ${workflow.projectName ?? ""} ${workflow.projectRoot ?? ""}`;
       return text.toLowerCase().includes(query.toLowerCase());
     });
   }, [query, workflows]);
-  const filteredDashboards = useMemo(() => {
-    return dashboards.filter((dashboard) => {
-      const text = `${dashboard.name} ${dashboard.id}`;
-      return text.toLowerCase().includes(query.toLowerCase());
-    });
-  }, [dashboards, query]);
   const usedAgentIds = useMemo(() => {
     return [
       ...new Set(
@@ -852,101 +1036,62 @@ export default function App() {
     ];
   }, [promptAgentIds, workflows]);
 
-  function markWorkflowDirty(workflowId) {
-    saveRevisionRef.current += 1;
-    const nextDirtyWorkflow = { id: workflowId, revision: saveRevisionRef.current };
-    dirtyWorkflowRef.current = nextDirtyWorkflow;
-    setDirtyWorkflow(nextDirtyWorkflow);
-  }
-
   function updateActiveWorkflow(nextWorkflow) {
     const summarizedWorkflow = summarizeWorkflow(nextWorkflow, dataDir);
-    const previousWorkflow = workflows.find((workflow) => workflow.id === summarizedWorkflow.id);
-    if (!previousWorkflow || workflowEditSnapshotEquals(previousWorkflow, summarizedWorkflow)) {
-      return;
-    }
-    workflowUndoHistoryRef.current = pushWorkflowEditHistory(
-      workflowUndoHistoryRef.current,
-      summarizedWorkflow.id,
-      previousWorkflow,
-    );
-    workflowRedoHistoryRef.current = {
-      ...workflowRedoHistoryRef.current,
-      [summarizedWorkflow.id]: [],
-    };
     setWorkflows((current) =>
       current.map((workflow) =>
         workflow.id === summarizedWorkflow.id ? summarizedWorkflow : workflow,
       ),
     );
-    markWorkflowDirty(summarizedWorkflow.id);
+    const revision = (workflowRevisionsRef.current.get(summarizedWorkflow.id) ?? 0) + 1;
+    workflowRevisionsRef.current.set(summarizedWorkflow.id, revision);
+    dirtyWorkflowsRef.current.set(summarizedWorkflow.id, {
+      revision,
+      workflow: summarizedWorkflow,
+    });
+    setDirtyWorkflowsById((current) => ({
+      ...current,
+      [summarizedWorkflow.id]: { revision },
+    }));
+    setSaveStatesByWorkflowId((current) => ({
+      ...current,
+      [summarizedWorkflow.id]: { status: "saving", error: "" },
+    }));
+
+    const previousTimerId = saveTimersRef.current.get(summarizedWorkflow.id);
+    if (previousTimerId) window.clearTimeout(previousTimerId);
+    const timerId = window.setTimeout(() => {
+      saveTimersRef.current.delete(summarizedWorkflow.id);
+      void saveWorkflow(summarizedWorkflow, revision);
+    }, 650);
+    saveTimersRef.current.set(summarizedWorkflow.id, timerId);
   }
 
-  function restoreWorkflowEdit(direction) {
-    if (!activeWorkflow?.id) return;
-    const workflowId = activeWorkflow.id;
-    const sourceRef = direction === "undo" ? workflowUndoHistoryRef : workflowRedoHistoryRef;
-    const targetRef = direction === "undo" ? workflowRedoHistoryRef : workflowUndoHistoryRef;
-    const { history: nextSourceHistory, workflow: restoredWorkflow } = popWorkflowEditHistory(
-      sourceRef.current,
-      workflowId,
-    );
-    if (!restoredWorkflow) return;
-
-    sourceRef.current = nextSourceHistory;
-    targetRef.current = pushWorkflowEditHistory(
-      targetRef.current,
-      workflowId,
-      activeWorkflow,
-    );
-
-    const summarizedWorkflow = summarizeWorkflow(restoredWorkflow, dataDir);
-    setWorkflows((current) =>
-      current.map((workflow) =>
-        workflow.id === workflowId ? summarizedWorkflow : workflow,
-      ),
-    );
-    markWorkflowDirty(workflowId);
-  }
-
-  useEffect(() => {
-    function handleKeyDown(event) {
-      if (event.defaultPrevented) return;
-      const target = event.target;
-      const tagName = target?.tagName?.toLowerCase?.();
-      if (
-        target?.isContentEditable ||
-        tagName === "input" ||
-        tagName === "textarea" ||
-        tagName === "select"
-      ) {
-        return;
-      }
-
-      const key = event.key.toLowerCase();
-      if ((event.ctrlKey || event.metaKey) && key === "z" && !event.shiftKey) {
-        event.preventDefault();
-        restoreWorkflowEdit("undo");
-      } else if (
-        (event.ctrlKey || event.metaKey) &&
-        (key === "y" || (key === "z" && event.shiftKey))
-      ) {
-        event.preventDefault();
-        restoreWorkflowEdit("redo");
+  async function saveWorkflow(workflow, revision) {
+    const workflowId = workflow.id;
+    const pendingSave = inFlightSavesRef.current.get(workflowId);
+    if (pendingSave) {
+      try {
+        await pendingSave;
+      } catch {
+        // A newer revision is still allowed to save after an older request fails.
       }
     }
 
-    window.addEventListener("keydown", handleKeyDown);
-    return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [activeWorkflow, dataDir]);
+    if (dirtyWorkflowsRef.current.get(workflowId)?.revision !== revision) {
+      return undefined;
+    }
 
-  async function saveWorkflow(workflow, revision) {
-    setSaveState({ saving: true, error: "" });
-    pendingWorkflowPersistenceRef.current.add(workflow.id);
+    setSaveStatesByWorkflowId((current) => ({
+      ...current,
+      [workflowId]: { status: "saving", error: "" },
+    }));
+    const saveRequest = persistWorkflow(workflow);
+    inFlightSavesRef.current.set(workflowId, saveRequest);
     try {
-      const savedWorkflow = await persistWorkflow(workflow);
+      const savedWorkflow = await saveRequest;
 
-      if (saveRevisionRef.current === revision) {
+      if (dirtyWorkflowsRef.current.get(workflowId)?.revision === revision) {
         setWorkflows((current) =>
           current.map((candidate) =>
             candidate.id === savedWorkflow.id
@@ -954,25 +1099,40 @@ export default function App() {
               : candidate,
           ),
         );
-        if (dirtyWorkflowRef.current?.id === workflow.id) {
-          dirtyWorkflowRef.current = undefined;
-        }
-        setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
-        setSaveState({ saving: false, error: "" });
+        dirtyWorkflowsRef.current.delete(workflowId);
+        setDirtyWorkflowsById((current) => withoutKey(current, workflowId));
+        setSaveStatesByWorkflowId((current) => ({
+          ...current,
+          [workflowId]: { status: "saved", error: "" },
+        }));
+        return savedWorkflow;
       }
+      return undefined;
     } catch (error) {
-      if (saveRevisionRef.current === revision) {
-        setSaveState({
-          saving: false,
-          error: error instanceof Error ? error.message : "Unable to save workflow",
-        });
+      if (dirtyWorkflowsRef.current.get(workflowId)?.revision === revision) {
+        setSaveStatesByWorkflowId((current) => ({
+          ...current,
+          [workflowId]: {
+            status: "error",
+            error: error instanceof Error ? error.message : "Unable to save workflow",
+          },
+        }));
       }
+      return undefined;
     } finally {
-      pendingWorkflowPersistenceRef.current.delete(workflow.id);
+      if (inFlightSavesRef.current.get(workflowId) === saveRequest) {
+        inFlightSavesRef.current.delete(workflowId);
+      }
     }
   }
 
-  async function persistWorkflow(workflow, auditMetadata = null) {
+  function retryWorkflowSave(workflowId) {
+    const dirtyWorkflow = dirtyWorkflowsRef.current.get(workflowId);
+    if (!dirtyWorkflow) return;
+    void saveWorkflow(dirtyWorkflow.workflow, dirtyWorkflow.revision);
+  }
+
+  async function persistWorkflow(workflow) {
     const response = await fetch(
       apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
       {
@@ -980,10 +1140,7 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          ...workflowPayloadForSave(workflow, dataDir),
-          ...(auditMetadata ? { auditMetadata } : {}),
-        }),
+        body: JSON.stringify(workflowPayloadForSave(workflow)),
       },
     );
     const payload = await response.json();
@@ -993,105 +1150,14 @@ export default function App() {
     return payload.workflow;
   }
 
-  function openChatPatchReview({ message, prompt, thread }) {
-    if (!activeWorkflow) return;
-    const parsed = extractWorkflowPatch(message?.body ?? "");
-    if (!parsed.ok) {
-      setTopBarNotice({ type: "error", message: parsed.error });
-      return;
-    }
-    const review = buildPatchReview(parsed.patch, activeWorkflow);
-    setChatPatchReview({
-      audit: {
-        prompt: prompt?.body ?? "",
-        response: message?.body ?? "",
-        messageId: message?.id ?? null,
-        threadId: thread?.id ?? null,
-        threadTitle: thread?.title ?? "",
-      },
-      error: "",
-      patch: parsed.patch,
-      review,
-      saving: false,
-      workflowId: activeWorkflow.id,
-    });
-  }
-
-  async function applyReviewedChatPatch(selectedHunkIds) {
-    if (!chatPatchReview || !activeWorkflow) return;
-    const patch = selectedPatchOperations(chatPatchReview.patch, selectedHunkIds);
-    if (!patch.operations.length) {
-      setChatPatchReview((current) => ({
-        ...current,
-        error: "Select at least one change to apply.",
-      }));
-      return;
-    }
-
-    setChatPatchReview((current) => ({ ...current, saving: true, error: "" }));
-    try {
-      const nextWorkflow = applyWorkflowPatch(activeWorkflow, patch);
-      const validateResponse = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(nextWorkflow.id)}/validate`),
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(workflowPayloadForSave(nextWorkflow, dataDir)),
-        },
-      );
-      const validation = await validateResponse.json();
-      if (!validateResponse.ok) {
-        throw new Error(validation.error || `Workflow API returned ${validateResponse.status}`);
-      }
-      const validationErrors = (validation.diagnostics ?? []).filter(
-        (diagnostic) => diagnostic.severity === "error",
-      );
-      if (validationErrors.length) {
-        throw new Error(validationErrors.map((diagnostic) => diagnostic.message).join("; "));
-      }
-
-      setSaveState({ saving: true, error: "" });
-      pendingWorkflowPersistenceRef.current.add(nextWorkflow.id);
-      const savedWorkflow = await persistWorkflow(nextWorkflow, {
-        source: "chat_patch",
-        patchTitle: chatPatchReview.patch.title,
-        appliedHunkIds: patch.operations.map((operation) => operation.id),
-        prompt: chatPatchReview.audit.prompt,
-        response: chatPatchReview.audit.response,
-        messageId: chatPatchReview.audit.messageId,
-        threadId: chatPatchReview.audit.threadId,
-        threadTitle: chatPatchReview.audit.threadTitle,
-      });
-      setWorkflows((current) =>
-        current.map((candidate) =>
-          candidate.id === savedWorkflow.id
-            ? summarizeWorkflow(mergeSavedWorkflow(nextWorkflow, savedWorkflow), dataDir)
-            : candidate,
-        ),
-      );
-      saveRevisionRef.current += 1;
-      dirtyWorkflowRef.current = undefined;
-      setDirtyWorkflow(undefined);
-      setSaveState({ saving: false, error: "" });
-      setTopBarNotice({ type: "success", message: "Applied chat workflow patch." });
-      setChatPatchReview(null);
-    } catch (error) {
-      setChatPatchReview((current) => ({
-        ...current,
-        saving: false,
-        error: error instanceof Error ? error.message : "Unable to apply workflow patch",
-      }));
-      setSaveState({ saving: false, error: "" });
-    } finally {
-      pendingWorkflowPersistenceRef.current.delete(activeWorkflow?.id);
-    }
-  }
-
   async function runWorkflowNow(workflow) {
     const workflowToRun = summarizeWorkflow(workflow, dataDir);
-    saveRevisionRef.current += 1;
-    dirtyWorkflowRef.current = undefined;
-    setDirtyWorkflow(undefined);
+    const dirtyWorkflow = dirtyWorkflowsRef.current.get(workflowToRun.id);
+    const pendingTimerId = saveTimersRef.current.get(workflowToRun.id);
+    if (pendingTimerId) {
+      window.clearTimeout(pendingTimerId);
+      saveTimersRef.current.delete(workflowToRun.id);
+    }
     setRunState({ running: true, workflowId: workflowToRun.id, error: "", result: null });
     setLogState((current) => ({
       ...current,
@@ -1099,19 +1165,52 @@ export default function App() {
       error: "",
       selectedRunId: null,
     }));
-    setSaveState({ saving: true, error: "" });
-    pendingWorkflowPersistenceRef.current.add(workflowToRun.id);
+    if (dirtyWorkflow) {
+      setSaveStatesByWorkflowId((current) => ({
+        ...current,
+        [workflowToRun.id]: { status: "saving", error: "" },
+      }));
+    }
 
     try {
-      const savedWorkflow = await persistWorkflow(workflowToRun);
-      setWorkflows((current) =>
-        current.map((candidate) =>
-          candidate.id === savedWorkflow.id
-            ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow), dataDir)
-            : candidate,
-        ),
-      );
-      setSaveState({ saving: false, error: "" });
+      let savedWorkflow;
+      if (workflowToRun.sourceFormat === "radish") {
+        if (radishEditorState?.document?.dirty) {
+          const savedDocument = await radishEditorRef.current?.save?.();
+          if (!savedDocument) {
+            throw new Error("Save workflow.rad before running the workflow.");
+          }
+        }
+        savedWorkflow = workflowToRun;
+      } else {
+        savedWorkflow = dirtyWorkflow
+          ? await saveWorkflow(dirtyWorkflow.workflow, dirtyWorkflow.revision)
+          : await persistWorkflow(workflowToRun);
+      }
+      if (!savedWorkflow) {
+        throw new Error("Unable to save workflow before running");
+      }
+      if (
+        workflowToRun.sourceFormat !== "radish" &&
+        (!dirtyWorkflow ||
+          dirtyWorkflowsRef.current.get(workflowToRun.id)?.revision === dirtyWorkflow.revision)
+      ) {
+        setWorkflows((current) =>
+          current.map((candidate) =>
+            candidate.id === savedWorkflow.id
+              ? summarizeWorkflow(mergeSavedWorkflow(candidate, savedWorkflow), dataDir)
+              : candidate,
+          ),
+        );
+        if (dirtyWorkflow) {
+          dirtyWorkflowsRef.current.delete(workflowToRun.id);
+          setDirtyWorkflowsById((current) => withoutKey(current, workflowToRun.id));
+          setSaveStatesByWorkflowId((current) => ({
+            ...current,
+            [workflowToRun.id]: { status: "saved", error: "" },
+          }));
+        }
+      }
       const externalAccessWarnings = agentExternalAccessWarnings(savedWorkflow);
       if (externalAccessWarnings.length > 0) {
         const confirmed = window.confirm(
@@ -1146,7 +1245,10 @@ export default function App() {
       setRunState({ running: false, workflowId: savedWorkflow.id, error: "", result: null });
       setLogState((current) => ({ ...current, loading: false }));
       setRunPreview({
-        workflow: savedWorkflow,
+        workflow: {
+          ...savedWorkflow,
+          inputs: previewPayload.plan?.inputs ?? savedWorkflow.inputs,
+        },
         plan: previewPayload.plan,
         triggerContext,
         parameters: initialParameters,
@@ -1154,11 +1256,8 @@ export default function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
       setRunState({ running: false, workflowId: workflowToRun.id, error: message, result: null });
-      setSaveState((current) => ({ ...current, saving: false }));
       loadLatestLog(workflowToRun.id, { silent: true });
       loadRunLogs(workflowToRun.id, { silent: true });
-    } finally {
-      pendingWorkflowPersistenceRef.current.delete(workflowToRun.id);
     }
   }
 
@@ -1182,7 +1281,7 @@ export default function App() {
             trigger: "ui",
             parameters:
               Object.keys(parameters ?? {}).length > 0
-                ? { triggerContext, workflowParams: parameters }
+                ? { triggerContext, workflowInputs: parameters }
                 : { triggerContext },
           }),
         });
@@ -1243,6 +1342,12 @@ export default function App() {
         runs: logState.runs,
         selectedRunId: null,
       });
+      if (!payload.run?.success) {
+        setTopBarNotice({
+          type: "error",
+          message: workflowRunFailureMessage(payload.run),
+        });
+      }
       loadRunLogs(workflow.id);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unable to run workflow";
@@ -1479,7 +1584,12 @@ export default function App() {
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ name, template: options.template || undefined }),
+        body: JSON.stringify({
+          name,
+          template: options.template || undefined,
+          projectRoot: options.projectRoot,
+          projectGrantId: options.projectGrantId || undefined,
+        }),
       });
       const payload = await response.json();
       if (!response.ok) {
@@ -1615,19 +1725,12 @@ export default function App() {
     try {
       if (isBundleFile(file)) {
         const bundleContent = await fileToBase64(file);
-        let grantId = "";
-        try {
-          const selectedPath = await window.goferDesktop?.grantDroppedPath?.(file);
-          grantId = window.goferDesktop?.workspace?.pathGrantForApi?.(selectedPath) || "";
-        } catch {
-          grantId = "";
-        }
         const previewResponse = await fetch(apiUrl("/workflows/import/preview"), {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ bundleContent, filename: file.name, grantId }),
+          body: JSON.stringify({ bundleContent, filename: file.name }),
         });
         const previewPayload = await previewResponse.json();
         if (!previewResponse.ok) {
@@ -1642,7 +1745,7 @@ export default function App() {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ bundleContent, filename: file.name, grantId }),
+          body: JSON.stringify({ bundleContent, filename: file.name }),
         });
         const importPayload = await importResponse.json();
         if (!importResponse.ok) {
@@ -1698,8 +1801,6 @@ export default function App() {
     if (!workflow || !outputPath.trim()) return;
     setExportDialog((current) => ({ ...current, error: "", saving: true }));
     try {
-      const trimmedOutputPath = outputPath.trim();
-      const grantId = window.goferDesktop?.workspace?.pathGrantForApi?.(trimmedOutputPath) || "";
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/export`),
         {
@@ -1707,7 +1808,7 @@ export default function App() {
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ outputPath: trimmedOutputPath, grantId }),
+          body: JSON.stringify({ outputPath: outputPath.trim() }),
         },
       );
       const payload = await response.json();
@@ -1725,27 +1826,6 @@ export default function App() {
     }
   }
 
-  async function chooseExportDestination(currentPath) {
-    const workflow = exportDialog.workflow;
-    if (!workflow || !window.goferDesktop?.workspace?.selectPath) return;
-    try {
-      const selectedPath = await window.goferDesktop.workspace.selectPath({
-        currentPath: currentPath || dataDir,
-        directoryOnly: true,
-      });
-      if (!selectedPath) return;
-      const filename = `${workflow.id}.gof.zip`;
-      const separator = selectedPath.includes("\\") ? "\\" : "/";
-      const nextPath = `${selectedPath.replace(/[\\/]+$/, "")}${separator}${filename}`;
-      setExportDialog((current) => ({ ...current, outputPath: nextPath }));
-    } catch (error) {
-      setExportDialog((current) => ({
-        ...current,
-        error: error instanceof Error ? error.message : "Unable to choose export destination",
-      }));
-    }
-  }
-
   async function deleteWorkflow(workflow) {
     if (!workflow) return;
     if (!window.confirm(`Delete workflow "${workflow.name}"?`)) return;
@@ -1753,12 +1833,15 @@ export default function App() {
     try {
       setCreateState({ saving: false, error: "" });
       deletedWorkflowIdsRef.current.add(workflow.id);
-      saveRevisionRef.current += 1;
-      if (dirtyWorkflowRef.current?.id === workflow.id) {
-        dirtyWorkflowRef.current = undefined;
+      const pendingTimerId = saveTimersRef.current.get(workflow.id);
+      if (pendingTimerId) {
+        window.clearTimeout(pendingTimerId);
+        saveTimersRef.current.delete(workflow.id);
       }
-      setDirtyWorkflow((current) => (current?.id === workflow.id ? undefined : current));
-      setSaveState((current) => ({ ...current, saving: false }));
+      dirtyWorkflowsRef.current.delete(workflow.id);
+      workflowRevisionsRef.current.delete(workflow.id);
+      setDirtyWorkflowsById((current) => withoutKey(current, workflow.id));
+      setSaveStatesByWorkflowId((current) => withoutKey(current, workflow.id));
       setRunState((current) =>
         current.workflowId === workflow.id
           ? { running: false, error: "", result: null }
@@ -1810,14 +1893,14 @@ export default function App() {
   }
 
   async function renameWorkflow(workflow, nextName) {
-    if (!workflow) return null;
-    if (!nextName || nextName.trim() === workflow.name) return workflow;
+    if (!workflow) return;
+    if (!nextName || nextName.trim() === workflow.name) return;
 
     try {
-      if (dirtyWorkflowRef.current?.id === workflow.id) {
-        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current, dataDir));
-        dirtyWorkflowRef.current = undefined;
-        setDirtyWorkflow(undefined);
+      const dirtyWorkflow = dirtyWorkflowsRef.current.get(workflow.id);
+      if (dirtyWorkflow) {
+        const savedWorkflow = await saveWorkflow(dirtyWorkflow.workflow, dirtyWorkflow.revision);
+        if (!savedWorkflow) return;
       }
 
       const response = await fetch(
@@ -1846,13 +1929,11 @@ export default function App() {
         currentId === workflow.id ? renamed.id : currentId,
       );
       setTopBarNotice({ type: "success", message: `Renamed to ${renamed.name}` });
-      return renamed;
     } catch (error) {
       setTopBarNotice({
         type: "error",
         message: error instanceof Error ? error.message : "Unable to rename workflow",
       });
-      return null;
     }
   }
 
@@ -1860,10 +1941,10 @@ export default function App() {
     if (!workflow) return;
 
     try {
-      if (dirtyWorkflowRef.current?.id === workflow.id) {
-        await persistWorkflow(summarizeWorkflow(dirtyWorkflowRef.current, dataDir));
-        dirtyWorkflowRef.current = undefined;
-        setDirtyWorkflow(undefined);
+      const dirtyWorkflow = dirtyWorkflowsRef.current.get(workflow.id);
+      if (dirtyWorkflow) {
+        const savedWorkflow = await saveWorkflow(dirtyWorkflow.workflow, dirtyWorkflow.revision);
+        if (!savedWorkflow) return;
       }
 
       const response = await fetch(
@@ -1894,165 +1975,42 @@ export default function App() {
     }
   }
 
-  async function changeDataDir() {
-    if (!window.goferDesktop?.dataDirectory?.choose) {
-      setTopBarNotice({
-        type: "error",
-        message: "Changing the app data folder is only available in the desktop app",
-      });
-      return;
-    }
-
-    try {
-      setTopBarNotice({ type: "success", message: "Switching app data folder..." });
-      const result = await window.goferDesktop.dataDirectory.choose({ currentPath: dataDir });
-      if (!result?.dataDir) {
-        setTopBarNotice({ type: "", message: "" });
-        return;
-      }
-      setDataDir(result.dataDir);
-      await loadWorkflows();
-      await loadDashboards();
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to change app data folder",
-      });
-    }
-  }
-
-  async function dashboardRequest(path, options = {}) {
-    const method = options.method ?? "GET";
-    const tracksMutation = method !== "GET";
-    if (tracksMutation) {
-      pendingDashboardMutationsRef.current += 1;
-    }
-    try {
-      const response = await fetch(apiUrl(path), {
-        headers: options.body ? { "Content-Type": "application/json" } : undefined,
-        ...options,
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || `Dashboard API returned ${response.status}`);
-      }
-      if (payload.dashboard) {
-        setDashboards((current) => {
-          const exists = current.some((dashboard) => dashboard.id === payload.dashboard.id);
-          return exists
-            ? current.map((dashboard) =>
-                dashboard.id === payload.dashboard.id ? payload.dashboard : dashboard,
-              )
-            : [payload.dashboard, ...current];
-        });
-        setActiveDashboardId(payload.dashboard.id);
-      }
-      return payload;
-    } finally {
-      if (tracksMutation) {
-        pendingDashboardMutationsRef.current = Math.max(
-          0,
-          pendingDashboardMutationsRef.current - 1,
-        );
-      }
-    }
-  }
-
-  async function createDashboard() {
-    try {
-      await dashboardRequest("/dashboards", {
-        method: "POST",
-        body: JSON.stringify({ name: "New Dashboard" }),
-      });
-      setWorkspaceMode("dashboards");
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to create dashboard",
-      });
-    }
-  }
-
-  async function duplicateDashboard(dashboard) {
-    if (!dashboard) return;
-    try {
-      await dashboardRequest(`/dashboards/${encodeURIComponent(dashboard.id)}`, {
-        method: "POST",
-        body: JSON.stringify({ duplicate: true }),
-      });
-      setWorkspaceMode("dashboards");
-      setTopBarNotice({ type: "success", message: `Duplicated ${dashboard.name}` });
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to duplicate dashboard",
-      });
-    }
-  }
-
-  async function deleteDashboard(dashboard) {
-    if (!dashboard || !window.confirm(`Delete dashboard "${dashboard.name}"?`)) return;
-    try {
-      await dashboardRequest(`/dashboards/${encodeURIComponent(dashboard.id)}`, { method: "DELETE" });
-      await loadDashboards();
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to delete dashboard",
-      });
-    }
-  }
-
-  async function mutateDashboard(path, body) {
-    try {
-      await dashboardRequest(path, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-    } catch (error) {
-      setTopBarNotice({
-        type: "error",
-        message: error instanceof Error ? error.message : "Unable to update dashboard",
-      });
-    }
-  }
-
-  function updateDashboardLocally(dashboardId, updater) {
-    setDashboards((current) =>
-      current.map((dashboard) => (dashboard.id === dashboardId ? updater(dashboard) : dashboard)),
-    );
-  }
-
   return (
-    <main className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}>
+    <main
+      aria-busy={runState.running || logState.loading || undefined}
+      className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}
+    >
+      <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
+        {!runState.running && runState.result
+          ? runState.result.status === "queued"
+            ? "Workflow run queued."
+            : `Workflow run completed: ${runState.result.status ?? (runState.result.success ? "success" : "error")}`
+          : ""}
+      </div>
+      <div aria-atomic="true" aria-live="assertive" className="sr-only" role="alert">
+        {runState.error}
+      </div>
       <WorkflowSidebar
-        activeDashboardId={activeDashboard?.id}
+        activeWorkflow={activeWorkflow}
         activeWorkflowId={activeWorkflow?.id}
-        dashboards={filteredDashboards}
-        dataDir={dataDir}
         loading={loadState.loading}
         query={query}
         runState={runState}
-        workspaceMode={workspaceMode}
         workflows={filteredWorkflows}
+        view={studioView}
         width={workflowPaneWidth}
-        onCreateDashboard={createDashboard}
         onQueryChange={setQuery}
         onCreate={() => {
           setCreateState({ saving: false, error: "" });
           setCreateDialogOpen(true);
         }}
-        onDataDirPick={changeDataDir}
-        onDeleteDashboard={deleteDashboard}
         onDeleteWorkflow={deleteWorkflow}
         onDuplicateWorkflow={duplicateWorkflow}
+        onCodeFileOpen={openCodeFile}
+        onCodeFilesystemChange={handleCodeFilesystemChange}
         onRefresh={loadWorkflows}
         onRenameWorkflow={renameWorkflow}
         onRunWorkflow={runWorkflowNow}
-        onSelectDashboard={(dashboardId) => {
-          setActiveDashboardId(dashboardId);
-          setWorkspaceMode("dashboards");
-        }}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 420,
@@ -2062,176 +2020,56 @@ export default function App() {
             onResize: setWorkflowPaneWidth,
           })
         }
-        onSelect={(workflowId) => {
-          setActiveWorkflowId(workflowId);
-          setWorkspaceMode("workflows");
-        }}
-        onWorkspaceModeChange={setWorkspaceMode}
+        onResizeKeyDown={(event) =>
+          handlePaneResizeKeyDown(event, {
+            defaultValue: 272,
+            max: 420,
+            min: 240,
+            onResize: setWorkflowPaneWidth,
+            width: workflowPaneWidth,
+          })
+        }
+        onSelect={setActiveWorkflowId}
+        onViewChange={changeStudioView}
       />
 
       <section className="flex min-w-0 flex-1 flex-col border-x border-line bg-[#f9fbfd]">
-        {workspaceMode === "dashboards" ? (
-          <DashboardWorkspace
-            dashboard={activeDashboard}
-            loading={loadState.loading}
-            notice={topBarNotice}
-            onAddComponent={(dashboard, section, type = "board") =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
-                { title: dashboardComponentLabel(type), type },
-              )
-            }
-            onAddDashboard={createDashboard}
-            onAddItem={(dashboard, component, item) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
-                { action: "add", item },
-              )
-            }
-            onAddSection={(dashboard) =>
-              mutateDashboard(`/dashboards/${encodeURIComponent(dashboard.id)}/sections`, {
-                title: "New Section",
-              })
-            }
-            onDeleteDashboard={deleteDashboard}
-            onDuplicateDashboard={duplicateDashboard}
-            onDeleteSection={(dashboard, section) => {
-              if (!window.confirm(`Delete section "${section.title}"?`)) return;
-              dashboardRequest(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
-                { method: "DELETE" },
-              ).catch((error) =>
-                setTopBarNotice({
-                  type: "error",
-                  message: error instanceof Error ? error.message : "Unable to delete dashboard section",
-                }),
-              );
-            }}
-            onDeleteComponent={(dashboard, component) => {
-              if (!window.confirm(`Remove "${component.title}" from this section?`)) return;
-              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
-                ...currentDashboard,
-                sections: (currentDashboard.sections ?? []).map((section) => ({
-                  ...section,
-                  components: (section.components ?? []).filter((item) => item.id !== component.id),
-                })),
-              }));
-              dashboardRequest(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { method: "DELETE" },
-              ).catch((error) =>
-                setTopBarNotice({
-                  type: "error",
-                  message: error instanceof Error ? error.message : "Unable to remove dashboard component",
-                }),
-              );
-            }}
-            onDeleteItem={(dashboard, component, item) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
-                { action: "delete", itemId: item.id },
-              )
-            }
-            onRename={(dashboard, name) =>
-              mutateDashboard(`/dashboards/${encodeURIComponent(dashboard.id)}`, { name })
-            }
-            onUpdateSection={(dashboard, section, patch) => {
-              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
-                ...currentDashboard,
-                sections: (currentDashboard.sections ?? []).map((item) =>
-                  item.id === section.id
-                    ? {
-                        ...item,
-                        ...("title" in patch ? { title: patch.title } : {}),
-                        layout: patch.layout ? { ...(item.layout ?? {}), ...patch.layout } : item.layout,
-                      }
-                    : item,
-                ),
-              }));
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/sections/${encodeURIComponent(section.id)}`,
-                patch,
-              );
-            }}
-            onSetSchema={(dashboard, component, schema) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { schema },
-              )
-            }
-            onSetViews={(dashboard, component, views) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { views },
-              )
-            }
-            onSetContent={(dashboard, component, content) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { content },
-              )
-            }
-            onSetComponentTitle={(dashboard, component, title) => {
-              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
-                ...currentDashboard,
-                sections: (currentDashboard.sections ?? []).map((section) => ({
-                  ...section,
-                  components: (section.components ?? []).map((item) =>
-                    item.id === component.id ? { ...item, title } : item,
-                  ),
-                })),
-              }));
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { title },
-              );
-            }}
-            onSetDisplay={(dashboard, component, display) => {
-              updateDashboardLocally(dashboard.id, (currentDashboard) => ({
-                ...currentDashboard,
-                sections: (currentDashboard.sections ?? []).map((section) => ({
-                  ...section,
-                  components: (section.components ?? []).map((item) =>
-                    item.id === component.id ? { ...item, display } : item,
-                  ),
-                })),
-              }));
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}`,
-                { display },
-              );
-            }}
-            onUpdateItem={(dashboard, component, item, patch) =>
-              mutateDashboard(
-                `/dashboards/${encodeURIComponent(dashboard.id)}/components/${encodeURIComponent(component.id)}/items`,
-                { action: "update", itemId: item.id, patch },
-              )
-            }
-          />
-        ) : activeWorkflow ? (
+        {activeWorkflow ? (
           <>
             <TopBar
+              editorState={radishEditorState}
+              saveState={
+                saveStatesByWorkflowId[activeWorkflow.id] ??
+                (dirtyWorkflowsById[activeWorkflow.id]
+                  ? { status: "saving", error: "" }
+                  : undefined)
+              }
               theme={theme}
               updateState={updateState}
               workflow={activeWorkflow}
+              view={studioView}
               onCheckForUpdates={() => checkForUpdates()}
               onApplyUpdate={() => applyUpdate(updateState)}
               onOpenHistory={() => openWorkflowHistory(activeWorkflow)}
+              onSaveRadish={() => radishEditorRef.current?.saveActive?.()}
+              onRetrySave={() => retryWorkflowSave(activeWorkflow.id)}
               onToggleTheme={() =>
                 setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
               }
             />
-            <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
-            <DagCanvas
-              dashboards={dashboards}
+            {studioView === "graph" ? (
+              <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
+            ) : null}
+            <div className={`${studioView === "graph" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
+              <DagCanvas
               dataDir={dataDir}
               logState={logState}
               approvalState={approvalState}
-              notice={topBarNotice}
+              notice={runState.error ? { type: "error", message: runState.error } : topBarNotice}
               retentionSettings={retentionSettings}
               runState={runState}
-              workflow={activeWorkflow}
-              workflows={workflows}
+              workflow={graphWorkflow}
+              radishDocument={radishEditorState?.document}
               usedAgentIds={usedAgentIds}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
@@ -2249,23 +2087,51 @@ export default function App() {
               onImportWorkflow={importWorkflow}
               onExportWorkflow={() => exportWorkflow(activeWorkflow)}
               onRunWorkflow={runWorkflowNow}
-              onValidateWorkflow={() => validateWorkflow(activeWorkflow)}
-              onStopWorkflow={stopWorkflowRun}
-              onNavigateWorkflow={(workflowId) => {
-                if (workflowId) {
-                  setActiveWorkflowId(workflowId);
-                  setWorkspaceMode("workflows");
+              onValidateWorkflow={() => {
+                if (activeWorkflow.sourceFormat !== "radish") {
+                  validateWorkflow(activeWorkflow);
+                  return;
                 }
+                const document = radishEditorStateRef.current?.document;
+                const errors = [
+                  ...(document?.diagnostics ?? []),
+                  ...(document?.preflight?.diagnostics ?? []),
+                ].filter((item) => item.severity === "error");
+                setTopBarNotice(
+                  errors.length
+                    ? { type: "error", message: errors[0].message }
+                    : document?.runnable
+                      ? { type: "success", message: "Radish compiles and preflight is ready" }
+                      : { type: "error", message: "Add at least one runnable node" },
+                );
               }}
-              onRenameWorkflow={(workflowId, nextName) => {
-                const targetWorkflow = workflows.find((candidate) => candidate.id === workflowId);
-                return renameWorkflow(targetWorkflow, nextName);
-              }}
+              onStopWorkflow={stopWorkflowRun}
               onDecideApproval={(approval, decision, notes, by) =>
                 decideApproval(activeWorkflow, approval, decision, notes, by)
               }
-              onWorkflowChange={updateActiveWorkflow}
-            />
+                onRadishMutation={mutateActiveRadish}
+                onWorkflowChange={
+                  activeWorkflow.sourceFormat === "radish"
+                    ? updateRadishGraphMetadata
+                    : updateActiveWorkflow
+                }
+              />
+            </div>
+            {codeEditorOpened && activeWorkflow.sourceFormat === "radish" ? (
+              <div className={`${studioView === "code" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
+                <CodeWorkspace
+                  active={studioView === "code"}
+                  activePath={activeCodePath}
+                  ref={radishEditorRef}
+                  openPaths={codeOpenPaths}
+                  theme={theme}
+                  workflow={activeWorkflow}
+                  onActivePathChange={setActiveCodePath}
+                  onClosePath={closeCodeFile}
+                  onDocumentStateChange={setRadishEditorState}
+                />
+              </div>
+            ) : null}
           </>
         ) : (
           <EmptyWorkspace error={loadState.error} loading={loadState.loading} onRefresh={loadWorkflows} />
@@ -2277,7 +2143,6 @@ export default function App() {
         activeWorkflowId={activeWorkflow?.id}
         workflow={activeWorkflow}
         workflows={workflows}
-        onReviewPatch={openChatPatchReview}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 520,
@@ -2285,6 +2150,15 @@ export default function App() {
             side: "left",
             width: chatPaneWidth,
             onResize: setChatPaneWidth,
+          })
+        }
+        onResizeKeyDown={(event) =>
+          handlePaneResizeKeyDown(event, {
+            defaultValue: 380,
+            max: 520,
+            min: 300,
+            onResize: setChatPaneWidth,
+            width: chatPaneWidth,
           })
         }
       />
@@ -2302,14 +2176,8 @@ export default function App() {
           queueState={queueState}
         />
       ) : null}
-      {chatPatchReview ? (
-        <ChatPatchReviewDialog
-          reviewState={chatPatchReview}
-          onApply={applyReviewedChatPatch}
-          onCancel={() => setChatPatchReview(null)}
-        />
-      ) : null}
       <CreateWorkflowDialog
+        defaultProjectRoot={activeWorkflow?.projectRoot ?? ""}
         error={createState.error}
         open={createDialogOpen}
         saving={createState.saving}
@@ -2335,9 +2203,6 @@ export default function App() {
           }
         }}
         onExport={confirmExportWorkflow}
-        onBrowse={
-          window.goferDesktop?.workspace?.selectPath ? chooseExportDestination : null
-        }
       />
 
       {historyState.open && activeWorkflow ? (
@@ -2359,8 +2224,45 @@ export default function App() {
   );
 }
 
+export function workflowRunFailureMessage(run) {
+  const directError = typeof run?.error === "string" ? run.error : run?.error?.message;
+  if (directError) return directError;
+  const failedNode = Object.values(run?.runNodes ?? {}).find(
+    (node) => node?.status === "error" || node?.status === "failed",
+  );
+  const nodeError = typeof failedNode?.error === "string"
+    ? failedNode.error
+    : failedNode?.error?.message ?? failedNode?.message;
+  if (nodeError) return nodeError;
+  return "Workflow failed. Select the failed node to inspect its output.";
+}
+
 function clampNumber(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+export function paneWidthForKey(
+  key,
+  width,
+  { defaultValue, max, min, shiftKey = false, step = 10 },
+) {
+  if (key === "Enter") return clampNumber(defaultValue, min, max);
+  if (key === "Home") return min;
+  if (key === "End") return max;
+  const amount = shiftKey ? step * 4 : step;
+  if (key === "ArrowLeft") return clampNumber(width - amount, min, max);
+  if (key === "ArrowRight") return clampNumber(width + amount, min, max);
+  return null;
+}
+
+function handlePaneResizeKeyDown(event, options) {
+  const nextWidth = paneWidthForKey(event.key, options.width, {
+    ...options,
+    shiftKey: event.shiftKey,
+  });
+  if (nextWidth === null) return;
+  event.preventDefault();
+  options.onResize(nextWidth);
 }
 
 function startPaneResize(event, { max, min, onResize, side, width }) {
@@ -2408,7 +2310,7 @@ export function summarizeWorkflow(workflow, dataDir = "") {
       agents: workflow.agents ?? {},
       nodes: workflow.nodes ?? [],
       edges: workflow.edges ?? [],
-      description: workflow.description || `Invalid workflow TOML: ${workflow.validationError}`,
+      description: workflow.description || `Invalid ${workflow.sourceFormat === "radish" ? "Radish" : "workflow TOML"}: ${workflow.validationError}`,
       status: "Error",
       tags: ["error", "invalid"],
     };
@@ -2428,6 +2330,105 @@ export function summarizeWorkflow(workflow, dataDir = "") {
     }`,
     status,
     tags: [status.toLowerCase(), ...operationTypes.slice(0, 2)],
+  };
+}
+
+export function radishGraphWorkflow(workflow, document) {
+  if (
+    !workflow ||
+    workflow.sourceFormat !== "radish" ||
+    !document?.graph ||
+    document.workflowId !== workflow.id
+  ) {
+    return workflow;
+  }
+  const positions = document.metadata?.canvas?.nodes ?? {};
+  const nodes = (document.graph.nodes ?? []).map((node) => {
+    const type = String(node.type || "unknown").replaceAll("-", "_");
+    const execution = node.execution ?? {};
+    return {
+      id: node.id,
+      label: node.label || node.id,
+      type,
+      operation: { type, ...(node.configuration ?? {}) },
+      settings: {
+        allowFailure: Boolean(execution.allow_fail),
+        awaitAllInputs: true,
+        failFast: false,
+        forEach: "",
+        maxConcurrency: execution.max_concurrency ?? 1,
+        pipeOutput: false,
+        retryCount: execution.retry_count ?? 0,
+        retryDelaySeconds: (execution.retry_delay_ms ?? 0) / 1000,
+        timeoutSeconds:
+          execution.timeout_ms === null || execution.timeout_ms === undefined
+            ? ""
+            : execution.timeout_ms / 1000,
+      },
+      x: positions[node.id]?.x ?? 0,
+      y: positions[node.id]?.y ?? 0,
+      radishStatus: node.status,
+      radish: node,
+    };
+  });
+  const edges = (document.graph.edges ?? []).map((edge) => ({
+    id: edge.id,
+    from: edge.from,
+    to: edge.to,
+    condition: edge.mode === "when" ? "output_field" : "always",
+    displayLabel:
+      edge.mode === "when"
+        ? edge.predicateSource
+          ? `when ${edge.predicateSource}`
+          : "when"
+        : edge.mode === "unconditional"
+          ? "always"
+          : edge.mode,
+    mode: edge.mode,
+    predicate: edge.predicate,
+    predicateSource: edge.predicateSource,
+    sourceSpan: edge.sourceSpan,
+  }));
+  const validationDiagnostics = [
+    ...(document.diagnostics ?? []).map((diagnostic) => ({
+      ...diagnostic,
+      id: diagnostic.code,
+      subject: "workflow",
+      targetId: workflow.id,
+      targetType: "workflow",
+    })),
+    ...(document.graph.nodes ?? []).flatMap((node) =>
+      (node.diagnostics ?? []).map((diagnostic) => ({
+        ...diagnostic,
+        id: diagnostic.code,
+        subject: `node:${node.id}`,
+        targetId: node.id,
+        targetType: "node",
+      })),
+    ),
+    ...(document.graph.edges ?? [])
+      .filter((edge) => edge.status !== "valid")
+      .map((edge) => ({
+        id: "RADISH_ROUTE_UNRESOLVED",
+        message: `Route target ${edge.to} is unresolved.`,
+        severity: "error",
+        subject: `edge:${edge.id}`,
+        targetId: edge.id,
+        targetType: "edge",
+      })),
+  ];
+  const laidOut = autoLayoutWorkflow({ ...workflow, nodes, edges });
+  return {
+    ...workflow,
+    ...laidOut,
+    invalid: false,
+    name: document.workflow?.name || workflow.name,
+    nodes: laidOut.nodes.map((node) =>
+      positions[node.id]
+        ? { ...node, x: positions[node.id].x, y: positions[node.id].y }
+        : node,
+    ),
+    validationDiagnostics,
   };
 }
 
@@ -2459,42 +2460,34 @@ export function mergeSavedWorkflow(localWorkflow, savedWorkflow) {
 }
 
 export function preserveLocalWorkflow(remoteWorkflows, localWorkflow, dataDir = "") {
-  return preserveLocalWorkflows(remoteWorkflows, [localWorkflow], dataDir);
-}
-
-export function preserveLocalWorkflows(remoteWorkflows, localWorkflows, dataDir = "") {
-  const localById = new Map(
-    (localWorkflows ?? []).filter(Boolean).map((workflow) => [workflow.id, workflow]),
-  );
-  if (!localById.size) {
-    return remoteWorkflows;
+  const foundWorkflow = remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id);
+  if (!foundWorkflow) {
+    return [...remoteWorkflows, localWorkflow];
   }
-  const merged = remoteWorkflows.map((workflow) => {
-    const localWorkflow = localById.get(workflow.id);
-    return localWorkflow
+  return remoteWorkflows.map((workflow) =>
+    workflow.id === localWorkflow.id
       ? summarizeWorkflow({
           ...localWorkflow,
           sourcePath: workflow.sourcePath ?? localWorkflow.sourcePath,
+          sourceFormat: workflow.sourceFormat ?? localWorkflow.sourceFormat,
           status: workflow.status ?? localWorkflow.status,
           updatedAt: workflow.updatedAt ?? localWorkflow.updatedAt,
+          projectRoot: workflow.projectRoot ?? localWorkflow.projectRoot,
+          projectName: workflow.projectRoot
+            ? projectNameFromPath(workflow.projectRoot)
+            : localWorkflow.projectName,
+          workflowRoot: workflow.workflowRoot ?? localWorkflow.workflowRoot,
         }, dataDir)
-      : workflow;
-  });
-  localById.forEach((localWorkflow) => {
-    if (!remoteWorkflows.some((workflow) => workflow.id === localWorkflow.id)) {
-      merged.push(localWorkflow);
-    }
-  });
-  return merged;
+      : workflow,
+  );
 }
 
-export function workflowPayloadForSave(workflow, dataDir = "") {
+export function workflowPayloadForSave(workflow) {
+  const { parameters, ...canonicalWorkflow } = workflow;
   return {
-    ...workflow,
-    filesystemAccess: normalizeWorkflowFilesystemAccess([
-      dataDir ? { path: dataDir } : null,
-      ...(workflow.filesystemAccess ?? []),
-    ]),
+    ...canonicalWorkflow,
+    inputs: workflow.inputs ?? parameters ?? {},
+    filesystemAccess: normalizeWorkflowFilesystemAccess(workflow.filesystemAccess),
     nodes: (workflow.nodes ?? []).map((node) => ({
       ...node,
       x: node.x ?? 0,
@@ -2510,9 +2503,9 @@ export function normalizeWorkflowFilesystemAccess(entries = []) {
   return (entries ?? [])
     .map((entry) => ({
       path: String(entry?.path ?? "").trim(),
-      read: true,
-      write: true,
-      execute: false,
+      read: entry?.read ?? true,
+      write: entry?.write ?? true,
+      execute: entry?.execute ?? false,
     }))
     .filter((entry) => {
       const key = entry.path.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -2525,7 +2518,7 @@ export function normalizeWorkflowFilesystemAccess(entries = []) {
 export function workflowPlanRequest(workflowId, triggerContext = {}, parameters = {}) {
   const body = { triggerContext };
   if (Object.keys(parameters ?? {}).length > 0) {
-    body.parameters = parameters;
+    body.inputs = parameters;
   }
   return {
     url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/plan`),
@@ -2545,7 +2538,7 @@ export function workflowRunRequest(
 ) {
   const body = { dryRun, triggerContext };
   if (Object.keys(parameters ?? {}).length > 0) {
-    body.parameters = parameters;
+    body.inputs = parameters;
   }
   return {
     url: apiUrl(`/workflows/${encodeURIComponent(workflowId)}/run`),
@@ -2612,10 +2605,11 @@ export function workflowLogUrls(workflowId, runId = null) {
   };
 }
 
-export function chatStreamRequestBody({ provider, model, messages, workflow }) {
+export function chatStreamRequestBody({ effort, provider, model, messages, workflow }) {
   return {
     provider,
     model,
+    ...(effort ? { effort } : {}),
     messages,
     workflow,
   };
@@ -2630,6 +2624,12 @@ export function workflowIdsAfterDelete(workflows, deletedWorkflowId) {
 export function nextActiveWorkflowIdAfterDelete(workflows, activeWorkflowId, deletedWorkflowId) {
   if (activeWorkflowId !== deletedWorkflowId) return activeWorkflowId;
   return workflows.find((workflow) => workflow.id !== deletedWorkflowId)?.id;
+}
+
+function withoutKey(record, key) {
+  const nextRecord = { ...record };
+  delete nextRecord[key];
+  return nextRecord;
 }
 
 function isUrlPath(pathValue = "") {
@@ -2656,75 +2656,171 @@ function resolveDisplayPath(pathValue = "", basePath = "") {
   return `${String(basePath).replace(/[\\/]+$/, "")}${separator}${value.replace(/^[\\/]+/, "")}`;
 }
 
-function WorkflowSidebar({
-  activeDashboardId,
+function replacePathPrefix(path, sourcePath, destinationPath, isDirectory) {
+  if (!path || !sourcePath || !destinationPath) return path;
+  if (!isDirectory) return path === sourcePath ? destinationPath : path;
+  const normalizedPath = String(path).replaceAll("\\", "/");
+  const normalizedSource = String(sourcePath).replaceAll("\\", "/").replace(/\/$/, "");
+  if (normalizedPath !== normalizedSource && !normalizedPath.startsWith(`${normalizedSource}/`)) {
+    return path;
+  }
+  const suffix = normalizedPath.slice(normalizedSource.length);
+  const separator = String(destinationPath).includes("\\") && !String(destinationPath).includes("/")
+    ? "\\"
+    : "/";
+  return `${String(destinationPath).replace(/[\\/]+$/, "")}${suffix.replaceAll("/", separator)}`;
+}
+
+function pathMatchesChange(path, changedPath, isDirectory) {
+  if (!path || !changedPath) return false;
+  if (!isDirectory) return path === changedPath;
+  const normalizedPath = String(path).replaceAll("\\", "/");
+  const normalizedChanged = String(changedPath).replaceAll("\\", "/").replace(/\/$/, "");
+  return normalizedPath === normalizedChanged || normalizedPath.startsWith(`${normalizedChanged}/`);
+}
+
+export function WorkflowSidebar({
+  activeWorkflow,
   activeWorkflowId,
-  dashboards,
-  dataDir,
   loading,
   query,
   runState,
-  workspaceMode,
   workflows,
-  onCreateDashboard,
+  view = "graph",
+  onCodeFileOpen,
+  onCodeFilesystemChange,
   onCreate,
-  onDataDirPick,
-  onDeleteDashboard,
   onDeleteWorkflow,
   onDuplicateWorkflow,
   onQueryChange,
   onRefresh,
   onRenameWorkflow,
+  onResizeKeyDown,
   onResizeStart,
   onRunWorkflow,
-  onSelectDashboard,
   onSelect,
-  onWorkspaceModeChange,
+  onViewChange,
   width,
 }) {
-  const [dataDirCopied, setDataDirCopied] = useState(false);
+  const [collapsedGroups, setCollapsedGroups] = useState({});
+  const [projectMenu, setProjectMenu] = useState(null);
+  const [copiedProjectRoot, setCopiedProjectRoot] = useState("");
+  const [projectLabels, setProjectLabels] = useState(loadProjectLabels);
+  const [renamingProjectRoot, setRenamingProjectRoot] = useState("");
+  const [projectLabelDraft, setProjectLabelDraft] = useState("");
+  const workflowGroups = useMemo(
+    () => groupWorkflowsByProject(workflows, projectLabels),
+    [projectLabels, workflows],
+  );
+  const canOpenCode = activeWorkflow?.sourceFormat === "radish";
 
-  async function copyDataDir() {
-    if (!dataDir) return;
-
+  useEffect(() => {
     try {
-      await navigator.clipboard.writeText(dataDir);
-      setDataDirCopied(true);
-      window.setTimeout(() => setDataDirCopied(false), 1400);
+      window.localStorage?.setItem(PROJECT_LABELS_STORAGE_KEY, JSON.stringify(projectLabels));
     } catch {
-      // Clipboard failures are non-critical; the path remains visible for manual copy.
+      // Labels still work for this session when browser storage is unavailable.
     }
+  }, [projectLabels]);
+
+  async function copyProjectRoot(root) {
+    try {
+      await navigator.clipboard.writeText(root);
+      setCopiedProjectRoot(root);
+      window.setTimeout(() => setCopiedProjectRoot(""), 1400);
+    } catch {
+      // The menu retains the path as a title so it can still be copied manually.
+      return;
+    }
+    setProjectMenu(null);
   }
 
-  async function openDataDir() {
-    if (!dataDir) return;
-    await window.goferDesktop?.workspace?.openPath?.(dataDir);
+  async function openProjectRoot(root) {
+    await window.goferDesktop?.workspace?.openPath?.(root);
+    setProjectMenu(null);
+  }
+
+  useEffect(() => {
+    if (!projectMenu) return undefined;
+    const close = () => setProjectMenu(null);
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setProjectMenu(null);
+    };
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [projectMenu]);
+
+  function showProjectMenu(event, group) {
+    event.preventDefault();
+    event.stopPropagation();
+    setProjectMenu({
+      ...projectMenuPosition(event.clientX, event.clientY),
+      name: group.name,
+      root: group.root,
+    });
+  }
+
+  function startProjectRename(group) {
+    setProjectLabelDraft(group.name);
+    setRenamingProjectRoot(group.root);
+    setProjectMenu(null);
+  }
+
+  function commitProjectRename(root) {
+    const label = projectLabelDraft.trim();
+    const folderName = projectNameFromPath(root);
+    setProjectLabels((current) => {
+      if (!label || label === folderName) return withoutKey(current, root);
+      return { ...current, [root]: label };
+    });
+    setRenamingProjectRoot("");
+    setProjectLabelDraft("");
+  }
+
+  function cancelProjectRename() {
+    setRenamingProjectRoot("");
+    setProjectLabelDraft("");
   }
 
   return (
     <aside
-      className="relative flex shrink-0 flex-col border-r border-line bg-white"
+      className="studio-sidebar relative flex shrink-0 flex-col border-r border-line bg-white"
       style={{ width }}
     >
       <div
+        aria-label="Resize workflows pane"
+        aria-orientation="vertical"
+        aria-valuemax={420}
+        aria-valuemin={240}
+        aria-valuenow={width}
+        aria-valuetext={`${width} pixels wide`}
         className="absolute right-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
         role="separator"
+        tabIndex={0}
         title="Resize workflows pane"
+        onKeyDown={onResizeKeyDown}
         onPointerDown={onResizeStart}
       />
-      <div className="border-b border-line px-5 py-4">
+      <div className="px-3.5 pb-2 pt-3.5">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="grid h-9 w-9 place-items-center rounded-lg bg-brand text-white">
-              <Waypoints size={20} />
+          <div className="flex items-center gap-2.5">
+            <span className="grid h-8 w-8 place-items-center rounded-[9px] bg-brand text-white shadow-sm">
+              <Waypoints size={17} />
             </span>
             <div>
-              <h1 className="text-base font-semibold leading-tight">Gofer Flow</h1>
-              <p className="text-xs text-muted">Workflow studio</p>
+              <h1 className="text-[13px] font-semibold leading-tight">Taskurotta</h1>
+              <p className="text-[11px] leading-tight text-muted">
+                {view === "code" ? "Project files" : "Workflow studio"}
+              </p>
             </div>
           </div>
           <button
-            className="grid h-9 w-9 place-items-center rounded-lg border border-line text-muted transition hover:border-slate-300 hover:text-ink"
+            className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
             title="Refresh workflows"
             type="button"
             onClick={onRefresh}
@@ -2733,131 +2829,276 @@ function WorkflowSidebar({
           </button>
         </div>
 
-        <div className="mt-5 grid grid-cols-2 gap-2 rounded-lg border border-line bg-slate-50 p-1">
+        <div
+          aria-label="Studio view"
+          className="mt-3 flex h-8 items-center gap-0.5 rounded-lg bg-slate-100 p-0.5"
+          role="tablist"
+        >
           <button
-            className={`flex h-8 items-center justify-center gap-2 rounded-md text-xs font-medium transition ${
-              workspaceMode === "workflows"
+            aria-selected={view === "graph"}
+            className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-xs font-medium transition ${
+              view === "graph"
                 ? "bg-white text-ink shadow-sm"
                 : "text-muted hover:text-ink"
             }`}
+            role="tab"
             type="button"
-            onClick={() => onWorkspaceModeChange("workflows")}
+            onClick={() => onViewChange?.("graph")}
           >
-            <Waypoints size={14} />
-            Workflows
+            <Waypoints aria-hidden="true" className={view === "graph" ? "text-brand" : ""} size={13} />
+            Graph
           </button>
           <button
-            className={`flex h-8 items-center justify-center gap-2 rounded-md text-xs font-medium transition ${
-              workspaceMode === "dashboards"
+            aria-disabled={!canOpenCode}
+            aria-selected={view === "code"}
+            className={`flex h-7 flex-1 items-center justify-center gap-1.5 rounded-md text-xs font-medium transition ${
+              view === "code"
                 ? "bg-white text-ink shadow-sm"
-                : "text-muted hover:text-ink"
+                : canOpenCode
+                  ? "text-muted hover:text-ink"
+                  : "cursor-not-allowed text-muted opacity-45"
             }`}
+            disabled={!canOpenCode}
+            role="tab"
+            title={canOpenCode ? "Open code view" : "Code view is available for Radish workflows"}
             type="button"
-            onClick={() => onWorkspaceModeChange("dashboards")}
+            onClick={() => onViewChange?.("code")}
           >
-            <Database size={14} />
-            Dashboards
+            <Code2 aria-hidden="true" className={view === "code" ? "text-brand" : ""} size={13} />
+            Code
           </button>
         </div>
 
-        <div className="mt-3 flex items-center gap-2 rounded-lg border border-line bg-slate-50 px-3 py-2">
-          <Search size={16} className="text-muted" />
+        <div className="mt-2.5 flex h-8 items-center gap-2 rounded-lg border border-transparent bg-slate-100 px-2.5 transition focus-within:border-indigo-500 focus-within:bg-white">
+          <Search size={14} className="text-muted" />
           <input
-            className="min-w-0 flex-1 bg-transparent text-sm outline-none placeholder:text-slate-400"
-            placeholder={workspaceMode === "dashboards" ? "Search dashboards" : "Search workflows"}
+            aria-label={view === "code" ? "Search files" : "Search workflows"}
+            className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
+            placeholder={view === "code" ? "Search files" : "Search workflows"}
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
           />
         </div>
       </div>
 
-      <div className="flex items-center justify-between px-5 py-4">
-        <div className="flex items-center gap-2 text-sm font-medium">
-          <ListFilter size={16} className="text-muted" />
-          {workspaceMode === "dashboards" ? "Dashboards" : "Workflows"}
-        </div>
+      {view === "graph" ? <div className="px-3.5 pb-2">
         <button
-          className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-          title={workspaceMode === "dashboards" ? "Create dashboard" : "Create workflow"}
+          className="flex h-9 w-full items-center justify-center gap-2 rounded-lg bg-brand px-3 text-xs font-semibold text-white shadow-sm transition hover:bg-indigo-700"
+          title="Create workflow"
           type="button"
-          onClick={workspaceMode === "dashboards" ? onCreateDashboard : onCreate}
+          onClick={onCreate}
         >
-          <Plus size={16} />
+          <Plus size={15} />
+          Create workflow
         </button>
-      </div>
+      </div> : null}
 
-      <div className="workflow-scrollbar flex-1 space-y-2 overflow-y-auto px-3 pb-4">
-        {workspaceMode === "dashboards" ? (
-          dashboards.length ? (
-            dashboards.map((dashboard) => (
-              <DashboardListItem
-                key={dashboard.id}
-                active={dashboard.id === activeDashboardId}
-                dashboard={dashboard}
-                onDelete={() => onDeleteDashboard(dashboard)}
-                onSelect={() => onSelectDashboard(dashboard.id)}
-              />
-            ))
-          ) : (
-            <div className="rounded-lg border border-dashed border-line bg-slate-50 p-4 text-sm leading-6 text-muted">
-              {loading ? "Loading dashboards..." : "No dashboards found."}
-            </div>
-          )
-        ) : workflows.length ? (
-          workflows.map((workflow) => (
-            <WorkflowListItem
-              key={workflow.id}
-              active={workflow.id === activeWorkflowId}
-              status={
-                runState?.running && runState.workflowId === workflow.id
-                  ? "Running"
-                  : workflow.status
-              }
-              workflow={workflow}
-              onDelete={() => onDeleteWorkflow(workflow)}
-              onDuplicate={() => onDuplicateWorkflow(workflow)}
-              onRename={(name) => onRenameWorkflow(workflow, name)}
-              onRun={() => onRunWorkflow(workflow)}
-              onSelect={() => onSelect(workflow.id)}
-            />
-          ))
+      <div className="workflow-scrollbar relative flex-1 overflow-y-auto px-2.5 pb-3 pt-1">
+        {view === "code" ? (
+          <CodeFileExplorer
+            query={query}
+            workflow={activeWorkflow}
+            onFilesystemChange={onCodeFilesystemChange}
+            onOpenFile={onCodeFileOpen}
+          />
+        ) : workflowGroups.length ? (
+          workflowGroups.map(({ id, name, items, root }) => {
+            const collapsed = Boolean(collapsedGroups[id]);
+            return (
+              <section
+                key={id}
+                className="mb-1 rounded-lg"
+                aria-label={`${name} workflows`}
+                onContextMenu={(event) => showProjectMenu(event, { name, root })}
+              >
+                <div className="group/folder flex h-8 items-center rounded-lg px-1.5 transition hover:bg-slate-100">
+                  <button
+                    aria-expanded={!collapsed}
+                    className="flex shrink-0 items-center gap-1.5 text-left text-xs font-semibold text-ink"
+                    type="button"
+                    onClick={() =>
+                      setCollapsedGroups((current) => ({ ...current, [id]: !current[id] }))
+                    }
+                  >
+                    <ChevronDown
+                      aria-hidden="true"
+                      className={`shrink-0 text-muted transition ${collapsed ? "-rotate-90" : ""}`}
+                      size={13}
+                    />
+                    <FolderOpen aria-hidden="true" className="shrink-0 text-muted" size={13} />
+                  </button>
+                  {renamingProjectRoot === root ? (
+                    <input
+                      autoFocus
+                      aria-label={`Project label for ${projectNameFromPath(root)}`}
+                      className="ml-1 h-6 min-w-0 flex-1 rounded-md border border-indigo-300 bg-white px-1.5 text-xs font-semibold text-ink outline-none ring-2 ring-indigo-100"
+                      maxLength={120}
+                      value={projectLabelDraft}
+                      onBlur={() => commitProjectRename(root)}
+                      onChange={(event) => setProjectLabelDraft(event.target.value)}
+                      onClick={(event) => event.stopPropagation()}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") event.currentTarget.blur();
+                        if (event.key === "Escape") {
+                          event.preventDefault();
+                          cancelProjectRename();
+                        }
+                      }}
+                    />
+                  ) : (
+                    <button
+                      className="min-w-0 flex-1 truncate pl-1 text-left text-xs font-semibold text-ink"
+                      title={`${name}\n${root}`}
+                      type="button"
+                      onClick={() =>
+                        setCollapsedGroups((current) => ({ ...current, [id]: !current[id] }))
+                      }
+                    >
+                      {name}
+                    </button>
+                  )}
+                  <span className="text-[10px] font-medium text-muted">{items.length}</span>
+                  <button
+                    aria-haspopup="menu"
+                    className="grid h-6 w-6 shrink-0 place-items-center rounded-md text-muted opacity-0 transition hover:bg-white hover:text-ink group-hover/folder:opacity-100 focus:opacity-100"
+                    title={`${name} project actions`}
+                    type="button"
+                    onClick={(event) => {
+                      const bounds = event.currentTarget.getBoundingClientRect();
+                      event.stopPropagation();
+                      setProjectMenu({
+                        ...projectMenuPosition(bounds.right, bounds.bottom),
+                        name,
+                        root,
+                      });
+                    }}
+                  >
+                    <MoreVertical size={13} />
+                  </button>
+                </div>
+                {!collapsed ? (
+                  <div className="ml-3 space-y-0.5 border-l border-line py-0.5 pl-1.5">
+                    {items.map((workflow) => (
+                      <WorkflowListItem
+                        key={workflow.id}
+                        active={workflow.id === activeWorkflowId}
+                        status={
+                          runState?.running && runState.workflowId === workflow.id
+                            ? "Running"
+                            : workflow.status
+                        }
+                        workflow={workflow}
+                        onDelete={() => onDeleteWorkflow(workflow)}
+                        onDuplicate={() => onDuplicateWorkflow(workflow)}
+                        onRename={(name) => onRenameWorkflow(workflow, name)}
+                        onRun={() => onRunWorkflow(workflow)}
+                        onSelect={() => onSelect(workflow.id)}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+              </section>
+            );
+          })
         ) : (
-          <div className="rounded-lg border border-dashed border-line bg-slate-50 p-4 text-sm leading-6 text-muted">
+          <div className="rounded-[10px] border border-dashed border-line bg-slate-50 p-4 text-xs leading-5 text-muted">
             {loading ? "Loading workflows..." : "No workflows found."}
           </div>
         )}
+        {projectMenu ? (
+          <div
+            aria-label={`${projectMenu.name} project actions`}
+            className="fixed z-[80] w-52 rounded-lg border border-line bg-white p-1 shadow-panel"
+            role="menu"
+            style={{ left: projectMenu.x, top: projectMenu.y }}
+            onPointerDown={(event) => event.stopPropagation()}
+          >
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50"
+              role="menuitem"
+              type="button"
+              onClick={() => startProjectRename(projectMenu)}
+            >
+              <PencilLine size={14} /> Rename
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50"
+              role="menuitem"
+              type="button"
+              onClick={() => copyProjectRoot(projectMenu.root)}
+            >
+              {copiedProjectRoot === projectMenu.root ? <Check size={14} /> : <Copy size={14} />}
+              {copiedProjectRoot === projectMenu.root ? "Path copied" : "Copy path"}
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50"
+              role="menuitem"
+              type="button"
+              onClick={() => openProjectRoot(projectMenu.root)}
+            >
+              <FolderOpen size={14} /> Open in file explorer
+            </button>
+            <p className="truncate px-2.5 pb-1.5 pt-1 font-mono text-[10px] text-muted" title={projectMenu.root}>
+              {projectMenu.root}
+            </p>
+          </div>
+        ) : null}
       </div>
-
-      {dataDir ? (
-        <div className="flex items-center gap-2 border-t border-line px-5 py-3 text-xs leading-5 text-muted">
-          <button
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
-            title={dataDirCopied ? "Copied" : "Copy app data folder path"}
-            type="button"
-            onClick={copyDataDir}
-          >
-            {dataDirCopied ? <Check size={14} /> : <Copy size={14} />}
-          </button>
-          <button
-            className="min-w-0 flex-1 truncate text-left text-teal-700 underline-offset-2 transition hover:text-teal-800 hover:underline"
-            title={dataDir}
-            type="button"
-            onClick={openDataDir}
-          >
-            {dataDir}
-          </button>
-          <button
-            className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink dark:hover:bg-[#2a2a2a]"
-            title="Change app data folder"
-            type="button"
-            onClick={onDataDirPick}
-          >
-            <FolderOpen size={15} />
-          </button>
-        </div>
-      ) : null}
     </aside>
   );
+}
+
+export function projectMenuPosition(clientX, clientY, viewportWidth = window.innerWidth, viewportHeight = window.innerHeight) {
+  const menuWidth = 208;
+  const menuHeight = 154;
+  const requestedX = Number.isFinite(clientX) ? clientX : 8;
+  const requestedY = Number.isFinite(clientY) ? clientY : 8;
+  const availableWidth = Number.isFinite(viewportWidth) ? viewportWidth : 1024;
+  const availableHeight = Number.isFinite(viewportHeight) ? viewportHeight : 768;
+  return {
+    x: Math.max(8, Math.min(requestedX, availableWidth - menuWidth - 8)),
+    y: Math.max(8, Math.min(requestedY, availableHeight - menuHeight - 8)),
+  };
+}
+
+export function groupWorkflowsByProject(workflows, projectLabels = {}) {
+  const groups = new Map();
+  for (const workflow of workflows ?? []) {
+    const root = workflow.projectRoot || workflow.sourcePath || "Unregistered";
+    const id = `project:${root}`;
+    if (!groups.has(id)) {
+      groups.set(id, {
+        id,
+        name: projectLabels[root]?.trim() || projectNameFromPath(root),
+        defaultName: projectNameFromPath(root),
+        root,
+        items: [],
+      });
+    }
+    groups.get(id).items.push(workflow);
+  }
+  return [...groups.values()].sort((left, right) =>
+    left.name.localeCompare(right.name) || left.root.localeCompare(right.root));
+}
+
+export function loadProjectLabels() {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(window.localStorage?.getItem(PROJECT_LABELS_STORAGE_KEY) ?? "{}");
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        ([root, label]) => root.trim() && typeof label === "string" && label.trim(),
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function projectNameFromPath(pathValue) {
+  const parts = String(pathValue).replaceAll("\\", "/").split("/").filter(Boolean);
+  return parts.at(-1) || "Unregistered";
 }
 
 function WorkflowListItem({
@@ -2917,16 +3158,16 @@ function WorkflowListItem({
 
   return (
     <div
-      className={`group relative w-full rounded-lg border text-left transition ${
+      className={`group relative w-full rounded-lg text-left transition ${
         active
-          ? "border-teal-200 bg-teal-50 shadow-sm"
-          : "border-transparent bg-white hover:border-line hover:bg-slate-50"
+          ? "bg-indigo-50"
+          : "bg-transparent hover:bg-slate-100"
       }`}
     >
       <div
         role="button"
         tabIndex={0}
-        className="w-full rounded-lg p-3 pr-10 text-left"
+        className="w-full rounded-lg px-2 py-2 pr-8 text-left"
         onClick={() => {
           if (!renaming) {
             onSelect();
@@ -2961,16 +3202,14 @@ function WorkflowListItem({
                 }}
               />
             ) : (
-              <p className="truncate text-sm font-semibold">{workflow.name}</p>
+              <p className={`truncate text-xs font-medium ${active ? "text-indigo-700" : "text-ink"}`}>{workflow.name}</p>
             )}
-            <p className="text-clamp-2 mt-1 text-xs leading-5 text-muted">
-              {workflow.description}
-            </p>
+            <p className="mt-0.5 truncate text-[10px] leading-4 text-muted">{workflow.status ?? "Ready"}</p>
           </div>
           <StatusDot status={status} />
         </div>
       </div>
-      <div ref={menuRef} className="absolute right-2 top-2">
+      <div ref={menuRef} className="absolute right-1 top-1.5">
         <button
           className="grid h-7 w-7 place-items-center rounded-md text-muted opacity-70 transition hover:bg-slate-100 hover:text-ink group-hover:opacity-100 dark:hover:bg-[#2a2a2a]"
           title="Workflow actions"
@@ -3040,86 +3279,111 @@ function WorkflowListItem({
   );
 }
 
-function DashboardListItem({ active, dashboard, onDelete, onSelect }) {
-  const itemCount = (dashboard.sections ?? []).reduce(
-    (total, section) =>
-      total +
-      (section.components ?? []).reduce(
-        (componentTotal, component) => componentTotal + (component.items?.length ?? 0),
-        0,
-      ),
-    0,
-  );
-  return (
-    <div
-      className={`group rounded-lg border p-3 transition ${
-        active ? "border-teal-200 bg-teal-50" : "border-line bg-white hover:border-slate-300"
-      }`}
-    >
-      <button className="w-full text-left" type="button" onClick={onSelect}>
-        <div className="flex items-start gap-3">
-          <span className="grid h-8 w-8 shrink-0 place-items-center rounded-md bg-slate-100 text-muted">
-            <Database size={15} />
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-sm font-semibold text-ink">{dashboard.name}</div>
-            <div className="mt-1 truncate text-xs text-muted">{dashboard.id}</div>
-            <div className="mt-2 text-xs text-muted">
-              {(dashboard.sections ?? []).length} sections · {itemCount} items
-            </div>
-          </div>
-        </div>
-      </button>
-      <div className="mt-2 flex justify-end opacity-0 transition group-hover:opacity-100">
-        <button
-          className="grid h-7 w-7 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-          title="Delete dashboard"
-          type="button"
-          onClick={onDelete}
-        >
-          <Trash2 size={14} />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function TopBar({
+export function TopBar({
+  editorState,
+  saveState,
   theme,
   updateState,
   workflow,
+  view = "graph",
   onApplyUpdate,
   onCheckForUpdates,
   onOpenHistory,
+  onRetrySave,
+  onSaveRadish,
   onToggleTheme,
 }) {
   const nodeCount = workflow.nodes?.length ?? 0;
   const edgeCount = workflow.edges?.length ?? 0;
   const hasUpdateBridge = Boolean(window.goferUpdates?.check);
+  const sourceParts = String(workflow.sourcePath ?? "").replaceAll("\\", "/").split("/").filter(Boolean);
+  const folderName = sourceParts.length > 1 ? sourceParts.at(-2) : "Unfiled";
+  const editorDocument = editorState?.document;
+  const editorDiagnostics = [
+    ...(editorDocument?.diagnostics ?? []),
+    ...(editorDocument?.preflight?.diagnostics ?? []),
+  ];
+  const editorErrorCount = editorDiagnostics.filter((item) => item.severity === "error").length;
+  const editorWarningCount = editorDiagnostics.filter((item) => item.severity === "warning").length;
+  const editorLineCount = editorDocument?.source
+    ? editorDocument.source.split(/\r\n|\r|\n/).length
+    : 0;
   return (
-    <header className="flex h-[62px] shrink-0 items-center justify-between bg-white px-6 pt-1">
-      <div className="min-w-0 pt-1">
-        <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-[0.14em] text-muted">
-          <GitBranch size={14} />
-          Visual workflow editor
-        </div>
-        <div className="mt-0.5 flex items-center gap-3">
-          <h2 className="truncate text-[19px] font-semibold">{workflow.name}</h2>
-          <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
-            {workflow.invalid ? "Invalid TOML" : `${nodeCount} nodes`}
+    <header className="studio-topbar flex h-[54px] shrink-0 items-center justify-between border-b border-line bg-white px-4">
+      <div className="flex min-w-0 items-center gap-3">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="shrink-0 text-xs text-muted">
+            {view === "code" ? workflow.projectName || folderName : folderName}
           </span>
-          {!workflow.invalid ? (
-            <span className="rounded-md border border-line px-2 py-1 text-xs font-medium text-muted">
+          <span aria-hidden="true" className="text-muted">/</span>
+          <h2 className="truncate text-sm font-semibold">
+            {view === "code" ? "workflow.rad" : workflow.name}
+          </h2>
+        </div>
+        <div className="hidden items-center gap-1.5 xl:flex">
+          <span className="rounded-full border border-line bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-muted">
+            {view === "code"
+              ? editorLineCount
+                ? `${editorLineCount} lines`
+                : "Opening"
+              : workflow.invalid
+                ? workflow.sourceFormat === "radish"
+                  ? "Invalid Radish"
+                  : "Invalid TOML"
+                : `${nodeCount} nodes`}
+          </span>
+          {view === "code" && editorErrorCount ? (
+            <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700">
+              {editorErrorCount} {editorErrorCount === 1 ? "error" : "errors"}
+            </span>
+          ) : null}
+          {view === "code" && editorWarningCount ? (
+            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
+              {editorWarningCount} {editorWarningCount === 1 ? "warning" : "warnings"}
+            </span>
+          ) : null}
+          {view === "graph" && !workflow.invalid ? (
+            <span className="rounded-full border border-line bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-muted">
               {edgeCount} edges
+            </span>
+          ) : null}
+          {view === "code" && editorDocument ? (
+            <span
+              className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                editorDocument.dirty
+                  ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                  : "border-emerald-200 bg-emerald-50 text-emerald-700"
+              }`}
+            >
+              {editorDocument.dirty ? "Unsaved" : "Saved"}
             </span>
           ) : null}
         </div>
       </div>
       <div className="flex items-center gap-2">
+        {view === "graph" ? <WorkflowSaveStatus saveState={saveState} onRetry={onRetrySave} /> : null}
+        {view === "code" && editorDocument ? (
+          <button
+            className="inline-flex h-8 items-center gap-2 rounded-lg border border-line bg-white px-3 text-xs font-semibold text-ink transition hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-default disabled:opacity-55"
+            disabled={!editorDocument.dirty || editorState?.saving}
+            title={editorDocument.dirty ? "Save workflow.rad" : "workflow.rad is saved"}
+            type="button"
+            onClick={onSaveRadish}
+          >
+            {editorState?.saving ? (
+              <Loader2 aria-hidden="true" className="animate-spin" size={14} />
+            ) : editorDocument.dirty ? (
+              <Save aria-hidden="true" size={14} />
+            ) : (
+              <Check aria-hidden="true" size={14} />
+            )}
+            {editorState?.saving ? "Saving" : editorDocument.dirty ? "Save" : "Saved"}
+          </button>
+        ) : null}
         {hasUpdateBridge ? (
           updateState?.available ? (
             <button
-              className="inline-flex h-9 items-center gap-2 rounded-lg border border-teal-700/30 bg-teal-50 px-3 text-xs font-semibold text-teal-800 transition hover:border-teal-700/50 hover:bg-teal-100 disabled:cursor-wait disabled:opacity-70 dark:border-teal-500/30 dark:bg-teal-950/40 dark:text-teal-200 dark:hover:bg-teal-900/50"
+              className="inline-flex h-8 items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50 px-3 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:cursor-wait disabled:opacity-70"
               disabled={Boolean(updateState.downloading)}
               title={updateButtonTitle(updateState)}
               type="button"
@@ -3134,7 +3398,7 @@ function TopBar({
             </button>
           ) : (
             <button
-              className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
               title={
                 updateState?.error
                   ? `Update check failed: ${updateState.error}`
@@ -3151,7 +3415,7 @@ function TopBar({
           )
         ) : null}
         <button
-          className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
           title="Workflow history"
           type="button"
           onClick={onOpenHistory}
@@ -3159,7 +3423,7 @@ function TopBar({
           <History size={16} />
         </button>
         <button
-          className="grid h-9 w-9 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
           title={theme === "dark" ? "Light mode" : "Dark mode"}
           type="button"
           onClick={onToggleTheme}
@@ -3168,6 +3432,60 @@ function TopBar({
         </button>
       </div>
     </header>
+  );
+}
+
+function WorkflowSaveStatus({ saveState, onRetry }) {
+  if (!saveState?.status) return null;
+
+  if (saveState.status === "error") {
+    return (
+      <div
+        aria-atomic="true"
+        aria-live="assertive"
+        className="inline-flex h-9 items-center gap-2 rounded-lg bg-red-50 px-3 text-xs font-medium text-red-800 dark:bg-red-950/40 dark:text-red-200"
+        role="alert"
+        title={saveState.error || "Unable to save workflow"}
+      >
+        <AlertCircle aria-hidden="true" size={15} />
+        <span>Couldn&apos;t save</span>
+        {saveState.error ? (
+          <span className="max-w-32 truncate text-red-700 dark:text-red-300">
+            {saveState.error}
+          </span>
+        ) : null}
+        <span aria-hidden="true">—</span>
+        <button
+          className="font-semibold underline underline-offset-2 hover:no-underline"
+          type="button"
+          onClick={onRetry}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      aria-atomic="true"
+      aria-busy={saveState.status === "saving" || undefined}
+      aria-live="polite"
+      className="inline-flex h-9 items-center gap-2 px-2 text-xs font-medium text-muted"
+      role="status"
+    >
+      {saveState.status === "saving" ? (
+        <>
+          <Loader2 aria-hidden="true" size={15} className="animate-spin" />
+          Saving…
+        </>
+      ) : (
+        <>
+          <Check aria-hidden="true" size={15} />
+          Saved
+        </>
+      )}
+    </div>
   );
 }
 
@@ -3181,12 +3499,12 @@ function updateButtonLabel(updateState) {
 }
 
 function updateButtonTitle(updateState) {
-  if (updateState?.downloaded) return "Restart Gofer Flow and apply the downloaded update";
+  if (updateState?.downloaded) return "Restart Taskurotta and apply the downloaded update";
   if (updateState?.downloading) return "Downloading update";
-  return "Download, install, and restart Gofer Flow";
+  return "Download, install, and restart Taskurotta";
 }
 
-function WorkflowHistoryDialog({
+export function WorkflowHistoryDialog({
   diff,
   error,
   loading,
@@ -3198,8 +3516,13 @@ function WorkflowHistoryDialog({
   onRestore,
 }) {
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
-      <div className="flex max-h-[86vh] w-full max-w-[920px] flex-col rounded-lg border border-line bg-white shadow-panel">
+    <Dialog
+      description={`${workflow.name} revision history`}
+      onClose={onClose}
+      panelClassName="flex max-h-[86vh] w-full max-w-[920px] flex-col rounded-lg border border-line bg-white shadow-panel"
+      panelProps={{ "aria-busy": loading || undefined }}
+      title="Workflow history"
+    >
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div className="min-w-0">
             <h2 className="truncate text-base font-semibold">Workflow history</h2>
@@ -3230,7 +3553,7 @@ function WorkflowHistoryDialog({
         <div className="grid min-h-0 flex-1 grid-cols-[340px_minmax(0,1fr)] overflow-hidden">
           <div className="workflow-scrollbar min-h-0 overflow-y-auto border-r border-line">
             {error ? (
-              <div className="border-b border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700">
+              <div className="border-b border-red-100 bg-red-50 px-4 py-3 text-sm text-red-700" role="alert">
                 {error}
               </div>
             ) : null}
@@ -3303,8 +3626,7 @@ function WorkflowHistoryDialog({
             )}
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -3314,30 +3636,47 @@ function formatRevisionDate(value) {
   return date.toLocaleString();
 }
 
-function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workflow, workflows }) {
+function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, workflow, workflows }) {
   const chatScrollRef = useRef(null);
   const conversationMenuRef = useRef(null);
   const [draft, setDraft] = useState("");
-  const [providers, setProviders] = useState([]);
   const [providerId, setProviderId] = useState("codex");
-  const [model, setModel] = useState("cli-default");
+  const [model, setModel] = useState("");
+  const [effort, setEffort] = useState("");
+  const {
+    capabilities: providers,
+    error: providerDiscoveryError,
+    loading: providersLoading,
+    refresh: refreshProviders,
+  } = useProviderCapabilities();
   const [threads, setThreads] = useState(loadChatThreads);
   const [activeThreadId, setActiveThreadId] = useState(null);
   const [messagesByThread, setMessagesByThread] = useState({});
   const [chatStateByThread, setChatStateByThread] = useState({});
+  const [chatAnnouncementByThread, setChatAnnouncementByThread] = useState({});
+  const [backgroundChatAnnouncement, setBackgroundChatAnnouncement] = useState("");
   const [showTypingByThread, setShowTypingByThread] = useState({});
   const [typingDelayByThread, setTypingDelayByThread] = useState({});
   const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
   const chatAbortControllersRef = useRef({});
+  const deletedChatThreadIdsRef = useRef(new Set());
+  const activeThreadIdRef = useRef(null);
   const workflowName = workflow?.name ?? "All workflows";
   const activeThread = threads.find((thread) => thread.id === activeThreadId);
-  const messages = activeThreadId
-    ? messagesByThread[activeThreadId] ?? loadChatMessages(chatStorageKeyFor(activeThreadId))
-    : [];
+  const messages = useMemo(
+    () =>
+      activeThreadId
+        ? messagesByThread[activeThreadId] ?? loadChatMessages(chatStorageKeyFor(activeThreadId))
+        : [],
+    [activeThreadId, messagesByThread],
+  );
   const chatState = activeThreadId
     ? chatStateByThread[activeThreadId] ?? { sending: false, error: "" }
     : { sending: false, error: "" };
+  const chatAnnouncement = activeThreadId
+    ? chatAnnouncementByThread[activeThreadId] ?? ""
+    : "";
   const showTypingIndicator = Boolean(activeThreadId && showTypingByThread[activeThreadId]);
   const typingDelayKey = activeThreadId ? typingDelayByThread[activeThreadId] ?? 0 : 0;
   const workflowContext = useMemo(
@@ -3352,24 +3691,25 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
   const chatItems = useMemo(() => buildChatItems(messages), [messages]);
 
   useEffect(() => {
-    async function loadProviders() {
-      try {
-        const response = await fetch(apiUrl("/chat/providers"));
-        if (!response.ok) return;
-        const payload = await response.json();
-        const nextProviders = payload.providers ?? [];
-        setProviders(nextProviders);
-        const availableProvider = nextProviders.find((provider) => provider.available);
-        if (availableProvider) {
-          setProviderId(availableProvider.id);
-          setModel(availableProvider.models?.[0] ?? "cli-default");
-        }
-      } catch {
-        setProviders([]);
-      }
+    activeThreadIdRef.current = activeThreadId;
+  }, [activeThreadId]);
+
+  useEffect(() => {
+    const current = providers.find((provider) => provider.id === providerId);
+    const nextProvider =
+      (current?.available && current.discoveryStatus === "ready" && current) ??
+      providers.find((provider) => provider.available && provider.discoveryStatus === "ready");
+    if (!nextProvider) return;
+    const nextModel =
+      nextProvider.models?.find((item) => item.id === nextProvider.defaultModel) ??
+      nextProvider.models?.[0];
+    if (!nextModel) return;
+    if (providerId !== nextProvider.id) setProviderId(nextProvider.id);
+    if (!nextProvider.models?.some((item) => item.id === model)) setModel(nextModel.id);
+    if (effort && !nextModel.efforts?.some((item) => item.id === effort)) {
+      setEffort(nextModel.defaultEffort ?? "");
     }
-    loadProviders();
-  }, []);
+  }, [effort, model, providerId, providers]);
 
   useEffect(() => {
     if (!activeThreadId) {
@@ -3426,19 +3766,15 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     });
   }, [showTypingIndicator]);
 
-  const selectedProvider =
-    providers.find((provider) => provider.id === providerId) ??
-    providers[0] ?? {
-      id: "codex",
-      name: "Codex",
-      available: true,
-      models: ["cli-default"],
-    };
-
   async function sendMessage() {
     const text = draft.trim();
-    if (!activeThreadId || !text || chatState.sending) return;
-    const targetThreadId = activeThreadId;
+    if (!text || chatState.sending) return;
+    const targetThreadId = activeThreadId ?? createThread();
+    const targetThreadTitle =
+      activeThread?.title && activeThread.title !== "New thread"
+        ? activeThread.title
+        : threadTitleFromMessage(text);
+    deletedChatThreadIdsRef.current.delete(targetThreadId);
 
     const userMessage = {
       id: uniqueClientId(),
@@ -3451,25 +3787,33 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     setDraft("");
     setChatStateByThread((current) => ({
       ...current,
-      [targetThreadId]: { sending: true, error: "" },
+      [targetThreadId]: { sending: true, error: "", hasNewResponse: false },
     }));
+    setBackgroundChatAnnouncement("");
+    setChatAnnouncementByThread((current) => ({ ...current, [targetThreadId]: "" }));
     const thoughtGroupId = uniqueClientId();
     window.requestAnimationFrame(() => {
       scrollMessageNearTop(userMessage.id);
     });
 
     function appendAssistantMessage(body, kind = "final", extra = {}) {
+      if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
       const assistantMessageId = uniqueClientId();
-      updateThreadMessages(targetThreadId, (current) => [
-        ...current,
-        {
-          id: assistantMessageId,
-          role: "assistant",
-          kind,
-          body,
-          ...extra,
-        },
-      ]);
+      updateThreadMessages(targetThreadId, (current) => {
+        const currentMessages = kind === "final"
+          ? removeTrailingDuplicateOutputThought(current, body, thoughtGroupId)
+          : current;
+        return [
+          ...currentMessages,
+          {
+            id: assistantMessageId,
+            role: "assistant",
+            kind,
+            body,
+            ...extra,
+          },
+        ];
+      });
       window.requestAnimationFrame(() => {
         scrollElementIntoView(
           kind === "thought" && extra.groupId
@@ -3480,6 +3824,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     }
 
     function restartTypingDelay() {
+      if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
       setShowTypingByThread((current) => ({ ...current, [targetThreadId]: false }));
       setTypingDelayByThread((current) => ({
         ...current,
@@ -3487,9 +3832,9 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
       }));
     }
 
+    const abortController = new AbortController();
+    chatAbortControllersRef.current[targetThreadId] = abortController;
     try {
-      const abortController = new AbortController();
-      chatAbortControllersRef.current[targetThreadId] = abortController;
       const response = await fetch(apiUrl("/chat/stream"), {
         method: "POST",
         headers: {
@@ -3499,6 +3844,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
         body: JSON.stringify(chatStreamRequestBody({
           provider: providerId,
           model,
+          effort: effort || undefined,
           messages: nextMessages.map(({ role, body }) => ({ role, body })),
           workflow: {
             ...workflowContext,
@@ -3533,7 +3879,10 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
             if (event.type === "thought") {
               const thought = String(event.text ?? "").trim();
               if (!thought) continue;
-              appendAssistantMessage(thought, "thought", { groupId: thoughtGroupId });
+              appendAssistantMessage(thought, "thought", {
+                groupId: thoughtGroupId,
+                trace: event.trace && typeof event.trace === "object" ? event.trace : undefined,
+              });
               restartTypingDelay();
             } else if (event.type === "compaction") {
               const compactedMessages = Array.isArray(event.messages)
@@ -3577,28 +3926,47 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
       if (!finalReceived) {
         throw new Error("Workflow assistant stream ended without a final response");
       }
-      setChatStateByThread((current) => ({
-        ...current,
-        [targetThreadId]: { sending: false, error: "" },
-      }));
-    } catch (error) {
-      if (error instanceof DOMException && error.name === "AbortError") {
-        appendAssistantMessage("Workflow assistant stopped.", "final");
-        setChatStateByThread((current) => ({
-          ...current,
-          [targetThreadId]: { sending: false, error: "" },
-        }));
-        return;
-      }
+      if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
       setChatStateByThread((current) => ({
         ...current,
         [targetThreadId]: {
           sending: false,
+          error: "",
+          hasNewResponse: activeThreadIdRef.current !== targetThreadId,
+        },
+      }));
+      if (activeThreadIdRef.current !== targetThreadId) {
+        setBackgroundChatAnnouncement(`Assistant response complete in ${targetThreadTitle}.`);
+      }
+      setChatAnnouncementByThread((current) => ({
+        ...current,
+        [targetThreadId]: "Workflow assistant response complete.",
+      }));
+    } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
+        appendAssistantMessage("Workflow assistant stopped.", "final");
+        setChatStateByThread((current) => ({
+          ...current,
+          [targetThreadId]: { sending: false, error: "", hasNewResponse: false },
+        }));
+        setChatAnnouncementByThread((current) => ({
+          ...current,
+          [targetThreadId]: "Workflow assistant stopped.",
+        }));
+        return;
+      }
+      if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
+      setChatStateByThread((current) => ({
+        ...current,
+        [targetThreadId]: {
+          sending: false,
+          hasNewResponse: false,
           error: error instanceof Error ? error.message : "Unable to send message",
         },
       }));
     } finally {
-      if (chatAbortControllersRef.current[targetThreadId]) {
+      if (chatAbortControllersRef.current[targetThreadId] === abortController) {
         delete chatAbortControllersRef.current[targetThreadId];
       }
     }
@@ -3610,6 +3978,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
   }
 
   function updateThreadMessages(threadId, nextValue) {
+    if (deletedChatThreadIdsRef.current.has(threadId)) return;
     setMessagesByThread((current) => {
       const currentMessages =
         current[threadId] ?? loadChatMessages(chatStorageKeyFor(threadId));
@@ -3631,8 +4000,29 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     const nextThreads = [thread, ...threads];
     persistChatThreads(nextThreads);
     setThreads(nextThreads);
+    activeThreadIdRef.current = thread.id;
     setActiveThreadId(thread.id);
     setDraft("");
+    return thread.id;
+  }
+
+  function openThread(threadId) {
+    activeThreadIdRef.current = threadId;
+    setActiveThreadId(threadId);
+    setChatStateByThread((current) => {
+      const threadState = current[threadId];
+      if (!threadState?.hasNewResponse) return current;
+      return {
+        ...current,
+        [threadId]: { ...threadState, hasNewResponse: false },
+      };
+    });
+  }
+
+  function showThreadList() {
+    activeThreadIdRef.current = null;
+    setActiveThreadId(null);
+    setConversationMenuOpen(false);
   }
 
   function updateThreadTitleFromMessage(threadId, message) {
@@ -3652,6 +4042,9 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
   }
 
   async function deleteThread(threadId) {
+    deletedChatThreadIdsRef.current.add(threadId);
+    chatAbortControllersRef.current[threadId]?.abort();
+    delete chatAbortControllersRef.current[threadId];
     const nextThreads = threads.filter((thread) => thread.id !== threadId);
     persistChatThreads(nextThreads);
     setThreads(nextThreads);
@@ -3676,9 +4069,8 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
       delete next[threadId];
       return next;
     });
-    chatAbortControllersRef.current[threadId]?.abort();
-    delete chatAbortControllersRef.current[threadId];
     if (activeThreadId === threadId) {
+      activeThreadIdRef.current = null;
       setActiveThreadId(null);
     }
     setExpandedThoughtGroups({});
@@ -3696,7 +4088,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unable to delete chat handoff file";
-      if (activeThreadId === threadId) {
+      if (!deletedChatThreadIdsRef.current.has(threadId) && activeThreadId === threadId) {
         setChatStateByThread((current) => ({
           ...current,
           [threadId]: { sending: false, error: message },
@@ -3712,7 +4104,7 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
 
     scrollContainer.scrollTo({
       top: messageElement.offsetTop - 12,
-      behavior: "smooth",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
     });
   }
 
@@ -3722,167 +4114,134 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
     if (!scrollContainer || !element) return;
 
     element.scrollIntoView({
-      behavior: "smooth",
+      behavior: prefersReducedMotion() ? "auto" : "smooth",
       block: "nearest",
     });
   }
 
-  function reviewPatchMessage(message) {
-    const messageIndex = messages.findIndex((candidate) => candidate.id === message.id);
-    const prompt = messages
-      .slice(0, Math.max(0, messageIndex))
-      .reverse()
-      .find((candidate) => candidate.role === "user");
-    onReviewPatch?.({ message, prompt, thread: activeThread });
-  }
-
   return (
     <aside
-      className="relative flex shrink-0 flex-col border-l border-line bg-white"
+      aria-busy={chatState.sending || undefined}
+      className="studio-chat relative flex shrink-0 flex-col border-l border-line bg-white"
       style={{ width }}
     >
+      <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
+        {chatAnnouncement}
+      </div>
+      <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
+        {backgroundChatAnnouncement}
+      </div>
+      <div aria-atomic="true" aria-live="assertive" className="sr-only" role="alert">
+        {chatState.error}
+      </div>
       <div
+        aria-label="Resize chat pane"
+        aria-orientation="vertical"
+        aria-valuemax={520}
+        aria-valuemin={300}
+        aria-valuenow={width}
+        aria-valuetext={`${width} pixels wide`}
         className="absolute left-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
         role="separator"
+        tabIndex={0}
         title="Resize chat pane"
+        onKeyDown={onResizeKeyDown}
         onPointerDown={onResizeStart}
       />
-      <div className="border-b border-line px-5 py-4">
-        <div className="flex items-start gap-3">
-          <span className="mt-0.5 grid h-9 w-9 place-items-center rounded-lg bg-slate-900 text-white">
-            {chatState.sending ? <Loader2 size={19} className="animate-spin" /> : <Bot size={19} />}
-          </span>
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex min-w-0 items-center gap-2">
-                {activeThread ? (
-                  <button
-                    className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-                    title="Back to threads"
-                    type="button"
-                    onClick={() => setActiveThreadId(null)}
-                  >
-                    <ArrowLeft size={15} />
-                  </button>
-                ) : null}
-                <div className="min-w-0">
-                  <h2 className="truncate text-base font-semibold">Workflow assistant</h2>
-                  <p className="truncate text-xs text-muted">
-                    {activeThread
-                      ? activeThread.title
-                      : workflow
-                        ? `${workflowName} selected`
-                        : "No workflow selected"}
-                  </p>
-                </div>
-              </div>
-              <div ref={conversationMenuRef} className="relative flex shrink-0 items-center gap-2">
-                <span
-                  className={`rounded-md border px-2 py-1 text-[11px] font-medium ${
-                    selectedProvider.available
-                      ? "border-emerald-200 bg-emerald-50 text-emerald-700"
-                      : "border-red-200 bg-red-50 text-red-700"
-                  }`}
-                >
-                  {selectedProvider.available ? "Ready" : "Missing CLI"}
-                </span>
-                <button
-                  className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-                  title="Conversation options"
-                  type="button"
-                  onClick={() => setConversationMenuOpen((current) => !current)}
-                >
-                  <MoreVertical size={15} />
-                </button>
-                {conversationMenuOpen ? (
-                  <div className="absolute right-0 top-10 z-40 w-44 rounded-lg border border-line bg-white p-1 shadow-panel">
-                    <button
-                      className="w-full rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50"
-                      type="button"
-                      disabled={!activeThread}
-                      onClick={() => activeThread && deleteThread(activeThread.id)}
-                    >
-                      Delete thread
-                    </button>
-                  </div>
-                ) : null}
-              </div>
+      <div className="flex h-[54px] shrink-0 items-center justify-between border-b border-line px-3.5">
+        <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-muted">
+          {activeThread ? (
+            <button
+              aria-label="Back to recent threads"
+              className="studio-icon-button -ml-1 grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+              title="Back to recent threads"
+              type="button"
+              onClick={showThreadList}
+            >
+              <ArrowLeft aria-hidden="true" size={16} />
+            </button>
+          ) : null}
+          <GitBranch aria-hidden="true" size={14} />
+          <span className="truncate">{workflow ? `Scoped to ${workflowName}` : "All workflows"}</span>
+        </div>
+        <div ref={conversationMenuRef} className="relative flex items-center gap-1">
+          <button
+            aria-label="New thread"
+            className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            title="New thread"
+            type="button"
+            onClick={createThread}
+          >
+            <Plus aria-hidden="true" size={17} />
+          </button>
+          <button
+            aria-expanded={conversationMenuOpen}
+            aria-label="Recent threads"
+            className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            title="Recent threads"
+            type="button"
+            onClick={() => setConversationMenuOpen((current) => !current)}
+          >
+            <History aria-hidden="true" size={16} />
+          </button>
+          {conversationMenuOpen ? (
+            <div className="absolute right-0 top-9 z-50 max-h-80 w-72 overflow-y-auto rounded-[14px] border border-line bg-white p-1.5 shadow-panel">
+              <p className="px-2 py-1.5 text-[10px] font-bold uppercase tracking-[0.06em] text-muted">Recent threads</p>
+              <ThreadList
+                activityByThread={chatStateByThread}
+                threads={threads}
+                activeThreadId={activeThreadId}
+                onDelete={deleteThread}
+                onOpen={openThread}
+              />
             </div>
-            <div className="mt-3 grid grid-cols-2 gap-2">
-              <select
-                className="h-9 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
-                value={providerId}
-                onChange={(event) => {
-                  const nextProvider = providers.find(
-                    (provider) => provider.id === event.target.value,
-                  );
-                  setProviderId(event.target.value);
-                  setModel(nextProvider?.models?.[0] ?? "cli-default");
-                }}
-              >
-                {(providers.length ? providers : [selectedProvider]).map((provider) => (
-                  <option key={provider.id} value={provider.id}>
-                    {provider.name}
-                  </option>
-                ))}
-              </select>
-              <select
-                className="h-9 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-              >
-                {(selectedProvider.models ?? ["cli-default"]).map((modelName) => (
-                  <option key={modelName} value={modelName}>
-                    {modelName}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+          ) : null}
         </div>
       </div>
 
       <div
         ref={chatScrollRef}
-        className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-5"
+        className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-3.5 py-4"
       >
         {!activeThread ? (
-          <ThreadList
-            threads={threads}
-            onCreate={createThread}
-            onDelete={deleteThread}
-            onOpen={setActiveThreadId}
-          />
+          <div className="min-h-full" data-assistant-home>
+            <div className="px-6 pb-8 pt-10 text-center">
+              <span className="mx-auto grid h-9 w-9 place-items-center rounded-[10px] bg-indigo-50 text-indigo-600">
+                <Bot size={18} />
+              </span>
+              <h2 className="mt-3 text-sm font-semibold text-ink">Workflow assistant</h2>
+              <p className="mt-1 text-xs leading-5 text-muted">Ask about the selected workflow or describe a change.</p>
+            </div>
+            <section aria-labelledby="assistant-home-recent" className="border-t border-line pt-3">
+              <h3 id="assistant-home-recent" className="px-2 pb-2 text-xs font-semibold text-muted">
+                Recent threads
+              </h3>
+              <ThreadList
+                activityByThread={chatStateByThread}
+                threads={threads}
+                activeThreadId={activeThreadId}
+                onDelete={deleteThread}
+                onOpen={openThread}
+              />
+            </section>
+          </div>
         ) : (
           <>
-            <div className="rounded-lg border border-line bg-slate-50 p-3">
-              <p className="text-sm leading-6 text-slate-700">
-                The workflow assistant understands all workflows in the open workspace.
-                It can answer questions, create and modify workflows, run them, and
-                handle anything else available through the Gofer Flow CLI.
-              </p>
-            </div>
-
             {chatItems.map((item) =>
               item.type === "thought-group" ? (
                 <ThoughtGroup
                   key={item.id}
-                  expanded={Boolean(expandedThoughtGroups[item.id])}
+                  expanded={expandedThoughtGroups[item.id] !== false}
                   thoughts={item.thoughts}
                   onToggle={() =>
                     setExpandedThoughtGroups((current) => ({
                       ...current,
-                      [item.id]: !current[item.id],
+                      [item.id]: current[item.id] === false,
                     }))
                   }
                 />
               ) : (
-                <ChatMessageBubble
-                  key={item.message.id}
-                  message={item.message}
-                  workflow={workflow}
-                  onReviewPatch={reviewPatchMessage}
-                />
+                <ChatMessageBubble key={item.message.id} message={item.message} />
               ),
             )}
             {showTypingIndicator ? <TypingIndicator /> : null}
@@ -3895,13 +4254,32 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
         )}
       </div>
 
-      {activeThread ? (
-        <div className="border-t border-line p-4">
-          <div className="rounded-lg border border-line bg-slate-50 p-2">
+      <div className="relative shrink-0 border-t border-line p-3">
+          <ProviderModelEffortFields
+            capabilities={providers}
+            className="mb-2"
+            disabled={providersLoading}
+            effort={effort}
+            model={model}
+            provider={providerId}
+            onChange={(patch) => {
+              if (patch.provider !== undefined) setProviderId(patch.provider);
+              if (patch.model !== undefined) setModel(patch.model);
+              if (patch.effort !== undefined) setEffort(patch.effort);
+            }}
+            onRefresh={refreshProviders}
+          />
+          {providerDiscoveryError ? (
+            <p className="mb-2 text-xs text-red-600">{providerDiscoveryError}</p>
+          ) : null}
+          <div
+            data-chat-composer
+            className="relative min-h-28 overflow-hidden rounded-[14px] border border-line bg-white transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/10"
+          >
             <textarea
-              className="h-20 w-full resize-none bg-transparent px-2 py-1 text-sm outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-muted"
+              className="block h-28 max-h-32 w-full resize-none bg-transparent px-3 pb-12 pr-12 pt-3 text-sm leading-5 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-muted"
               disabled={chatState.sending}
-              placeholder="Ask about your workflows"
+              placeholder="Message this workflow"
               value={draft}
               onChange={(event) => setDraft(event.target.value)}
               onKeyDown={(event) => {
@@ -3911,16 +4289,11 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
                 }
               }}
             />
-            <div className="flex items-center justify-between px-1">
-              <div className="flex items-center gap-2 text-xs text-muted">
-                <MessageSquare size={14} />
-                {selectedProvider.name} · {model}
-              </div>
-              <button
-                className={`grid h-8 w-8 place-items-center rounded-lg transition disabled:cursor-not-allowed disabled:opacity-60 ${
+            <button
+                className={`absolute bottom-2 right-2 z-10 grid h-8 w-8 place-items-center rounded-lg transition disabled:cursor-not-allowed disabled:opacity-60 ${
                   chatState.sending
                     ? "border border-line bg-white text-red-600 hover:border-red-200 hover:bg-red-50"
-                    : "bg-ink text-white hover:bg-slate-700 dark:border dark:border-[#3a3a3d] dark:bg-[#2d2d30] dark:text-[#f2f2f2] dark:hover:border-[#4a4a4f] dark:hover:bg-[#37373d] dark:disabled:border-[#2a2a2a] dark:disabled:bg-[#242426] dark:disabled:text-[#777]"
+                    : "bg-brand text-white hover:bg-indigo-700"
                 }`}
                 disabled={!chatState.sending && !draft.trim()}
                 title={chatState.sending ? "Stop workflow assistant" : "Send message"}
@@ -3937,40 +4310,36 @@ function ChatPane({ activeWorkflowId, onResizeStart, onReviewPatch, width, workf
                   <Send size={15} />
                 )}
               </button>
-            </div>
           </div>
-        </div>
-      ) : null}
+          <p className="mt-1.5 px-1 text-[10px] text-muted">Enter to send · Shift+Enter for a new line</p>
+      </div>
     </aside>
   );
 }
 
-function ThreadList({ onCreate, onDelete, onOpen, threads }) {
+function ThreadList({ activeThreadId, activityByThread = {}, onDelete, onOpen, threads }) {
   if (threads.length) {
     return (
-      <div className="space-y-2">
-        <button
-          className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-          type="button"
-          onClick={onCreate}
-        >
-          <Plus size={14} />
-          New thread
-        </button>
-
-        <div className="space-y-2">
+      <div className="space-y-1">
           {threads.map((thread) => (
             <div
               key={thread.id}
-              className="group flex items-center gap-2 rounded-lg border border-line bg-white p-2 transition hover:bg-slate-50"
+              className={`group flex items-center gap-1 rounded-lg p-1 transition ${
+                thread.id === activeThreadId ? "bg-indigo-50" : "hover:bg-slate-50"
+              }`}
             >
               <button
-                className="min-w-0 flex-1 px-2 py-1 text-left"
+                className="min-w-0 flex-1 px-2 py-1.5 text-left"
                 type="button"
                 onClick={() => onOpen(thread.id)}
               >
-                <div className="truncate text-sm font-medium text-ink">{thread.title}</div>
-                <div className="mt-0.5 text-xs text-muted">{formatThreadDate(thread.updatedAt)}</div>
+                <div className="flex min-w-0 items-center gap-2">
+                  <div className="min-w-0 flex-1 truncate text-xs font-medium text-ink">
+                    {thread.title}
+                  </div>
+                  <ThreadActivityIndicator state={activityByThread[thread.id]} />
+                </div>
+                <div className="mt-0.5 text-[10px] text-muted">{formatThreadDate(thread.updatedAt)}</div>
               </button>
               <button
                 className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted opacity-70 transition hover:bg-red-50 hover:text-red-600 group-hover:opacity-100"
@@ -3982,168 +4351,46 @@ function ThreadList({ onCreate, onDelete, onOpen, threads }) {
               </button>
             </div>
           ))}
-        </div>
       </div>
     );
   }
 
   return (
-    <div className="rounded-lg border border-line bg-slate-50 p-4">
-      <p className="text-sm leading-6 text-slate-700">
-        The workflow assistant understands all workflows in the open workspace. It can
-        answer questions, create and modify workflows, run them, and handle anything
-        else available through the Gofer Flow CLI. Start a new thread to begin.
-      </p>
-      <button
-        className="mt-4 inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-ink transition hover:border-slate-300 hover:bg-slate-50"
-        type="button"
-        onClick={onCreate}
-      >
-        <Plus size={15} />
-        New thread
-      </button>
-    </div>
+    <p className="px-2 py-4 text-center text-xs text-muted">No thread history yet.</p>
   );
 }
 
-function ChatPatchReviewDialog({ onApply, onCancel, reviewState }) {
-  const hunks = reviewState.review.hunks;
-  const [selectedIds, setSelectedIds] = useState(() => hunks.map((hunk) => hunk.id));
-  const grouped = groupPatchHunksByRisk(hunks);
-  const canApply = reviewState.review.ok && selectedIds.length > 0 && !reviewState.saving;
-
-  function toggleHunk(hunkId) {
-    setSelectedIds((current) =>
-      current.includes(hunkId)
-        ? current.filter((candidate) => candidate !== hunkId)
-        : [...current, hunkId],
+function ThreadActivityIndicator({ state }) {
+  if (state?.sending) {
+    return (
+      <span
+        className="grid h-4 w-4 shrink-0 place-items-center text-brand"
+        title="Assistant response running"
+      >
+        <Loader2 aria-hidden="true" className="animate-spin" size={13} />
+        <span className="sr-only">Running</span>
+      </span>
     );
   }
 
-  return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/35 px-4">
-      <section className="max-h-[86vh] w-full max-w-3xl overflow-hidden rounded-xl border border-line bg-white shadow-panel">
-        <div className="border-b border-line px-5 py-4">
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <h2 className="text-lg font-semibold text-ink">Review workflow patch</h2>
-              <p className="mt-1 text-sm text-muted">{reviewState.review.title}</p>
-            </div>
-            <button
-              className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink"
-              title="Close patch review"
-              type="button"
-              onClick={onCancel}
-            >
-              <X size={16} />
-            </button>
-          </div>
-          {reviewState.review.summary ? (
-            <p className="mt-3 text-sm leading-6 text-slate-700">{reviewState.review.summary}</p>
-          ) : null}
-        </div>
-        <div className="workflow-scrollbar max-h-[58vh] space-y-4 overflow-y-auto px-5 py-4">
-          {reviewState.review.errors.length ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm leading-6 text-red-700">
-              <div className="font-semibold">Patch rejected</div>
-              <ul className="mt-1 list-disc space-y-1 pl-5">
-                {reviewState.review.errors.map((error) => (
-                  <li key={error}>{error}</li>
-                ))}
-              </ul>
-            </div>
-          ) : null}
-          {reviewState.error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm leading-6 text-red-700">
-              {reviewState.error}
-            </div>
-          ) : null}
-          {grouped.map(([risk, riskHunks]) => (
-            <section key={risk} className="rounded-lg border border-line">
-              <div className="border-b border-line bg-slate-50 px-3 py-2 text-xs font-semibold uppercase tracking-[0.08em] text-muted">
-                {riskLabel(risk)}
-              </div>
-              <div className="divide-y divide-line">
-                {riskHunks.map((hunk) => (
-                  <label
-                    key={hunk.id}
-                    className="flex cursor-pointer items-start gap-3 px-3 py-3 transition hover:bg-slate-50"
-                  >
-                    <input
-                      className="mt-1"
-                      type="checkbox"
-                      checked={selectedIds.includes(hunk.id)}
-                      disabled={!reviewState.review.ok || reviewState.saving}
-                      onChange={() => toggleHunk(hunk.id)}
-                    />
-                    <span className="min-w-0 flex-1">
-                      <span className="block text-sm font-semibold text-ink">{hunk.label}</span>
-                      <span className="mt-1 block break-words text-xs leading-5 text-muted">
-                        {hunk.detail}
-                      </span>
-                    </span>
-                  </label>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
-        <div className="flex items-center justify-between gap-3 border-t border-line px-5 py-4">
-          <p className="text-xs text-muted">
-            Applying changes validates the draft and saves a revision with chat audit metadata.
-          </p>
-          <div className="flex shrink-0 items-center gap-2">
-            <button
-              className="h-9 rounded-lg border border-line bg-white px-3 text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              type="button"
-              disabled={reviewState.saving}
-              onClick={onCancel}
-            >
-              Reject
-            </button>
-            <button
-              className="inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-semibold text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
-              type="button"
-              disabled={!canApply}
-              onClick={() => onApply(selectedIds)}
-            >
-              {reviewState.saving ? <Loader2 size={15} className="animate-spin" /> : <Check size={15} />}
-              Apply selected
-            </button>
-          </div>
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function groupPatchHunksByRisk(hunks) {
-  const order = ["destructive", "filesystem", "secret", "trigger", "agent", "graph", "workflow"];
-  const grouped = new Map();
-  for (const hunk of hunks) {
-    if (!grouped.has(hunk.risk)) grouped.set(hunk.risk, []);
-    grouped.get(hunk.risk).push(hunk);
+  if (state?.hasNewResponse) {
+    return (
+      <span
+        className="grid h-4 w-4 shrink-0 place-items-center"
+        title="Assistant response complete"
+      >
+        <span aria-hidden="true" className="h-2 w-2 rounded-full bg-blue-500" />
+        <span className="sr-only">Completed</span>
+      </span>
+    );
   }
-  return [...grouped.entries()].sort(
-    ([left], [right]) => order.indexOf(left) - order.indexOf(right),
-  );
-}
 
-function riskLabel(risk) {
-  return {
-    agent: "Agents",
-    destructive: "Destructive changes",
-    filesystem: "Filesystem access",
-    graph: "Graph changes",
-    secret: "Secrets and parameters",
-    trigger: "Triggers",
-    workflow: "Workflow settings",
-  }[risk] ?? risk;
+  return null;
 }
 
 function TypingIndicator() {
   return (
-    <div className="flex justify-start" data-message-id="typing-indicator">
+    <div className="flex justify-start" data-message-id="typing-indicator" role="status">
       <div className="max-w-[86%] rounded-lg border border-line bg-white px-3 py-2 text-sm leading-6 text-slate-700 shadow-sm">
         <div className="flex items-center gap-2">
           <span className="text-xs text-muted">Workflow assistant is typing</span>
@@ -4158,10 +4405,9 @@ function TypingIndicator() {
   );
 }
 
-function ChatMessageBubble({ message, onReviewPatch, workflow }) {
+function ChatMessageBubble({ message }) {
   const isSystem = message.role === "system" || message.kind === "system";
-  const patchParse = message.role === "assistant" ? extractWorkflowPatch(message.body) : null;
-  const review = patchParse?.ok ? buildPatchReview(patchParse.patch, workflow) : null;
+  const isUser = message.role === "user";
   return (
     <div
       data-message-id={message.id}
@@ -4170,7 +4416,7 @@ function ChatMessageBubble({ message, onReviewPatch, workflow }) {
       }`}
     >
       <div
-        className={`max-w-[86%] rounded-lg px-3 py-2 text-sm leading-6 ${
+        className={`${isSystem ? "max-w-[86%]" : "w-full min-w-0"} rounded-lg px-3 py-2 text-sm leading-6 ${
           isSystem
             ? "border border-line bg-slate-50 text-xs font-medium text-muted"
             : message.role === "user"
@@ -4178,51 +4424,130 @@ function ChatMessageBubble({ message, onReviewPatch, workflow }) {
             : "border border-line bg-white text-slate-700 shadow-sm"
         }`}
       >
-        <pre className="whitespace-pre-wrap font-sans">{message.body}</pre>
-        {review ? (
-          <div className="mt-3 rounded-md border border-teal-200 bg-teal-50 p-2">
-            <div className="text-xs font-semibold text-teal-800">{review.title}</div>
-            <div className="mt-1 text-xs text-teal-700">
-              {review.hunks.length} proposed change{review.hunks.length === 1 ? "" : "s"}
-              {review.errors.length ? `, ${review.errors.length} validation issue${review.errors.length === 1 ? "" : "s"}` : ""}
-            </div>
-            <button
-              className="mt-2 inline-flex h-8 items-center gap-2 rounded-md border border-teal-200 bg-white px-2.5 text-xs font-semibold text-teal-800 transition hover:bg-teal-100"
-              type="button"
-              onClick={() => onReviewPatch?.(message)}
-            >
-              <GitBranch size={13} />
-              Review patch
-            </button>
-          </div>
-        ) : null}
+        {isSystem ? (
+          <span className="whitespace-pre-wrap">{message.body}</span>
+        ) : (
+          <MarkdownMessage inverse={isUser} value={message.body} />
+        )}
       </div>
     </div>
   );
 }
 
+function MarkdownMessage({ compact = false, inverse = false, value }) {
+  const blocks = parseMinimalMarkdown(value);
+  return (
+    <div className={`min-w-0 break-words ${compact ? "space-y-2" : "space-y-3"}`}>
+      {blocks.map((block, blockIndex) => {
+        const key = `${block.type}-${blockIndex}`;
+        if (block.type === "code") {
+          return (
+            <pre
+              key={key}
+              className={`workflow-scrollbar max-w-full overflow-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-5 ${
+                inverse
+                  ? "border-white/20 bg-black/20 text-white"
+                  : "border-line bg-slate-50 text-slate-700 dark:bg-[#111113]"
+              }`}
+            >
+              <code>{block.text}</code>
+            </pre>
+          );
+        }
+        if (block.type === "heading") {
+          const Heading = `h${block.level}`;
+          return (
+            <Heading key={key} className="font-semibold leading-5 text-inherit">
+              <MarkdownInline inverse={inverse} tokens={block.tokens} />
+            </Heading>
+          );
+        }
+        if (block.type === "list") {
+          const List = block.ordered ? "ol" : "ul";
+          return (
+            <List
+              key={key}
+              className={`ml-5 space-y-1 ${block.ordered ? "list-decimal" : "list-disc"}`}
+            >
+              {block.items.map((tokens, itemIndex) => (
+                <li key={`${key}-${itemIndex}`}>
+                  <MarkdownInline inverse={inverse} tokens={tokens} />
+                </li>
+              ))}
+            </List>
+          );
+        }
+        if (block.type === "quote") {
+          return (
+            <blockquote
+              key={key}
+              className={`border-l pl-3 ${inverse ? "border-white/40" : "border-line text-muted"}`}
+            >
+              <MarkdownInline inverse={inverse} tokens={block.tokens} />
+            </blockquote>
+          );
+        }
+        return (
+          <p key={key}>
+            <MarkdownInline inverse={inverse} tokens={block.tokens} />
+          </p>
+        );
+      })}
+    </div>
+  );
+}
+
+function MarkdownInline({ inverse, tokens }) {
+  return tokens.map((token, index) => {
+    const key = `${token.type}-${index}`;
+    if (token.type === "code") {
+      return (
+        <code
+          key={key}
+          className={`rounded px-1 py-0.5 font-mono text-[0.9em] ${
+            inverse ? "bg-white/15 text-white" : "bg-slate-100 text-ink dark:bg-[#2a2a2e]"
+          }`}
+        >
+          {token.text}
+        </code>
+      );
+    }
+    if (token.type === "strong") return <strong key={key}>{token.text}</strong>;
+    if (token.type === "emphasis") return <em key={key}>{token.text}</em>;
+    if (token.type === "link") {
+      return (
+        <a
+          key={key}
+          className={`underline underline-offset-2 ${inverse ? "text-white" : "text-brand"}`}
+          href={token.href}
+          rel="noreferrer"
+          target="_blank"
+        >
+          {token.text}
+        </a>
+      );
+    }
+    return token.text;
+  });
+}
+
 function ThoughtGroup({ expanded, onToggle, thoughts }) {
-  const count = thoughts.length;
-  const showBottomToggle = expanded && count >= 3;
-  const tokenSummary = extractThoughtTokenSummary(thoughts);
+  const trace = buildThoughtTrace(thoughts);
+  const count = trace.length;
+
+  if (!count) return null;
 
   return (
     <div className="flex justify-start" data-message-id={thoughts[0]?.groupAnchorId}>
-      <div className="max-w-[86%] rounded-lg border border-line bg-slate-50 text-sm text-slate-700 shadow-sm dark:bg-[#252526] dark:text-[#d4d4d4]">
+      <div className="w-full min-w-0 text-sm text-slate-700 dark:text-[#d4d4d4]">
         <button
-          className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-2 text-left transition hover:bg-slate-100 dark:hover:bg-[#2d2d30]"
+          className="flex w-full items-center justify-between gap-3 rounded-md px-1 py-1.5 text-left transition hover:text-ink"
           type="button"
           onClick={onToggle}
         >
-          <span className="min-w-0">
-            <span className="block text-xs font-semibold uppercase tracking-[0.08em] text-muted">
-              {expanded ? "Hide thoughts" : "Show thoughts"} ({count})
-            </span>
-            {tokenSummary ? (
-              <span className="mt-0.5 block text-[11px] font-normal normal-case tracking-normal text-muted/80">
-                {tokenSummary}
-              </span>
-            ) : null}
+          <span className="min-w-0 text-xs font-semibold text-ink">
+            {expanded ? "Hide thoughts" : "Show thoughts"}
+            <span className="ml-1.5 font-normal text-muted">{count}</span>
           </span>
           <span className="grid h-6 w-6 place-items-center rounded-md text-muted transition">
             {expanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
@@ -4234,37 +4559,47 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
           }`}
         >
           <div className="overflow-hidden">
-            <div className="space-y-2 border-t border-line px-3 py-3">
-              {thoughts.map((thought, index) => (
+            <div className="px-1 pb-1 pt-2">
+              {trace.map((entry, index) => (
                 <div
-                  key={thought.id}
-                  className="rounded-md bg-white px-3 py-2 text-xs leading-5 text-slate-600 dark:bg-[#1e1e1e] dark:text-[#c8c8c8]"
+                  key={entry.key}
+                  className={`relative ml-1 border-l border-line pl-5 ${
+                    index === trace.length - 1 ? "pb-1" : "pb-4"
+                  }`}
                 >
-                  <div className="mb-1 font-semibold text-muted">Thought {index + 1}</div>
-                  <pre className="whitespace-pre-wrap font-sans">{thought.body}</pre>
+                  <span
+                    aria-hidden="true"
+                    className={`absolute -left-[4.5px] top-1 h-2 w-2 rounded-full border border-white dark:border-[#18181a] ${
+                      entry.kind === "tool" && entry.status !== "error"
+                        ? "bg-emerald-500"
+                        : entry.status === "error"
+                        ? "bg-red-500"
+                        : "bg-slate-400"
+                    }`}
+                  />
+                  {entry.kind === "tool" || !entry.body ? (
+                    <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 text-xs leading-5">
+                      {entry.title ? (
+                        <span className="font-semibold text-ink">{entry.title}</span>
+                      ) : null}
+                      {entry.detail ? (
+                        <span className="min-w-0 break-words text-muted">{entry.detail}</span>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  {entry.kind === "summary" && entry.body ? (
+                    <div className="text-xs leading-5 text-slate-600 dark:text-[#b9b9b9]">
+                      <MarkdownMessage compact value={entry.body} />
+                    </div>
+                  ) : null}
+                  {entry.kind === "tool" && (entry.input || entry.output) ? (
+                    <div className="mt-2 overflow-hidden rounded-md border border-line bg-white dark:bg-[#181818]">
+                      {entry.input ? <TracePayload label="In" value={entry.input} /> : null}
+                      {entry.output ? <TracePayload label="Out" value={entry.output} divided={Boolean(entry.input)} /> : null}
+                    </div>
+                  ) : null}
                 </div>
               ))}
-              {showBottomToggle ? (
-                <button
-                  className="mt-2 flex w-full items-center justify-between gap-3 rounded-md px-2 py-2 text-left transition hover:bg-slate-100 dark:hover:bg-[#2d2d30]"
-                  type="button"
-                  onClick={onToggle}
-                >
-                  <span className="min-w-0">
-                    <span className="block text-xs font-semibold uppercase tracking-[0.08em] text-muted">
-                      Hide thoughts ({count})
-                    </span>
-                    {tokenSummary ? (
-                      <span className="mt-0.5 block text-[11px] font-normal normal-case tracking-normal text-muted/80">
-                        {tokenSummary}
-                      </span>
-                    ) : null}
-                  </span>
-                  <span className="grid h-6 w-6 place-items-center rounded-md text-muted">
-                    <ChevronUp size={15} />
-                  </span>
-                </button>
-              ) : null}
             </div>
           </div>
         </div>
@@ -4273,16 +4608,17 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
   );
 }
 
-function extractThoughtTokenSummary(thoughts) {
-  const tokenPattern =
-    /(?:tokens?\s*(?:used|spent|total)?\s*[:=]?\s*([\d,.]+k?)|([\d,.]+k?)\s*tokens?\s*(?:used|spent)?)/gi;
-  for (const thought of [...thoughts].reverse()) {
-    const matches = [...String(thought?.body ?? "").matchAll(tokenPattern)];
-    const match = matches.at(-1);
-    const value = match?.[1] || match?.[2];
-    if (value) return `${value} tokens used`;
-  }
-  return "";
+function TracePayload({ divided = false, label, value }) {
+  return (
+    <div className={`grid grid-cols-[2rem_minmax(0,1fr)] gap-2 px-2.5 py-2 ${divided ? "border-t border-line" : ""}`}>
+      <span className="pt-0.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted">
+        {label}
+      </span>
+      <pre className="workflow-scrollbar max-h-40 min-w-0 overflow-auto whitespace-pre-wrap break-words font-mono text-[10px] leading-4 text-slate-600 dark:text-[#b9b9b9]">
+        {value}
+      </pre>
+    </div>
+  );
 }
 
 const chatThreadsStorageKey = "gofer-flow-chat-threads";
@@ -4374,14 +4710,231 @@ export function buildChatItems(messages) {
       });
       index += 1;
     }
-    items.push({
-      id: `thought-group-${groupId}`,
-      type: "thought-group",
-      thoughts,
-    });
+    const nextMessage = messages[index];
+    while (isDuplicateOutputThought(thoughts.at(-1), nextMessage)) thoughts.pop();
+    if (thoughts.length) {
+      items.push({
+        id: `thought-group-${groupId}`,
+        type: "thought-group",
+        thoughts,
+      });
+    }
   }
 
   return items;
+}
+
+export function removeTrailingDuplicateOutputThought(messages, finalBody, groupId) {
+  const finalMessage = { role: "assistant", kind: "final", body: finalBody };
+  return messages.filter((message) => {
+    if (message.groupId !== groupId || message.kind !== "thought") return true;
+    if (isDuplicateOutputThought(message, finalMessage)) return false;
+    const body = message.trace?.body ?? message.body;
+    return message.trace?.kind === "tool" || !isProviderMetadataSummary(body);
+  });
+}
+
+function isDuplicateOutputThought(thought, finalMessage) {
+  if (!thought || thought.kind !== "thought" || finalMessage?.role !== "assistant") return false;
+  if (finalMessage.kind === "thought" || finalMessage.kind === "memory") return false;
+  if (thought.trace?.kind === "tool") return false;
+  const thoughtBody = normalizeMarkdownText(thought.trace?.body ?? thought.body);
+  const finalBody = normalizeMarkdownText(finalMessage.body);
+  if (!thoughtBody || !finalBody) return false;
+  if (thoughtBody === finalBody) return true;
+  const untruncatedThought = thoughtBody.replace(/(?:\.{3}|…)$/, "").trim();
+  return untruncatedThought.length >= 48 && finalBody.startsWith(untruncatedThought);
+}
+
+export function buildThoughtTrace(thoughts) {
+  const entries = [];
+  const traceIndexes = new Map();
+
+  for (const thought of thoughts) {
+    const hasStructuredTrace = Boolean(thought?.trace && typeof thought.trace === "object");
+    const rawTrace = hasStructuredTrace
+      ? thought.trace
+      : { kind: "summary", title: "Thought", body: thought?.body };
+    const kind = rawTrace.kind === "tool" ? "tool" : "summary";
+    const traceId = rawTrace.id ? String(rawTrace.id) : "";
+    const entry = {
+      key: traceId ? `trace-${traceId}` : thought?.id || `trace-${entries.length}`,
+      id: traceId,
+      kind,
+      title: kind === "summary"
+        ? String(rawTrace.title || "")
+        : String(rawTrace.title || "Tool"),
+      detail: rawTrace.detail ? String(rawTrace.detail) : "",
+      body: rawTrace.body
+        ? String(rawTrace.body)
+        : kind === "summary" && !hasStructuredTrace
+        ? String(thought?.body || "")
+        : "",
+      input: rawTrace.input ? String(rawTrace.input) : "",
+      output: rawTrace.output ? String(rawTrace.output) : "",
+      status: String(rawTrace.status || ""),
+    };
+
+    if (kind === "summary" && isProviderMetadataSummary(entry.body)) continue;
+
+    if (!traceId || !traceIndexes.has(traceId)) {
+      if (traceId) traceIndexes.set(traceId, entries.length);
+      entries.push(entry);
+      continue;
+    }
+
+    const existingIndex = traceIndexes.get(traceId);
+    const existing = entries[existingIndex];
+    entries[existingIndex] = {
+      ...existing,
+      title: kind === "summary"
+        ? entry.title || existing.title
+        : existing.title === "Tool result"
+        ? entry.title
+        : existing.title,
+      detail: entry.detail || existing.detail,
+      body: entry.body || existing.body,
+      input: existing.input || entry.input,
+      output: entry.output || existing.output,
+      status: entry.status || existing.status,
+    };
+  }
+
+  return entries;
+}
+
+function isProviderMetadataSummary(value) {
+  const compact = String(value ?? "").trim().replace(/\s+/g, " ");
+  return /^(?:tokens? used\s*:?[\s]*)[\d,]+$/i.test(compact) ||
+    /^[\d,]+\s+tokens? used$/i.test(compact);
+}
+
+export function normalizeMarkdownText(value) {
+  return String(value ?? "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/```[^\n]*\n?/g, "")
+    .replace(/^\s{0,3}(?:#{1,6}\s+|>\s*|[-+*]\s+|\d+[.)]\s+)/gm, "")
+    .replace(/\[([^\]]+)\]\([^\s)]+\)/g, "$1")
+    .replace(/[*_~`]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+export function parseMinimalMarkdown(value) {
+  const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
+  const blocks = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    const fence = line.match(/^\s*```([^`]*)$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
+        code.push(lines[index]);
+        index += 1;
+      }
+      if (index < lines.length) index += 1;
+      blocks.push({ type: "code", language: fence[1].trim(), text: code.join("\n") });
+      continue;
+    }
+
+    const heading = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
+    if (heading) {
+      blocks.push({
+        type: "heading",
+        level: heading[1].length,
+        tokens: parseInlineMarkdown(heading[2]),
+      });
+      index += 1;
+      continue;
+    }
+
+    const listItem = line.match(/^\s*(?:(\d+)[.)]|[-+*])\s+(.+)$/);
+    if (listItem) {
+      const ordered = Boolean(listItem[1]);
+      const items = [];
+      while (index < lines.length) {
+        const match = lines[index].match(/^\s*(?:(\d+)[.)]|[-+*])\s+(.+)$/);
+        if (!match || Boolean(match[1]) !== ordered) break;
+        items.push(parseInlineMarkdown(match[2]));
+        index += 1;
+      }
+      blocks.push({ type: "list", ordered, items });
+      continue;
+    }
+
+    const quote = line.match(/^\s*>\s?(.*)$/);
+    if (quote) {
+      const quoteLines = [];
+      while (index < lines.length) {
+        const match = lines[index].match(/^\s*>\s?(.*)$/);
+        if (!match) break;
+        quoteLines.push(match[1]);
+        index += 1;
+      }
+      blocks.push({ type: "quote", tokens: parseInlineMarkdown(quoteLines.join(" ")) });
+      continue;
+    }
+
+    const paragraph = [line.trim()];
+    index += 1;
+    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
+      paragraph.push(lines[index].trim());
+      index += 1;
+    }
+    blocks.push({ type: "paragraph", tokens: parseInlineMarkdown(paragraph.join(" ")) });
+  }
+
+  return blocks;
+}
+
+function isMarkdownBlockStart(line) {
+  return /^\s*```/.test(line) ||
+    /^\s{0,3}#{1,3}\s+/.test(line) ||
+    /^\s*(?:(?:\d+)[.)]|[-+*])\s+/.test(line) ||
+    /^\s*>/.test(line);
+}
+
+function parseInlineMarkdown(value) {
+  const tokens = [];
+  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^\s)]+\))/g;
+  let cursor = 0;
+  for (const match of value.matchAll(pattern)) {
+    if (match.index > cursor) tokens.push({ type: "text", text: value.slice(cursor, match.index) });
+    const token = match[0];
+    if (token.startsWith("`")) {
+      tokens.push({ type: "code", text: token.slice(1, -1) });
+    } else if (token.startsWith("**")) {
+      tokens.push({ type: "strong", text: token.slice(2, -2) });
+    } else if (token.startsWith("*")) {
+      tokens.push({ type: "emphasis", text: token.slice(1, -1) });
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const href = safeMarkdownHref(link?.[2]);
+      if (link && href) tokens.push({ type: "link", text: link[1], href });
+      else tokens.push({ type: "text", text: token });
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < value.length) tokens.push({ type: "text", text: value.slice(cursor) });
+  return tokens.length ? tokens : [{ type: "text", text: value }];
+}
+
+function safeMarkdownHref(value) {
+  if (typeof value !== "string") return "";
+  try {
+    const url = new URL(value);
+    return ["http:", "https:", "mailto:"].includes(url.protocol) ? url.href : "";
+  } catch {
+    return "";
+  }
 }
 
 export function parseChatStreamEvent(line) {
@@ -4416,82 +4969,6 @@ function formatFanOutCount(fanOut) {
     return `at least ${fanOut.countLowerBound ?? fanOut.count}`;
   }
   return String(fanOut.count);
-}
-
-function formatNetworkAllowlistItems(sideEffectDetails) {
-  return (sideEffectDetails ?? [])
-    .filter(
-      (detail) =>
-        detail?.kind === "network" &&
-        Array.isArray(detail.networkAllowlist) &&
-        detail.networkAllowlist.length > 0,
-    )
-    .map((detail) => {
-      const host = detail.host ? ` ${detail.host}` : "";
-      return `Network allowlist${host}: ${detail.networkAllowlist.join(", ")}`;
-    });
-}
-
-function formatValidationItems(validation) {
-  const diagnostics = Array.isArray(validation?.diagnostics) ? validation.diagnostics : [];
-  return diagnostics.map((item) => {
-    const severity = item.severity ?? "warning";
-    const subject = item.subject || item.targetId;
-    return `${severity}: ${item.message}${subject ? ` (${subject})` : ""}`;
-  });
-}
-
-function hasBlockingValidationErrors(validation) {
-  if (validation?.ok === false) return true;
-  const diagnostics = Array.isArray(validation?.diagnostics) ? validation.diagnostics : [];
-  return diagnostics.some((item) => item?.severity === "error");
-}
-
-function formatSecretItem(item) {
-  if (item && typeof item === "object") return item.name ?? "";
-  return String(item);
-}
-
-function formatSecretReadinessItems(readiness) {
-  return (readiness ?? []).map((item) => {
-    const status = item.present || item.status === "present" ? "present" : "missing";
-    const sources = Array.isArray(item.sources) && item.sources.length ? ` (${item.sources.join(", ")})` : "";
-    return `${item.name}: ${status}${sources}`;
-  });
-}
-
-function formatConditionalBranchItems(branches) {
-  return (branches ?? []).map(
-    (branch) => `${branch.from} -> ${branch.to} when ${branch.label ?? branch.condition}`,
-  );
-}
-
-function formatResourceLimitItems(resourceLimits, executionLimits) {
-  if (!resourceLimits || typeof resourceLimits !== "object") return [];
-  return [
-    `Fan-out items: ${resourceLimits.max_fanout_items}`,
-    `Fan-out concurrency: ${resourceLimits.max_fanout_concurrency}`,
-    `Files scanned: ${resourceLimits.max_files_scanned}`,
-    `File read bytes: ${resourceLimits.max_file_read_bytes}`,
-    `Total node runs: ${executionLimits?.maxTotalNodeRuns ?? "default"}`,
-  ];
-}
-
-function formatUsageBudgetItems(usageBudget) {
-  if (!usageBudget?.enabled) return [];
-  return Object.entries(usageBudget)
-    .filter(([key, value]) => key !== "enabled" && value !== undefined && value !== null)
-    .map(([key, value]) => `${key}: ${value}`);
-}
-
-function formatProjectedUsageItems(projectedUsage) {
-  if (!projectedUsage || !projectedUsage.agent_calls) return [];
-  return [
-    `Agent calls: ${projectedUsage.agent_calls}`,
-    `Tokens: ${projectedUsage.total_tokens}`,
-    `Estimated cost: $${Number(projectedUsage.estimated_cost || 0).toFixed(6)}`,
-    `Agent time: ${Number(projectedUsage.agent_time_seconds || 0).toFixed(2)}s`,
-  ];
 }
 
 function formatTriggerContextItems(triggerContext) {
@@ -4534,7 +5011,7 @@ function buildRunPreviewTriggerContext(workflow) {
 
 function initialWorkflowParameters(workflow) {
   const values = {};
-  for (const [name, spec] of Object.entries(workflow.parameters ?? {})) {
+  for (const [name, spec] of Object.entries(workflow.inputs ?? workflow.parameters ?? {})) {
     if (spec.default !== undefined && spec.default !== null) {
       values[name] = spec.default;
     } else if (spec.type === "boolean") {
@@ -4548,7 +5025,7 @@ function initialWorkflowParameters(workflow) {
 
 function validateWorkflowParameters(workflow, values) {
   const errors = {};
-  for (const [name, spec] of Object.entries(workflow.parameters ?? {})) {
+  for (const [name, spec] of Object.entries(workflow.inputs ?? workflow.parameters ?? {})) {
     const value = values[name];
     if (spec.required && (value === undefined || value === null || value === "")) {
       errors[name] = "Required";
@@ -4575,33 +5052,29 @@ export function RunPreviewDialog({
   onExecutionModeChange = () => {},
   queueState = { runners: [] },
 }) {
-  const parameterSchema = workflow.parameters ?? {};
+  const parameterSchema = workflow.inputs ?? workflow.parameters ?? {};
   const [parameters, setParameters] = useState(() => ({
     ...initialWorkflowParameters(workflow),
     ...initialParameters,
   }));
   const [parameterErrors, setParameterErrors] = useState({});
   const warnings = plan?.warnings ?? [];
+  const blockingDiagnostics = plan?.blockingDiagnostics ?? [];
   const destructiveActions = plan?.destructiveActions ?? [];
   const providers = plan?.providerRequirements ?? [];
   const requiredSecrets = plan?.requiredSecrets ?? [];
-  const secretReadinessItems = formatSecretReadinessItems(
-    plan?.secretReadiness ?? workflow.secretReadiness,
-  );
-  const unresolvedValues = plan?.unresolvedDynamicValues ?? [];
+  const bindings = plan?.bindings ?? [];
   const triggerItems = formatTriggerContextItems(plan?.triggerContext);
-  const validationItems = formatValidationItems(plan?.validation);
-  const branchItems = formatConditionalBranchItems(plan?.conditionalBranches);
-  const resourceLimitItems = formatResourceLimitItems(plan?.resourceLimits, plan?.executionLimits);
-  const usageBudgetItems = formatUsageBudgetItems(plan?.usageBudget);
-  const projectedUsageItems = formatProjectedUsageItems(plan?.projectedLlmUsage);
-  const startNodes = plan?.startNodes ?? [];
   const generations = plan?.generations ?? [];
-  const validationBlocked = hasBlockingValidationErrors(plan?.validation);
+  const filesystemAccess = workflow.filesystemAccess ?? [];
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
-      <div className="flex max-h-[86vh] w-full max-w-[760px] flex-col rounded-lg border border-line bg-white shadow-panel">
+    <Dialog
+      description={`Review execution details for ${workflow.name}`}
+      onClose={onCancel}
+      panelClassName="flex max-h-[86vh] w-full max-w-[760px] flex-col rounded-lg border border-line bg-white shadow-panel"
+      title={`Run preview: ${workflow.name}`}
+    >
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div className="min-w-0">
             <h2 className="truncate text-base font-semibold">Run preview: {workflow.name}</h2>
@@ -4618,15 +5091,8 @@ export function RunPreviewDialog({
         </div>
 
         <div className="min-h-0 flex-1 space-y-4 overflow-auto px-5 py-4">
-          {startNodes.length > 0 ? (
-            <PreviewSection title="Start nodes" items={startNodes} />
-          ) : null}
-          {validationItems.length > 0 ? (
-            <PreviewSection
-              title="Validation diagnostics"
-              tone={validationItems.some((item) => item.startsWith("error:")) ? "danger" : "warning"}
-              items={validationItems}
-            />
+          {blockingDiagnostics.length > 0 ? (
+            <PreviewSection title="Cannot run" tone="danger" items={blockingDiagnostics} />
           ) : null}
           {destructiveActions.length > 0 ? (
             <PreviewSection title="Destructive actions" tone="danger" items={destructiveActions} />
@@ -4635,25 +5101,28 @@ export function RunPreviewDialog({
             <PreviewSection title="Warnings" tone="warning" items={warnings} />
           ) : null}
           {requiredSecrets.length > 0 ? (
-            <PreviewSection title="Required secrets" items={requiredSecrets.map(formatSecretItem)} />
-          ) : null}
-          {secretReadinessItems.length > 0 ? (
-            <PreviewSection
-              title="Secret readiness"
-              tone={secretReadinessItems.some((item) => item.includes(": missing")) ? "warning" : "default"}
-              items={secretReadinessItems}
-            />
+            <PreviewSection title="Required secrets" items={requiredSecrets} />
           ) : null}
           {triggerItems.length > 0 ? (
             <PreviewSection title="Trigger context" items={triggerItems} />
           ) : null}
-          {branchItems.length > 0 ? (
-            <PreviewSection title="Conditional branches" items={branchItems} />
+          {filesystemAccess.length > 0 ? (
+            <PreviewSection
+              title="Filesystem access"
+              items={normalizeWorkflowFilesystemAccess(filesystemAccess).map((entry) => {
+                const permissions = [
+                  entry.read ? "read" : null,
+                  entry.write ? "write" : null,
+                  entry.execute ? "execute" : null,
+                ].filter(Boolean);
+                return `${entry.path}: ${permissions.length > 0 ? permissions.join(", ") : "no access"}`;
+              })}
+            />
           ) : null}
           {Object.keys(parameterSchema).length > 0 ? (
             <section>
               <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
-                Run parameters
+                Run inputs
               </h3>
               <div className="space-y-3 rounded-lg border border-line bg-slate-50 p-3">
                 {Object.entries(parameterSchema).map(([name, spec]) => (
@@ -4690,22 +5159,7 @@ export function RunPreviewDialog({
               })}
             />
           ) : null}
-          {projectedUsageItems.length > 0 ? (
-            <PreviewSection title="Projected LLM usage" items={projectedUsageItems} />
-          ) : null}
-          {usageBudgetItems.length > 0 ? (
-            <PreviewSection title="Usage budget" items={usageBudgetItems} />
-          ) : null}
-          {resourceLimitItems.length > 0 ? (
-            <PreviewSection title="Resource limits" items={resourceLimitItems} />
-          ) : null}
-          {unresolvedValues.length > 0 ? (
-            <PreviewSection
-              title="Unresolved dynamic values"
-              tone="warning"
-              items={unresolvedValues}
-            />
-          ) : null}
+          {bindings.length > 0 ? <BindingPreviewSection bindings={bindings} /> : null}
 
           <section>
             <h3 className="mb-2 text-xs font-semibold uppercase text-muted">
@@ -4775,13 +5229,6 @@ export function RunPreviewDialog({
                             {(node.sideEffects ?? []).join("; ")}
                           </p>
                         ) : null}
-                        {formatNetworkAllowlistItems(node.sideEffectDetails).length > 0 ? (
-                          <ul className="mt-2 space-y-0.5 text-xs text-slate-600">
-                            {formatNetworkAllowlistItems(node.sideEffectDetails).map((item) => (
-                              <li key={`${node.id}-${item}`}>{item}</li>
-                            ))}
-                          </ul>
-                        ) : null}
                         {node.workingDir ? (
                           <p className="mt-2 break-words text-xs text-slate-600">
                             Working directory: {node.workingDir}
@@ -4807,28 +5254,21 @@ export function RunPreviewDialog({
                             ) : null}
                           </div>
                         ) : null}
-                        {(node.unresolvedDynamicValues ?? []).length > 0 ? (
-                          <div className="mt-2 text-xs text-amber-700">
-                            <p className="font-medium">Unresolved values</p>
-                            <ul className="mt-1 space-y-0.5">
-                              {(node.unresolvedDynamicValues ?? []).map((value) => (
-                                <li key={value}>{value}</li>
+                        {(node.bindings ?? []).length > 0 ? (
+                          <div className="mt-2 text-xs text-slate-600">
+                            <p className="font-medium text-ink">Runtime bindings</p>
+                            <ul className="mt-1 space-y-1">
+                              {(node.bindings ?? []).map((binding) => (
+                                <li key={binding.id} className="break-words">
+                                  <span className="font-medium">{binding.destinationField}</span>
+                                  {" ← "}
+                                  <code>{binding.expression}</code>
+                                  {` · ${binding.status} · ${binding.resolutionPhase}`}
+                                  {binding.readiness ? ` · secret ${binding.readiness}` : ""}
+                                </li>
                               ))}
                             </ul>
                           </div>
-                        ) : null}
-                        {node.timeoutSeconds || node.retryCount || node.allowFailure ? (
-                          <p className="mt-2 text-xs text-slate-600">
-                            {[
-                              node.timeoutSeconds ? `Timeout: ${node.timeoutSeconds}s` : "",
-                              node.retryCount
-                                ? `Retries: ${node.retryCount} delay=${node.retryDelaySeconds}s`
-                                : "",
-                              node.allowFailure ? "Allow failure" : "",
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")}
-                          </p>
                         ) : null}
                       </div>
                     ))}
@@ -4840,20 +5280,15 @@ export function RunPreviewDialog({
         </div>
 
         <div className="flex justify-end gap-2 border-t border-line px-5 py-4">
-          {validationBlocked ? (
-            <p className="mr-auto self-center text-xs font-medium text-red-700">
-              Resolve validation errors before running.
-            </p>
-          ) : null}
           <button className="btn-ghost" type="button" onClick={onCancel}>
             Cancel
           </button>
           <button
             className="btn-primary inline-flex items-center justify-center gap-2 whitespace-nowrap"
-            disabled={validationBlocked}
+            disabled={plan?.runnable === false}
+            title={plan?.runnable === false ? "Resolve the blocking preflight errors first" : "Run workflow"}
             type="button"
             onClick={() => {
-              if (validationBlocked) return;
               const errors = validateWorkflowParameters(workflow, parameters);
               setParameterErrors(errors);
               if (Object.keys(errors).length === 0) {
@@ -4864,8 +5299,52 @@ export function RunPreviewDialog({
             Run workflow
           </button>
         </div>
+    </Dialog>
+  );
+}
+
+function BindingPreviewSection({ bindings }) {
+  const hasShellConsumer = bindings.some((binding) =>
+    ["shell", "process-or-shell"].includes(binding.consumer),
+  );
+  return (
+    <section>
+      <div className="mb-2">
+        <h3 className="text-xs font-semibold uppercase text-muted">Runtime bindings</h3>
+        <p className="mt-1 text-xs text-slate-600">
+          Deferred values resolve automatically at the phase shown below.
+          {hasShellConsumer
+            ? " Taskurotta resolves {{...}} first; the shell owns expressions such as ${FILE_NAME}."
+            : ""}
+        </p>
       </div>
-    </div>
+      <div className="overflow-hidden rounded-lg border border-line bg-slate-50">
+        <ul className="divide-y divide-slate-200">
+          {bindings.map((binding) => {
+            const isError = ["invalid", "type-incompatible"].includes(binding.status);
+            return (
+              <li key={binding.id} className="px-3 py-2.5 text-xs">
+                <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+                  <p className="min-w-0 break-words text-sm font-medium text-ink">
+                    {binding.destinationNode}.{binding.destinationField}
+                  </p>
+                  <span className={isError ? "font-semibold text-red-700" : "font-medium text-cyan-700"}>
+                    {binding.status}
+                  </span>
+                </div>
+                <p className="mt-1 break-words text-slate-600">
+                  <code>{binding.expression}</code>
+                  {` from ${binding.producer} · ${binding.sourceType} → ${binding.destinationType} · ${binding.resolutionPhase}`}
+                  {binding.coercion === "string" ? " · string coercion" : ""}
+                  {binding.readiness ? ` · secret ${binding.readiness}` : ""}
+                </p>
+                {binding.message ? <p className="mt-1 text-red-700">{binding.message}</p> : null}
+              </li>
+            );
+          })}
+        </ul>
+      </div>
+    </section>
   );
 }
 
@@ -4969,10 +5448,21 @@ function PreviewSection({ title, items, tone = "default" }) {
   );
 }
 
-function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreate }) {
+export function CreateWorkflowDialog({
+  defaultProjectRoot = "",
+  error,
+  open,
+  saving,
+  templates,
+  onClose,
+  onCreate,
+}) {
   const [name, setName] = useState("");
   const [mode, setMode] = useState("blank");
   const [templateName, setTemplateName] = useState("");
+  const [projectRoot, setProjectRoot] = useState("");
+  const [projectError, setProjectError] = useState("");
+  const [pickingProject, setPickingProject] = useState(false);
 
   const selectedTemplate = templates.find((item) => item.name === templateName) ?? null;
 
@@ -4981,26 +5471,65 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
       setName("");
       setMode("blank");
       setTemplateName("");
+      setProjectRoot(defaultProjectRoot);
+      setProjectError("");
+      setPickingProject(false);
     }
-  }, [open]);
+  }, [defaultProjectRoot, open]);
 
   if (!open) return null;
 
   function handleSubmit(event) {
     event.preventDefault();
-    onCreate(name, { template: mode === "template" ? templateName : "" });
+    const selectedProject = projectRoot.trim();
+    if (!selectedProject) {
+      setProjectError("Choose the project folder that will own this workflow.");
+      return;
+    }
+    onCreate(name, {
+      projectRoot: selectedProject,
+      projectGrantId: window.goferDesktop?.workspace?.pathGrantForApi?.(selectedProject) ?? "",
+      template: mode === "template" ? templateName : "",
+    });
+  }
+
+  async function pickProjectFolder() {
+    if (!window.goferDesktop?.workspace?.selectPath) {
+      setProjectError("Native folder selection is available in the desktop app.");
+      return;
+    }
+    setPickingProject(true);
+    setProjectError("");
+    try {
+      const selected = await window.goferDesktop.workspace.selectPath({
+        currentPath: projectRoot || defaultProjectRoot,
+        directoryOnly: true,
+      });
+      if (selected) setProjectRoot(selected);
+    } catch (selectionError) {
+      setProjectError(
+        selectionError instanceof Error
+          ? selectionError.message
+          : "Unable to open the project folder picker.",
+      );
+    } finally {
+      setPickingProject(false);
+    }
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
-      <form
-        className="w-full max-w-[560px] rounded-lg border border-line bg-white shadow-panel"
-        onSubmit={handleSubmit}
-      >
+    <Dialog
+      description="Create a workflow inside a project folder"
+      onClose={onClose}
+      panelClassName="w-full max-w-[560px] rounded-lg border border-line bg-white shadow-panel"
+      panelProps={{ "aria-busy": saving || undefined }}
+      title="New workflow"
+    >
+      <form onSubmit={handleSubmit}>
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="text-base font-semibold">New workflow</h2>
-            <p className="text-xs text-muted">Stored in the Gofer data directory</p>
+            <p className="text-xs text-muted">Stored under the project&apos;s .taskurotta folder</p>
           </div>
           <button
             className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
@@ -5028,8 +5557,9 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
             <button
               className={`h-9 rounded-md text-sm font-medium transition ${
                 mode === "template" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
-              }`}
-              disabled={saving}
+              } disabled:cursor-not-allowed disabled:opacity-50`}
+              disabled
+              title="Templates will return after they have been migrated to Radish"
               type="button"
               onClick={() => {
                 setMode("template");
@@ -5050,6 +5580,40 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
               onChange={(event) => setName(event.target.value)}
             />
           </label>
+          <div>
+            <span className="text-xs font-medium text-muted">Project folder</span>
+            <div className="mt-1 flex gap-2">
+              <input
+                aria-describedby={projectError ? "project-folder-error" : "project-folder-hint"}
+                className="h-10 min-w-0 flex-1 rounded-lg border border-line px-3 font-mono text-xs outline-none transition focus:border-indigo-500"
+                disabled={saving || pickingProject}
+                placeholder="Choose a repository or project folder"
+                value={projectRoot}
+                onChange={(event) => {
+                  setProjectRoot(event.target.value);
+                  setProjectError("");
+                }}
+              />
+              <button
+                className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-slate-700 transition hover:border-slate-300 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={saving || pickingProject}
+                type="button"
+                onClick={pickProjectFolder}
+              >
+                {pickingProject ? <Loader2 size={15} className="animate-spin" /> : <FolderOpen size={15} />}
+                Browse
+              </button>
+            </div>
+            {projectError ? (
+              <p className="mt-1 text-xs text-rose-700" id="project-folder-error" role="alert">
+                {projectError}
+              </p>
+            ) : (
+              <p className="mt-1 text-xs text-muted" id="project-folder-hint">
+                Taskurotta will create .taskurotta/&lt;workflow-id&gt; inside this folder.
+              </p>
+            )}
+          </div>
           {mode === "template" ? (
             <>
               <label className="block">
@@ -5106,7 +5670,7 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
             </>
           ) : null}
           {error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700" role="alert">
               {error}
             </div>
           ) : null}
@@ -5123,7 +5687,7 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
           </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={saving || (mode === "blank" && !name.trim()) || (mode === "template" && !templateName)}
+            disabled={saving || !projectRoot.trim() || (mode === "blank" && !name.trim()) || (mode === "template" && !templateName)}
             type="submit"
           >
             {saving ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
@@ -5131,17 +5695,16 @@ function CreateWorkflowDialog({ error, open, saving, templates, onClose, onCreat
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 
-function ExportWorkflowDialog({
+export function ExportWorkflowDialog({
   error,
   open,
   outputPath,
   saving,
   workflow,
-  onBrowse,
   onClose,
   onExport,
 }) {
@@ -5161,11 +5724,14 @@ function ExportWorkflowDialog({
   }
 
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-slate-950/30 px-4">
-      <form
-        className="w-full max-w-[600px] rounded-lg border border-line bg-white shadow-panel"
-        onSubmit={handleSubmit}
-      >
+    <Dialog
+      description={workflow?.name ? `Create a portable bundle for ${workflow.name}` : "Create a portable workflow bundle"}
+      onClose={onClose}
+      panelClassName="w-full max-w-[600px] rounded-lg border border-line bg-white shadow-panel"
+      panelProps={{ "aria-busy": saving || undefined }}
+      title="Export workflow bundle"
+    >
+      <form onSubmit={handleSubmit}>
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="text-base font-semibold">Export workflow bundle</h2>
@@ -5187,32 +5753,17 @@ function ExportWorkflowDialog({
         <div className="space-y-4 px-5 py-5">
           <label className="block">
             <span className="text-xs font-medium text-muted">Output path</span>
-            <div className="mt-1 flex gap-2">
-              <input
-                autoFocus
-                className="h-10 min-w-0 flex-1 rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
-                disabled={saving}
-                placeholder="/path/to/workflow.gof.zip"
-                value={draftPath}
-                onChange={(event) => setDraftPath(event.target.value)}
-              />
-              {onBrowse ? (
-                <button
-                  className="grid h-10 w-10 flex-none place-items-center rounded-lg border border-line bg-white text-slate-700 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
-                  disabled={saving}
-                  title="Choose export folder"
-                  type="button"
-                  onClick={async () => {
-                    await onBrowse(draftPath);
-                  }}
-                >
-                  <FolderOpen size={16} />
-                </button>
-              ) : null}
-            </div>
+            <input
+              autoFocus
+              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
+              disabled={saving}
+              placeholder="/path/to/workflow.gof.zip"
+              value={draftPath}
+              onChange={(event) => setDraftPath(event.target.value)}
+            />
           </label>
           {error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700" role="alert">
               {error}
             </div>
           ) : null}
@@ -5238,7 +5789,7 @@ function ExportWorkflowDialog({
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 
@@ -5256,1675 +5807,6 @@ function TemplatePreviewList({ title, items }) {
   );
 }
 
-function DashboardWorkspace({
-  dashboard,
-  loading,
-  notice,
-  onAddComponent,
-  onAddDashboard,
-  onAddItem,
-  onAddSection,
-  onDeleteDashboard,
-  onDuplicateDashboard,
-  onDeleteComponent,
-  onDeleteSection,
-  onDeleteItem,
-  onRename,
-  onSetComponentTitle,
-  onSetContent,
-  onSetDisplay,
-  onSetSchema,
-  onSetViews,
-  onUpdateSection,
-  onUpdateItem,
-}) {
-  const [draftName, setDraftName] = useState("");
-  const [editingSectionIds, setEditingSectionIds] = useState(() => new Set());
-
-  useEffect(() => {
-    setDraftName(dashboard?.name ?? "");
-    setEditingSectionIds(new Set());
-  }, [dashboard?.id, dashboard?.name]);
-
-  function toggleSectionEditing(sectionId) {
-    setEditingSectionIds((current) => {
-      const next = new Set(current);
-      if (next.has(sectionId)) {
-        next.delete(sectionId);
-      } else {
-        next.add(sectionId);
-      }
-      return next;
-    });
-  }
-
-  if (!dashboard) {
-    return (
-      <div className="flex flex-1 items-center justify-center p-8">
-        <div className="w-full max-w-md rounded-lg border border-dashed border-line bg-white p-6 text-center">
-          <Database className="mx-auto text-muted" size={28} />
-          <h2 className="mt-4 text-base font-semibold">No dashboards</h2>
-          <p className="mt-2 text-sm leading-6 text-muted">
-            {loading ? "Loading dashboards..." : "Create a dashboard to organize workflow state."}
-          </p>
-          <button
-            className="mt-5 inline-flex h-9 items-center gap-2 rounded-md bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700"
-            type="button"
-            onClick={onAddDashboard}
-          >
-            <Plus size={15} />
-            New dashboard
-          </button>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <>
-      <div className="border-b border-line bg-white px-6 py-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2 text-xs font-medium uppercase text-muted">
-              <Database size={14} />
-              Dashboard
-            </div>
-            <input
-              className="mt-2 w-full bg-transparent text-xl font-semibold outline-none"
-              value={draftName}
-              onBlur={() => draftName.trim() && draftName !== dashboard.name && onRename(dashboard, draftName)}
-              onChange={(event) => setDraftName(event.target.value)}
-            />
-            <p className="mt-1 text-xs text-muted">ID: {dashboard.id}</p>
-          </div>
-          <div className="flex items-center gap-2">
-            <button
-              className="inline-flex h-9 items-center gap-2 rounded-md border border-line bg-white px-3 text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              type="button"
-              onClick={() => onAddSection(dashboard)}
-            >
-              <Plus size={15} />
-              Section
-            </button>
-            <button
-              className="grid h-9 w-9 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Duplicate dashboard"
-              type="button"
-              onClick={() => onDuplicateDashboard(dashboard)}
-            >
-              <Copy size={15} />
-            </button>
-            <button
-              className="grid h-9 w-9 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-              title="Delete dashboard"
-              type="button"
-              onClick={() => onDeleteDashboard(dashboard)}
-            >
-              <Trash2 size={15} />
-            </button>
-          </div>
-        </div>
-        {notice?.message ? (
-          <div
-            className={`mt-3 rounded-md border px-3 py-2 text-sm ${
-              notice.type === "error"
-                ? "border-red-200 bg-red-50 text-red-700"
-                : "border-emerald-200 bg-emerald-50 text-emerald-700"
-            }`}
-          >
-            {notice.message}
-          </div>
-        ) : null}
-      </div>
-
-      <div className="workflow-scrollbar flex-1 overflow-y-auto px-6 py-5">
-        {(dashboard.sections ?? []).length ? (
-          <div className="grid grid-cols-12 gap-5">
-            {dashboard.sections.map((section) => (
-              <DashboardSectionPanel
-                key={section.id}
-                dashboard={dashboard}
-                editing={editingSectionIds.has(section.id)}
-                section={section}
-                onAddComponent={onAddComponent}
-                onAddItem={onAddItem}
-                onDeleteComponent={onDeleteComponent}
-                onDeleteItem={onDeleteItem}
-                onDeleteSection={onDeleteSection}
-                onSetComponentTitle={onSetComponentTitle}
-                onSetContent={onSetContent}
-                onSetDisplay={onSetDisplay}
-                onSetSchema={onSetSchema}
-                onSetViews={onSetViews}
-                onToggleEditing={() => toggleSectionEditing(section.id)}
-                onUpdateItem={onUpdateItem}
-                onUpdateSection={onUpdateSection}
-              />
-            ))}
-          </div>
-        ) : (
-          <button
-            className="flex h-40 w-full items-center justify-center gap-2 rounded-lg border border-dashed border-line bg-white text-sm font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-            type="button"
-            onClick={() => onAddSection(dashboard)}
-          >
-            <Plus size={16} />
-            Add section
-          </button>
-        )}
-      </div>
-    </>
-  );
-}
-
-function DashboardSectionPanel({
-  dashboard,
-  editing,
-  section,
-  onAddComponent,
-  onAddItem,
-  onDeleteComponent,
-  onDeleteItem,
-  onDeleteSection,
-  onSetComponentTitle,
-  onSetContent,
-  onSetDisplay,
-  onSetSchema,
-  onSetViews,
-  onToggleEditing,
-  onUpdateItem,
-  onUpdateSection,
-}) {
-  const [sectionTitleDraft, setSectionTitleDraft] = useState(section.title ?? "");
-
-  useEffect(() => {
-    setSectionTitleDraft(section.title ?? "");
-  }, [section.id, section.title]);
-
-  function commitSectionTitle() {
-    const title = sectionTitleDraft.trim();
-    if (title && title !== section.title) {
-      onUpdateSection(dashboard, section, { title });
-    } else {
-      setSectionTitleDraft(section.title ?? "");
-    }
-  }
-  const sectionTitleHidden = Boolean(section.layout?.hideTitle);
-
-  return (
-    <section
-      className={`col-span-12 rounded-lg border bg-white ${
-        editing ? "border-teal-200 shadow-sm" : "border-line"
-      }`}
-      style={{
-        gridColumn: `span ${dashboardSectionColumns(section)} / span ${dashboardSectionColumns(section)}`,
-      }}
-    >
-      <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
-        <div className="min-w-0">
-          {editing ? (
-            <input
-              className="w-full min-w-0 bg-transparent text-base font-semibold outline-none focus:text-teal-700"
-              value={sectionTitleDraft}
-              onBlur={commitSectionTitle}
-              onChange={(event) => setSectionTitleDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") event.currentTarget.blur();
-                if (event.key === "Escape") {
-                  setSectionTitleDraft(section.title ?? "");
-                  event.currentTarget.blur();
-                }
-              }}
-            />
-          ) : (
-            <h2 className={`truncate text-base font-semibold ${sectionTitleHidden ? "sr-only" : ""}`}>
-              {section.title}
-            </h2>
-          )}
-          {editing ? <p className="mt-0.5 truncate text-xs text-muted">ID: {section.id}</p> : null}
-        </div>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2">
-          {editing ? (
-            <>
-              <label className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted">
-                <input
-                  type="checkbox"
-                  checked={sectionTitleHidden}
-                  onChange={(event) =>
-                    onUpdateSection(dashboard, section, {
-                      layout: { ...(section.layout ?? {}), hideTitle: event.target.checked },
-                    })
-                  }
-                />
-                Hide title
-              </label>
-              <select
-                className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-muted outline-none transition hover:border-slate-300 focus:border-teal-500"
-                title="Section width"
-                value={dashboardSectionColumns(section)}
-                onChange={(event) =>
-                  onUpdateSection(dashboard, section, {
-                    layout: { ...(section.layout ?? {}), columns: Number(event.target.value) },
-                  })
-                }
-              >
-                {DASHBOARD_SECTION_WIDTHS.map((option) => (
-                  <option key={option.columns} value={option.columns}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              {DASHBOARD_COMPONENT_TYPES.map(({ type, label }) => (
-                <button
-                  key={type}
-                  className="inline-flex h-8 items-center gap-2 rounded-md border border-line bg-white px-2.5 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-                  type="button"
-                  onClick={() => onAddComponent(dashboard, section, type)}
-                >
-                  <Plus size={14} />
-                  {label}
-                </button>
-              ))}
-              <button
-                className="grid h-8 w-8 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-                title="Delete section"
-                type="button"
-                onClick={() => onDeleteSection(dashboard, section)}
-              >
-                <Trash2 size={14} />
-              </button>
-            </>
-          ) : null}
-          <button
-            className={`inline-flex h-8 items-center gap-2 rounded-md border px-2.5 text-xs font-medium transition ${
-              editing
-                ? "border-teal-200 bg-teal-50 text-teal-700 hover:bg-teal-100"
-                : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-            }`}
-            type="button"
-            onMouseDown={() => {
-              if (!editing) return;
-              const activeElement = document.activeElement;
-              if (activeElement && typeof activeElement.blur === "function") {
-                activeElement.blur();
-              }
-            }}
-            onClick={() => {
-              if (editing) commitSectionTitle();
-              onToggleEditing();
-            }}
-          >
-            <PencilLine size={14} />
-            {editing ? "Done" : "Edit"}
-          </button>
-        </div>
-      </div>
-      <div className={editing ? "grid min-w-0 grid-cols-1 gap-4 p-4 2xl:grid-cols-2" : "space-y-4 p-4"}>
-        {(section.components ?? []).length ? (
-          (section.components ?? []).map((component) =>
-            editing ? (
-              <DashboardComponentPanel
-                key={component.id}
-                component={component}
-                dashboard={dashboard}
-                onAddItem={onAddItem}
-                onDeleteComponent={onDeleteComponent}
-                onDeleteItem={onDeleteItem}
-                onSetComponentTitle={onSetComponentTitle}
-                onSetContent={onSetContent}
-                onSetDisplay={onSetDisplay}
-                onSetSchema={onSetSchema}
-                onSetViews={onSetViews}
-                onUpdateItem={onUpdateItem}
-              />
-            ) : (
-              <DashboardComponentView
-                key={component.id}
-                component={component}
-                dashboard={dashboard}
-                onAddItem={onAddItem}
-                onDeleteItem={onDeleteItem}
-                onUpdateItem={onUpdateItem}
-              />
-            ),
-          )
-        ) : (
-          <div className="rounded-md border border-dashed border-line bg-slate-50 px-4 py-8 text-center text-sm text-muted">
-            {editing ? "Add a component to this section." : "No dashboard content yet."}
-          </div>
-        )}
-      </div>
-    </section>
-  );
-}
-
-function DashboardComponentPanel({
-  component,
-  dashboard,
-  onAddItem,
-  onDeleteComponent,
-  onDeleteItem,
-  onSetComponentTitle,
-  onSetContent,
-  onSetDisplay,
-  onSetSchema,
-  onSetViews,
-  onUpdateItem,
-}) {
-  const [titleDraft, setTitleDraft] = useState(component.title ?? "");
-  const [schemaDraft, setSchemaDraft] = useState(schemaToRows(component.schema));
-  const [viewDraft, setViewDraft] = useState(viewsToRows(component.views));
-  const [cardDisplayDraft, setCardDisplayDraft] = useState(displayToRows(component.display?.cardFields, "card"));
-  const [detailDisplayDraft, setDetailDisplayDraft] = useState(
-    displayToRows(component.display?.detailFields, "detail"),
-  );
-  const [contentDraft, setContentDraft] = useState(component.content ?? "");
-  const [itemDraft, setItemDraft] = useState({});
-  const fields = Object.keys(component.schema ?? {});
-  const views = component.views ?? [];
-
-  useEffect(() => {
-    setTitleDraft(component.title ?? "");
-    setSchemaDraft(schemaToRows(component.schema));
-    setViewDraft(viewsToRows(component.views));
-    setCardDisplayDraft(displayToRows(component.display?.cardFields, "card"));
-    setDetailDisplayDraft(displayToRows(component.display?.detailFields, "detail"));
-    setContentDraft(component.content ?? "");
-    setItemDraft({});
-  }, [component.id]);
-
-  function commitComponentTitle() {
-    const title = titleDraft.trim();
-    if (title && title !== component.title) {
-      onSetComponentTitle(dashboard, component, title);
-    } else {
-      setTitleDraft(component.title ?? "");
-    }
-  }
-
-  function saveSchema() {
-    const schema = {};
-    for (const row of schemaDraft) {
-      if (!row.name.trim()) continue;
-      schema[row.name.trim()] =
-        row.type === "enum"
-          ? {
-              type: "enum",
-              values: row.values.split(",").map((value) => value.trim()).filter(Boolean),
-            }
-          : row.type;
-    }
-    onSetSchema(dashboard, component, schema);
-  }
-
-  function addItem() {
-    const item = {};
-    for (const field of fields) {
-      if (itemDraft[field] !== undefined && itemDraft[field] !== "") {
-        item[field] = itemDraft[field];
-      }
-    }
-    onAddItem(dashboard, component, item);
-    setItemDraft({});
-  }
-
-  function setDefaultBoardViews() {
-    const defaultViews = [
-      { title: "Backlog", filter: { field: "status", operator: "equals", value: "backlog" } },
-      { title: "Todo", filter: { field: "status", operator: "equals", value: "todo" } },
-      { title: "In Progress", filter: { field: "status", operator: "equals", value: "in_progress" } },
-      { title: "Completed", filter: { field: "status", operator: "equals", value: "completed" } },
-    ];
-    setViewDraft(viewsToRows(defaultViews));
-    onSetViews(dashboard, component, defaultViews);
-  }
-
-  function saveViews() {
-    onSetViews(
-      dashboard,
-      component,
-      viewDraft
-        .filter((view) => view.title.trim())
-        .map((view) => ({
-          title: view.title.trim(),
-          filter: view.field.trim()
-            ? {
-                field: view.field.trim(),
-                operator: view.operator,
-                value: view.operator === "exists" ? null : view.value,
-              }
-            : null,
-        })),
-    );
-  }
-
-  function saveContent() {
-    onSetContent(dashboard, component, contentDraft);
-  }
-
-  function saveDisplay() {
-    onSetDisplay(dashboard, component, {
-      ...(component.display ?? {}),
-      cardFields: displayRowsToConfig(cardDisplayDraft),
-      detailFields: displayRowsToConfig(detailDisplayDraft),
-    });
-  }
-  const componentTitleHidden = Boolean(component.display?.hideTitle);
-
-  return (
-    <div className="min-w-0 overflow-hidden rounded-lg border border-line bg-white">
-      <div className="border-b border-line px-4 py-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <input
-              className="w-full min-w-0 bg-transparent text-sm font-semibold outline-none focus:text-teal-700"
-              value={titleDraft}
-              onBlur={commitComponentTitle}
-              onChange={(event) => setTitleDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") event.currentTarget.blur();
-                if (event.key === "Escape") {
-                  setTitleDraft(component.title ?? "");
-                  event.currentTarget.blur();
-                }
-              }}
-            />
-            <p className="mt-0.5 truncate text-xs text-muted">
-              {component.type} · ID: {component.id}
-            </p>
-          </div>
-          <label className="inline-flex h-8 shrink-0 items-center gap-2 rounded-md border border-line px-2 text-xs font-medium text-muted">
-            <input
-              type="checkbox"
-              checked={componentTitleHidden}
-              onChange={(event) =>
-                onSetDisplay(dashboard, component, {
-                  ...(component.display ?? {}),
-                  hideTitle: event.target.checked,
-                })
-              }
-            />
-            Hide title
-          </label>
-          {component.type === "board" ? (
-            <button
-              className="h-8 rounded-md border border-line px-2 text-xs font-medium text-muted transition hover:bg-slate-50 hover:text-ink"
-              type="button"
-              onClick={setDefaultBoardViews}
-            >
-              Defaults
-            </button>
-          ) : null}
-          <button
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-600"
-            title="Remove component"
-            type="button"
-            onClick={() => onDeleteComponent(dashboard, component)}
-          >
-            <Trash2 size={14} />
-          </button>
-        </div>
-      </div>
-
-      {component.type === "markdown" ? (
-        <DashboardMarkdownBlock
-          contentDraft={contentDraft}
-          onContentDraftChange={setContentDraft}
-          onSave={saveContent}
-        />
-      ) : (
-      <div className="space-y-4 p-4">
-        <div>
-          <div className="mb-2 flex items-center justify-between">
-            <span className="text-xs font-semibold uppercase text-muted">Schema</span>
-            <button
-              className="text-xs font-medium text-teal-700"
-              type="button"
-              onClick={() =>
-                setSchemaDraft((current) => [
-                  ...current,
-                  { rowId: newDraftRowId("field"), name: "", type: "string", values: "" },
-                ])
-              }
-            >
-              Add field
-            </button>
-          </div>
-          <div className="space-y-2">
-            {schemaDraft.map((row, index) => (
-              <div
-                key={row.rowId}
-                className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_110px_minmax(0,1fr)_32px]"
-              >
-                <input
-                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                  placeholder="field"
-                  value={row.name}
-                  onChange={(event) =>
-                    setSchemaDraft((current) =>
-                      current.map((item, itemIndex) =>
-                        itemIndex === index ? { ...item, name: event.target.value } : item,
-                      ),
-                    )
-                  }
-                />
-                <select
-                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                  value={row.type}
-                  onChange={(event) =>
-                    setSchemaDraft((current) =>
-                      current.map((item, itemIndex) =>
-                        itemIndex === index ? { ...item, type: event.target.value } : item,
-                      ),
-                    )
-                  }
-                >
-                  {["string", "text", "number", "boolean", "date", "datetime", "enum", "json"].map((type) => (
-                    <option key={type} value={type}>
-                      {type}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500 disabled:bg-slate-50"
-                  disabled={row.type !== "enum"}
-                  placeholder="enum values"
-                  value={row.values}
-                  onChange={(event) =>
-                    setSchemaDraft((current) =>
-                      current.map((item, itemIndex) =>
-                        itemIndex === index ? { ...item, values: event.target.value } : item,
-                      ),
-                    )
-                  }
-                />
-                <button
-                  className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-                  type="button"
-                  onClick={() => setSchemaDraft((current) => current.filter((_, itemIndex) => itemIndex !== index))}
-                >
-                  <X size={14} />
-                </button>
-              </div>
-            ))}
-          </div>
-          <button
-            className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
-            type="button"
-            onClick={saveSchema}
-          >
-            Save schema
-          </button>
-        </div>
-
-        {component.type === "board" ? (
-          <div>
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-xs font-semibold uppercase text-muted">Columns</span>
-              <button
-                className="text-xs font-medium text-teal-700"
-                type="button"
-                onClick={() =>
-                  setViewDraft((current) => [
-                    ...current,
-                    {
-                      rowId: newDraftRowId("view"),
-                      title: "New column",
-                      field: "status",
-                      operator: "equals",
-                      value: "",
-                    },
-                  ])
-                }
-              >
-                Add column
-              </button>
-            </div>
-            <div className="space-y-2">
-              {viewDraft.map((view, index) => (
-                <div
-                  key={view.rowId}
-                  className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_120px_minmax(0,1fr)_72px]"
-                >
-                  <input
-                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                    placeholder="column title"
-                    value={view.title}
-                    onChange={(event) =>
-                      setViewDraft((current) =>
-                        current.map((item, itemIndex) =>
-                          itemIndex === index ? { ...item, title: event.target.value } : item,
-                        ),
-                      )
-                    }
-                  />
-                  <input
-                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                    placeholder="field"
-                    value={view.field}
-                    onChange={(event) =>
-                      setViewDraft((current) =>
-                        current.map((item, itemIndex) =>
-                          itemIndex === index ? { ...item, field: event.target.value } : item,
-                        ),
-                      )
-                    }
-                  />
-                  <select
-                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                    value={view.operator}
-                    onChange={(event) =>
-                      setViewDraft((current) =>
-                        current.map((item, itemIndex) =>
-                          itemIndex === index ? { ...item, operator: event.target.value } : item,
-                        ),
-                      )
-                    }
-                  >
-                    {["equals", "not_equals", "contains", "exists"].map((operator) => (
-                      <option key={operator} value={operator}>
-                        {operator}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500 disabled:bg-slate-50"
-                    disabled={view.operator === "exists"}
-                    placeholder="value"
-                    value={view.value}
-                    onChange={(event) =>
-                      setViewDraft((current) =>
-                        current.map((item, itemIndex) =>
-                          itemIndex === index ? { ...item, value: event.target.value } : item,
-                        ),
-                      )
-                    }
-                  />
-                  <div className="flex items-center justify-end gap-1">
-                    <button
-                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
-                      disabled={index === 0}
-                      type="button"
-                      onClick={() => setViewDraft((current) => moveArrayItem(current, index, index - 1))}
-                    >
-                      <ChevronUp size={14} />
-                    </button>
-                    <button
-                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink disabled:opacity-40"
-                      disabled={index === viewDraft.length - 1}
-                      type="button"
-                      onClick={() => setViewDraft((current) => moveArrayItem(current, index, index + 1))}
-                    >
-                      <ChevronDown size={14} />
-                    </button>
-                    <button
-                      className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-                      type="button"
-                      onClick={() => setViewDraft((current) => current.filter((_, itemIndex) => itemIndex !== index))}
-                    >
-                      <X size={14} />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-            <button
-              className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
-              type="button"
-              onClick={saveViews}
-            >
-              Save columns
-            </button>
-          </div>
-        ) : null}
-
-        {component.type === "board" ? (
-          <DashboardBoardDisplayEditor
-            cardDisplayDraft={cardDisplayDraft}
-            detailDisplayDraft={detailDisplayDraft}
-            fields={fields}
-            onAddCardField={() =>
-              setCardDisplayDraft((current) => [
-                ...current,
-                { rowId: newDraftRowId("card-display"), field: fields[0] ?? "title", style: "text" },
-              ])
-            }
-            onAddDetailField={() =>
-              setDetailDisplayDraft((current) => [
-                ...current,
-                { rowId: newDraftRowId("detail-display"), field: fields[0] ?? "title", style: "text" },
-              ])
-            }
-            onCardDisplayChange={setCardDisplayDraft}
-            onDetailDisplayChange={setDetailDisplayDraft}
-            onSave={saveDisplay}
-          />
-        ) : null}
-
-        <div>
-          <div className="mb-2 text-xs font-semibold uppercase text-muted">Items</div>
-          {fields.length ? (
-            <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              {fields.map((field) => (
-                <input
-                  key={field}
-                  className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-                  placeholder={field}
-                  value={itemDraft[field] ?? ""}
-                  onChange={(event) => setItemDraft((current) => ({ ...current, [field]: event.target.value }))}
-                />
-              ))}
-              <button
-                className="h-8 rounded-md border border-line bg-white px-2 text-xs font-medium text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-                type="button"
-                onClick={addItem}
-              >
-                Add item
-              </button>
-            </div>
-          ) : null}
-
-          {component.type === "board" && views.length ? (
-            <div className="grid grid-cols-1 gap-2 md:grid-cols-2 2xl:grid-cols-4">
-              {views.map((view) => (
-                <DashboardBoardColumn
-                  key={view.title}
-                  component={component}
-                  dashboard={dashboard}
-                  items={(component.items ?? []).filter((item) => dashboardItemMatchesView(item, view))}
-                  view={view}
-                  onAddItem={onAddItem}
-                  onDeleteItem={onDeleteItem}
-                  onMoveItem={(item, patch) => onUpdateItem(dashboard, component, item, patch)}
-                  onUpdateItem={onUpdateItem}
-                />
-              ))}
-            </div>
-          ) : component.type === "stats" ? (
-            <DashboardStats component={component} fields={fields} />
-          ) : component.type === "chart" ? (
-            <DashboardChart component={component} views={views} />
-          ) : component.type === "json_list" ? (
-            <pre className="max-h-72 overflow-auto rounded-md border border-line bg-slate-950 p-3 text-xs text-slate-100">
-              {JSON.stringify(component.items ?? [], null, 2)}
-            </pre>
-          ) : (
-            <div className="overflow-hidden rounded-md border border-line">
-              {(component.items ?? []).map((item) => (
-                <DashboardItemRow
-                  key={item.id}
-                  component={component}
-                  dashboard={dashboard}
-                  item={item}
-                  onDeleteItem={onDeleteItem}
-                  onUpdateItem={onUpdateItem}
-                />
-              ))}
-            </div>
-          )}
-        </div>
-      </div>
-      )}
-    </div>
-  );
-}
-
-function DashboardBoardDisplayEditor({
-  cardDisplayDraft,
-  detailDisplayDraft,
-  fields,
-  onAddCardField,
-  onAddDetailField,
-  onCardDisplayChange,
-  onDetailDisplayChange,
-  onSave,
-}) {
-  return (
-    <div>
-      <div className="mb-2 flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase text-muted">Card display</span>
-        <button className="text-xs font-medium text-teal-700" type="button" onClick={onAddCardField}>
-          Add card field
-        </button>
-      </div>
-      <DashboardDisplayRows
-        fields={fields}
-        rows={cardDisplayDraft}
-        styles={DASHBOARD_CARD_FIELD_STYLES}
-        onChange={onCardDisplayChange}
-      />
-
-      <div className="mb-2 mt-4 flex items-center justify-between">
-        <span className="text-xs font-semibold uppercase text-muted">Preview pane</span>
-        <button className="text-xs font-medium text-teal-700" type="button" onClick={onAddDetailField}>
-          Add preview field
-        </button>
-      </div>
-      <DashboardDisplayRows
-        fields={fields}
-        rows={detailDisplayDraft}
-        styles={DASHBOARD_DETAIL_FIELD_STYLES}
-        onChange={onDetailDisplayChange}
-      />
-
-      <button
-        className="mt-2 h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
-        type="button"
-        onClick={onSave}
-      >
-        Save display
-      </button>
-    </div>
-  );
-}
-
-function DashboardDisplayRows({ fields, rows, styles, onChange }) {
-  return (
-    <div className="space-y-2">
-      {rows.map((row, index) => (
-        <div
-          key={row.rowId}
-          className="grid min-w-0 grid-cols-1 gap-2 md:grid-cols-[minmax(0,1fr)_140px_32px]"
-        >
-          <select
-            className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-            value={row.field}
-            onChange={(event) =>
-              onChange((current) =>
-                current.map((item, itemIndex) =>
-                  itemIndex === index ? { ...item, field: event.target.value } : item,
-                ),
-              )
-            }
-          >
-            {fields.map((field) => (
-              <option key={field} value={field}>
-                {field}
-              </option>
-            ))}
-          </select>
-          <select
-            className="h-8 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-            value={row.style}
-            onChange={(event) =>
-              onChange((current) =>
-                current.map((item, itemIndex) =>
-                  itemIndex === index ? { ...item, style: event.target.value } : item,
-                ),
-              )
-            }
-          >
-            {styles.map((style) => (
-              <option key={style} value={style}>
-                {style}
-              </option>
-            ))}
-          </select>
-          <button
-            className="grid h-8 w-8 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-            type="button"
-            onClick={() => onChange((current) => current.filter((_, itemIndex) => itemIndex !== index))}
-          >
-            <X size={14} />
-          </button>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function DashboardComponentView({ component, dashboard, onAddItem, onDeleteItem, onUpdateItem }) {
-  const fields = Object.keys(component.schema ?? {});
-  const views = component.views ?? [];
-
-  if (component.type === "markdown") {
-    return (
-      <div className="rounded-lg border border-transparent bg-transparent">
-        <DashboardMarkdownPreview content={component.content} />
-      </div>
-    );
-  }
-
-  return (
-    <div className="min-w-0 rounded-lg border border-line bg-white">
-      {component.display?.hideTitle ? null : (
-        <div className="border-b border-line px-4 py-3">
-          <h3 className="truncate text-sm font-semibold">{component.title}</h3>
-        </div>
-      )}
-      <div className="p-4">
-        {component.type === "board" && views.length ? (
-          <div className="grid grid-cols-1 gap-3 md:grid-cols-2 2xl:grid-cols-4">
-            {views.map((view) => (
-              <DashboardBoardColumn
-                key={view.title}
-                component={component}
-                dashboard={dashboard}
-                items={(component.items ?? []).filter((item) => dashboardItemMatchesView(item, view))}
-                view={view}
-                onAddItem={onAddItem}
-                onDeleteItem={onDeleteItem}
-                onMoveItem={(item, patch) => onUpdateItem(dashboard, component, item, patch)}
-                onUpdateItem={onUpdateItem}
-              />
-            ))}
-          </div>
-        ) : component.type === "stats" ? (
-          <DashboardStats component={component} fields={fields} />
-        ) : component.type === "chart" ? (
-          <DashboardChart component={component} views={views} />
-        ) : component.type === "json_list" ? (
-          <pre className="max-h-72 overflow-auto rounded-md border border-line bg-slate-950 p-3 text-xs text-slate-100">
-            {JSON.stringify(component.items ?? [], null, 2)}
-          </pre>
-        ) : (
-          <div className="overflow-hidden rounded-md border border-line">
-            {(component.items ?? []).length ? (
-              (component.items ?? []).map((item) => (
-                <DashboardItemRow
-                  key={item.id}
-                  component={component}
-                  dashboard={dashboard}
-                  item={item}
-                  onDeleteItem={onDeleteItem}
-                  onUpdateItem={onUpdateItem}
-                />
-              ))
-            ) : (
-              <div className="bg-slate-50 px-3 py-6 text-center text-sm text-muted">No items yet.</div>
-            )}
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-function DashboardBoardColumn({
-  component,
-  dashboard,
-  items,
-  view,
-  onAddItem,
-  onDeleteItem,
-  onMoveItem,
-  onUpdateItem,
-}) {
-  const [draftTitle, setDraftTitle] = useState("");
-  const [dragOver, setDragOver] = useState(false);
-  const [selectedItemId, setSelectedItemId] = useState(null);
-  const movePatch = dashboardBoardColumnPatch(view);
-  const titleField = dashboardPrimaryField(component);
-  const selectedItem = (component.items ?? []).find((item) => String(item.id) === String(selectedItemId));
-
-  function addCard() {
-    const title = draftTitle.trim();
-    if (!title || !movePatch) return;
-    onAddItem(dashboard, component, { [titleField]: title, ...movePatch });
-    setDraftTitle("");
-  }
-
-  function dropCard(event) {
-    event.preventDefault();
-    setDragOver(false);
-    if (!movePatch) return;
-    const raw = event.dataTransfer.getData("application/x-gofer-dashboard-card");
-    if (!raw) return;
-    try {
-      const payload = JSON.parse(raw);
-      if (payload.dashboardId !== dashboard.id || payload.componentId !== component.id) return;
-      const item = (component.items ?? []).find((candidate) => String(candidate.id) === String(payload.itemId));
-      if (item) {
-        onMoveItem(item, movePatch);
-      }
-    } catch {
-      // Ignore malformed drag payloads from outside the board.
-    }
-  }
-
-  return (
-    <div
-      className={`min-w-0 rounded-md border p-3 transition ${
-        dragOver ? "border-teal-300 bg-teal-50" : "border-line bg-slate-50"
-      }`}
-      onDragLeave={() => setDragOver(false)}
-      onDragOver={(event) => {
-        if (!movePatch) return;
-        event.preventDefault();
-        setDragOver(true);
-      }}
-      onDrop={dropCard}
-    >
-      <div className="mb-2 flex items-center justify-between gap-2">
-        <div>
-          <div className="text-xs font-semibold uppercase text-muted">{view.title}</div>
-          <div className="mt-0.5 text-[11px] text-muted">{items.length} items</div>
-        </div>
-      </div>
-      {movePatch ? (
-        <div className="mb-3 flex gap-2">
-          <input
-            className="h-8 min-w-0 flex-1 rounded-md border border-line bg-white px-2 text-xs outline-none focus:border-teal-500"
-            placeholder="Add card"
-            value={draftTitle}
-            onChange={(event) => setDraftTitle(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") addCard();
-              if (event.key === "Escape") setDraftTitle("");
-            }}
-          />
-          <button
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:opacity-40"
-            disabled={!draftTitle.trim()}
-            title="Add card"
-            type="button"
-            onClick={addCard}
-          >
-            <Plus size={14} />
-          </button>
-        </div>
-      ) : null}
-      <div className="space-y-2">
-        {items.length ? (
-          items.map((item) => (
-            <DashboardItemCard
-              key={item.id}
-              component={component}
-              dashboard={dashboard}
-              draggable
-              item={item}
-              onDeleteItem={onDeleteItem}
-              onDragStart={(event) => {
-                event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData(
-                  "application/x-gofer-dashboard-card",
-                  JSON.stringify({
-                    dashboardId: dashboard.id,
-                    componentId: component.id,
-                    itemId: item.id,
-                  }),
-                );
-              }}
-              onOpen={() => setSelectedItemId(item.id)}
-              onUpdateItem={onUpdateItem}
-            />
-          ))
-        ) : (
-          <div className="rounded-md border border-dashed border-line bg-white px-3 py-6 text-center text-xs text-muted">
-            Drop cards here
-          </div>
-        )}
-      </div>
-      {selectedItem ? (
-        <DashboardItemPreviewPane
-          component={component}
-          dashboard={dashboard}
-          item={selectedItem}
-          onClose={() => setSelectedItemId(null)}
-          onDeleteItem={(targetDashboard, targetComponent, targetItem) => {
-            onDeleteItem(targetDashboard, targetComponent, targetItem);
-            setSelectedItemId(null);
-          }}
-          onUpdateItem={onUpdateItem}
-        />
-      ) : null}
-    </div>
-  );
-}
-
-function DashboardItemCard({
-  component,
-  dashboard,
-  draggable = false,
-  item,
-  onDeleteItem,
-  onDragStart,
-  onOpen,
-  onUpdateItem,
-}) {
-  return (
-    <div
-      className="cursor-pointer rounded-md border border-line bg-white p-3 text-xs shadow-sm transition hover:border-teal-200 hover:shadow"
-      draggable={draggable}
-      onDragStart={onDragStart}
-      onClick={onOpen}
-    >
-      <DashboardCardFields component={component} item={item} />
-    </div>
-  );
-}
-
-function DashboardCardFields({ component, item }) {
-  const rows = dashboardDisplayRows(component, "card");
-  return (
-    <div className="space-y-1.5">
-      {rows.map((row) => (
-        <DashboardDisplayValue key={`${row.field}-${row.style}`} item={item} row={row} compact />
-      ))}
-    </div>
-  );
-}
-
-function DashboardItemPreviewPane({ component, dashboard, item, onClose, onDeleteItem, onUpdateItem }) {
-  const rows = dashboardDisplayRows(component, "detail");
-  return (
-    <div className="fixed inset-y-0 right-0 z-50 flex w-[420px] max-w-[calc(100vw-40px)] flex-col border-l border-line bg-white shadow-2xl">
-      <div className="flex items-start justify-between gap-3 border-b border-line px-5 py-4">
-        <div className="min-w-0">
-          <div className="text-xs font-semibold uppercase text-muted">Card preview</div>
-          <div className="mt-1 truncate text-base font-semibold text-ink">
-            {item.title ?? item.name ?? item.id}
-          </div>
-        </div>
-        <button
-          className="grid h-8 w-8 shrink-0 place-items-center rounded-md text-muted transition hover:bg-slate-50 hover:text-ink"
-          type="button"
-          onClick={onClose}
-        >
-          <X size={16} />
-        </button>
-      </div>
-      <div className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-5 py-4">
-        {rows.map((row) => (
-          <DashboardPreviewField
-            key={`${row.field}-${row.style}`}
-            component={component}
-            dashboard={dashboard}
-            item={item}
-            row={row}
-            onUpdateItem={onUpdateItem}
-          />
-        ))}
-      </div>
-      <div className="flex items-center justify-between gap-3 border-t border-line px-5 py-4">
-        <button
-          className="inline-flex h-9 items-center gap-2 rounded-md border border-red-200 bg-red-50 px-3 text-sm font-medium text-red-600 transition hover:bg-red-100"
-          type="button"
-          onClick={() => onDeleteItem(dashboard, component, item)}
-        >
-          <Trash2 size={15} />
-          Delete
-        </button>
-        <button
-          className="h-9 rounded-md bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"
-          type="button"
-          onClick={onClose}
-        >
-          Done
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function DashboardPreviewField({ component, dashboard, item, row, onUpdateItem }) {
-  const [draft, setDraft] = useState(String(item[row.field] ?? ""));
-  const fieldSchema = component.schema?.[row.field];
-  const enumValues = fieldSchema?.type === "enum" ? fieldSchema.values ?? [] : [];
-
-  useEffect(() => {
-    setDraft(String(item[row.field] ?? ""));
-  }, [item.id, item[row.field], row.field]);
-
-  function commit(nextValue = draft) {
-    if (nextValue !== String(item[row.field] ?? "")) {
-      onUpdateItem(dashboard, component, item, { [row.field]: nextValue });
-    }
-  }
-
-  if (enumValues.length && (row.style === "text" || row.style === "dropdown" || row.style === "textarea")) {
-    return (
-      <label className="block">
-        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
-        <select
-          className="mt-2 h-9 w-full rounded-md border border-line bg-white px-3 text-sm outline-none focus:border-teal-500"
-          value={draft}
-          onChange={(event) => {
-            setDraft(event.target.value);
-            commit(event.target.value);
-          }}
-        >
-          {enumValues.map((value) => (
-            <option key={String(value)} value={String(value)}>
-              {String(value)}
-            </option>
-          ))}
-        </select>
-      </label>
-    );
-  }
-
-  if (row.style === "textarea") {
-    return (
-      <label className="block">
-        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
-        <textarea
-          className="mt-2 min-h-32 w-full resize-y rounded-md border border-line px-3 py-2 text-sm leading-6 outline-none focus:border-teal-500"
-          value={draft}
-          onBlur={commit}
-          onChange={(event) => setDraft(event.target.value)}
-        />
-      </label>
-    );
-  }
-
-  if (row.style === "text") {
-    return (
-      <label className="block">
-        <span className="text-xs font-semibold uppercase text-muted">{row.field}</span>
-        <input
-          className="mt-2 h-9 w-full rounded-md border border-line px-3 text-sm outline-none focus:border-teal-500"
-          value={draft}
-          onBlur={commit}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") event.currentTarget.blur();
-            if (event.key === "Escape") {
-              setDraft(String(item[row.field] ?? ""));
-              event.currentTarget.blur();
-            }
-          }}
-        />
-      </label>
-    );
-  }
-
-  return (
-    <div>
-      <div className="text-xs font-semibold uppercase text-muted">{row.field}</div>
-      <DashboardDisplayValue item={item} row={row} />
-    </div>
-  );
-}
-
-function DashboardDisplayValue({ compact = false, item, row }) {
-  const value = item[row.field] ?? "";
-  const text = typeof value === "object" ? JSON.stringify(value, null, 2) : String(value);
-  if (row.style === "heading") {
-    return <div className={`${compact ? "text-sm" : "text-xl"} font-semibold leading-6 text-ink`}>{text}</div>;
-  }
-  if (row.style === "muted") {
-    return <div className={`${compact ? "line-clamp-2 text-xs" : "text-sm"} leading-6 text-muted`}>{text}</div>;
-  }
-  if (row.style === "code") {
-    return (
-      <pre className="max-h-40 overflow-auto rounded-md bg-slate-950 p-2 text-xs text-slate-100">{text}</pre>
-    );
-  }
-  return <div className={`${compact ? "line-clamp-2 text-xs" : "text-sm"} leading-6 text-slate-700`}>{text}</div>;
-}
-
-function DashboardMarkdownBlock({ contentDraft, onContentDraftChange, onSave }) {
-  return (
-    <div className="space-y-3 p-4">
-      <textarea
-        className="min-h-28 w-full resize-y rounded-md border border-line px-3 py-2 text-sm leading-6 outline-none focus:border-teal-500"
-        placeholder={"# Label\n\nAdd explanatory dashboard text here."}
-        value={contentDraft}
-        onChange={(event) => onContentDraftChange(event.target.value)}
-      />
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-xs text-muted">Markdown label and paragraph block</span>
-        <button
-          className="h-8 rounded-md bg-ink px-3 text-xs font-medium text-white transition hover:bg-slate-700"
-          type="button"
-          onClick={onSave}
-        >
-          Save Markdown
-        </button>
-      </div>
-      <div className="rounded-md border border-line bg-slate-50 p-4 text-ink">
-        <DashboardMarkdownPreview content={contentDraft} />
-      </div>
-    </div>
-  );
-}
-
-function DashboardMarkdownPreview({ content }) {
-  const blocks = dashboardMarkdownBlocks(content);
-  if (!blocks.length) {
-    return <p className="text-sm leading-6 text-muted">Markdown content</p>;
-  }
-  return (
-    <div className="space-y-2">
-      {blocks.map((block, index) => {
-        if (block.type === "heading") {
-          const Tag = block.level === 1 ? "h2" : block.level === 2 ? "h3" : "h4";
-          const sizeClass =
-            block.level === 1 ? "text-lg" : block.level === 2 ? "text-base" : "text-sm";
-          return (
-            <Tag key={`${block.type}-${index}`} className={`${sizeClass} font-semibold leading-6`}>
-              {block.text}
-            </Tag>
-          );
-        }
-        if (block.type === "list") {
-          return (
-            <ul key={`${block.type}-${index}`} className="list-disc space-y-1 pl-5 text-sm leading-6">
-              {block.items.map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-          );
-        }
-        return (
-          <p key={`${block.type}-${index}`} className="text-sm leading-6 text-slate-700">
-            {block.text}
-          </p>
-        );
-      })}
-    </div>
-  );
-}
-
-function DashboardItemRow({ component, dashboard, item, onDeleteItem, onUpdateItem }) {
-  return (
-    <div className="border-b border-line bg-white p-2 text-xs last:border-b-0">
-      <DashboardItemFields
-        component={component}
-        dashboard={dashboard}
-        item={item}
-        onDeleteItem={onDeleteItem}
-        onUpdateItem={onUpdateItem}
-      />
-    </div>
-  );
-}
-
-function DashboardItemFields({ component, dashboard, item, onDeleteItem, onUpdateItem }) {
-  const fields = Object.keys(component.schema ?? {});
-  const [draft, setDraft] = useState(() => itemFieldsDraft(item, fields));
-
-  useEffect(() => {
-    setDraft(itemFieldsDraft(item, fields));
-  }, [item.id, fields.join("|")]);
-
-  function commitField(field) {
-    const nextValue = draft[field] ?? "";
-    if (String(nextValue) !== String(item[field] ?? "")) {
-      onUpdateItem(dashboard, component, item, { [field]: nextValue });
-    }
-  }
-
-  return (
-    <div className="space-y-2">
-      <div className="flex items-start justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <div className="truncate font-medium text-ink">{item.title ?? item.name ?? item.id}</div>
-          <div className="mt-0.5 truncate text-[11px] text-muted">{item.id}</div>
-        </div>
-        <button
-          className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-muted transition hover:bg-red-50 hover:text-red-600"
-          type="button"
-          onClick={() => onDeleteItem(dashboard, component, item)}
-        >
-          <Trash2 size={13} />
-        </button>
-      </div>
-      {fields.map((field) => (
-        <label key={field} className="grid grid-cols-[72px_1fr] items-center gap-2">
-          <span className="truncate text-[11px] text-muted">{field}</span>
-          <input
-            className="h-7 min-w-0 rounded-md border border-line px-2 text-xs outline-none focus:border-teal-500"
-            value={draft[field] ?? ""}
-            onBlur={() => commitField(field)}
-            onChange={(event) => setDraft((current) => ({ ...current, [field]: event.target.value }))}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.currentTarget.blur();
-              }
-              if (event.key === "Escape") {
-                setDraft(itemFieldsDraft(item, fields));
-                event.currentTarget.blur();
-              }
-            }}
-          />
-        </label>
-      ))}
-    </div>
-  );
-}
-
-function itemFieldsDraft(item, fields) {
-  return Object.fromEntries(fields.map((field) => [field, item[field] ?? ""]));
-}
-
-const DASHBOARD_COMPONENT_TYPES = [
-  { type: "markdown", label: "Markdown label" },
-  { type: "table", label: "Table" },
-  { type: "board", label: "Board" },
-  { type: "stats", label: "Stats" },
-  { type: "json_list", label: "JSON List" },
-  { type: "chart", label: "Chart" },
-];
-
-const DASHBOARD_SECTION_WIDTHS = [
-  { columns: 12, label: "Full" },
-  { columns: 8, label: "Wide" },
-  { columns: 6, label: "Half" },
-  { columns: 4, label: "Third" },
-];
-
-const DASHBOARD_CARD_FIELD_STYLES = ["heading", "text", "muted", "code"];
-const DASHBOARD_DETAIL_FIELD_STYLES = ["heading", "text", "muted", "textarea", "dropdown", "code"];
-
-function dashboardComponentLabel(type) {
-  if (type === "markdown") return "Markdown Label";
-  return DASHBOARD_COMPONENT_TYPES.find((item) => item.type === type)?.label ?? "Component";
-}
-
-function dashboardSectionColumns(section) {
-  const columns = Number(section.layout?.columns ?? 12);
-  return DASHBOARD_SECTION_WIDTHS.some((option) => option.columns === columns) ? columns : 12;
-}
-
-function dashboardPrimaryField(component) {
-  const fields = Object.keys(component.schema ?? {});
-  if (fields.includes("title")) return "title";
-  if (fields.includes("name")) return "name";
-  return fields[0] ?? "title";
-}
-
-function dashboardFieldSchema(component, field) {
-  return component.schema?.[field] ?? {};
-}
-
-function dashboardBoardColumnPatch(view) {
-  if (!view?.filter || view.filter.operator !== "equals" || !view.filter.field) {
-    return null;
-  }
-  return { [view.filter.field]: view.filter.value };
-}
-
-function dashboardDisplayRows(component, kind) {
-  const configured = kind === "card" ? component.display?.cardFields : component.display?.detailFields;
-  const fallback = kind === "card" ? defaultCardDisplay(component) : defaultDetailDisplay(component);
-  return (configured?.length ? configured : fallback).filter((row) => row.field);
-}
-
-function defaultCardDisplay(component) {
-  const fields = Object.keys(component.schema ?? {});
-  const primary = dashboardPrimaryField(component);
-  return [
-    { field: primary, style: "heading" },
-    ...(fields.includes("description") ? [{ field: "description", style: "muted" }] : []),
-  ];
-}
-
-function defaultDetailDisplay(component) {
-  const fields = Object.keys(component.schema ?? {});
-  const primary = dashboardPrimaryField(component);
-  const rows = [{ field: primary, style: "heading" }];
-  for (const field of fields) {
-    if (field === primary) continue;
-    rows.push({
-      field,
-      style: dashboardFieldSchema(component, field).type === "enum" ? "dropdown" : field === "description" ? "textarea" : "text",
-    });
-  }
-  return rows;
-}
-
-function displayToRows(rows, kind) {
-  const source = rows?.length
-    ? rows
-    : kind === "card"
-      ? [
-          { field: "title", style: "heading" },
-          { field: "description", style: "muted" },
-        ]
-      : [
-          { field: "title", style: "heading" },
-          { field: "status", style: "dropdown" },
-          { field: "description", style: "textarea" },
-        ];
-  return source.map((row) => ({
-    rowId: newDraftRowId(`${kind}-display`),
-    field: row.field ?? "",
-    style: row.style ?? "text",
-  }));
-}
-
-function displayRowsToConfig(rows) {
-  return rows
-    .filter((row) => row.field)
-    .map((row) => ({
-      field: row.field,
-      style: row.style || "text",
-    }));
-}
-
-function dashboardMarkdownBlocks(content) {
-  const blocks = [];
-  let listItems = [];
-  function flushList() {
-    if (listItems.length) {
-      blocks.push({ type: "list", items: listItems });
-      listItems = [];
-    }
-  }
-  for (const rawLine of String(content ?? "").split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) {
-      flushList();
-      continue;
-    }
-    const heading = line.match(/^(#{1,3})\s+(.+)$/);
-    if (heading) {
-      flushList();
-      blocks.push({ type: "heading", level: heading[1].length, text: heading[2] });
-      continue;
-    }
-    const listItem = line.match(/^[-*]\s+(.+)$/);
-    if (listItem) {
-      listItems.push(listItem[1]);
-      continue;
-    }
-    flushList();
-    blocks.push({ type: "paragraph", text: line });
-  }
-  flushList();
-  return blocks;
-}
-
-function viewsToRows(views = []) {
-  const rows = views.map((view) => ({
-    rowId: view.id ?? newDraftRowId("view"),
-    title: view.title ?? "",
-    field: view.filter?.field ?? "",
-    operator: view.filter?.operator ?? "equals",
-    value: view.filter?.value ?? "",
-  }));
-  return rows.length
-    ? rows
-    : [
-        { rowId: newDraftRowId("view"), title: "Backlog", field: "status", operator: "equals", value: "backlog" },
-        { rowId: newDraftRowId("view"), title: "Todo", field: "status", operator: "equals", value: "todo" },
-        { rowId: newDraftRowId("view"), title: "In Progress", field: "status", operator: "equals", value: "in_progress" },
-        { rowId: newDraftRowId("view"), title: "Completed", field: "status", operator: "equals", value: "completed" },
-      ];
-}
-
-function newDraftRowId(prefix) {
-  return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function moveArrayItem(items, fromIndex, toIndex) {
-  const next = [...items];
-  const [item] = next.splice(fromIndex, 1);
-  next.splice(toIndex, 0, item);
-  return next;
-}
-
-function DashboardStats({ component, fields }) {
-  const items = component.items ?? [];
-  return (
-    <div className="grid grid-cols-2 gap-2">
-      <div className="rounded-md border border-line bg-slate-50 p-3">
-        <div className="text-[11px] font-semibold uppercase text-muted">Items</div>
-        <div className="mt-1 text-2xl font-semibold text-ink">{items.length}</div>
-      </div>
-      {fields.slice(0, 5).map((field) => (
-        <div key={field} className="rounded-md border border-line bg-slate-50 p-3">
-          <div className="truncate text-[11px] font-semibold uppercase text-muted">{field}</div>
-          <div className="mt-1 text-2xl font-semibold text-ink">
-            {new Set(items.map((item) => item[field]).filter((value) => value !== undefined && value !== "")).size}
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function DashboardChart({ component, views }) {
-  const items = component.items ?? [];
-  const buckets = views.length
-    ? views.map((view) => ({
-        title: view.title,
-        count: items.filter((item) => dashboardItemMatchesView(item, view)).length,
-      }))
-    : [{ title: "Items", count: items.length }];
-  const max = Math.max(1, ...buckets.map((bucket) => bucket.count));
-  return (
-    <div className="space-y-2 rounded-md border border-line bg-slate-50 p-3">
-      {buckets.map((bucket) => (
-        <div key={bucket.title} className="grid grid-cols-[96px_1fr_32px] items-center gap-2 text-xs">
-          <div className="truncate font-medium text-muted">{bucket.title}</div>
-          <div className="h-2 overflow-hidden rounded-full bg-white">
-            <div className="h-full rounded-full bg-teal-600" style={{ width: `${(bucket.count / max) * 100}%` }} />
-          </div>
-          <div className="text-right font-semibold text-ink">{bucket.count}</div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-function schemaToRows(schema = {}) {
-  const rows = Object.entries(schema).map(([name, config]) => {
-    const normalized = typeof config === "string" ? { type: config } : config ?? {};
-    return {
-      rowId: `field-${name}`,
-      name,
-      type: normalized.type ?? "string",
-      values: (normalized.values ?? []).join(", "),
-    };
-  });
-  return rows.length ? rows : [{ rowId: "field-title", name: "title", type: "string", values: "" }];
-}
-
-function dashboardItemMatchesView(item, view) {
-  const filter = view?.filter;
-  if (!filter?.field) return true;
-  const current = item[filter.field];
-  if (filter.operator === "not_equals") return String(current) !== String(filter.value);
-  if (filter.operator === "contains") {
-    return String(current ?? "").toLowerCase().includes(String(filter.value ?? "").toLowerCase());
-  }
-  if (filter.operator === "exists") return current !== undefined && current !== null && current !== "";
-  return String(current) === String(filter.value);
-}
-
 function EmptyWorkspace({ error, loading, onRefresh }) {
   return (
     <div className="flex flex-1 items-center justify-center p-8">
@@ -6936,7 +5818,7 @@ function EmptyWorkspace({ error, loading, onRefresh }) {
           {loading ? "Loading workflows" : "No workflow selected"}
         </h2>
         <p className="mt-2 text-sm leading-6 text-muted">
-          {error || "Create or save a workflow TOML file in the Gofer data directory."}
+          {error || "Create or save a workflow TOML file in the Taskurotta data directory."}
         </p>
         <button
           className="mt-5 inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"

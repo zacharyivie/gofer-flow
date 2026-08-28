@@ -261,9 +261,7 @@ def test_release_workflow_uploads_expected_artifacts_and_checksums() -> None:
         ("macos", "Generate macOS checksums"),
     ):
         checksum_run = cast(str, steps[step_name]["run"])
-        assert _bash_checksum_patterns(checksum_run) == set(
-            _checksum_inputs(matrix[platform])
-        )
+        assert _bash_checksum_patterns(checksum_run) == set(_checksum_inputs(matrix[platform]))
         assert f"checksums-{platform}.txt" in checksum_run
 
     windows_checksum_run = cast(str, steps["Generate Windows checksums"]["run"])

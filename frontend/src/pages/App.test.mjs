@@ -1,4 +1,3 @@
-/* global document, TextEncoder */
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import fs from "node:fs";
@@ -16,12 +15,12 @@ const require = createRequire(import.meta.url);
 
 let viteServer;
 let apiUrl;
-let ensureGoferApiToken;
-let installGoferApiFetchAuth;
-let withGoferApiAuth;
 let appModule;
 let canvasModule;
-let patchModule;
+let codeWorkspaceModule;
+let dialogModule;
+let radishEditorModule;
+let radishRangesModule;
 
 before(async () => {
   viteServer = await createServer({
@@ -38,11 +37,13 @@ before(async () => {
     root: frontendRoot,
     server: { hmr: false, middlewareMode: true, watch: null },
   });
-  ({ apiUrl, ensureGoferApiToken, installGoferApiFetchAuth, withGoferApiAuth } =
-    await viteServer.ssrLoadModule("/src/lib/api.js"));
+  ({ apiUrl } = await viteServer.ssrLoadModule("/src/lib/api.js"));
   appModule = await viteServer.ssrLoadModule("/src/pages/App.jsx");
   canvasModule = await viteServer.ssrLoadModule("/src/components/DagCanvas.jsx");
-  patchModule = await viteServer.ssrLoadModule("/src/lib/workflowPatch.js");
+  codeWorkspaceModule = await viteServer.ssrLoadModule("/src/components/CodeWorkspace.jsx");
+  dialogModule = await viteServer.ssrLoadModule("/src/components/Dialog.jsx");
+  radishEditorModule = await viteServer.ssrLoadModule("/src/components/RadishEditor.jsx");
+  radishRangesModule = await viteServer.ssrLoadModule("/src/lib/radishRanges.js");
 });
 
 after(async () => {
@@ -52,10 +53,6 @@ after(async () => {
 beforeEach(() => {
   globalThis.window = {
     goferApiBaseUrl: undefined,
-    goferApiToken: undefined,
-    __goferApiFetchAuthInstalled: undefined,
-    __goferApiTokenPromise: undefined,
-    location: { href: "http://127.0.0.1:5173/" },
     localStorage: {
       getItem: () => null,
       setItem: () => {},
@@ -82,87 +79,203 @@ test("apiUrl normalizes relative paths, HTTP origins, trailing slashes, and pref
   assert.equal(apiUrl("/workflows"), "/custom-api/workflows");
 });
 
-test("withGoferApiAuth attaches bearer tokens only to Gofer API requests", () => {
-  globalThis.window.goferApiBaseUrl = "http://127.0.0.1:8765";
-  globalThis.window.goferApiToken = "ui-token";
+test("shared dialogs trap focus, close with Escape, and restore focus to the opener", async () => {
+  function DialogHarness() {
+    const [open, setOpen] = React.useState(false);
+    return React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "button",
+        { "aria-label": "Open test dialog", type: "button", onClick: () => setOpen(true) },
+        "Open",
+      ),
+      open
+        ? React.createElement(
+            dialogModule.Dialog,
+            {
+              description: "Dialog focus behavior",
+              onClose: () => setOpen(false),
+              title: "Test dialog",
+            },
+            React.createElement(
+              "button",
+              { "aria-label": "First dialog action", type: "button" },
+              "First",
+            ),
+            React.createElement(
+              "button",
+              { "aria-label": "Last dialog action", type: "button" },
+              "Last",
+            ),
+          )
+        : null,
+    );
+  }
 
-  const [, init] = withGoferApiAuth("http://127.0.0.1:8765/api/workflows", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-  });
-  assert.equal(init.headers.get("Authorization"), "Bearer ui-token");
-  assert.equal(init.headers.get("Content-Type"), "application/json");
-
-  const [, externalInit] = withGoferApiAuth("https://example.com/api/workflows", {
-    method: "POST",
-  });
-  assert.equal(externalInit.headers, undefined);
-});
-
-test("ensureGoferApiToken loads the UI session token without changing API base URL", async () => {
-  const requests = [];
-  const fetchImpl = async (url) => {
-    requests.push(url);
-    return {
-      ok: true,
-      json: async () => ({
-        apiBaseUrl: "http://127.0.0.1:8765/api",
-        apiToken: "boot-token",
-      }),
-    };
-  };
-
-  const token = await ensureGoferApiToken(fetchImpl);
-
-  assert.equal(token, "boot-token");
-  assert.equal(globalThis.window.goferApiToken, "boot-token");
-  assert.equal(globalThis.window.goferApiBaseUrl, undefined);
-  assert.deepEqual(requests, ["/api/session"]);
-});
-
-test("installGoferApiFetchAuth bootstraps token before mutating Gofer API requests", async () => {
-  const calls = [];
-  globalThis.window.fetch = async (url, init = {}) => {
-    calls.push({ url, init });
-    if (url === "/api/session") {
-      return {
-        ok: true,
-        json: async () => ({ apiToken: "boot-token" }),
-      };
-    }
-    return { ok: true, json: async () => ({ ok: true }) };
-  };
-
-  installGoferApiFetchAuth();
-  await globalThis.window.fetch("/api/workflows", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-  });
-
-  assert.equal(calls.length, 2);
-  assert.equal(calls[0].url, "/api/session");
-  assert.equal(calls[1].url, "/api/workflows");
-  assert.equal(calls[1].init.headers.get("Authorization"), "Bearer boot-token");
-  assert.equal(calls[1].init.headers.get("Content-Type"), "application/json");
-});
-
-test("installGoferApiFetchAuth does not bootstrap for webhook requests", async () => {
-  const calls = [];
-  globalThis.window.fetch = async (url, init = {}) => {
-    calls.push({ url, init });
-    return { ok: true, json: async () => ({ ok: true }) };
-  };
-
-  installGoferApiFetchAuth();
-  await globalThis.window.fetch("/api/workflows/demo/webhooks/main/trigger", {
-    method: "POST",
-  });
-
-  assert.deepEqual(
-    calls.map((call) => call.url),
-    ["/api/workflows/demo/webhooks/main/trigger"],
+  const dom = await mountReact(
+    React.createElement(DialogHarness),
+    createFetchMock([]),
   );
-  assert.equal(calls[0].init.headers, undefined);
+  const opener = dom.byLabel("Open test dialog");
+  await dom.focus(opener);
+  await dom.click(opener);
+
+  const dialog = allElements(dom.container).find(
+    (element) => element.getAttribute?.("role") === "dialog",
+  );
+  assert.ok(dialog);
+  assert.equal(dialog.getAttribute("aria-modal"), "true");
+  assert.ok(dialog.getAttribute("aria-labelledby"));
+  assert.ok(dialog.getAttribute("aria-describedby"));
+
+  const first = dom.byLabel("First dialog action");
+  const last = dom.byLabel("Last dialog action");
+  assert.equal(document.activeElement, first);
+
+  await dom.focus(last);
+  await dom.dispatchWindow("keydown", { key: "Tab" });
+  assert.equal(document.activeElement, first);
+
+  await dom.focus(first);
+  await dom.dispatchWindow("keydown", { key: "Tab", shiftKey: true });
+  assert.equal(document.activeElement, last);
+
+  await dom.dispatchWindow("keydown", { key: "Escape" });
+  assert.equal(document.activeElement, opener);
+  assert.equal(
+    allElements(dom.container).some((element) => element.getAttribute?.("role") === "dialog"),
+    false,
+  );
+
+  await dom.unmount();
+});
+
+test("every migrated dialog family uses the shared keyboard and focus contract", async (context) => {
+  const approval = {
+    workflowId: "demo",
+    runId: "run-1",
+    nodeId: "approve",
+    message: "Approve deployment?",
+    status: "pending",
+    approvers: ["ops"],
+  };
+  const cases = [
+    {
+      name: "workflow history",
+      render: (onClose) => React.createElement(appModule.WorkflowHistoryDialog, {
+        diff: null,
+        error: "",
+        loading: false,
+        revisions: [],
+        workflow: workflowFixture(),
+        onClose,
+        onPreview() {},
+        onRefresh() {},
+        onRestore() {},
+      }),
+    },
+    {
+      name: "run preview",
+      render: (onClose) => React.createElement(appModule.RunPreviewDialog, {
+        plan: { generations: [] },
+        workflow: workflowFixture(),
+        onCancel: onClose,
+        onRun() {},
+      }),
+    },
+    {
+      name: "create workflow",
+      render: (onClose) => React.createElement(appModule.CreateWorkflowDialog, {
+        error: "",
+        open: true,
+        saving: false,
+        templates: [],
+        onClose,
+        onCreate() {},
+      }),
+    },
+    {
+      name: "export workflow",
+      render: (onClose) => React.createElement(appModule.ExportWorkflowDialog, {
+        error: "",
+        open: true,
+        outputPath: "/tmp/demo.gof.zip",
+        saving: false,
+        workflow: workflowFixture(),
+        onClose,
+        onExport() {},
+      }),
+    },
+    {
+      name: "node rename",
+      render: (onClose) => React.createElement(canvasModule.NodeRenameDialog, {
+        initialLabel: "Step",
+        onCancel: onClose,
+        onRename() {},
+      }),
+    },
+    {
+      name: "filesystem trust",
+      render: (onClose) => React.createElement(canvasModule.FilesystemTrustPrompt, {
+        parentPath: "/workspace",
+        onCancel: onClose,
+        onConfirm() {},
+      }),
+    },
+    {
+      name: "file editor",
+      desktop: { textFiles: { read: async () => ({ content: "hello" }) } },
+      render: (onClose) => React.createElement(canvasModule.TextFileDialog, {
+        mode: "edit",
+        path: "/workspace/demo.txt",
+        onClose,
+      }),
+    },
+    {
+      name: "path picker",
+      desktop: {
+        workspace: {
+          listDirectory: async () => ({
+            directory: "/workspace",
+            entries: [],
+            parent: null,
+          }),
+        },
+      },
+      render: (onClose) => React.createElement(canvasModule.PathPickerDialog, {
+        currentPath: "/workspace",
+        label: "Working directory",
+        onClose,
+        onSelect() {},
+      }),
+    },
+    {
+      name: "path create and rename",
+      render: (onClose) => React.createElement(canvasModule.PathNameDialog, {
+        directory: "/workspace",
+        initialName: "old.txt",
+        kind: "file",
+        mode: "rename",
+        onClose,
+        onSubmit: async () => {},
+      }),
+    },
+    {
+      name: "approval",
+      render: () => React.createElement(canvasModule.ApprovalDecisionOverlay, {
+        approval,
+        node: { id: "approve", label: "Deploy" },
+        onDecideApproval() {},
+      }),
+    },
+  ];
+
+  for (const dialogCase of cases) {
+    await context.test(dialogCase.name, async () => {
+      await exerciseDialogFamily(dialogCase.render, dialogCase.desktop);
+    });
+  }
 });
 
 test("workflow refresh helpers preserve local edits during silent refresh", () => {
@@ -191,113 +304,297 @@ test("workflow refresh helpers preserve local edits during silent refresh", () =
   assert.equal(preserved.nodes[0].x, 99);
 });
 
-test("workflow refresh helpers preserve pending dashboard item loop sources", () => {
-  const remote = [
-    {
-      id: "demo",
-      name: "Remote",
-      nodes: [
-        {
-          id: "loop",
-          type: "loop",
-          label: "Loop",
-          operation: {
-            type: "loop",
-            source: { type: "count", count: 1, max_concurrency: 1, fail_fast: false },
-          },
-        },
-      ],
-      edges: [],
-      agents: {},
-      sourcePath: "/tmp/demo.toml",
-      status: "Ready",
-    },
-  ];
-  const local = {
-    ...remote[0],
+test("reduced-motion preference disables smooth scrolling and status animation", () => {
+  globalThis.window.matchMedia = (query) => ({
+    matches: query === "(prefers-reduced-motion: reduce)",
+  });
+  assert.equal(appModule.prefersReducedMotion(), true);
+
+  const css = fs.readFileSync(path.join(frontendRoot, "src/styles/index.css"), "utf8");
+  assert.match(css, /prefers-reduced-motion:\s*reduce/);
+  assert.match(css, /\.animate-bounce[\s\S]*\.animate-spin[\s\S]*animation:\s*none/);
+});
+
+test("workflow save payload keeps all filesystem permission combinations and graph positions", () => {
+  const permissionCombinations = Array.from({ length: 8 }, (_unused, value) => ({
+    path: `/outside/shared-${value}`,
+    read: Boolean(value & 4),
+    write: Boolean(value & 2),
+    execute: Boolean(value & 1),
+  }));
+  const payload = appModule.workflowPayloadForSave({
+    id: "demo",
+    name: "Demo",
+    filesystemAccess: [
+      ...permissionCombinations,
+      { path: "/outside/shared-0/", read: true, write: true, execute: true },
+      { path: "/outside/defaults" },
+      { path: "" },
+    ],
     nodes: [
       {
-        ...remote[0].nodes[0],
-        operation: {
-          type: "loop",
-          source: {
-            type: "dashboard_items",
-            dashboard: "development-dashboard",
-            component: "tickets",
-            filter: "status=todo",
-            max_concurrency: 1,
-            fail_fast: false,
-          },
-        },
+        id: "step",
+        type: "bash_command",
+        label: "Run",
+        operation: { type: "bash_command", command: "echo hi" },
       },
     ],
-  };
-
-  const preserved = appModule.preserveLocalWorkflows(remote, [local], "/data")[0];
-
-  assert.equal(preserved.nodes[0].operation.source.type, "dashboard_items");
-  assert.equal(preserved.nodes[0].operation.source.dashboard, "development-dashboard");
-  assert.equal(preserved.sourcePath, "/tmp/demo.toml");
-});
-
-test("workflow edit history helpers push and pop snapshots without duplicating restores", () => {
-  const first = workflowFixture({ id: "history", name: "History", label: "First" });
-  const second = {
-    ...first,
-    nodes: [{ ...first.nodes[0], label: "Second" }],
-  };
-  const duplicateFirst = appModule.pushWorkflowEditHistory({}, first.id, first);
-  const unchanged = appModule.pushWorkflowEditHistory(duplicateFirst, first.id, first);
-  assert.equal(unchanged[first.id].length, 1);
-
-  const withSecond = appModule.pushWorkflowEditHistory(unchanged, first.id, second);
-  assert.equal(withSecond[first.id].length, 2);
-  const poppedSecond = appModule.popWorkflowEditHistory(withSecond, first.id);
-  assert.equal(poppedSecond.workflow.nodes[0].label, "Second");
-  const poppedFirst = appModule.popWorkflowEditHistory(poppedSecond.history, first.id);
-  assert.equal(poppedFirst.workflow.nodes[0].label, "First");
-  const empty = appModule.popWorkflowEditHistory(poppedFirst.history, first.id);
-  assert.equal(empty.workflow, null);
-});
-
-test("workflow save payload keeps graph positions and serializes defaults", () => {
-  const payload = appModule.workflowPayloadForSave(
-    {
-      id: "demo",
-      name: "Demo",
-      filesystemAccess: [
-        { path: "/project", read: false, write: false, execute: true },
-        { path: "/outside/shared", read: false, write: false, execute: true },
-        { path: "/outside/shared/", read: true, write: true, execute: true },
-        { path: "" },
-      ],
-      metadata: {
-        canvas: {
-          groups: [{ id: "group-1", label: "Phase", nodeIds: ["step"] }],
-        },
-      },
-      nodes: [
-        {
-          id: "step",
-          type: "bash_command",
-          label: "Run",
-          operation: { type: "bash_command", command: "echo hi" },
-        },
-      ],
-    },
-    "/project",
-  );
+  });
 
   assert.deepEqual(payload.edges, []);
   assert.deepEqual(payload.agents, {});
   assert.deepEqual(payload.filesystemAccess, [
-    { path: "/project", read: true, write: true, execute: false },
-    { path: "/outside/shared", read: true, write: true, execute: false },
+    ...permissionCombinations,
+    { path: "/outside/defaults", read: true, write: true, execute: false },
   ]);
   assert.equal(payload.nodes[0].x, 0);
   assert.equal(payload.nodes[0].y, 0);
   assert.equal(payload.nodes[0].operation.command, "echo hi");
-  assert.deepEqual(payload.metadata.canvas.groups[0].nodeIds, ["step"]);
+});
+
+test("filesystem permission controls update each flag independently", async () => {
+  const changes = [];
+  const workflow = {
+    ...workflowFixture(),
+    filesystemAccess: [
+      { path: "/outside/tools", read: false, write: true, execute: false },
+    ],
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange: (nextWorkflow) => changes.push(nextWorkflow),
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.click(dom.byTitle("Show workflow settings and node inspector"));
+  assert.equal(dom.byText("Workflow settings").tagName, "H2");
+  const workflowSettingsHeader = dom.ancestor(dom.byText("Workflow settings"), "HEADER");
+  assert.equal(
+    allElements(workflowSettingsHeader).some(
+      (element) => element.tagName === "P" && textOf(element) === workflow.id,
+    ),
+    true,
+  );
+  assert.equal(
+    allElements(dom.container).some(
+      (element) => element.tagName === "LABEL" && textOf(element) === "ID",
+    ),
+    false,
+  );
+  await dom.click(dom.byText("Access"));
+
+  await dom.change(dom.controlAfterLabel("Read files"), true);
+  await dom.change(dom.controlAfterLabel("Write files"), false);
+  await dom.change(dom.controlAfterLabel("Execute files"), true);
+
+  assert.deepEqual(changes.at(-1).filesystemAccess, [
+    { path: "/outside/tools", read: true, write: false, execute: true },
+  ]);
+  assert.match(
+    dom.text(),
+    /Write access allows this workflow to create, change, move, and delete files/,
+  );
+  assert.match(dom.text(), /Execute access allows this workflow to run programs/);
+
+  await dom.unmount();
+});
+
+test("autosave persists edits to two workflows with independent debounces", async () => {
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "a", name: "Workflow A", label: "A original" }),
+      workflowFixture({ id: "b", name: "Workflow B", label: "B original" }),
+    ])),
+    saveWorkflowResponse(),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Name"), "A final");
+  await dom.click(dom.ancestor(dom.byText("Workflow B"), (node) => node.getAttribute?.("role") === "button"));
+  await dom.change(dom.controlAfterLabel("Name"), "B final");
+  await dom.flush(650);
+
+  const saves = fetchMock.calls.filter((call) => call.options.method === "PUT");
+  assert.equal(saves.length, 2);
+  assert.deepEqual(
+    saves.map((call) => [call.url, JSON.parse(call.options.body).name]).sort(),
+    [
+      ["/api/workflows/a", "A final"],
+      ["/api/workflows/b", "B final"],
+    ],
+  );
+  assert.match(dom.text(), /Saved/);
+
+  await dom.unmount();
+});
+
+test("autosave serializes revisions and ignores a stale response", async () => {
+  const firstSave = createDeferred();
+  let saveCount = 0;
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "demo", name: "Demo", label: "Original" }),
+    ])),
+    (url, options = {}) => {
+      if (url !== "/api/workflows/demo" || options.method !== "PUT") return null;
+      saveCount += 1;
+      const workflow = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 200,
+        json: async () => (saveCount === 1 ? firstSave.promise : { workflow }),
+      };
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Name"), "First revision");
+  await dom.flush(650);
+  await dom.change(dom.controlAfterLabel("Name"), "Newest revision");
+  await dom.flush(650);
+  assert.equal(fetchMock.calls.filter((call) => call.options.method === "PUT").length, 1);
+
+  firstSave.resolve({
+    workflow: workflowFixture({ id: "demo", name: "First revision", label: "Original" }),
+  });
+  await dom.flush();
+  await dom.flush();
+
+  assert.equal(dom.controlAfterLabel("Name").value, "Newest revision");
+  const saves = fetchMock.calls.filter((call) => call.options.method === "PUT");
+  assert.equal(saves.length, 2);
+  assert.equal(JSON.parse(saves[1].options.body).name, "Newest revision");
+  assert.match(dom.text(), /Saved/);
+
+  await dom.unmount();
+});
+
+test("failed autosave remains visible and retryable", async () => {
+  let saveCount = 0;
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "demo", name: "Demo", label: "Original" }),
+    ])),
+    (url, options = {}) => {
+      if (url !== "/api/workflows/demo" || options.method !== "PUT") return null;
+      saveCount += 1;
+      const workflow = JSON.parse(options.body);
+      return saveCount === 1
+        ? { ok: false, status: 500, json: async () => ({ error: "Disk is unavailable" }) }
+        : { ok: true, status: 200, json: async () => ({ workflow }) };
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Name"), "Recoverable edit");
+  assert.match(dom.text(), /Saving…/);
+  await dom.flush(650);
+
+  const retryButton = dom.byText("Retry");
+  const alert = dom.ancestor(retryButton, (node) => node.getAttribute?.("role") === "alert");
+  assert.match(alert.textContent, /Couldn't saveDisk is unavailable—Retry/);
+  assert.equal(alert.getAttribute("title"), "Disk is unavailable");
+  assert.equal(alert.getAttribute("aria-live"), "assertive");
+  assert.equal(alert.getAttribute("aria-atomic"), "true");
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "assertive",
+      role: "alert",
+      text: "Disk is unavailable",
+    }).length,
+    1,
+  );
+
+  await dom.click(retryButton);
+  await dom.flush();
+  assert.equal(saveCount, 2);
+  assert.match(dom.text(), /Saved/);
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "assertive",
+      role: "alert",
+      text: "Disk is unavailable",
+    }).length,
+    0,
+  );
+
+  await dom.unmount();
+});
+
+test("silent refresh preserves every dirty workflow and updates clean workflows", async () => {
+  const pendingSave = createDeferred();
+  let workflowLoadCount = 0;
+  const initialWorkflows = [
+    workflowFixture({ id: "a", name: "Workflow A", label: "A original" }),
+    workflowFixture({ id: "b", name: "Workflow B", label: "B original" }),
+    workflowFixture({ id: "c", name: "Workflow C", label: "C original" }),
+  ];
+  const refreshedWorkflows = [
+    workflowFixture({ id: "a", name: "A remote", label: "A remote" }),
+    workflowFixture({ id: "b", name: "B remote", label: "B remote" }),
+    workflowFixture({ id: "c", name: "C refreshed", label: "C refreshed" }),
+  ];
+  const fetchMock = createFetchMock([
+    (url, options = {}) => {
+      if (url !== "/api/workflows" || (options.method ?? "GET") !== "GET") return null;
+      workflowLoadCount += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => workflowsPayload(
+          workflowLoadCount === 1 ? initialWorkflows : refreshedWorkflows,
+        ),
+      };
+    },
+    (url, options = {}) => {
+      if (!url.startsWith("/api/workflows/") || options.method !== "PUT") return null;
+      return { ok: true, status: 200, json: async () => pendingSave.promise };
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Name"), "A local");
+  await dom.click(dom.ancestor(dom.byText("Workflow B"), (node) => node.getAttribute?.("role") === "button"));
+  await dom.change(dom.controlAfterLabel("Name"), "B local");
+  await dom.click(dom.ancestor(dom.byText("Workflow C"), (node) => node.getAttribute?.("role") === "button"));
+  await dom.flush(2000);
+
+  assert.equal(dom.controlAfterLabel("Name").value, "C refreshed");
+  await dom.click(dom.ancestor(dom.byText("A local"), (node) => node.getAttribute?.("role") === "button"));
+  assert.equal(dom.controlAfterLabel("Name").value, "A local");
+  await dom.click(dom.ancestor(dom.byText("B local"), (node) => node.getAttribute?.("role") === "button"));
+  assert.equal(dom.controlAfterLabel("Name").value, "B local");
+
+  await dom.unmount();
+});
+
+test("page hide preserves pending edits with a keepalive save", async () => {
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([
+      workflowFixture({ id: "demo", name: "Demo", label: "Original" }),
+    ])),
+    saveWorkflowResponse(),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.controlAfterLabel("Name"), "Pending at unload");
+  await dom.dispatchWindow("pagehide");
+
+  const unloadSave = fetchMock.calls.find(
+    (call) => call.url === "/api/workflows/demo" && call.options.keepalive,
+  );
+  assert.ok(unloadSave);
+  assert.equal(JSON.parse(unloadSave.options.body).name, "Pending at unload");
+
+  await dom.unmount();
 });
 
 test("workflow deletion helpers remove the selected workflow and choose the next active ID", () => {
@@ -308,6 +605,603 @@ test("workflow deletion helpers remove the selected workflow and choose the next
   assert.equal(appModule.nextActiveWorkflowIdAfterDelete(workflows, "c", "b"), "c");
 });
 
+test("workflow sidebar groups workflows by registered project folder", () => {
+  assert.deepEqual(
+    appModule.groupWorkflowsByProject([
+      { id: "review", projectRoot: "/workspace/gofer-flow", projectName: "stale-workflow-slug" },
+      { id: "release", projectRoot: "/workspace/gofer-flow", projectName: "gofer-flow" },
+      { id: "deploy", projectRoot: "/workspace/deployment", projectName: "Deployment" },
+    ]).map((group) => ({
+      name: group.name,
+      ids: group.items.map((workflow) => workflow.id),
+    })),
+    [
+      { name: "deployment", ids: ["deploy"] },
+      { name: "gofer-flow", ids: ["review", "release"] },
+    ],
+  );
+
+  assert.deepEqual(
+    appModule.groupWorkflowsByProject(
+      [{ id: "review", projectRoot: "/workspace/gofer-flow" }],
+      { "/workspace/gofer-flow": "Taskurotta" },
+    ).map((group) => ({ name: group.name, root: group.root })),
+    [{ name: "Taskurotta", root: "/workspace/gofer-flow" }],
+  );
+});
+
+test("silent refresh replaces stale local project identity with the registry identity", () => {
+  const local = workflowFixture({ id: "review" });
+  local.projectRoot = "/app-data/showcase-completed-workflow";
+  local.projectName = "showcase-completed-workflow";
+  const remote = {
+    ...local,
+    projectRoot: "/repos/customer-api",
+    projectName: "wrong-cached-name",
+    workflowRoot: "/repos/customer-api/.taskurotta/review",
+  };
+
+  const [preserved] = appModule.preserveLocalWorkflow([remote], local, "/app-data");
+
+  assert.equal(preserved.projectRoot, "/repos/customer-api");
+  assert.equal(preserved.projectName, "customer-api");
+  assert.equal(preserved.workflowRoot, "/repos/customer-api/.taskurotta/review");
+});
+
+test("project folder menus stay inside the desktop viewport", () => {
+  assert.deepEqual(appModule.projectMenuPosition(790, 590, 800, 600), { x: 584, y: 438 });
+  assert.deepEqual(appModule.projectMenuPosition(-20, -30, 800, 600), { x: 8, y: 8 });
+});
+
+test("project context menu renames only the local display label", async () => {
+  window.localStorage.removeItem("gofer.projectLabels");
+  const dom = await mountReact(
+    React.createElement(appModule.WorkflowSidebar, {
+      activeWorkflowId: "review",
+      loading: false,
+      query: "",
+      runState: {},
+      workflows: [{
+        ...workflowFixture({ id: "review", name: "Review PR" }),
+        projectRoot: "/workspace/gofer-flow",
+      }],
+      width: 272,
+      onCreate() {},
+      onDeleteWorkflow() {},
+      onDuplicateWorkflow() {},
+      onQueryChange() {},
+      onRefresh() {},
+      onRenameWorkflow() {},
+      onResizeKeyDown() {},
+      onResizeStart() {},
+      onRunWorkflow() {},
+      onSelect() {},
+    }),
+    createFetchMock([]),
+  );
+  const section = allElements(dom.container).find((element) => element.tagName === "SECTION");
+  const contextEvent = testEvent(section);
+  contextEvent.clientX = 100;
+  contextEvent.clientY = 100;
+  await React.act(async () => reactProps(section).onContextMenu(contextEvent));
+  await dom.click(dom.byText("Rename"));
+  const input = dom.byLabel("Project label for gofer-flow");
+  await dom.change(input, "Taskurotta");
+  await dom.blur(input);
+
+  assert.ok(dom.byText("Taskurotta"));
+  assert.deepEqual(JSON.parse(window.localStorage.getItem("gofer.projectLabels")), {
+    "/workspace/gofer-flow": "Taskurotta",
+  });
+  await dom.unmount();
+  window.localStorage.removeItem("gofer.projectLabels");
+});
+
+test("workflow sidebar swaps project workflows for Radish files", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "review-pr", name: "Review PR" }),
+    projectName: "gofer-flow",
+    projectRoot: "/workspace/gofer-flow",
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/.taskurotta/review-pr/workflow.rad",
+  };
+  const dom = await mountReact(
+    React.createElement(appModule.WorkflowSidebar, {
+      activeWorkflow: workflow,
+      activeWorkflowId: workflow.id,
+      loading: false,
+      query: "",
+      runState: {},
+      view: "code",
+      workflows: [workflow],
+      width: 272,
+      onCreate() {},
+      onDeleteWorkflow() {},
+      onDuplicateWorkflow() {},
+      onQueryChange() {},
+      onRefresh() {},
+      onRenameWorkflow() {},
+      onResizeKeyDown() {},
+      onResizeStart() {},
+      onRunWorkflow() {},
+      onSelect() {},
+      onViewChange() {},
+    }),
+    createFetchMock([]),
+    {
+      desktop: {
+        workspace: {
+          listDirectory: async ({ currentPath }) => ({
+            directory: currentPath,
+            parent: path.dirname(currentPath),
+            entries: currentPath === "/workspace/gofer-flow"
+              ? [
+                  { name: ".taskurotta", path: "/workspace/gofer-flow/.taskurotta", isDirectory: true, isFile: false },
+                  { name: "README.md", path: "/workspace/gofer-flow/README.md", isDirectory: false, isFile: true },
+                ]
+              : currentPath === "/workspace/gofer-flow/.taskurotta"
+                ? [{ name: "review-pr", path: "/workspace/gofer-flow/.taskurotta/review-pr", isDirectory: true, isFile: false }]
+                : currentPath === "/workspace/gofer-flow/.taskurotta/review-pr"
+                  ? [
+                      { name: "workflow.rad", path: "/workspace/gofer-flow/.taskurotta/review-pr/workflow.rad", isDirectory: false, isFile: true },
+                      { name: "workflow.metadata.json", path: "/workspace/gofer-flow/.taskurotta/review-pr/workflow.metadata.json", isDirectory: false, isFile: true },
+                    ]
+                  : [],
+          }),
+        },
+      },
+    },
+  );
+
+  await dom.flush();
+  assert.equal(dom.byLabel("Search files").getAttribute("placeholder"), "Search files");
+  assert.ok(dom.byText("Project files"));
+  assert.ok(dom.byText("README.md"));
+  await dom.click(dom.ancestor(dom.byText(".taskurotta"), "BUTTON"));
+  await dom.flush();
+  await dom.click(dom.ancestor(dom.byText("review-pr"), "BUTTON"));
+  await dom.flush();
+  assert.ok(dom.byText("workflow.rad"));
+  assert.ok(dom.byText("workflow.metadata.json"));
+  assert.equal(dom.byText("Code").getAttribute("aria-selected"), "true");
+  assert.equal(dom.byText("Graph").getAttribute("aria-selected"), "false");
+  await dom.unmount();
+});
+
+test("Code file explorer creates, copies, pastes, reveals, renames, and trashes paths", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "review-pr", name: "Review PR" }),
+    projectName: "gofer-flow",
+    projectRoot: "/workspace/gofer-flow",
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/.taskurotta/review-pr/workflow.rad",
+  };
+  const entries = {
+    "/workspace/gofer-flow": [
+      { name: "docs", path: "/workspace/gofer-flow/docs", isDirectory: true, isFile: false },
+      { name: "README.md", path: "/workspace/gofer-flow/README.md", isDirectory: false, isFile: true },
+    ],
+    "/workspace/gofer-flow/docs": [],
+  };
+  const calls = [];
+  const openedFiles = [];
+  const workspace = {
+    async listDirectory({ currentPath }) {
+      return { directory: currentPath, parent: path.dirname(currentPath), entries: entries[currentPath] ?? [] };
+    },
+    async createFile({ directory, name }) {
+      calls.push(["create", directory, name]);
+      const next = { name, path: `${directory}/${name}`, isDirectory: false, isFile: true };
+      entries[directory].push(next);
+      return next;
+    },
+    async copyPath({ sourcePath, destinationPath }) {
+      calls.push(["copy", sourcePath, destinationPath]);
+      const directory = path.dirname(destinationPath);
+      entries[directory].push({
+        name: path.basename(destinationPath),
+        path: destinationPath,
+        isDirectory: false,
+        isFile: true,
+      });
+      return { path: destinationPath };
+    },
+    async deletePath(targetPath) {
+      calls.push(["delete", targetPath]);
+      for (const directoryEntries of Object.values(entries)) {
+        const index = directoryEntries.findIndex((entry) => entry.path === targetPath);
+        if (index >= 0) directoryEntries.splice(index, 1);
+      }
+      return { deleted: true };
+    },
+    async renamePath({ sourcePath, name }) {
+      calls.push(["rename", sourcePath, name]);
+      const directory = path.dirname(sourcePath);
+      const entry = entries[directory].find((candidate) => candidate.path === sourcePath);
+      entry.name = name;
+      entry.path = `${directory}/${name}`;
+      return { path: entry.path };
+    },
+    async revealPath(targetPath) {
+      calls.push(["reveal", targetPath]);
+      return { opened: true };
+    },
+    async openPath(targetPath) {
+      calls.push(["open", targetPath]);
+      return { opened: true };
+    },
+  };
+  const dom = await mountReact(
+    React.createElement(appModule.WorkflowSidebar, {
+      activeWorkflow: workflow,
+      activeWorkflowId: workflow.id,
+      loading: false,
+      query: "",
+      runState: {},
+      view: "code",
+      workflows: [workflow],
+      width: 272,
+      onCreate() {},
+      onCodeFileOpen(targetPath) { openedFiles.push(targetPath); },
+      onCodeFilesystemChange() {},
+      onDeleteWorkflow() {},
+      onDuplicateWorkflow() {},
+      onQueryChange() {},
+      onRefresh() {},
+      onRenameWorkflow() {},
+      onResizeKeyDown() {},
+      onResizeStart() {},
+      onRunWorkflow() {},
+      onSelect() {},
+      onViewChange() {},
+    }),
+    createFetchMock([]),
+    { desktop: { workspace } },
+  );
+  const contextMenu = async (element) => {
+    const target = dom.ancestor(element, "BUTTON");
+    const event = testEvent(element);
+    event.clientX = 100;
+    event.clientY = 100;
+    await React.act(async () => reactProps(target).onContextMenu(event));
+  };
+  const menuAction = (label) => {
+    const menu = dom.byLabel("File actions");
+    const labelElement = allElements(menu).find(
+      (element) => element.tagName === "SPAN" && directText(element) === label,
+    );
+    return dom.ancestor(labelElement, "BUTTON");
+  };
+
+  await dom.flush();
+  const readmeButton = dom.ancestor(dom.byText("README.md"), "BUTTON");
+  await React.act(async () => reactProps(readmeButton).onDoubleClick(testEvent(readmeButton)));
+  assert.deepEqual(openedFiles, ["/workspace/gofer-flow/README.md"]);
+
+  await dom.click(dom.byTitle("New file"));
+  const nameInput = allElements(dom.container).find(
+    (element) => element.tagName === "INPUT" && element.getAttribute("placeholder") === "new-file.txt",
+  );
+  await dom.change(nameInput, "notes.md");
+  await React.act(async () => {
+    const form = dom.ancestor(nameInput, "FORM");
+    await reactProps(form).onSubmit(testEvent(form));
+  });
+  await dom.flush();
+  assert.ok(dom.byText("notes.md"));
+  assert.deepEqual(calls[0], ["create", "/workspace/gofer-flow", "notes.md"]);
+  assert.equal(openedFiles.at(-1), "/workspace/gofer-flow/notes.md");
+
+  await contextMenu(dom.byText("README.md"));
+  await dom.click(menuAction("Copy"));
+  await contextMenu(dom.byText("docs"));
+  await dom.click(menuAction("Paste"));
+  await dom.flush();
+  assert.deepEqual(calls.at(-1), ["copy", "/workspace/gofer-flow/README.md", "/workspace/gofer-flow/docs/README copy.md"]);
+
+  await contextMenu(dom.byText("README.md"));
+  await dom.click(menuAction("Open in file explorer"));
+  assert.deepEqual(calls.at(-1), ["reveal", "/workspace/gofer-flow/README.md"]);
+
+  await contextMenu(dom.byText("notes.md"));
+  await dom.click(menuAction("Rename"));
+  const renameInput = allElements(dom.container).find(
+    (element) => element.tagName === "INPUT" && element.value === "notes.md",
+  );
+  await dom.change(renameInput, "decisions.md");
+  await React.act(async () => {
+    const form = dom.ancestor(renameInput, "FORM");
+    await reactProps(form).onSubmit(testEvent(form));
+  });
+  await dom.flush();
+  assert.ok(dom.byText("decisions.md"));
+
+  await contextMenu(dom.byText("decisions.md"));
+  await dom.click(menuAction("Delete"));
+  await dom.flush();
+  assert.equal(calls.at(-1)[0], "delete");
+  assert.equal(allElements(dom.container).some((element) => textOf(element) === "decisions.md"), false);
+
+  await dom.unmount();
+});
+
+test("code workspace maps common project files to Monaco languages", () => {
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/src/app.py"), "python");
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/src/app.tsx"), "typescript");
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/workflow.metadata.json"), "json");
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/Dockerfile"), "dockerfile");
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/.env"), "plaintext");
+});
+
+test("Radish byte spans convert to Monaco text ranges across Unicode", () => {
+  const source = "a😀é\nz";
+  assert.equal(radishRangesModule.utf8ByteOffsetToTextOffset(source, 0), 0);
+  assert.equal(radishRangesModule.utf8ByteOffsetToTextOffset(source, 1), 1);
+  assert.equal(radishRangesModule.utf8ByteOffsetToTextOffset(source, 5), 3);
+  assert.equal(radishRangesModule.utf8ByteOffsetToTextOffset(source, 7), 4);
+
+  const model = {
+    getLineMaxColumn: () => 5,
+    getPositionAt(offset) {
+      const prefix = source.slice(0, offset);
+      const lines = prefix.split("\n");
+      return { lineNumber: lines.length, column: lines.at(-1).length + 1 };
+    },
+  };
+  const marker = radishRangesModule.diagnosticToMarker(
+    { MarkerSeverity: { Warning: 4, Info: 2, Error: 8 } },
+    model,
+    source,
+    {
+      code: "RADISH_TEST",
+      message: "Unicode warning",
+      severity: "warning",
+      span: { start: { offset: 1 }, end: { offset: 7 } },
+    },
+  );
+  assert.deepEqual(marker, {
+    code: "RADISH_TEST",
+    endColumn: 5,
+    endLineNumber: 1,
+    message: "Unicode warning",
+    severity: 4,
+    source: "Radish",
+    startColumn: 2,
+    startLineNumber: 1,
+  });
+});
+
+test("Radish editor projection populates the graph with source-backed route details", () => {
+  const workflow = {
+    ...workflowFixture({ id: "review-pr", name: "Review PR" }),
+    sourceFormat: "radish",
+    nodes: [],
+    edges: [],
+  };
+  const projected = appModule.radishGraphWorkflow(workflow, {
+    workflowId: "review-pr",
+    workflow: { name: "Review the PR" },
+    metadata: { canvas: { nodes: { prepare: { x: 32, y: 48 } } } },
+    graph: {
+      nodes: [
+        {
+          id: "prepare",
+          label: "Prepare",
+          type: "bash-command",
+          configuration: { command: "echo ready" },
+          execution: { allow_fail: false, max_concurrency: 1 },
+          diagnostics: [],
+        },
+        {
+          id: "review",
+          label: "Review",
+          type: "agent",
+          configuration: { provider: "codex" },
+          execution: { allow_fail: false, max_concurrency: 1 },
+          diagnostics: [{ code: "RADISH_TEST", message: "Review is incomplete", severity: "error" }],
+        },
+      ],
+      edges: [
+        { id: "prepare:route:0", from: "prepare", to: "review", mode: "when", status: "valid" },
+      ],
+    },
+  });
+
+  assert.equal(projected.name, "Review the PR");
+  assert.equal(projected.nodes.length, 2);
+  assert.equal(projected.edges.length, 1);
+  assert.equal(projected.nodes[0].type, "bash_command");
+  assert.deepEqual({ x: projected.nodes[0].x, y: projected.nodes[0].y }, { x: 32, y: 48 });
+  assert.ok(projected.nodes[1].x > projected.nodes[0].x);
+  assert.equal(projected.edges[0].displayLabel, "when");
+  assert.equal(projected.validationDiagnostics[0].targetId, "review");
+});
+
+test("Radish graph restores selection and emits targeted inspector mutations", async () => {
+  const mutations = [];
+  const document = {
+    workflowId: "radish-inspector",
+    source: "Radish: 1\nWorkflow:\n  name: Inspector\nNode prepare:\n  type: bash-command\n  command: echo ready\n",
+    workflow: { name: "Inspector", fields: { name: { value: "Inspector" } } },
+    nodeContracts: [
+      {
+        nodeType: "bash-command",
+        configurationSchema: {
+          type: "object",
+          properties: { command: { type: "string" }, working_dir: { type: ["string", "null"] } },
+        },
+        defaults: { working_dir: null },
+      },
+    ],
+    graph: {
+      nodes: [
+        {
+          id: "prepare",
+          label: "prepare",
+          type: "bash-command",
+          configuration: { command: "echo ready", working_dir: null },
+          execution: { allow_fail: false, max_concurrency: 1, retry_count: 0, retry_delay_ms: 1000 },
+          authoredFields: { command: { value: "echo ready" }, type: { value: "bash-command" } },
+          bindings: [],
+          needs: [],
+          diagnostics: [],
+        },
+      ],
+      edges: [],
+    },
+  };
+  const workflow = appModule.radishGraphWorkflow(
+    { ...workflowFixture({ id: "radish-inspector", name: "Inspector" }), sourceFormat: "radish", nodes: [], edges: [] },
+    document,
+  );
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      workflow,
+      radishDocument: document,
+      onRadishMutation(next) {
+        mutations.push(next);
+        if (next[0]?.kind === "rename_node") {
+          const renamedId = next[0].name.toLowerCase();
+          return Promise.resolve({
+            ...document,
+            graph: {
+              ...document.graph,
+              nodes: document.graph.nodes.map((candidate) =>
+                candidate.id === next[0].node
+                  ? { ...candidate, id: renamedId, label: renamedId }
+                  : candidate,
+              ),
+            },
+            source: document.source.replace("Node prepare:", `Node ${next[0].name}:`),
+          });
+        }
+        return null;
+      },
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.pointer(dom.ancestor(dom.byText("prepare"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  assert.equal(dom.byText("Node inspector").tagName, "H2");
+  const id = dom.controlAfterLabel("ID");
+  await dom.focus(id);
+  await dom.change(id, "");
+  assert.equal(id.value, "");
+  assert.match(dom.text(), /Enter a node ID/);
+  assert.deepEqual(mutations, []);
+  await dom.change(id, "prepare-next");
+  assert.equal(id.value, "prepare-next");
+  assert.equal(globalThis.document.activeElement, id);
+  assert.deepEqual(mutations, []);
+  await dom.keyDown(id, "Enter");
+  await dom.flush();
+  assert.deepEqual(mutations, [
+    [{ kind: "rename_node", node: "prepare", name: "prepare-next" }],
+  ]);
+  const renamedId = dom.controlAfterLabel("ID");
+  assert.equal(renamedId.value, "prepare-next");
+  assert.equal(globalThis.document.activeElement, renamedId);
+  assert.equal(dom.byText("Node inspector").tagName, "H2");
+  await dom.blur(renamedId);
+  assert.equal(mutations.length, 1);
+  await dom.click(dom.byText("Action"));
+  const command = dom.controlAfterLabel("Command");
+  await dom.focus(command);
+  await dom.change(command, "echo changed");
+  assert.equal(globalThis.document.activeElement, command);
+  assert.equal(mutations.length, 1);
+  await dom.blur(dom.controlAfterLabel("Command"));
+
+  assert.deepEqual(mutations.at(-1), [
+    {
+      kind: "set_field",
+      target: { node: "prepare-next" },
+      field: "command",
+      value: "echo changed",
+    },
+  ]);
+  await dom.unmount();
+});
+
+test("Radish edits become dirty immediately and the top bar exposes Save", async () => {
+  const savedSource = "Radish: 1\n\nWorkflow:\n  name: Demo\n";
+  const editedSource = `${savedSource}\nNode prepare:\n  type: bash-command\n  command: echo ready\n`;
+  const edited = radishEditorModule.editorDocumentAfterChange(
+    { diagnostics: [], dirty: false, source: savedSource },
+    editedSource,
+    savedSource,
+  );
+  assert.equal(edited.dirty, true);
+  assert.equal(
+    radishEditorModule.editorDocumentAfterChange(edited, savedSource, savedSource).dirty,
+    false,
+  );
+
+  let saveRequests = 0;
+  const workflow = {
+    ...workflowFixture({ id: "demo", name: "Demo" }),
+    projectName: "gofer-flow",
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/.taskurotta/demo/workflow.rad",
+  };
+  const dom = await mountReact(
+    React.createElement(appModule.TopBar, {
+      editorState: { document: edited, saving: false },
+      theme: "light",
+      updateState: {},
+      view: "code",
+      workflow,
+      onApplyUpdate() {},
+      onCheckForUpdates() {},
+      onOpenHistory() {},
+      onRetrySave() {},
+      onSaveRadish() { saveRequests += 1; },
+      onToggleTheme() {},
+    }),
+    createFetchMock([]),
+  );
+  const save = dom.byText("Save");
+  assert.equal(save.disabled, false);
+  await dom.click(save);
+  assert.equal(saveRequests, 1);
+  await dom.unmount();
+});
+
+test("create workflow dialog submits the selected project folder", async () => {
+  const submissions = [];
+  const dom = await mountReact(
+    React.createElement(appModule.CreateWorkflowDialog, {
+      defaultProjectRoot: "/repos/taskurotta",
+      error: "",
+      open: true,
+      saving: false,
+      templates: [],
+      onClose() {},
+      onCreate: (name, options) => submissions.push({ name, options }),
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.change(dom.controlAfterLabel("Name"), "Review PR");
+  await dom.flush();
+  await React.act(async () => {
+    const form = allElements(dom.container).find((element) => element.tagName === "FORM");
+    reactProps(form).onSubmit(testEvent(form));
+  });
+
+  assert.deepEqual(submissions, [{
+    name: "Review PR",
+    options: {
+      projectRoot: "/repos/taskurotta",
+      projectGrantId: "",
+      template: "",
+    },
+  }]);
+  await dom.unmount();
+});
+
 test("App keeps the new workflow name field enabled after deleting a workflow", async () => {
   const dom = await mountReact(
     React.createElement(appModule.default),
@@ -316,8 +1210,20 @@ test("App keeps the new workflow name field enabled after deleting a workflow", 
         workflowFixture({ id: "demo", name: "Demo" }),
         workflowFixture({ id: "other", name: "Other" }),
       ])),
-      jsonResponse("/api/chat/providers", {
-        providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+      jsonResponse("/api/provider/capabilities", {
+        providers: [{
+          id: "codex",
+          displayName: "Codex",
+          available: true,
+          discoveryStatus: "ready",
+          defaultModel: "gpt-5.6-sol",
+          models: [{
+            id: "gpt-5.6-sol",
+            displayName: "GPT-5.6-Sol",
+            defaultEffort: "medium",
+            efforts: [{ id: "low", displayName: "Low" }, { id: "medium", displayName: "Medium" }],
+          }],
+        }],
       }),
       jsonResponse("/api/workflows/demo/logs/latest", {
         log: { logText: "latest demo log", logPath: "/tmp/demo.log" },
@@ -398,6 +1304,20 @@ test("run, plan, and log helpers build backend requests without a real server", 
   });
 });
 
+test("workflow failures prefer the runtime error and fall back to the failed node", () => {
+  assert.equal(
+    appModule.workflowRunFailureMessage({ error: { message: "grep found no match" } }),
+    "grep found no match",
+  );
+  assert.equal(
+    appModule.workflowRunFailureMessage({
+      runNodes: { asdf: { status: "error", error: { message: "command not found" } } },
+    }),
+    "command not found",
+  );
+  assert.match(appModule.workflowRunFailureMessage({}), /Select the failed node/);
+});
+
 test("chat helpers parse stream events, group thoughts, and build request payloads", () => {
   const messages = [
     { id: "u1", role: "user", body: "Summarize this workflow" },
@@ -413,6 +1333,195 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
   assert.equal(items[1].thoughts.length, 2);
   assert.equal(items[2].message.body, "Done");
 
+  const duplicateOutputItems = appModule.buildChatItems([
+    { id: "u2", role: "user", body: "Can you do this?" },
+    {
+      id: "t3",
+      role: "assistant",
+      kind: "thought",
+      groupId: "g2",
+      body: "I need filesystem access.",
+      trace: { kind: "summary", title: "Thought", body: "I need filesystem access." },
+    },
+    { id: "a2", role: "assistant", kind: "final", body: "I need filesystem access." },
+  ]);
+  assert.deepEqual(duplicateOutputItems.map((item) => item.type), ["message", "message"]);
+
+  const retainedTraceItems = appModule.buildChatItems([
+    { id: "u3", role: "user", body: "Inspect this" },
+    {
+      id: "t4",
+      role: "assistant",
+      kind: "thought",
+      groupId: "g3",
+      body: "Inspecting files",
+      trace: { kind: "summary", title: "Thought", body: "Inspecting files" },
+    },
+    {
+      id: "t5",
+      role: "assistant",
+      kind: "thought",
+      groupId: "g3",
+      body: "Inspection complete",
+      trace: { kind: "summary", title: "Thought", body: "Inspection complete" },
+    },
+    { id: "a3", role: "assistant", kind: "final", body: "Inspection complete" },
+  ]);
+  assert.equal(retainedTraceItems[1].type, "thought-group");
+  assert.deepEqual(retainedTraceItems[1].thoughts.map((thought) => thought.body), [
+    "Inspecting files",
+  ]);
+
+  const streamedMessages = [
+    {
+      id: "t6",
+      role: "assistant",
+      kind: "thought",
+      groupId: "g4",
+      body: "Final answer",
+      trace: { kind: "summary", title: "Thought", body: "Final answer" },
+    },
+  ];
+  assert.deepEqual(
+    appModule.removeTrailingDuplicateOutputThought(streamedMessages, "Final answer", "g4"),
+    [],
+  );
+  assert.equal(
+    appModule.removeTrailingDuplicateOutputThought(streamedMessages, "Different answer", "g4")
+      .length,
+    1,
+  );
+  assert.deepEqual(
+    appModule.removeTrailingDuplicateOutputThought([
+      {
+        id: "metadata-thought",
+        role: "assistant",
+        kind: "thought",
+        groupId: "g4",
+        body: "tokens used\n15,930",
+        trace: { kind: "summary", body: "tokens used\n15,930" },
+      },
+      ...streamedMessages,
+    ], "Final answer", "g4"),
+    [],
+  );
+
+  const markdownDuplicate = {
+    id: "t7",
+    role: "assistant",
+    kind: "thought",
+    groupId: "g5",
+    body: "The workflow processes tickets.\n1. `collect` reads files.\n2. `classify` labels them...",
+    trace: {
+      kind: "summary",
+      title: "Thought",
+      body: "The workflow processes tickets.\n1. `collect` reads files.\n2. `classify` labels them...",
+    },
+  };
+  assert.deepEqual(
+    appModule.removeTrailingDuplicateOutputThought(
+      [markdownDuplicate],
+      "The workflow processes tickets.\n\n1. `collect` reads files.\n2. `classify` labels them for routing and review.",
+      "g5",
+    ),
+    [],
+  );
+
+  const trace = appModule.buildThoughtTrace([
+    {
+      id: "trace-summary",
+      body: "Inspecting nodes",
+      trace: { kind: "summary", title: "Thought", body: "Inspecting nodes" },
+    },
+    {
+      id: "trace-tool-start",
+      body: "Read",
+      trace: {
+        id: "tool-1",
+        kind: "tool",
+        title: "Read",
+        detail: "workflow.toml",
+        input: "workflow.toml",
+        status: "running",
+      },
+    },
+    {
+      id: "trace-tool-result",
+      body: "Tool result",
+      trace: {
+        id: "tool-1",
+        kind: "tool",
+        title: "Tool result",
+        output: "[workflow]",
+        status: "complete",
+      },
+    },
+  ]);
+  assert.equal(trace.length, 2);
+  assert.equal(trace[1].title, "Read");
+  assert.equal(trace[1].detail, "workflow.toml");
+  assert.equal(trace[1].output, "[workflow]");
+  assert.equal(trace[0].title, "Thought");
+  const thinkingTrace = appModule.buildThoughtTrace([
+    {
+      id: "thinking-start",
+      kind: "thought",
+      body: "Thinking",
+      trace: {
+        id: "claude-thinking-msg-1-0",
+        kind: "summary",
+        title: "Thinking",
+        status: "running",
+      },
+    },
+    {
+      id: "thinking-complete",
+      kind: "thought",
+      body: "Thought",
+      trace: {
+        id: "claude-thinking-msg-1-0",
+        kind: "summary",
+        title: "Thought",
+        detail: "for 8s",
+        status: "complete",
+      },
+    },
+  ]);
+  assert.equal(thinkingTrace.length, 1);
+  assert.equal(thinkingTrace[0].title, "Thought");
+  assert.equal(thinkingTrace[0].detail, "for 8s");
+  assert.equal(thinkingTrace[0].body, "");
+  assert.equal(thinkingTrace[0].status, "complete");
+  assert.deepEqual(appModule.buildThoughtTrace([
+    {
+      id: "trace-metadata",
+      body: "tokens used\n15,930",
+      trace: { kind: "summary", title: "Thought", body: "tokens used\n15,930" },
+    },
+  ]), []);
+
+  const markdownBlocks = appModule.parseMinimalMarkdown(
+    "## Result\n\n**Ready** with `workflow.toml`.\n\n1. Read files\n2. Classify tickets\n\n```toml\n[workflow]\nname = \"Demo\"\n```",
+  );
+  assert.deepEqual(markdownBlocks.map((block) => block.type), [
+    "heading",
+    "paragraph",
+    "list",
+    "code",
+  ]);
+  assert.deepEqual(markdownBlocks[1].tokens.map((token) => token.type), [
+    "strong",
+    "text",
+    "code",
+    "text",
+  ]);
+  assert.equal(markdownBlocks[2].ordered, true);
+  assert.equal(markdownBlocks[3].text, '[workflow]\nname = "Demo"');
+  assert.equal(
+    appModule.normalizeMarkdownText("1. **Run** `collect`\n2. Review"),
+    "Run collect Review",
+  );
+
   assert.deepEqual(appModule.parseChatStreamEvent('{"type":"final","message":{"body":"ok"}}'), {
     type: "final",
     message: { body: "ok" },
@@ -426,221 +1535,25 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
   assert.deepEqual(appModule.chatStreamRequestBody({
     provider: "codex",
     model: "cli-default",
+    effort: "high",
     messages: [{ role: "user", body: "hi" }],
     workflow: { id: "workflow-assistant:thread-1", chatThreadId: "thread-1" },
   }), {
     provider: "codex",
     model: "cli-default",
+    effort: "high",
     messages: [{ role: "user", body: "hi" }],
     workflow: { id: "workflow-assistant:thread-1", chatThreadId: "thread-1" },
   });
-});
-
-test("workflow patch helpers parse, validate, apply selected hunks, and reject unsafe actions", () => {
-  const workflow = workflowFixture({ id: "demo", name: "Demo" });
-  const body = [
-    "Proposed patch:",
-    "```gofer-workflow-patch",
-    JSON.stringify({
-      type: "gofer.workflow.patch",
-      version: 1,
-      title: "Add review step",
-      operations: [
-        {
-          id: "add-review",
-          op: "add_node",
-          node: {
-            id: "review",
-            type: "agent",
-            label: "Review output",
-            operation: { type: "agent", agent_id: "reviewer", prompt: "Review {{step.output}}" },
-          },
-        },
-        {
-          id: "connect-review",
-          op: "add_edge",
-          edge: {
-            from: "step",
-            to: "review",
-            condition: "output_matches",
-            outputPattern: "ok",
-          },
-        },
-      ],
-    }),
-    "```",
-  ].join("\n");
-
-  const parsed = patchModule.extractWorkflowPatch(body);
-  assert.equal(parsed.ok, true);
-  const review = patchModule.buildPatchReview(parsed.patch, workflow);
-  assert.equal(review.ok, true);
-  assert.deepEqual(review.hunks.map((hunk) => hunk.risk), ["graph", "graph"]);
-
-  const selected = patchModule.selectedPatchOperations(parsed.patch, ["add-review"]);
-  const nextWorkflow = patchModule.applyWorkflowPatch(workflow, selected);
-  assert.equal(nextWorkflow.nodes.some((node) => node.id === "review"), true);
-  assert.equal(nextWorkflow.edges.length, 0);
-  assert.equal(nextWorkflow.agents.reviewer.subscription, "codex");
-
-  const unsafe = patchModule.buildPatchReview(
-    { type: "gofer.workflow.patch", version: 1, operations: [{ op: "run_workflow" }] },
-    workflow,
-  );
-  assert.equal(unsafe.ok, false);
-  assert.match(unsafe.errors.join("\n"), /Unsupported patch operation/);
-});
-
-test("App reviews and applies selected chat workflow patch hunks with validation and audit metadata", async () => {
-  const patch = {
-    type: "gofer.workflow.patch",
-    version: 1,
-    title: "Add notify step",
-    summary: "Add a notification node and connect it conditionally.",
-    operations: [
-      {
-        id: "add-notify",
-        op: "add_node",
-        node: {
-          id: "notify",
-          type: "notification",
-          label: "Notify owner",
-          x: 240,
-          y: 80,
-          operation: { type: "notification", title: "Done", body: "Workflow finished" },
-        },
-      },
-      {
-        id: "connect-notify",
-        op: "add_edge",
-        edge: {
-          from: "step",
-          to: "notify",
-          condition: "output_matches",
-          outputPattern: "done",
-        },
-      },
-    ],
-  };
-  const chatStream = streamResponse([
-    `{"type":"final","message":{"body":${JSON.stringify(`Here is the patch:\n\`\`\`gofer-workflow-patch\n${JSON.stringify(patch)}\n\`\`\``)}}}\n`,
-  ]);
-  const fetchMock = createFetchMock([
-    jsonResponse("/api/workflows", workflowsPayload([workflowFixture({ id: "demo", name: "Demo" })])),
-    jsonResponse("/api/chat/providers", {
-      providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
-    }),
-    jsonResponse("/api/workflows/demo/logs/latest", { log: null }),
-    jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
-    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
-    jsonResponse("/api/workflows/demo/validate", { ok: true, diagnostics: [] }, { method: "POST" }),
-    (url, options = {}) => {
-      if (url !== "/api/workflows/demo" || options.method !== "PUT") return null;
-      const saved = JSON.parse(options.body);
-      return {
-        ok: true,
-        status: 200,
-        json: async () => ({ workflow: { ...saved, status: "Ready", tags: ["ready"] } }),
-      };
-    },
-  ]);
-  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
-
-  await dom.flush();
-  await dom.click(dom.byText("New thread"));
-  await dom.change(dom.first("textarea"), "Add a notification");
-  await dom.click(dom.byTitle("Send message"));
-  await dom.flush();
-  await dom.click(dom.byText("Review patch"));
-  await dom.flush();
-
-  assert.match(dom.text(), /Review workflow patch/);
-  assert.match(dom.text(), /Add a notification node and connect it conditionally/);
-  assert.match(dom.text(), /Connect nodes/);
-
-  const connectCheckbox = dom.controlAfterLabel("Connect nodes");
-  await dom.change(connectCheckbox, false);
-  await dom.click(dom.byText("Apply selected"));
-  await dom.flush();
-
-  const saveCall = fetchMock.calls.find((call) => call.url === "/api/workflows/demo" && call.options.method === "PUT");
-  const saved = JSON.parse(saveCall.options.body);
-  assert.equal(saved.nodes.some((node) => node.id === "notify"), true);
-  assert.equal(saved.edges.length, 0);
-  assert.deepEqual(saved.auditMetadata.appliedHunkIds, ["add-notify"]);
-  assert.equal(saved.auditMetadata.prompt, "Add a notification");
-  assert.match(saved.auditMetadata.response, /gofer-workflow-patch/);
-
-  await dom.unmount();
-});
-
-test("App rejects invalid chat workflow patches before changing the workflow", async () => {
-  const patch = {
-    type: "gofer.workflow.patch",
-    version: 1,
-    title: "Broken edge",
-    operations: [
-      {
-        id: "bad-edge",
-        op: "add_edge",
-        edge: { from: "missing", to: "step" },
-      },
-    ],
-  };
-  const chatStream = streamResponse([
-    `{"type":"final","message":{"body":${JSON.stringify(`\`\`\`json\n${JSON.stringify(patch)}\n\`\`\``)}}}\n`,
-  ]);
-  const fetchMock = createFetchMock([
-    jsonResponse("/api/workflows", workflowsPayload([workflowFixture({ id: "demo", name: "Demo" })])),
-    jsonResponse("/api/chat/providers", {
-      providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
-    }),
-    jsonResponse("/api/workflows/demo/logs/latest", { log: null }),
-    jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
-    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
-  ]);
-  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
-
-  await dom.flush();
-  await dom.click(dom.byText("New thread"));
-  await dom.change(dom.first("textarea"), "Connect missing node");
-  await dom.click(dom.byTitle("Send message"));
-  await dom.flush();
-  await dom.click(dom.byText("Review patch"));
-  await dom.flush();
-
-  assert.match(dom.text(), /Patch rejected/);
-  assert.match(dom.text(), /Edge source 'missing' does not exist/);
-  assert.equal(
-    fetchMock.calls.some((call) => call.url === "/api/workflows/demo" && call.options.method === "PUT"),
-    false,
-  );
-
-  await dom.unmount();
 });
 
 test("RunPreviewDialog renders grouped warnings, destructive actions, providers, fan-out samples, and node details", () => {
   const plan = {
     workflowId: "preview-demo",
     workflowName: "Preview Demo",
-    startNodes: ["scan"],
-    validation: {
-      ok: true,
-      diagnostics: [
-        { severity: "warning", message: "Provider CLI missing", subject: "agent:reviewer" },
-      ],
-    },
     warnings: ["Missing read target: /workspace/missing.txt"],
     destructiveActions: ["overwrite file: /workspace/out.txt"],
     requiredSecrets: ["OPENAI_API_KEY"],
-    secretReadiness: [
-      {
-        name: "OPENAI_API_KEY",
-        status: "missing",
-        present: false,
-        sources: ["node:review.provider.api_key"],
-      },
-    ],
     providerRequirements: [
       {
         agentId: "reviewer",
@@ -654,24 +1567,37 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
         extraPaths: ["/workspace/shared"],
       },
     ],
-    unresolvedDynamicValues: ["agent.prompt={{previous.output}}"],
+    bindings: [
+      {
+        id: "binding:scan:operation.command:previous.output",
+        destinationNode: "scan",
+        destinationField: "operation.command",
+        expression: "previous.output",
+        producer: "previous-predecessor",
+        sourceType: "string",
+        destinationType: "string",
+        resolutionPhase: "upstream-node-completion",
+        status: "runtime-bound",
+        coercion: "string",
+        consumer: "shell",
+      },
+      {
+        id: "binding:scan:operation.env.TOKEN:secret.API_TOKEN",
+        destinationNode: "scan",
+        destinationField: "operation.env.TOKEN",
+        expression: "secret.API_TOKEN",
+        producer: "secret-store",
+        sourceType: "secret",
+        destinationType: "string",
+        resolutionPhase: "run-start",
+        status: "runtime-bound",
+        coercion: "string",
+        consumer: "process-or-shell",
+        readiness: "present",
+      },
+    ],
     triggerContext: {
       watch: { path: "/workspace/inbox", glob: "*.md", mode: "fanout" },
-    },
-    conditionalBranches: [{ from: "scan", to: "review", label: "output_matches:ready" }],
-    resourceLimits: {
-      max_fanout_items: 10,
-      max_fanout_concurrency: 2,
-      max_files_scanned: 100,
-      max_file_read_bytes: 1024,
-    },
-    executionLimits: { maxTotalNodeRuns: 25 },
-    usageBudget: { enabled: true, max_agent_calls: 3 },
-    projectedLlmUsage: {
-      agent_calls: 2,
-      total_tokens: 1200,
-      estimated_cost: 0.03,
-      agent_time_seconds: 4.5,
     },
     generations: [
       {
@@ -683,15 +1609,6 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
             detail: "echo scan",
             workingDir: "/workspace/jobs",
             sideEffects: ["shell command: echo scan"],
-            sideEffectDetails: [
-              {
-                kind: "network",
-                action: "http_request",
-                method: "GET",
-                host: "internal.service",
-                networkAllowlist: ["10.0.0.0/8", "internal.service"],
-              },
-            ],
             fanOut: {
               sourceType: "directory",
               count: 2,
@@ -702,11 +1619,15 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
                 { path: "/workspace/inbox/b.md" },
               ],
             },
-            unresolvedDynamicValues: ["scan.inputs={{trigger.file}}"],
-            retryCount: 1,
-            retryDelaySeconds: 2,
-            timeoutSeconds: 30,
-            allowFailure: true,
+            bindings: [
+              {
+                id: "binding:scan:inputs.file:trigger.file",
+                destinationField: "inputs.file",
+                expression: "trigger.file",
+                status: "optional",
+                resolutionPhase: "run-start",
+              },
+            ],
           },
         ],
       },
@@ -723,16 +1644,10 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
   );
 
   assert.match(html, /Destructive actions/);
-  assert.match(html, /Start nodes/);
-  assert.match(html, /scan/);
-  assert.match(html, /Validation diagnostics/);
-  assert.match(html, /warning: Provider CLI missing \(agent:reviewer\)/);
   assert.match(html, /overwrite file: \/workspace\/out\.txt/);
   assert.match(html, /Warnings/);
   assert.match(html, /Required secrets/);
   assert.match(html, /OPENAI_API_KEY/);
-  assert.match(html, /Secret readiness/);
-  assert.match(html, /OPENAI_API_KEY: missing/);
   assert.match(html, /Provider CLI requirements/);
   assert.match(
     html,
@@ -740,57 +1655,23 @@ test("RunPreviewDialog renders grouped warnings, destructive actions, providers,
   );
   assert.match(html, /Trigger context/);
   assert.match(html, /Watch: \/workspace\/inbox glob=\*\.md mode=fanout/);
-  assert.match(html, /Conditional branches/);
-  assert.match(html, /scan -&gt; review when output_matches:ready/);
-  assert.match(html, /Projected LLM usage/);
-  assert.match(html, /Agent calls: 2/);
-  assert.match(html, /Usage budget/);
-  assert.match(html, /max_agent_calls: 3/);
-  assert.match(html, /Resource limits/);
-  assert.match(html, /Fan-out concurrency: 2/);
   assert.match(html, /<details/);
   assert.match(html, /Generation 0/);
   assert.match(html, /Working directory: \/workspace\/jobs/);
-  assert.match(html, /Network allowlist internal\.service: 10\.0\.0\.0\/8, internal\.service/);
   assert.match(html, /Fan-out directory:/);
   assert.match(html, /at least 2 items/);
   assert.match(html, /Sample: \/workspace\/inbox\/a\.md/);
-  assert.match(html, /Unresolved values/);
-  assert.match(html, /Timeout: 30s/);
-  assert.match(html, /Retries: 1 delay=2s/);
-  assert.match(html, /Allow failure/);
+  assert.match(html, /Runtime bindings/);
+  assert.match(html, /upstream-node-completion/);
+  assert.match(html, /secret present/);
+  assert.match(html, /shell owns expressions such as \$\{FILE_NAME\}/);
+  assert.match(html, /role="dialog"/);
+  assert.match(html, /aria-modal="true"/);
+  assert.match(html, /aria-labelledby=/);
+  assert.match(html, /aria-describedby=/);
 });
 
-test("RunPreviewDialog blocks execution while validation has errors", () => {
-  const html = renderToStaticMarkup(
-    React.createElement(appModule.RunPreviewDialog, {
-      plan: {
-        workflowId: "broken",
-        workflowName: "Broken",
-        validation: {
-          ok: false,
-          diagnostics: [
-            {
-              severity: "error",
-              message: "Edge target 'missing' does not exist",
-              subject: "edge:start->missing",
-            },
-          ],
-        },
-        generations: [],
-      },
-      workflow: { id: "broken", name: "Broken" },
-      onCancel: () => {},
-      onRun: () => {},
-    }),
-  );
-
-  assert.match(html, /error: Edge target &#x27;missing&#x27; does not exist/);
-  assert.match(html, /Resolve validation errors before running\./);
-  assert.match(html, /disabled=""/);
-});
-
-test("UsageSummaryStrip renders run cost, expensive nodes, slow nodes, and budget failures", () => {
+test("UsageSummaryStrip renders run cost, expensive nodes, and slow nodes", () => {
   const html = renderToStaticMarkup(
     React.createElement(canvasModule.UsageSummaryStrip, {
       summary: {
@@ -802,7 +1683,6 @@ test("UsageSummaryStrip renders run cost, expensive nodes, slow nodes, and budge
         },
         most_expensive_nodes: [{ node_id: "review", estimated_cost: 0.04 }],
         slowest_nodes: [{ node_id: "draft", duration_seconds: 8.25 }],
-        budget_failures: [{ node_id: "review" }],
       },
     }),
   );
@@ -813,39 +1693,6 @@ test("UsageSummaryStrip renders run cost, expensive nodes, slow nodes, and budge
   assert.match(html, /cost~\$0\.045000/);
   assert.match(html, /Most expensive: review/);
   assert.match(html, /Slowest: draft/);
-  assert.match(html, /Budget failures: review/);
-});
-
-test("bundle import preview surfaces high-risk webhook trigger warnings", () => {
-  const preview = appModule.formatBundleImportPreview({
-    workflowId: "local-hook",
-    workflowName: "Local Hook",
-    filesToCreate: [],
-    filesToOverwrite: [],
-    manifest: {
-      includedPaths: [],
-      providerAssumptions: [],
-      triggers: [
-        {
-          type: "webhook",
-          id: "github",
-          source: "github",
-          enabled: "true",
-          tokenConfigured: "false",
-          allowUnauthenticated: "true",
-          risk: "high",
-          riskReasons: "unauthenticated_allowed",
-        },
-      ],
-    },
-    riskWarnings: [
-      "Webhook trigger 'github' explicitly allows unauthenticated requests; only use this for local testing.",
-    ],
-  });
-
-  assert.match(preview, /webhook github: github, enabled, allows unauthenticated requests, high risk/);
-  assert.match(preview, /High-risk configuration:/);
-  assert.match(preview, /explicitly allows unauthenticated requests/);
 });
 
 test("App loads workflows, preserves local edits on silent refreshes, saves errors, deletes workflows, and loads logs", async () => {
@@ -856,8 +1703,20 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
         workflowFixture({ id: "demo", name: "Demo", label: "Original label" }),
         workflowFixture({ id: "other", name: "Other", label: "Other label" }),
       ])),
-      jsonResponse("/api/chat/providers", {
-        providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+      jsonResponse("/api/provider/capabilities", {
+        providers: [{
+          id: "codex",
+          displayName: "Codex",
+          available: true,
+          discoveryStatus: "ready",
+          defaultModel: "gpt-5.6-sol",
+          models: [{
+            id: "gpt-5.6-sol",
+            displayName: "GPT-5.6-Sol",
+            defaultEffort: "medium",
+            efforts: [{ id: "low", displayName: "Low" }, { id: "medium", displayName: "Medium" }],
+          }],
+        }],
       }),
       jsonResponse("/api/workflows/demo/logs/latest", {
         log: { logText: "latest demo log", logPath: "/tmp/demo.log" },
@@ -885,7 +1744,7 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
     true,
   );
 
-  const labelInput = dom.controlAfterLabel("Label");
+  const labelInput = dom.controlAfterLabel("Name");
   await dom.change(labelInput, "Local unsaved label");
   assert.match(dom.text(), /Local unsaved label/);
 
@@ -926,53 +1785,38 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   await dom.unmount();
 });
 
-test("App supports workflow undo and redo without recording restore states", async () => {
-  const workflow = workflowFixture({ id: "undo", name: "Undo", label: "Original label" });
-  const dom = await mountReact(
-    React.createElement(appModule.default),
-    createFetchMock([
-      jsonResponse("/api/workflows", workflowsPayload([workflow])),
-      jsonResponse("/api/workflows/undo/logs/latest", {
-        log: { logText: "", logPath: "/tmp/undo.log" },
-      }),
-      jsonResponse("/api/workflows/undo/logs?limit=100", { runs: [] }),
-      jsonResponse("/api/workflows/undo", { workflow }, { method: "PUT" }),
-    ]),
-  );
-
-  await dom.flush();
-  await dom.change(dom.controlAfterLabel("Label"), "Edited once");
-  assert.equal(dom.controlAfterLabel("Label").value, "Edited once");
-
-  await dom.keyDown("z", { ctrlKey: true });
-  await dom.flush();
-  assert.equal(dom.controlAfterLabel("Label").value, "Undo");
-
-  await dom.keyDown("y", { ctrlKey: true });
-  await dom.flush();
-  assert.equal(dom.controlAfterLabel("Label").value, "Edited once");
-
-  await dom.keyDown("z", { ctrlKey: true });
-  await dom.flush();
-  assert.equal(dom.controlAfterLabel("Label").value, "Undo");
-
-  await dom.unmount();
-});
-
 test("App renders run and stop state, opens the run preview, executes runs, and sends chat prompts", async () => {
   const chatStream = streamResponse([
-    '{"type":"thought","text":"Inspecting graph"}\n',
-    '{"type":"final","message":{"body":"Looks ready"}}\n',
+    '{"type":"thought","text":"**Inspecting graph** with [workflow](https://example.com) and `step`.\\n\\n1. Read nodes\\n2. Check edges","trace":{"kind":"summary","title":"Summary","body":"**Inspecting graph** with [workflow](https://example.com) and `step`.\\n\\n1. Read nodes\\n2. Check edges"}}\n',
+    '{"type":"thought","text":"Read","trace":{"id":"tool-1","kind":"tool","title":"Read","detail":"workflow.toml","input":"workflow.toml","status":"running"}}\n',
+    '{"type":"thought","text":"Read","trace":{"id":"tool-1","kind":"tool","title":"Tool result","output":"[workflow]","status":"complete"}}\n',
+    '{"type":"final","message":{"body":"**Looks ready**\\n\\n1. Read files\\n2. Classify tickets"}}\n',
   ]);
   const fetchMock = createFetchMock([
     jsonResponse("/api/workflows", workflowsPayload([
       {
         ...workflowFixture({ id: "demo", name: "Demo", status: "Running" }),
+        filesystemAccess: [
+          { path: "/outside/input", read: true, write: false, execute: false },
+          { path: "/outside/tools", read: false, write: false, execute: true },
+        ],
         runs: [{ id: "run-1", status: "running", startedAt: "2026-01-02T03:04:05Z" }],
       },
     ])),
-    jsonResponse("/api/chat/providers", {
-      providers: [{ id: "codex", name: "Codex", available: true, models: ["cli-default"] }],
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{
+        id: "codex",
+        displayName: "Codex",
+        available: true,
+        discoveryStatus: "ready",
+        defaultModel: "gpt-5.6-sol",
+        models: [{
+          id: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          defaultEffort: "medium",
+          efforts: [{ id: "low", displayName: "Low" }, { id: "medium", displayName: "Medium" }],
+        }],
+      }],
     }),
     jsonResponse("/api/workflows/demo/logs/latest", {
       log: { logText: "running log", logPath: "/tmp/demo.log" },
@@ -981,7 +1825,13 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
       runs: [{ id: "run-1", status: "running", startedAt: "2026-01-02T03:04:05Z" }],
     }),
     jsonResponse("/api/workflows/demo", {
-      workflow: workflowFixture({ id: "demo", name: "Demo", status: "Ready" }),
+      workflow: {
+        ...workflowFixture({ id: "demo", name: "Demo", status: "Ready" }),
+        filesystemAccess: [
+          { path: "/outside/input", read: true, write: false, execute: false },
+          { path: "/outside/tools", read: false, write: false, execute: true },
+        ],
+      },
     }, { method: "PUT" }),
     jsonResponse("/api/workflows/demo/plan", {
       plan: {
@@ -1008,6 +1858,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   const dom = await mountReact(React.createElement(appModule.default), fetchMock);
 
   await dom.flush();
+  assert.ok(dom.byLabel("Search workflows"));
   const stopButton = dom.byTitle("Stop all runs");
   assert.equal(stopButton.disabled, false);
   await dom.click(stopButton);
@@ -1018,6 +1869,8 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   await dom.flush();
   assert.match(dom.text(), /Run preview: Demo/);
   assert.match(dom.text(), /delete file: \/tmp\/out\.txt/);
+  assert.match(dom.text(), /\/outside\/input: read/);
+  assert.match(dom.text(), /\/outside\/tools: execute/);
   const previewRunButton = dom.ancestor(dom.byText("Run workflow"), "BUTTON");
   assert.match(previewRunButton.getAttribute("class"), /inline-flex/);
   assert.match(previewRunButton.getAttribute("class"), /items-center/);
@@ -1027,17 +1880,291 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   await dom.flush();
   assert.match(dom.text(), /run stopped/);
   assert.match(dom.text(), /Stopped/);
+  assert.match(dom.text(), /Workflow run completed: stopped/);
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow run completed: stopped",
+    }).length,
+    1,
+  );
+  await dom.flush();
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow run completed: stopped",
+    }).length,
+    1,
+  );
   const runRequest = fetchMock.calls.find((call) => call.url === "/api/workflows/demo/run");
   assert.deepEqual(JSON.parse(runRequest.options.body), { dryRun: false, triggerContext: {} });
 
-  await dom.click(dom.byText("New thread"));
   await dom.change(dom.first("textarea"), "Explain this workflow");
   await dom.click(dom.byTitle("Send message"));
   await dom.flush();
   assert.match(dom.text(), /Explain this workflow/);
+  assert.match(dom.text(), /Hide thoughts/);
+  assert.match(dom.text(), /Inspecting graph/);
+  const thoughtGroup = dom.byText("Hide thoughts").parentNode.parentNode;
+  assert.doesNotMatch(textOf(thoughtGroup), /Summary/);
+  assert.equal(
+    allElements(thoughtGroup).some(
+      (element) => element.tagName === "STRONG" && element.textContent === "Inspecting graph",
+    ),
+    true,
+  );
+  assert.equal(
+    allElements(thoughtGroup).some(
+      (element) => element.tagName === "A" && element.getAttribute("href") === "https://example.com/",
+    ),
+    true,
+  );
+  assert.equal(
+    allElements(thoughtGroup).some(
+      (element) => element.tagName === "CODE" && element.textContent === "step",
+    ),
+    true,
+  );
+  assert.equal(
+    allElements(thoughtGroup).some(
+      (element) => element.tagName === "OL" && /Read nodes/.test(element.textContent),
+    ),
+    true,
+  );
+  assert.match(dom.text(), /workflow\.toml/);
+  assert.match(dom.text(), /\[workflow\]/);
   assert.match(dom.text(), /Looks ready/);
+  assert.equal(
+    allElements(dom.container).some(
+      (element) => element.tagName === "STRONG" && element.textContent === "Looks ready",
+    ),
+    true,
+  );
+  assert.equal(
+    allElements(dom.container).some(
+      (element) => element.tagName === "OL" && /Read files/.test(element.textContent),
+    ),
+    true,
+  );
+  assert.match(dom.text(), /Workflow assistant response complete/);
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow assistant response complete",
+    }).length,
+    1,
+  );
   const chatRequest = fetchMock.calls.find((call) => call.url === "/api/chat/stream");
   assert.equal(JSON.parse(chatRequest.options.body).workflow.selectedWorkflowId, "demo");
+
+  await dom.unmount();
+});
+
+test("assistant threads keep streaming after navigation and report running and completed state", async () => {
+  const controlledStream = controlledStreamResponse([
+    '{"type":"thought","text":"Still working"}\n',
+    '{"type":"final","message":{"body":"Background response finished"}}\n',
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => (url === "/api/chat/stream" ? controlledStream.response(url) : null),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.first("textarea"), "Keep tracking this response");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  await dom.click(dom.byTitle("Back to recent threads"));
+
+  assert.equal(dom.byTitle("Assistant response running").tagName, "SPAN");
+  assert.match(dom.text(), /Keep tracking this response/);
+
+  controlledStream.releaseNext();
+  await dom.flush();
+  assert.equal(dom.byTitle("Assistant response running").tagName, "SPAN");
+
+  controlledStream.releaseNext();
+  await dom.flush();
+  assert.equal(dom.byTitle("Assistant response complete").tagName, "SPAN");
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Assistant response complete in Keep tracking this response",
+    }).length,
+    1,
+  );
+
+  const completedThreadButton = allElements(dom.container).find(
+    (element) =>
+      element.tagName === "BUTTON" && textOf(element).includes("Keep tracking this response"),
+  );
+  assert.ok(completedThreadButton);
+  await dom.click(completedThreadButton);
+  await dom.flush();
+  assert.match(dom.text(), /Background response finished/);
+
+  await dom.click(dom.byTitle("Recent threads"));
+  assert.equal(
+    allElements(dom.container).some(
+      (element) => element.getAttribute?.("title") === "Assistant response complete",
+    ),
+    false,
+  );
+
+  await dom.unmount();
+});
+
+test("deleting a background assistant thread disposes its pending stream state", async () => {
+  const controlledStream = controlledStreamResponse([
+    '{"type":"final","message":{"body":"This must stay deleted"}}\n',
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => (url === "/api/chat/stream" ? controlledStream.response(url) : null),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.first("textarea"), "Delete this running thread");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  const chatRequest = fetchMock.calls.find((call) => call.url === "/api/chat/stream");
+  const threadId = JSON.parse(chatRequest.options.body).workflow.chatThreadId;
+  await dom.click(dom.byTitle("Back to recent threads"));
+  await dom.click(dom.byTitle("Delete thread"));
+  await dom.flush();
+
+  controlledStream.releaseNext();
+  await dom.flush();
+
+  assert.doesNotMatch(dom.text(), /Delete this running thread/);
+  assert.equal(window.localStorage.getItem(appModule.chatStorageKeyFor(threadId)), null);
+  assert.equal(dom.allByTitle("Assistant response running").length, 0);
+  assert.equal(dom.allByTitle("Assistant response complete").length, 0);
+
+  await dom.unmount();
+});
+
+test("assistant activity remains independent across concurrent threads", async () => {
+  const firstStream = controlledStreamResponse([
+    '{"type":"final","message":{"body":"First finished"}}\n',
+  ]);
+  const secondStream = controlledStreamResponse([
+    '{"type":"final","message":{"body":"Second finished"}}\n',
+  ]);
+  let streamIndex = 0;
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => {
+      if (url !== "/api/chat/stream") return null;
+      const stream = streamIndex === 0 ? firstStream : secondStream;
+      streamIndex += 1;
+      return stream.response(url);
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.first("textarea"), "First background thread");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  await dom.click(dom.byTitle("Back to recent threads"));
+  await dom.click(dom.byTitle("New thread"));
+  await dom.change(dom.first("textarea"), "Second background thread");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  await dom.click(dom.byTitle("Back to recent threads"));
+  assert.equal(dom.allByTitle("Assistant response running").length, 2);
+
+  secondStream.releaseNext();
+  await dom.flush();
+  assert.equal(dom.allByTitle("Assistant response running").length, 1);
+  assert.equal(dom.allByTitle("Assistant response complete").length, 1);
+
+  firstStream.releaseNext();
+  await dom.flush();
+  assert.equal(dom.allByTitle("Assistant response running").length, 0);
+  assert.equal(dom.allByTitle("Assistant response complete").length, 2);
+
+  await dom.unmount();
+});
+
+test("assistant errors use one assertive live region and clear on the next request", async () => {
+  let chatRequestCount = 0;
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => {
+      if (url !== "/api/chat/stream") return null;
+      chatRequestCount += 1;
+      return streamResponse(
+        chatRequestCount === 1
+          ? ['{"type":"error","error":"Assistant unavailable"}\n']
+          : ['{"type":"final","message":{"body":"Recovered"}}\n'],
+      )(url);
+    },
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  const composer = dom.first("textarea");
+  await dom.change(composer, "First request");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "assertive",
+      role: "alert",
+      text: "Assistant unavailable",
+    }).length,
+    1,
+  );
+  await dom.flush();
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "assertive",
+      role: "alert",
+      text: "Assistant unavailable",
+    }).length,
+    1,
+  );
+
+  await dom.change(composer, "Try again");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "assertive",
+      role: "alert",
+      text: "Assistant unavailable",
+    }).length,
+    0,
+  );
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow assistant response complete",
+    }).length,
+    1,
+  );
 
   await dom.unmount();
 });
@@ -1135,7 +2262,23 @@ test("App lets users dismiss a doctor load failure warning", async () => {
 });
 
 test("DagCanvas mounted interactions create/select/edit/delete nodes, create edges, persist positions, and use folder pickers", async () => {
-  let workflow = workflowFixture({ id: "canvas", name: "Canvas", label: "Initial command" });
+  let workflow = {
+    ...workflowFixture({ id: "canvas", name: "Canvas", label: "Initial command" }),
+    validationBindings: [
+      {
+        id: "binding:step:operation.command:trigger.name",
+        destinationNode: "step",
+        destinationField: "operation.command",
+        expression: "trigger.name",
+        producer: "workflow.trigger",
+        sourceType: "unknown",
+        destinationType: "string",
+        resolutionPhase: "run-start",
+        status: "optional",
+        coercion: "string",
+      },
+    ],
+  };
   const changes = [];
   const dom = await mountReact(
     React.createElement(DagCanvasHarness, {
@@ -1151,28 +2294,99 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
       desktop: {
         workspace: {
           getPathInfo: async () => ({ isDirectory: true, isFile: false }),
-          selectPath: async () => "/outside/repo",
+          listDirectory: async ({ currentPath }) => ({
+            directory: currentPath === "/workspace/repo" ? "/workspace/repo" : "/workspace",
+            parent: currentPath === "/workspace/repo" ? "/workspace" : null,
+            entries: currentPath === "/workspace/repo"
+              ? []
+              : [{ name: "repo", path: "/workspace/repo", isDirectory: true, isFile: false }],
+          }),
         },
       },
     },
   );
 
   await dom.flush();
-  const initialViewport = canvasModule.fitViewportToNodes(workflow.nodes, { width: 960, height: 640 });
-  const canvas = dom.byTestId("dag-canvas");
-  await dom.pointer(canvas, "onPointerDown", { button: 2, clientX: 100, clientY: 100 });
-  await dom.pointer(canvas, "onPointerMove", { movementX: 120, movementY: 80 });
-  await dom.pointer(canvas, "onPointerUp", { button: 2 });
   await dom.click(dom.byTitle("Add node"));
   assert.equal(changes.at(-1).nodes.length, 2);
   assert.equal(changes.at(-1).nodes[1].type, "agent");
+
+  await dom.pointer(dom.ancestor(dom.byText("Initial command"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  assert.equal(dom.byText("Node inspector").tagName, "H2");
+  const nodeInspectorHeader = dom.ancestor(dom.byText("Node inspector"), "HEADER");
   assert.equal(
-    changes.at(-1).nodes[1].x,
-    Math.round((480 - (initialViewport.x + 120)) / initialViewport.scale - 110),
+    allElements(nodeInspectorHeader).some(
+      (element) => element.tagName === "P" && textOf(element) === workflow.nodes[0].id,
+    ),
+    true,
+  );
+  assert.equal(dom.byTitle("Hide node inspector").tagName, "BUTTON");
+  const nodeInspectorTabs = allElements(dom.byLabel("Node inspector sections")).filter(
+    (element) => element.getAttribute("role") === "tab",
+  );
+  assert.deepEqual(
+    nodeInspectorTabs.map((tab) => textOf(tab)),
+    ["General", "Action", "Inputs", "Run", "Edges"],
+  );
+  assert.equal(nodeInspectorTabs[0].getAttribute("aria-selected"), "true");
+  const nodeInspectorPanel = (id) =>
+    allElements(dom.container).find((element) => element.getAttribute("id") === id);
+  assert.equal(nodeInspectorPanel("node-tabpanel-action").getAttribute("hidden"), "");
+  assert.equal(nodeInspectorPanel("node-tabpanel-general").getAttribute("tabindex"), "0");
+  assert.equal(
+    nodeInspectorPanel("node-tabpanel-general").contains(dom.controlAfterLabel("Label")),
+    true,
   );
   assert.equal(
-    changes.at(-1).nodes[1].y,
-    Math.round((320 - (initialViewport.y + 80)) / initialViewport.scale - 48),
+    allElements(nodeInspectorPanel("node-tabpanel-general")).some(
+      (element) => element.tagName === "LABEL" && textOf(element) === "ID",
+    ),
+    false,
+  );
+  assert.equal(
+    nodeInspectorPanel("node-tabpanel-action").contains(dom.controlAfterLabel("Command")),
+    true,
+  );
+  assert.equal(
+    nodeInspectorPanel("node-tabpanel-inputs").textContent.includes("Source output"),
+    true,
+  );
+  assert.equal(
+    nodeInspectorPanel("node-tabpanel-run").contains(dom.controlAfterLabel("Pipe output")),
+    true,
+  );
+  assert.equal(
+    allElements(nodeInspectorPanel("node-tabpanel-edges")).some(
+      (element) => element.tagName === "BUTTON" && textOf(element) === "Add edge",
+    ),
+    true,
+  );
+  assert.equal(
+    nodeInspectorPanel("node-tabpanel-general").contains(dom.controlAfterLabel("Command")),
+    false,
+  );
+  await dom.keyDown(nodeInspectorTabs[0], "ArrowRight");
+  assert.equal(nodeInspectorTabs[1].getAttribute("aria-selected"), "true");
+  assert.equal(nodeInspectorTabs[1].getAttribute("tabindex"), "0");
+  assert.equal(document.activeElement, nodeInspectorTabs[1]);
+  assert.equal(nodeInspectorPanel("node-tabpanel-general").getAttribute("hidden"), "");
+  assert.equal(nodeInspectorPanel("node-tabpanel-action").getAttribute("hidden"), null);
+  assert.equal(
+    allElements(dom.container).some(
+      (element) => element.tagName === "BUTTON" && element.contains(dom.byText("Node inspector")),
+    ),
+    false,
+  );
+  assert.match(dom.text(), /operation\.commandoptional/);
+  assert.match(dom.text(), /trigger\.name from workflow\.trigger/);
+
+  await dom.click(dom.byTitle("Hide node inspector"));
+  await dom.click(dom.byTitle("Show workflow settings and node inspector"));
+  assert.equal(dom.byText("Workflow settings").tagName, "H2");
+  assert.doesNotMatch(
+    dom.ancestor(dom.byText("Initial command"), "ARTICLE").getAttribute("class"),
+    /border-indigo-500|ring-indigo-100/,
   );
 
   await dom.pointer(dom.ancestor(dom.byText("Initial command"), "ARTICLE"), "onPointerDown");
@@ -1182,20 +2396,17 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
 
   await dom.click(dom.byTitle("Choose working directory"));
   await dom.flush();
-  assert.match(dom.text(), /Trust selected path/);
-  await dom.click(dom.byText("Trust and use path"));
-  await dom.flush(1);
-  assert.equal(changes.at(-1).nodes[0].operation.working_dir, "/outside/repo");
-  assert.deepEqual(changes.at(-1).filesystemAccess, [
-    { execute: false, path: "/outside/repo", read: true, write: true },
-  ]);
+  await dom.click(dom.ancestor(dom.byText("repo"), "BUTTON"));
+  await dom.flush();
+  await dom.click(dom.byText("Choose current folder"));
+  assert.equal(changes.at(-1).nodes[0].operation.working_dir, "/workspace/repo");
 
   const nodeCard = dom.ancestor(dom.byText("Initial command"), "ARTICLE");
   await dom.pointer(nodeCard, "onPointerDown", { clientX: 10, clientY: 10, pointerId: 7 });
   await dom.pointer(nodeCard, "onPointerMove", { clientX: 35, clientY: 45, movementX: 25, movementY: 35, pointerId: 7 });
   await dom.pointer(nodeCard, "onPointerUp", { clientX: 35, clientY: 45, pointerId: 7 });
-  assert.ok(Math.abs(changes.at(-1).nodes[0].x - 25 / 1.8) < 0.001);
-  assert.ok(Math.abs(changes.at(-1).nodes[0].y - 35 / 1.8) < 0.001);
+  assert.equal(changes.at(-1).nodes[0].x, 25);
+  assert.equal(changes.at(-1).nodes[0].y, 35);
 
   await dom.click(dom.byText("Add edge"));
   await dom.change(dom.selectWithOption("node-1"), "node-1");
@@ -1207,17 +2418,8 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   await dom.click(dom.byText("Duplicate node"));
   assert.equal(changes.at(-1).nodes.length, 3);
   assert.equal(changes.at(-1).nodes.at(-1).label, "Initial command copy");
-  assert.ok(Math.abs(changes.at(-1).nodes.at(-1).x - (25 / 1.8 + 28)) < 0.001);
-  assert.ok(Math.abs(changes.at(-1).nodes.at(-1).y - (35 / 1.8 + 28)) < 0.001);
-
-  await dom.pointer(
-    dom.ancestor(dom.byText("Initial command copy"), "ARTICLE"),
-    "onContextMenu",
-    { button: 2, clientX: 90, clientY: 100 },
-  );
-  await dom.click(dom.byText("Rename node"));
-  await dom.click(dom.byText("Cancel"));
-  assert(!dom.text().includes("Node label"));
+  assert.equal(changes.at(-1).nodes.at(-1).x, 53);
+  assert.equal(changes.at(-1).nodes.at(-1).y, 63);
 
   await dom.pointer(
     dom.ancestor(dom.byText("Initial command copy"), "ARTICLE"),
@@ -1226,7 +2428,7 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   );
   await dom.click(dom.byText("Rename node"));
   await dom.change(dom.controlAfterLabel("Node label"), "Renamed command");
-  await dom.click(dom.byTitle("Confirm node rename"));
+  await dom.pointer(dom.ancestor(dom.byTitle("Confirm node rename"), "FORM"), "onSubmit");
   assert.equal(changes.at(-1).nodes.at(-1).label, "Renamed command");
 
   await dom.pointer(
@@ -1249,34 +2451,32 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   await dom.unmount();
 });
 
-test("DagCanvas delete key confirms before deleting selected nodes", async () => {
+test("graph outline supports the complete keyboard node and edge editing flow", async () => {
   let workflow = {
-    ...workflowFixture({ id: "delete-key", name: "Delete Key", label: "Delete keyboard" }),
+    ...workflowFixture({ id: "keyboard-graph", label: "Collect input" }),
     nodes: [
       {
-        id: "first",
+        id: "collect",
         type: "bash_command",
-        label: "First node",
+        label: "Collect input",
         x: 0,
         y: 0,
-        operation: { type: "bash_command", command: "echo first", working_dir: "" },
+        operation: { type: "bash_command", command: "echo input" },
       },
       {
-        id: "second",
-        type: "bash_command",
-        label: "Second node",
-        x: 260,
+        id: "review",
+        type: "agent",
+        label: "Review input",
+        x: 320,
         y: 0,
-        operation: { type: "bash_command", command: "echo second", working_dir: "" },
+        operation: { type: "agent", agent_id: "reviewer", prompt: "Review" },
       },
     ],
-    edges: [{ id: "first-second", from: "first", to: "second", label: "always", condition: "always" }],
+    edges: [],
   };
   const changes = [];
-  const confirmMessages = [];
   const dom = await mountReact(
     React.createElement(DagCanvasHarness, {
-      dataDir: "/workspace",
       workflow,
       onWorkflowChange(nextWorkflow) {
         workflow = nextWorkflow;
@@ -1286,23 +2486,322 @@ test("DagCanvas delete key confirms before deleting selected nodes", async () =>
     createFetchMock([]),
   );
 
-  await dom.pointer(dom.ancestor(dom.byText("First node"), "ARTICLE"), "onPointerDown");
-  globalThis.window.confirm = (message) => {
-    confirmMessages.push(message);
-    return false;
-  };
-  await dom.keyDown("Delete");
-  assert.equal(changes.length, 0);
-  assert.equal(confirmMessages.at(-1), 'Delete selected node "First node"?');
+  await dom.click(dom.byTitle("Map"));
+  const outline = dom.byLabel("Graph outline");
+  const nodeButtons = () => allElements(outline).filter(
+    (element) => element.tagName === "BUTTON" && element.getAttribute("aria-label")?.includes("status"),
+  );
+  assert.equal(nodeButtons().length, 2);
+  assert.match(nodeButtons()[0].getAttribute("aria-label"), /0 incoming; 0 outgoing, valid/);
 
-  globalThis.window.confirm = (message) => {
-    confirmMessages.push(message);
-    return true;
-  };
-  await dom.keyDown("Delete");
-  assert.equal(changes.at(-1).nodes.some((node) => node.id === "first"), false);
+  await dom.focus(nodeButtons()[0]);
+  assert.equal(nodeButtons()[0].getAttribute("aria-current"), "true");
+  await dom.keyDown(nodeButtons()[0], "c");
+  assert.match(dom.text(), /Connecting from Collect input/);
+  await dom.keyDown(nodeButtons()[1], "Enter");
+  assert.equal(changes.at(-1).edges[0].from, "collect");
+  assert.equal(changes.at(-1).edges[0].to, "review");
+
+  const edgeButton = allElements(outline).find(
+    (element) => element.tagName === "BUTTON" && element.getAttribute("aria-label")?.startsWith("Collect input to Review input"),
+  );
+  assert.ok(edgeButton);
+  assert.match(edgeButton.getAttribute("aria-label"), /condition always, valid/);
+  assert.equal(document.activeElement, edgeButton);
+  assert.equal(edgeButton.getAttribute("aria-current"), "true");
+  await dom.keyDown(document.activeElement, "Delete");
   assert.deepEqual(changes.at(-1).edges, []);
-  assert.match(confirmMessages.at(-1), /First node/);
+  assert.equal(document.activeElement, nodeButtons()[0]);
+  assert.equal(nodeButtons()[0].getAttribute("aria-current"), "true");
+
+  await dom.keyDown(document.activeElement, "d", { ctrlKey: true });
+  assert.equal(changes.at(-1).nodes.length, 3);
+  assert.equal(changes.at(-1).nodes.at(-1).label, "Collect input copy");
+
+  const duplicatedButton = nodeButtons().find((button) =>
+    button.getAttribute("aria-label")?.startsWith("Collect input copy"),
+  );
+  assert.equal(document.activeElement, duplicatedButton);
+  assert.equal(duplicatedButton.getAttribute("aria-current"), "true");
+  await dom.keyDown(document.activeElement, "Delete");
+  assert.equal(changes.at(-1).nodes.some((node) => node.label === "Collect input copy"), false);
+  assert.equal(document.activeElement.getAttribute("aria-label")?.startsWith("Review input,"), true);
+  assert.equal(document.activeElement.getAttribute("aria-current"), "true");
+
+  await dom.unmount();
+});
+
+test("edge inspector displays and edits structured-output field relationships", async () => {
+  let workflow = {
+    ...workflowFixture({ id: "structured-edge", label: "Analyze request" }),
+    nodes: [
+      {
+        id: "analyze",
+        type: "agent",
+        label: "Analyze request",
+        x: 0,
+        y: 0,
+        operation: { type: "agent", agent_id: "analyzer", prompt: "Analyze" },
+      },
+      {
+        id: "format-high",
+        type: "bash_command",
+        label: "Format high priority",
+        x: 320,
+        y: 0,
+        operation: { type: "bash_command", command: "printf HIGH" },
+      },
+    ],
+    edges: [
+      {
+        id: "analyze-format-high",
+        from: "analyze",
+        to: "format-high",
+        condition: "output_field",
+        field: "priority",
+        operator: "equals",
+        value: "high",
+        label: 'priority equals "high"',
+      },
+    ],
+  };
+  const changes = [];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        workflow = nextWorkflow;
+        changes.push(nextWorkflow);
+      },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.click(dom.byTitle("Map"));
+  const edgeButton = allElements(dom.byLabel("Graph outline")).find(
+    (element) => element.tagName === "BUTTON"
+      && element.getAttribute("aria-label")?.startsWith("Analyze request to Format high priority"),
+  );
+  assert.ok(edgeButton);
+  await dom.click(edgeButton);
+
+  const edgeInspector = dom.ancestor(dom.byText("Edge inspector"), "SECTION");
+  const inspectorControl = (labelText) => {
+    const label = allElements(edgeInspector).find(
+      (element) => element.tagName === "LABEL" && textOf(element).includes(labelText),
+    );
+    assert.ok(label, `Unable to find edge inspector label: ${labelText}`);
+    const control = allElements(label).find((element) =>
+      ["INPUT", "SELECT", "TEXTAREA"].includes(element.tagName),
+    );
+    assert.ok(control, `Unable to find edge inspector control: ${labelText}`);
+    return control;
+  };
+  const selectedValue = (select) =>
+    [...select.options].find((option) => option.selected)?.value ?? "";
+
+  const typeControl = inspectorControl("Type");
+  assert.deepEqual(
+    [...typeControl.options].map((option) => option.value),
+    ["always", "on_success", "on_failure", "output_matches", "output_field", "after_loop"],
+  );
+  assert.equal(selectedValue(typeControl), "output_field");
+  assert.equal(inspectorControl("Field").value, "priority");
+  assert.equal(selectedValue(inspectorControl("Operator")), "equals");
+  assert.equal(inspectorControl("Comparison value (JSON)").value, '"high"');
+
+  await dom.change(inspectorControl("Field"), "result.priority");
+  assert.equal(changes.at(-1).edges[0].field, "result.priority");
+  assert.equal(changes.at(-1).edges[0].label, 'result.priority equals "high"');
+
+  await dom.change(inspectorControl("Operator"), "exists");
+  assert.equal(changes.at(-1).edges[0].operator, "exists");
+  assert.equal(changes.at(-1).edges[0].label, "result.priority exists");
+  assert.doesNotMatch(dom.text(), /Comparison value \(JSON\)/);
+
+  await dom.unmount();
+});
+
+test("START nodes open the same tabbed node inspector as every other node type", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "start-inspector" }),
+    nodes: [
+      {
+        id: "start",
+        type: "start",
+        label: "START",
+        x: 0,
+        y: 0,
+        operation: { type: "start" },
+      },
+    ],
+  };
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, { workflow, onWorkflowChange() {} }),
+    createFetchMock([]),
+  );
+
+  await dom.pointer(dom.ancestor(dom.byText("START"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+
+  assert.equal(dom.byText("Node inspector").tagName, "H2");
+  assert.equal(dom.byLabel("Node inspector sections").getAttribute("role"), "tablist");
+  await dom.click(dom.byText("Action"));
+  assert.match(dom.text(), /This node does no work/);
+  const actionPanel = allElements(dom.container).find(
+    (element) => element.getAttribute("id") === "node-tabpanel-action",
+  );
+  assert.equal(actionPanel.getAttribute("tabindex"), "0");
+  await dom.focus(actionPanel);
+  assert.equal(document.activeElement, actionPanel);
+
+  await dom.unmount();
+});
+
+test("pane separators expose values and support arrow, boundary, and reset keys", async () => {
+  const canvasDom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      workflow: workflowFixture({ id: "resizers" }),
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+  await canvasDom.click(canvasDom.byTitle("Show workflow settings and node inspector"));
+  const inspectorResizer = canvasDom.byLabel("Resize workflow settings and node inspector");
+  assert.equal(inspectorResizer.getAttribute("role"), "separator");
+  assert.equal(inspectorResizer.getAttribute("aria-orientation"), "vertical");
+  assert.equal(inspectorResizer.getAttribute("aria-valuemin"), "280");
+  assert.equal(inspectorResizer.getAttribute("aria-valuemax"), "520");
+  assert.equal(inspectorResizer.getAttribute("aria-valuenow"), "340");
+  await canvasDom.keyDown(inspectorResizer, "ArrowRight");
+  assert.equal(inspectorResizer.getAttribute("aria-valuenow"), "350");
+  await canvasDom.keyDown(inspectorResizer, "End");
+  assert.equal(inspectorResizer.getAttribute("aria-valuenow"), "520");
+  await canvasDom.keyDown(inspectorResizer, "Enter");
+  assert.equal(inspectorResizer.getAttribute("aria-valuenow"), "340");
+
+  await canvasDom.click(canvasDom.byTitle("Expand log"));
+  const logResizer = canvasDom.byLabel("Resize workflow log");
+  assert.equal(logResizer.getAttribute("aria-orientation"), "horizontal");
+  await canvasDom.keyDown(logResizer, "ArrowUp");
+  assert.equal(logResizer.getAttribute("aria-valuenow"), "250");
+  await canvasDom.keyDown(logResizer, "Home");
+  assert.equal(logResizer.getAttribute("aria-valuenow"), "140");
+  await canvasDom.unmount();
+
+  const appDom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    ]),
+  );
+  await appDom.flush();
+  const workflowsResizer = appDom.byLabel("Resize workflows pane");
+  const chatResizer = appDom.byLabel("Resize chat pane");
+  assert.equal(workflowsResizer.getAttribute("aria-valuenow"), "272");
+  await appDom.keyDown(workflowsResizer, "ArrowRight", { shiftKey: true });
+  assert.equal(workflowsResizer.getAttribute("aria-valuenow"), "312");
+  await appDom.keyDown(workflowsResizer, "Enter");
+  assert.equal(workflowsResizer.getAttribute("aria-valuenow"), "272");
+  assert.equal(chatResizer.getAttribute("aria-valuemin"), "300");
+  await appDom.keyDown(chatResizer, "ArrowLeft");
+  assert.equal(chatResizer.getAttribute("aria-valuenow"), "370");
+  await appDom.unmount();
+});
+
+test("inspector parsed fields keep drafts stable and commit or restore consistently", async () => {
+  const changes = { keyValue: [], list: [], number: [], path: [] };
+  const dom = await mountReact(
+    React.createElement(InspectorDraftHarness, { changes }),
+    createFetchMock([]),
+  );
+
+  const number = dom.controlAfterLabel("Draft number");
+  await dom.focus(number);
+  await dom.change(number, "");
+  assert.equal(number.value, "");
+  assert.deepEqual(changes.number, []);
+  await dom.change(number, "-");
+  assert.equal(number.value, "-");
+  assert.match(dom.text(), /Enter a complete number/);
+  await dom.change(number, "-2.5");
+  assert.deepEqual(changes.number, []);
+  await dom.blur(number);
+  assert.deepEqual(changes.number, [-2.5]);
+
+  await dom.focus(number);
+  await dom.change(number, "4.");
+  assert.equal(number.value, "4.");
+  await dom.keyDown(number, "Escape");
+  assert.equal(number.value, "-2.5");
+  assert.deepEqual(changes.number, [-2.5]);
+  await dom.change(number, "3.75");
+  await dom.keyDown(number, "Enter");
+  assert.deepEqual(changes.number, [-2.5, 3.75]);
+  assert.doesNotMatch(dom.text(), /changed elsewhere.*draft is preserved/i);
+
+  await dom.change(number, "-");
+  await dom.click(dom.byText("Update number externally"));
+  assert.equal(number.value, "-");
+  assert.match(dom.text(), /Enter a complete number/);
+  assert.match(dom.text(), /changed elsewhere.*draft is preserved/i);
+  await dom.keyDown(number, "Escape");
+  assert.equal(number.value, "11");
+
+  const list = dom.controlAfterLabel("Draft list");
+  await dom.focus(list);
+  await dom.change(list, "alpha, beta,");
+  assert.equal(list.value, "alpha, beta,");
+  assert.deepEqual(changes.list, []);
+  await dom.blur(list);
+  assert.deepEqual(changes.list, [["alpha", "beta"]]);
+  assert.equal(list.value, "alpha, beta");
+  await dom.focus(list);
+  await dom.change(list, "gamma, delta");
+  await dom.keyDown(list, "Enter");
+  assert.deepEqual(changes.list.at(-1), ["gamma", "delta"]);
+  await dom.change(list, "temporary,");
+  await dom.keyDown(list, "Escape");
+  assert.equal(list.value, "gamma, delta");
+  assert.deepEqual(changes.list, [["alpha", "beta"], ["gamma", "delta"]]);
+
+  const keyValue = dom.controlAfterLabel("Draft key/value");
+  await dom.focus(keyValue);
+  await dom.change(keyValue, "TOKEN");
+  assert.equal(keyValue.value, "TOKEN");
+  assert.match(dom.text(), /Line 1 needs an “=”/);
+  await dom.blur(keyValue);
+  assert.deepEqual(changes.keyValue, []);
+  assert.equal(keyValue.value, "TOKEN");
+  await dom.focus(keyValue);
+  await dom.change(keyValue, "TOKEN=secret\nMODE=");
+  await dom.keyDown(keyValue, "Enter");
+  assert.deepEqual(changes.keyValue, [{ TOKEN: "secret", MODE: "" }]);
+  await dom.change(keyValue, "BROKEN");
+  await dom.keyDown(keyValue, "Escape");
+  assert.equal(keyValue.value, "TOKEN=secret\nMODE=");
+
+  const pathInput = dom.controlAfterLabel("Draft path");
+  assert.equal(pathInput.value, "scripts/run.sh");
+  assert.equal(pathInput.getAttribute("title"), "/workspace/scripts/run.sh");
+  await dom.focus(pathInput);
+  await dom.change(pathInput, "");
+  await dom.change(pathInput, "scripts/next.sh");
+  assert.equal(pathInput.value, "scripts/next.sh");
+  assert.deepEqual(changes.path, []);
+  await dom.blur(pathInput);
+  assert.deepEqual(changes.path, ["scripts/next.sh"]);
+  assert.equal(pathInput.value, "scripts/next.sh");
+  await dom.focus(pathInput);
+  await dom.change(pathInput, "scripts/entered.sh");
+  await dom.keyDown(pathInput, "Enter");
+  assert.deepEqual(changes.path, ["scripts/next.sh", "scripts/entered.sh"]);
+  assert.equal(pathInput.value, "scripts/entered.sh");
+  assert.doesNotMatch(dom.text(), /changed elsewhere.*draft is preserved/i);
+  await dom.change(pathInput, "scripts/cancelled.sh");
+  await dom.keyDown(pathInput, "Escape");
+  assert.equal(pathInput.value, "scripts/entered.sh");
+  assert.deepEqual(changes.path, ["scripts/next.sh", "scripts/entered.sh"]);
 
   await dom.unmount();
 });
@@ -1348,9 +2847,20 @@ test("DagCanvas renders pending approvals as a centered graph overlay", async ()
   );
 
   await dom.flush();
+  const approvalDialog = allElements(dom.container).find(
+    (element) => element.getAttribute?.("role") === "dialog",
+  );
+  assert.ok(approvalDialog);
+  assert.equal(approvalDialog.getAttribute("aria-modal"), "true");
   assert.ok(dom.byText("Approval Required"));
   assert.ok(dom.byText("Review deployment"));
-  assert.ok(dom.byText("Approve deployment?"));
+  const approvalMessage = allElements(dom.container).find(
+    (element) =>
+      element.textContent === "Approve deployment?" &&
+      /\btext-ink\b/.test(element.getAttribute?.("class") ?? ""),
+  );
+  assert.ok(approvalMessage);
+  assert.doesNotMatch(approvalMessage.getAttribute("class"), /\btext-slate-800\b/);
 
   await dom.change(dom.controlAfterLabel("Notes"), "ship it");
   await dom.click(dom.byTitle("Approve pending approval"));
@@ -1413,6 +2923,48 @@ test("DagCanvas renders inline agent health warnings in the inspector", async ()
   assert.match(dom.text(), /Agent config/);
   assert.match(dom.text(), /Workflow requires provider CLI 'codex'/);
 
+  await dom.unmount();
+});
+
+test("DagCanvas edits named structured-output schemas without mounting an eager textarea", async () => {
+  const changes = [];
+  const workflow = workflowFixture({ id: "schemas", name: "Schemas" });
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        changes.push(nextWorkflow);
+      },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.flush();
+  assert.equal(
+    allElements(dom.container).filter((element) => element.tagName === "TEXTAREA").length,
+    0,
+  );
+  await dom.click(dom.byText("Variables"));
+  await dom.flush();
+  const schemaEditor = dom.controlAfterLabel("Named output schemas (JSON object)");
+  await dom.focus(schemaEditor);
+  await dom.change(schemaEditor, "");
+  assert.equal(schemaEditor.value, "");
+  assert.deepEqual(changes, []);
+  await dom.change(
+    schemaEditor,
+    '{"review_result":{"type":"object","properties":{"verdict":{"type":"string"}}}}',
+  );
+  assert.deepEqual(changes, []);
+  await dom.blur(schemaEditor);
+
+  assert.deepEqual(changes.at(-1).outputSchemas, {
+    review_result: {
+      type: "object",
+      properties: { verdict: { type: "string" } },
+    },
+  });
   await dom.unmount();
 });
 
@@ -1515,9 +3067,6 @@ test("DagCanvas renders structured run timeline and selected node details", asyn
           slowest_nodes: [
             { node_id: "step", estimated_cost: 0.012345, duration_seconds: 1.5 },
           ],
-          budget_failures: [
-            { node_id: "step", budget_violations: ["node max_estimated_cost exceeded"] },
-          ],
         },
       },
       onWorkflowChange() {},
@@ -1530,7 +3079,6 @@ test("DagCanvas renders structured run timeline and selected node details", asyn
   assert.match(dom.text(), /LLM usage/);
   assert.match(dom.text(), /321 tokens/);
   assert.match(dom.text(), /Most expensive: step/);
-  assert.match(dom.text(), /Budget failures: step/);
   assert.match(dom.text(), /completed/);
   await dom.pointer(dom.ancestor(dom.byText("Run command"), "ARTICLE"), "onPointerDown");
   await dom.flush();
@@ -1600,48 +3148,6 @@ test("DagCanvas run history exposes resume and rerun controls", async () => {
   await dom.unmount();
 });
 
-test("DagCanvas notification inspector exposes retry controls for network channels", async () => {
-  const workflow = workflowFixture({ id: "notify-canvas", name: "Notify Canvas" });
-  workflow.nodes = [
-    {
-      id: "notify",
-      type: "notification",
-      label: "Notify ops",
-      x: 0,
-      y: 0,
-      operation: {
-        type: "notification",
-        channel: "email",
-        title: "Deploy",
-        body: "Done",
-        email_from: "gofer@example.test",
-        email_to: ["ops@example.test"],
-        smtp_host: "smtp.example.test",
-        smtp_username: "***",
-        smtp_password: "***",
-        retry: { attempts: 2, backoff_seconds: 0.5, retry_on_statuses: [429, 503] },
-      },
-    },
-  ];
-  const dom = await mountReact(
-    React.createElement(DagCanvasHarness, {
-      dataDir: "/workspace",
-      workflow,
-      onWorkflowChange() {},
-    }),
-    createFetchMock([]),
-  );
-
-  await dom.flush();
-  await dom.pointer(dom.ancestor(dom.byText("Notify ops"), "ARTICLE"), "onPointerDown");
-  await dom.flush();
-  assert.ok(dom.controlAfterLabel("Retry attempts"));
-  assert.ok(dom.controlAfterLabel("Retry backoff seconds"));
-  assert.ok(dom.controlAfterLabel("Retry statuses"));
-
-  await dom.unmount();
-});
-
 test("DagCanvas surfaces webhook trigger state and replay controls", async () => {
   const replayCalls = [];
   const workflow = {
@@ -1686,6 +3192,8 @@ test("DagCanvas surfaces webhook trigger state and replay controls", async () =>
     createFetchMock([]),
   );
 
+  await dom.click(dom.byText("Triggers"));
+
   await dom.flush();
   assert.match(dom.text(), /API trigger: github \(github\)/);
   assert.match(dom.text(), /Webhook\/API triggers/);
@@ -1698,41 +3206,186 @@ test("DagCanvas surfaces webhook trigger state and replay controls", async () =>
   await dom.unmount();
 });
 
-test("DagCanvas marks enabled unauthenticated webhook triggers as high risk", async () => {
-  const workflowChanges = [];
+test("DagCanvas exposes invocation bindings for triggers and child calls", async () => {
   const workflow = {
-    ...workflowFixture({ id: "hook-risk", name: "Hook Risk" }),
+    ...workflowFixture({ id: "bindings", name: "Bindings" }),
+    schedule: { cron_expression: "0 9 * * *", timezone: "UTC", inputs: {} },
+    watch: {
+      path: "/workspace/inbox",
+      glob: "*",
+      recursive: false,
+      debounce_seconds: 1,
+      mode: "batch",
+      max_concurrency: 1,
+      inputs: {},
+    },
     webhooks: {
-      github: {
-        id: "github",
+      default: {
+        id: "default",
         enabled: true,
-        source: "github",
-        concurrency_policy: "allow",
+        source: "webhook",
+        input_bindings: {},
       },
     },
+    nodes: [
+      {
+        id: "call-workflow",
+        label: "Call workflow",
+        type: "workflow",
+        operation: canvasModule.defaultOperation("workflow"),
+        settings: {},
+        x: 0,
+        y: 0,
+      },
+      {
+        id: "call-subflow",
+        label: "Call subflow",
+        type: "subflow",
+        operation: canvasModule.defaultOperation("subflow"),
+        settings: {},
+        x: 260,
+        y: 0,
+      },
+    ],
+    edges: [],
   };
   const dom = await mountReact(
     React.createElement(DagCanvasHarness, {
       dataDir: "/workspace",
       workflow,
-      onWorkflowChange(patch) {
-        workflowChanges.push(patch);
+      onWorkflowChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.click(dom.byText("Triggers"));
+
+  await dom.flush();
+  assert.ok((dom.text().match(/Invocation inputs \(JSON object\)/g) ?? []).length >= 2);
+  assert.match(dom.text(), /Input bindings \(JSON object\)/);
+
+  await dom.pointer(dom.ancestor(dom.byText("Call workflow"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  assert.match(dom.text(), /Workflow ID/);
+  assert.match(dom.text(), /Input bindings \(JSON object or quoted exact reference\)/);
+  assert.match(dom.text(), /called workflow’s immutable inputs/);
+
+  await dom.pointer(dom.ancestor(dom.byText("Call subflow"), "ARTICLE"), "onPointerDown");
+  await dom.flush();
+  assert.match(dom.text(), /Component ID/);
+  assert.match(dom.text(), /Declared outputs \(JSON object\)/);
+
+  await dom.unmount();
+});
+
+test("DagCanvas notification editor exposes every delivery channel configuration", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "notifications", name: "Notifications" }),
+    nodes: [
+      {
+        id: "notify",
+        label: "Notify operators",
+        type: "notification",
+        operation: canvasModule.defaultOperation("notification"),
+        settings: {},
+        x: 0,
+        y: 0,
+      },
+    ],
+  };
+  const changes = [];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        changes.push(nextWorkflow);
       },
     }),
     createFetchMock([]),
   );
 
+  await dom.pointer(dom.ancestor(dom.byText("Notify operators"), "ARTICLE"), "onPointerDown");
+  await dom.change(dom.controlAfterLabel("Channel"), "email");
   await dom.flush();
-  assert.match(dom.text(), /API trigger: github \(github\) - high risk/);
-  assert.match(dom.text(), /High risk/);
-  assert.match(dom.text(), /No token configured/);
-  assert.match(dom.text(), /Missing authentication/);
+  assert.ok(dom.controlAfterLabel("From address"));
+  assert.ok(dom.controlAfterLabel("Recipients"));
+  assert.ok(dom.controlAfterLabel("SMTP host"));
+  assert.ok(dom.controlAfterLabel("SMTP password or secret reference"));
+  assert.ok(dom.controlAfterLabel("Use STARTTLS"));
+  assert.ok(dom.controlAfterLabel("Network allowlist"));
 
-  await dom.change(dom.controlAfterLabel("Allow unauthenticated local testing"), true);
-  assert.equal(
-    workflowChanges.at(-1).webhooks.github.allow_unauthenticated,
-    true,
+  await dom.change(dom.controlAfterLabel("Channel"), "webhook");
+  await dom.flush();
+  assert.ok(dom.controlAfterLabel("Webhook URL"));
+  assert.ok(dom.controlAfterLabel("Headers"));
+  assert.ok(dom.controlAfterLabel("Payload (JSON)"));
+  assert.equal(changes.at(-1).nodes[0].operation.channel, "webhook");
+
+  await dom.change(dom.controlAfterLabel("Channel"), "__runtime_reference__");
+  await dom.flush();
+  const channelReference = dom.controlAfterLabel("Channel reference");
+  assert.equal(channelReference.value, "{{inputs.value}}");
+  await dom.focus(channelReference);
+  await dom.change(channelReference, "{{inputs.channel}}");
+  await dom.blur(channelReference);
+  assert.equal(changes.at(-1).nodes[0].operation.channel, "{{inputs.channel}}");
+
+  await dom.unmount();
+});
+
+test("number fields accept exact runtime references only when enabled", () => {
+  assert.deepEqual(canvasModule.parseNumberDraft("{{inputs.timeout}}", 0, true), {
+    ok: true,
+    value: "{{inputs.timeout}}",
+  });
+  assert.equal(canvasModule.parseNumberDraft("{{inputs.timeout}}", 0).ok, false);
+  assert.equal(canvasModule.parseNumberDraft("{{inputs.timeout}} trailing", 0, true).ok, false);
+});
+
+test("DagCanvas authors runtime generic fan-out settings", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "runtime-fields", name: "Runtime fields" }),
+    nodes: [
+      {
+        id: "fan",
+        label: "Fan items",
+        type: "pass",
+        operation: canvasModule.defaultOperation("pass"),
+        settings: {},
+        x: 0,
+        y: 0,
+      },
+    ],
+  };
+  const changes = [];
+  const dom = await mountReact(
+    React.createElement(DagCanvasHarness, {
+      dataDir: "/workspace",
+      workflow,
+      onWorkflowChange(nextWorkflow) {
+        changes.push(nextWorkflow);
+      },
+    }),
+    createFetchMock([]),
   );
+
+  await dom.pointer(dom.ancestor(dom.byText("PASS"), "ARTICLE"), "onPointerDown");
+  await dom.change(dom.controlAfterLabel("For each"), "{{inputs.items}}");
+  await dom.flush();
+  const concurrency = dom.controlAfterLabel("Fan-out max concurrency");
+  await dom.focus(concurrency);
+  await dom.change(concurrency, "{{inputs.workers}}");
+  await dom.blur(concurrency);
+  await dom.click(dom.byText("Use an exact runtime reference"));
+  await dom.flush();
+  const failFast = dom.controlAfterLabel("Fan-out fail fast reference");
+  await dom.focus(failFast);
+  await dom.change(failFast, "{{inputs.stop_early}}");
+  await dom.blur(failFast);
+  assert.equal(changes.at(-1).nodes[0].settings.forEach, "{{inputs.items}}");
+  assert.equal(changes.at(-1).nodes[0].settings.maxConcurrency, "{{inputs.workers}}");
+  assert.equal(changes.at(-1).nodes[0].settings.failFast, "{{inputs.stop_early}}");
 
   await dom.unmount();
 });
@@ -1765,6 +3418,7 @@ test("DagCanvas retention controls send configured cleanup settings", async () =
   );
 
   await dom.flush();
+  await dom.click(dom.byTitle("Expand log"));
   await dom.click(dom.byTitle("Run retention settings"));
   await dom.change(dom.controlAfterLabel("Keep latest runs"), "25");
   await dom.change(dom.controlAfterLabel("Keep runs for days"), "5");
@@ -1938,7 +3592,6 @@ test("Electron IPC security confines file paths to data dir and explicit grants"
     () => security.resolveAllowedPath(path.join(outsideDir, "secret.txt"), { mustExist: true }),
     /outside the approved/,
   );
-  assert.equal(security.resolvePickerPath(path.join(outsideDir, "secret.txt")), outsideDir);
 
   const symlinkPath = path.join(dataDir, "leak.txt");
   try {
@@ -2174,7 +3827,22 @@ test("DagCanvas helpers create default agent nodes and serialize node edits", ()
   assert.deepEqual(canvasModule.defaultOperation("workflow"), {
     type: "workflow",
     workflow_id: "",
+    input_bindings: {},
   });
+  assert.deepEqual(canvasModule.defaultOperation("subflow"), {
+    type: "subflow",
+    component_id: "",
+    source_path: "",
+    input_bindings: {},
+    output_contract: {},
+  });
+  assert.deepEqual(canvasModule.defaultOperation("notification").expected_statuses, [
+    200,
+    201,
+    202,
+    204,
+  ]);
+  assert.equal(canvasModule.defaultOperation("notification").smtp_port, 587);
 });
 
 test("DagCanvas helper duplicates nodes with unique ids and agent configs", () => {
@@ -2238,297 +3906,6 @@ test("DagCanvas exposes HTTP response fields as selectable outputs", () => {
   assert(paths.has("data.body"));
   assert(paths.has("data.json"));
   assert(paths.has("data.selected"));
-});
-
-test("DagCanvas exposes dashboard item fields as selectable outputs", () => {
-  const fields = canvasModule.nodeOutputFields({
-    id: "tickets",
-    type: "dashboard_item",
-    operation: { type: "dashboard_item" },
-  });
-  const paths = new Set(fields.map(([pathValue]) => pathValue));
-
-  assert(paths.has("items"));
-  assert(paths.has("data.message"));
-  assert(paths.has("data.items"));
-  assert(paths.has("data.item"));
-  assert(paths.has("data.selected"));
-});
-
-test("DagCanvas exposes workflow call fields as selectable outputs", () => {
-  const fields = canvasModule.nodeOutputFields({
-    id: "call-workflow",
-    type: "workflow",
-    operation: { type: "workflow", workflow_id: "child" },
-  });
-  const paths = new Set(fields.map(([pathValue]) => pathValue));
-
-  assert(paths.has("data.workflow_id"));
-  assert(paths.has("data.workflow_name"));
-  assert(paths.has("data.log_path"));
-  assert(paths.has("data.duration_seconds"));
-});
-
-test("DagCanvas creates dashboard item loop sources and exposes dashboard loop fields", () => {
-  assert.deepEqual(canvasModule.defaultFanSource("dashboard_items"), {
-    type: "dashboard_items",
-    dashboard: "",
-    component: "",
-    filter: "",
-    max_concurrency: 1,
-    fail_fast: false,
-  });
-
-  const sourceOptions = canvasModule.buildInputSourceOptions(
-    { id: "agent", type: "agent" },
-    [
-      {
-        id: "loop",
-        label: "Loop tickets",
-        type: "loop",
-        operation: {
-          type: "loop",
-          source: {
-            type: "dashboard_items",
-            dashboard: "development-dashboard",
-            component: "tickets",
-          },
-        },
-      },
-      { id: "agent", type: "agent" },
-    ],
-    [{ from: "loop", to: "agent" }],
-    [
-      {
-        id: "development-dashboard",
-        name: "Development Dashboard",
-        sections: [
-          {
-            id: "kanban",
-            title: "Kanban",
-            components: [
-              {
-                id: "tickets",
-                title: "Tickets",
-                schema: {
-                  title: { type: "string" },
-                  status: { type: "enum", values: ["backlog", "todo"] },
-                },
-                items: [
-                  {
-                    id: "ticket-1",
-                    title: "Write docs",
-                    owner: "Dana",
-                    status: "todo",
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  );
-  const paths = new Set(sourceOptions.map(([pathValue]) => pathValue));
-
-  assert(paths.has("loop.current.item_id"));
-  assert(paths.has("loop.current.item_json"));
-  assert(paths.has("loop.current.item.title"));
-  assert(paths.has("loop.current.item.status"));
-  assert(paths.has("loop.current.item.owner"));
-  assert(paths.has("loop.data.dashboard"));
-  assert(paths.has("loop.data.component"));
-  assert(!paths.has("loop.current.file_path"));
-  assert(!paths.has("loop.data.glob"));
-
-  const sourceGroups = canvasModule.buildInputSourceGroups(
-    { id: "agent", type: "agent" },
-    [
-      {
-        id: "loop",
-        label: "Loop tickets",
-        type: "loop",
-        operation: {
-          type: "loop",
-          source: {
-            type: "dashboard_items",
-            dashboard: "development-dashboard",
-            component: "tickets",
-          },
-        },
-      },
-      { id: "agent", type: "agent" },
-    ],
-    [{ from: "loop", to: "agent" }],
-    [
-      {
-        id: "development-dashboard",
-        name: "Development Dashboard",
-        sections: [
-          {
-            id: "kanban",
-            title: "Kanban",
-            components: [
-              {
-                id: "tickets",
-                title: "Tickets",
-                schema: {
-                  title: { type: "string" },
-                  status: { type: "enum", values: ["backlog", "todo"] },
-                },
-                items: [
-                  {
-                    id: "ticket-1",
-                    title: "Write docs",
-                    owner: "Dana",
-                    status: "todo",
-                  },
-                ],
-              },
-            ],
-          },
-        ],
-      },
-    ],
-  );
-  const loopGroup = sourceGroups.find((group) => group.id === "loop");
-  assert.equal(loopGroup.label, "Loop tickets");
-  assert.deepEqual(
-    loopGroup.options.filter(([pathValue]) => pathValue === "loop.current.item.title"),
-    [["loop.current.item.title", "dashboard item title"]],
-  );
-});
-
-test("DagCanvas only exposes loop inputs that match the parent loop source", () => {
-  const countOptions = canvasModule.buildInputSourceOptions(
-    { id: "child", type: "bash_command" },
-    [
-      {
-        id: "loop",
-        label: "Repeat",
-        type: "loop",
-        operation: {
-          type: "loop",
-          source: { type: "count", count: 3 },
-        },
-      },
-      { id: "child", type: "bash_command" },
-    ],
-    [{ from: "loop", to: "child" }],
-  );
-  const countPaths = new Set(countOptions.map(([pathValue]) => pathValue));
-  assert(countPaths.has("loop.current.index"));
-  assert(countPaths.has("loop.data.count"));
-  assert(!countPaths.has("loop.current.file_path"));
-  assert(!countPaths.has("loop.current.item_id"));
-  assert(!countPaths.has("loop.data.dashboard"));
-  assert(!countPaths.has("loop.data.component"));
-  assert(!countPaths.has("loop.data.glob"));
-
-  const directoryOptions = canvasModule.buildInputSourceOptions(
-    { id: "child", type: "bash_command" },
-    [
-      {
-        id: "loop",
-        label: "Files",
-        type: "loop",
-        operation: {
-          type: "loop",
-          source: { type: "directory", path: "docs", include_content: false },
-        },
-      },
-      { id: "child", type: "bash_command" },
-    ],
-    [{ from: "loop", to: "child" }],
-  );
-  const directoryPaths = new Set(directoryOptions.map(([pathValue]) => pathValue));
-  assert(directoryPaths.has("loop.current.file_path"));
-  assert(directoryPaths.has("loop.data.source_path"));
-  assert(directoryPaths.has("loop.data.glob"));
-  assert(!directoryPaths.has("loop.current.file_content"));
-  assert(!directoryPaths.has("loop.data.dashboard"));
-});
-
-test("DagCanvas exposes loop inputs to downstream iteration nodes", () => {
-  const nodes = [
-    {
-      id: "loop",
-      label: "Files",
-      type: "loop",
-      operation: {
-        type: "loop",
-        source: { type: "directory", path: "docs", include_content: true },
-      },
-    },
-    { id: "first", type: "bash_command" },
-    { id: "second", type: "bash_command" },
-    { id: "after", type: "bash_command" },
-  ];
-  const edges = [
-    { from: "loop", to: "first", condition: "always" },
-    { from: "first", to: "second", condition: "always" },
-    { from: "loop", to: "after", condition: "after_loop" },
-  ];
-
-  const downstreamOptions = canvasModule.buildInputSourceOptions(
-    { id: "second", type: "bash_command" },
-    nodes,
-    edges,
-  );
-  const downstreamPaths = new Set(downstreamOptions.map(([pathValue]) => pathValue));
-  assert(downstreamPaths.has("loop.current.file_path"));
-  assert(downstreamPaths.has("loop.current.file_content"));
-
-  const afterLoopOptions = canvasModule.buildInputSourceOptions(
-    { id: "after", type: "bash_command" },
-    nodes,
-    edges,
-  );
-  const afterLoopPaths = new Set(afterLoopOptions.map(([pathValue]) => pathValue));
-  assert(!afterLoopPaths.has("loop.current.file_path"));
-  assert(!afterLoopPaths.has("loop.current.file_content"));
-  assert(afterLoopPaths.has("loop.data.count"));
-});
-
-test("DagCanvas groups all ancestor outputs by node label for input mapping", () => {
-  const nodes = [
-    {
-      id: "collect",
-      label: "Collect files",
-      type: "read_file",
-      operation: { type: "read_file" },
-    },
-    {
-      id: "review",
-      label: "Review agent",
-      type: "agent",
-      operation: { type: "agent" },
-    },
-    {
-      id: "commit",
-      label: "Commit changes",
-      type: "bash_command",
-      operation: { type: "bash_command" },
-    },
-  ];
-  const edges = [
-    { from: "collect", to: "review" },
-    { from: "review", to: "commit" },
-  ];
-
-  const groups = canvasModule.buildInputSourceGroups(nodes[2], nodes, edges);
-  assert.deepEqual(
-    groups.map((group) => group.label),
-    ["Previous node", "Review agent", "Collect files"],
-  );
-  const reviewGroup = groups.find((group) => group.id === "review");
-  const collectGroup = groups.find((group) => group.id === "collect");
-  assert(
-    reviewGroup.options.some(
-      ([pathValue, label]) => pathValue === "review.data.message" && label === "agent message",
-    ),
-  );
-  assert(collectGroup.options.some(([pathValue, label]) => pathValue === "collect.data.content" && label === "content"));
 });
 
 test("DagCanvas exposes approval and notification fields as selectable outputs", () => {
@@ -2616,123 +3993,29 @@ test("DagCanvas helpers persist graph positions and create/remove edges", () => 
   assert.equal(workflow.edges[0].label, "matches ready");
   assert.equal(workflow.edges[0].outputPattern, "ready");
 
+  const typedWorkflow = canvasModule.addWorkflowEdge(
+    { ...workflow, edges: [] },
+    "a",
+    "b",
+    "output_field",
+    null,
+    "score",
+    "greater_than",
+    7,
+  );
+  assert.equal(typedWorkflow.edges[0].label, "score greater than 7");
+  assert.equal(
+    canvasModule.edgeLabel("output_field", null, "verdict", "equals", "approved"),
+    'verdict equals "approved"',
+  );
+  assert.equal(
+    canvasModule.edgeLabel("output_field", null, "findings", "exists", null),
+    "findings exists",
+  );
+
   workflow = canvasModule.removeWorkflowNode(workflow, "a");
   assert.deepEqual(workflow.nodes.map((node) => node.id), ["b"]);
   assert.deepEqual(workflow.edges, []);
-});
-
-test("DagCanvas canvas group helpers preserve metadata without changing graph semantics", () => {
-  let workflow = {
-    id: "wf",
-    agents: {},
-    nodes: [
-      { id: "scan", type: "bash_command", label: "Scan", operation: { type: "bash_command" }, x: 10, y: 20 },
-      { id: "review", type: "agent", label: "Review", operation: { type: "agent" }, x: 330, y: 20 },
-      { id: "ship", type: "pass", label: "Ship", operation: { type: "pass" }, x: 660, y: 20 },
-    ],
-    edges: [{ id: "scan-review", from: "scan", to: "review" }],
-  };
-
-  workflow = canvasModule.createCanvasGroup(workflow, ["scan", "review"]);
-  let group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.label, "Group 1");
-  assert.deepEqual(group.nodeIds, ["scan", "review"]);
-  assert.equal(group.opacity, 0.08);
-  assert.deepEqual(workflow.edges, [{ id: "scan-review", from: "scan", to: "review" }]);
-  assert.equal(canvasModule.createCanvasGroup(workflow, []), workflow);
-
-  workflow = canvasModule.updateCanvasGroup(workflow, group.id, {
-    label: "Research",
-    color: "#9333ea",
-    opacity: 0.22,
-    collapsed: true,
-  });
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.label, "Research");
-  assert.equal(group.color, "#9333ea");
-  assert.equal(group.opacity, 0.22);
-  workflow = canvasModule.updateCanvasGroup(workflow, group.id, { label: "" });
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.label, "");
-  workflow = canvasModule.updateCanvasGroup(workflow, group.id, { label: "Research" });
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.deepEqual(
-    canvasModule.visibleNodesForGroups(workflow.nodes, [group]).map((node) => node.id),
-    ["ship"],
-  );
-  assert.deepEqual(canvasModule.visibleEdgesForGroups(workflow.edges, [workflow.nodes[2]]), []);
-
-  workflow = canvasModule.moveCanvasGroup(workflow, group.id, { x: 40, y: 10 });
-  assert.equal(workflow.nodes[0].x, 50);
-  assert.equal(workflow.nodes[1].x, 370);
-  assert.equal(canvasModule.normalizeCanvasGroups(workflow)[0].x, group.x + 40);
-
-  workflow = canvasModule.duplicateCanvasGroup(workflow, group.id);
-  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 2);
-
-  workflow = canvasModule.deleteCanvasGroup(workflow, group.id);
-  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 1);
-  assert.equal(workflow.nodes.length, 3);
-  assert.equal(workflow.edges.length, 1);
-});
-
-test("DagCanvas auto-layout, search visibility, and run overlays understand groups", () => {
-  const workflow = {
-    id: "wf",
-    agents: {},
-    metadata: {
-      canvas: {
-        groups: [
-          {
-            id: "group-1",
-            label: "Phase",
-            color: "#0f766e",
-            nodeIds: ["scan", "review"],
-            x: 0,
-            y: 0,
-            width: 260,
-            height: 160,
-            collapsed: false,
-          },
-        ],
-      },
-    },
-    nodes: [
-      { id: "review", type: "agent", label: "Review", operation: { type: "agent" }, x: 400, y: 300 },
-      { id: "scan", type: "bash_command", label: "Scan", operation: { type: "bash_command" }, x: 20, y: 20 },
-      { id: "publish", type: "pass", label: "Publish", operation: { type: "pass" }, x: 760, y: 20 },
-    ],
-    edges: [
-      { id: "scan-review", from: "scan", to: "review" },
-      { id: "review-publish", from: "review", to: "publish" },
-    ],
-  };
-
-  const laidOut = canvasModule.autoLayoutWorkflow(workflow, {
-    columnGap: 280,
-    rowGap: 120,
-    startX: 40,
-    startY: 60,
-  });
-  const group = canvasModule.normalizeCanvasGroups(laidOut)[0];
-  const byId = Object.fromEntries(laidOut.nodes.map((node) => [node.id, node]));
-  assert.equal(byId.scan.x, 40);
-  assert.equal(byId.review.x, 320);
-  assert.ok(group.width >= 500);
-  assert.ok(group.height >= 160);
-  assert.deepEqual(canvasModule.matchingNodeIds(laidOut.nodes, "review"), ["review"]);
-  assert.equal(
-    canvasModule.canvasGroupStatus(group, { scan: "success", review: "started" }, []),
-    "running",
-  );
-  assert.equal(
-    canvasModule.canvasGroupStatus(group, { scan: "success", review: "success" }, []),
-    "success",
-  );
-  assert.equal(
-    canvasModule.canvasGroupStatus(group, {}, [{ nodeId: "review", status: "pending" }]),
-    "approval",
-  );
 });
 
 test("DagCanvas layout, search, and fit helpers handle large directed graphs deterministically", () => {
@@ -2834,17 +4117,7 @@ test("selected nodes stack above overlapping nodes, including expanded folders",
   );
 });
 
-test("DagCanvas toolbar overflow calculation keeps every action visible until it runs out of width", () => {
-  const widths = Array.from({ length: 5 }, () => 32);
-  assert.equal(canvasModule.visibleToolbarActionCount(400, widths, 32), 5);
-  assert.equal(canvasModule.visibleToolbarActionCount(191, widths, 32), 3);
-  assert.equal(canvasModule.visibleToolbarActionCount(151, widths, 32), 2);
-  assert.equal(canvasModule.visibleToolbarActionCount(31, widths, 32), 0);
-  assert.equal(canvasModule.visibleToolbarActionCount(0, widths, 32), 0);
-  assert.equal(canvasModule.visibleToolbarActionCount(0, [0, 0, 0], 0), 3);
-});
-
-test("DagCanvas rendered navigation controls use one toolbar row and overflow menu", async () => {
+test("DagCanvas rendered navigation controls auto-layout, fit, and zoom", async () => {
   let workflow = {
     ...workflowFixture({ id: "nav", name: "Navigation", label: "Scan" }),
     nodes: [
@@ -2894,17 +4167,26 @@ test("DagCanvas rendered navigation controls use one toolbar row and overflow me
 
   const runSelector = dom.byTitle("Select workflow run");
   const toolbar = dom.ancestor(runSelector, (node) => node.getAttribute?.("data-toolbar") === "graph-editor");
-  const toolbarRow = dom.ancestor(
+  const primaryToolbarRow = dom.ancestor(
     runSelector,
     (node) => node.getAttribute?.("data-toolbar-row") === "primary",
   );
+  const secondaryToolbarRow = dom.ancestor(
+    dom.byTitle("Auto-layout graph"),
+    (node) => node.getAttribute?.("data-toolbar-row") === "secondary",
+  );
+  const validationButton = dom.byTitle("Validate workflow");
+  const validationToolbarRow = dom.ancestor(
+    validationButton,
+    (node) => node.getAttribute?.("data-toolbar-row") === "primary",
+  );
   assert.equal(toolbar.getAttribute("data-toolbar"), "graph-editor");
-  assert.equal(toolbarRow, toolbar);
-  assert.ok(dom.byTitle("Validate workflow"));
-  assert.equal(dom.allByTitle("More graph actions").length, 0);
-  assert.ok(dom.byLabel("Search nodes"));
+  assert.equal(validationToolbarRow, primaryToolbarRow);
+  assert.equal(primaryToolbarRow.contains(secondaryToolbarRow), false);
+  assert.doesNotMatch(secondaryToolbarRow.getAttribute("class"), /flex-wrap/);
   assert.doesNotMatch(toolbar.getAttribute("class"), /overflow-x-auto|workflow-scrollbar/);
-  assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-6/);
+  assert.equal(allElements(dom.container).some((element) => element.getAttribute?.("aria-label") === "Search nodes"), false);
+  assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-0/);
 
   await dom.flush();
   await dom.click(dom.byTitle("Auto-layout graph"));
@@ -2915,185 +4197,21 @@ test("DagCanvas rendered navigation controls use one toolbar row and overflow me
   await dom.click(dom.byTitle("Fit graph"));
   await dom.click(dom.byTitle("Zoom in"));
   await dom.click(dom.byTitle("Zoom out"));
+
+  const enterFullscreen = dom.byTitle("Enter full screen");
+  assert.equal(enterFullscreen.getAttribute("aria-pressed"), "false");
+  await dom.click(enterFullscreen);
+  const exitFullscreen = dom.byTitle("Exit full screen");
+  const fullscreenGraph = dom.ancestor(
+    exitFullscreen,
+    (node) => node.getAttribute?.("data-graph-fullscreen") === "true",
+  );
+  assert.match(fullscreenGraph.getAttribute("class"), /fixed inset-0/);
+  assert.equal(exitFullscreen.getAttribute("aria-pressed"), "true");
+  await dom.dispatchWindow("keydown", { key: "Escape" });
+  assert.ok(dom.byTitle("Enter full screen"));
+
   await dom.click(dom.byTitle("Fit selection"));
-  await dom.change(dom.byLabel("Search nodes"), "reviewer");
-  await dom.click(dom.byTitle("Next search match"));
-  assert.match(dom.text(), /Agent ID/);
-  assert.match(dom.text(), /reviewer/);
-  const actionGroup = dom.ancestor(dom.byTitle("Auto-layout graph"), (node) =>
-    node.getAttribute?.("class")?.includes("justify-start"),
-  );
-  await dom.click(dom.byTitle("Validate workflow"));
-
-  Object.defineProperty(actionGroup, "clientWidth", { configurable: true, value: 48 });
-  globalThis.window.dispatchEvent({ type: "resize" });
-  await dom.flush();
-  await dom.click(dom.byTitle("More graph actions"));
-  assert.ok(dom.byTestId("toolbar-overflow-menu"));
-  await dom.documentPointerDown(dom.byTestId("dag-canvas"));
-  await dom.flush();
-  assert.throws(() => dom.byTestId("toolbar-overflow-menu"), /Unable to find test id/);
-
-  await dom.unmount();
-});
-
-test("DagCanvas rendered canvas groups can be edited, collapsed, duplicated, and ungrouped", async () => {
-  let workflow = {
-    ...workflowFixture({ id: "groups", name: "Groups", label: "Scan" }),
-    metadata: {
-      canvas: {
-        groups: [
-          {
-            id: "group-1",
-            label: "Group 1",
-            color: "#475569",
-            opacity: 0.08,
-            nodeIds: ["scan", "review"],
-            x: 0,
-            y: 40,
-            width: 640,
-            height: 184,
-            collapsed: false,
-          },
-        ],
-      },
-    },
-    nodes: [
-      {
-        id: "scan",
-        type: "bash_command",
-        label: "Scan",
-        x: 40,
-        y: 80,
-        operation: { type: "bash_command", command: "find docs", working_dir: "" },
-      },
-      {
-        id: "review",
-        type: "agent",
-        label: "Review",
-        x: 340,
-        y: 80,
-        operation: { type: "agent", agent_id: "reviewer", prompt: "Review" },
-      },
-    ],
-  };
-  const dom = await mountReact(
-    React.createElement(DagCanvasHarness, {
-      workflow,
-      onWorkflowChange(nextWorkflow) {
-        workflow = nextWorkflow;
-      },
-    }),
-    createFetchMock([]),
-  );
-
-  let group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.deepEqual(group.nodeIds, ["scan", "review"]);
-  assert.ok(dom.byTitle("Select nodes to group"));
-  await dom.pointer(dom.byTitle("Move canvas group"), "onPointerDown");
-  await dom.flush();
-  assert.match(dom.text(), /Group settings/);
-
-  await dom.change(dom.byLabel("Rename Group 1"), "Research phase");
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.label, "Research phase");
-
-  await dom.change(dom.byLabel("Color Research phase"), "#dc2626");
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.color, "#dc2626");
-
-  const opacityInput = dom.controlAfterLabel("Background opacity (%)");
-  await dom.focus(opacityInput);
-  await dom.change(opacityInput, "");
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.opacity, 0.08);
-  assert.equal(opacityInput.value, "");
-
-  await dom.change(opacityInput, "18");
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.opacity, 0.18);
-
-  await dom.blur(opacityInput);
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.opacity, 0.18);
-
-  await dom.change(opacityInput, "19");
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.opacity, 0.19);
-
-  await dom.change(dom.controlAfterLabel("Collapsed"), true);
-  group = canvasModule.normalizeCanvasGroups(workflow)[0];
-  assert.equal(group.collapsed, true);
-
-  await dom.click(dom.byText("Duplicate"));
-  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 2);
-
-  await dom.click(dom.byText("Ungroup"));
-  assert.equal(canvasModule.normalizeCanvasGroups(workflow).length, 1);
-  assert.equal(workflow.nodes.length, 2);
-
-  await dom.unmount();
-});
-
-test("DagCanvas dropped file trust prompt can be dismissed or confirmed", async () => {
-  let workflow = workflowFixture({ id: "drop-trust", name: "Drop Trust", label: "Initial command" });
-  const changes = [];
-  const dom = await mountReact(
-    React.createElement(DagCanvasHarness, {
-      dataDir: "/workspace",
-      workflow,
-      onWorkflowChange(nextWorkflow) {
-        workflow = nextWorkflow;
-        changes.push(nextWorkflow);
-      },
-    }),
-    createFetchMock([]),
-    {
-      desktop: {
-        getDroppedFilePath: (file) => file.path,
-        grantDroppedPath: async (file) => file.path,
-        workspace: {
-          getPathInfo: async (targetPath) => ({
-            basename: "ticket.md",
-            isDirectory: false,
-            isFile: true,
-            path: targetPath,
-          }),
-        },
-      },
-    },
-  );
-
-  const canvas = dom.byTestId("dag-canvas");
-  await dom.drop(canvas, {
-    clientX: 300,
-    clientY: 240,
-    dataTransfer: { files: [{ path: "/outside/ticket.md" }] },
-  });
-  await dom.flush();
-  assert.match(dom.text(), /Trust the files in/);
-
-  const prompt = dom.ancestor(dom.byText("Trust the files in"), "SECTION");
-  await dom.click(prompt.parentNode);
-  assert.doesNotMatch(dom.text(), /Trust the files in/);
-  assert.equal(changes.length, 0);
-
-  await dom.drop(canvas, {
-    clientX: 300,
-    clientY: 240,
-    dataTransfer: { files: [{ path: "/outside/ticket.md" }] },
-  });
-  await dom.flush();
-  await dom.pointer(dom.byText("Add access"), "onPointerDown");
-  await dom.click(dom.byText("Add access"));
-
-  assert.doesNotMatch(dom.text(), /Trust the files in/);
-  assert.equal(changes.at(-1).nodes.length, 2);
-  assert.equal(changes.at(-1).nodes.at(-1).type, "file");
-  assert.deepEqual(changes.at(-1).filesystemAccess, [
-    { execute: false, path: "/outside", read: true, write: true },
-  ]);
-
   await dom.unmount();
 });
 
@@ -3128,17 +4246,27 @@ test("DagCanvas minimap sits top left, handles translucent dark mode styling, an
     createFetchMock([]),
   );
 
+  await dom.click(dom.byTitle("Map"));
+  const outline = dom.byLabel("Graph outline");
+  let outlineWheelStopped = false;
+  const outlineWheelEvent = testEvent(outline, {
+    deltaY: -100,
+    stopPropagation() {
+      outlineWheelStopped = true;
+    },
+  });
+  reactProps(outline).onWheel(outlineWheelEvent);
+  assert.equal(outlineWheelStopped, true);
+  assert.equal(outlineWheelEvent.defaultPrevented, false);
+
+  await dom.click(dom.ancestor(dom.byText("Minimap"), "BUTTON"));
   const minimap = dom.byTitle("Minimap");
-  assert.match(minimap.getAttribute("class"), /left-4/);
-  assert.match(minimap.getAttribute("class"), /top-4/);
-  assert.match(minimap.getAttribute("class"), /bg-white\/70/);
-  assert.match(minimap.getAttribute("class"), /opacity-80/);
-  assert.match(minimap.getAttribute("class"), /dark:bg-\[#252526\]\/70/);
+  assert.match(minimap.getAttribute("class"), /bg-slate-50/);
 
   const minimapSurface = minimap.childNodes[0];
   assert.match(minimapSurface.getAttribute("class"), /dark:bg-\[#1b1f22\]\/80/);
-  assert.equal(minimapSurface.style.width, "124px");
-  assert.equal(minimapSurface.style.height, "86px");
+  assert.equal(minimapSurface.style.width, "100%");
+  assert.equal(minimapSurface.style.height, "100%");
   assert.equal(typeof reactProps(minimapSurface).onPointerLeave, "function");
 
   const viewportIndicator = minimapSurface.childNodes[minimapSurface.childNodes.length - 1];
@@ -3165,11 +4293,38 @@ test("DagCanvas minimap sits top left, handles translucent dark mode styling, an
     top: 0,
     width: 184,
   });
+  const bounds = canvasModule.graphBounds(workflow.nodes, 160);
+  const minimapScale = Math.min(184 / bounds.width, 128 / bounds.height);
+  assert.deepEqual(
+    canvasModule.minimapPointToWorld(
+      { clientX: 92, clientY: 64 },
+      minimapSurface.getBoundingClientRect(),
+      bounds,
+    ),
+    {
+      x: bounds.left + 92 / minimapScale,
+      y: bounds.top + 64 / minimapScale,
+    },
+  );
+  const clickedWorld = canvasModule.minimapPointToWorld(
+    { clientX: 80, clientY: 50 },
+    minimapSurface.getBoundingClientRect(),
+    bounds,
+  );
   await dom.pointer(minimapSurface, "onPointerDown", {
     clientX: 80,
     clientY: 50,
     pointerId: 9,
   });
+  const scanCard = allElements(dom.container).find(
+    (element) => element.tagName === "ARTICLE" && textOf(element).includes("Scan"),
+  );
+  const viewportTransform = scanCard.parentNode.style.transform.match(
+    /translate\(([-\d.]+)px, ([-\d.]+)px\) scale\(([-\d.]+)\)/,
+  );
+  assert.ok(viewportTransform);
+  assert.ok(Math.abs(Number(viewportTransform[1]) - (480 - clickedWorld.x * 1.08)) < 0.001);
+  assert.ok(Math.abs(Number(viewportTransform[2]) - (320 - clickedWorld.y * 1.08)) < 0.001);
   await dom.pointer(minimapSurface, "onPointerMove", {
     clientX: 240,
     clientY: 50,
@@ -3181,16 +4336,10 @@ test("DagCanvas minimap sits top left, handles translucent dark mode styling, an
 
 test("Electron preload exposes stable desktop and update bridge contracts", async () => {
   const exposed = runPreload({
-    argv: [
-      "electron",
-      "preload",
-      "--gofer-api-base-url=http://localhost:9000",
-      "--gofer-api-token=ui-token",
-    ],
+    argv: ["electron", "preload", "--gofer-api-base-url=http://localhost:9000"],
   });
 
   assert.equal(exposed.goferApiBaseUrl, "http://localhost:9000");
-  assert.equal(exposed.goferApiToken, "ui-token");
   assert.deepEqual(Object.keys(exposed.goferDesktop).sort(), [
     "dataDirectory",
     "getDataDir",
@@ -3244,48 +4393,35 @@ test("Electron preload keeps file grants private while attaching them to later c
     invoke(channel, payload) {
       calls.push({ channel, payload });
       if (channel === "gofer:select-path") {
-        return { grantId: "grant-1", path: "/outside/workflow.toml" };
+        return { grantId: "grant-1", path: "/outside/shared" };
       }
       if (channel === "gofer:path-info") {
-        return { basename: "workflow.toml", grantId: "grant-1", isFile: true, path: payload.targetPath };
-      }
-      if (channel === "gofer:grant-path") {
-        return { grantId: "grant-drop", path: payload.targetPath };
+        return { basename: "shared", grantId: "grant-1", isDirectory: true, path: payload.targetPath };
       }
       return { channel, payload };
     },
   });
 
-  assert.equal(await exposed.goferDesktop.workspace.selectPath({}), "/outside/workflow.toml");
-  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.getPathInfo("/outside/workflow.toml")), {
-    basename: "workflow.toml",
-    isFile: true,
-    path: "/outside/workflow.toml",
+  assert.equal(await exposed.goferDesktop.workspace.selectPath({}), "/outside/shared");
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.getPathInfo("/outside/shared")), {
+    basename: "shared",
+    isDirectory: true,
+    path: "/outside/shared",
   });
   assert.deepEqual(toPlainObject(calls.at(-1)), {
     channel: "gofer:path-info",
     payload: {
       grantId: "grant-1",
-      targetPath: "/outside/workflow.toml",
+      targetPath: "/outside/shared",
     },
   });
-  assert.equal(await exposed.goferDesktop.workspace.selectPath({ currentPath: "/outside" }), "/outside/workflow.toml");
-  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/workflow.toml"), "grant-1");
-  assert.equal(await exposed.goferDesktop.grantDroppedPath({ path: "/outside/dropped.gof.zip" }), "/outside/dropped.gof.zip");
-  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/dropped.gof.zip"), "grant-drop");
-  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/workflow.toml" })), {
+  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/shared"), "grant-1");
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: "/outside/shared" })), {
     channel: "gofer:list-directory",
     payload: {
       create: true,
-      currentPath: "/outside/workflow.toml",
+      currentPath: "/outside/shared",
       grantId: "grant-1",
-    },
-  });
-  assert.deepEqual(toPlainObject(await exposed.goferDesktop.textFiles.read("/outside/workflow.toml")), {
-    channel: "gofer:read-text-file",
-    payload: {
-      grantId: "grant-1",
-      targetPath: "/outside/workflow.toml",
     },
   });
 });
@@ -3384,14 +4520,17 @@ function DagCanvasHarness({
   notice,
   onDecideApproval,
   onPruneRunLogs,
+  onRadishMutation,
   onReplayRunLog,
   onRetentionSettingsChange,
   onResumeRunLog,
   onWorkflowChange,
   retentionSettings,
+  radishDocument,
   workflow,
 }) {
   const [currentWorkflow, setCurrentWorkflow] = React.useState(workflow);
+  const [currentRadishDocument, setCurrentRadishDocument] = React.useState(radishDocument);
   const [currentRetentionSettings, setCurrentRetentionSettings] = React.useState(
     retentionSettings,
   );
@@ -3406,11 +4545,21 @@ function DagCanvasHarness({
     onRetentionSettingsChange?.(nextSettings);
   }
 
+  async function handleRadishMutation(mutations) {
+    const nextDocument = await onRadishMutation?.(mutations);
+    if (nextDocument) {
+      setCurrentRadishDocument(nextDocument);
+      setCurrentWorkflow((current) => appModule.radishGraphWorkflow(current, nextDocument));
+    }
+    return nextDocument;
+  }
+
   return React.createElement(canvasModule.default, {
     dataDir,
     logState: logState ?? { loading: false, error: "", text: "", path: null, runs: [] },
     notice,
     retentionSettings: currentRetentionSettings,
+    radishDocument: currentRadishDocument,
     approvalState: approvalState ?? { approvals: [], error: "", loading: false },
     runResult: null,
     runState: { running: false },
@@ -3419,6 +4568,7 @@ function DagCanvasHarness({
     onImportWorkflow: () => {},
     onLoadLatestLog: () => {},
     onPruneRunLogs: onPruneRunLogs ?? (() => {}),
+    onRadishMutation: handleRadishMutation,
     onReplayRunLog: onReplayRunLog ?? (() => {}),
     onRetentionSettingsChange: handleRetentionSettingsChange,
     onResumeRunLog: onResumeRunLog ?? (() => {}),
@@ -3430,6 +4580,59 @@ function DagCanvasHarness({
     onDecideApproval: onDecideApproval ?? (() => {}),
     onWorkflowChange: handleChange,
   });
+}
+
+function InspectorDraftHarness({ changes }) {
+  const [keyValue, setKeyValue] = React.useState({});
+  const [list, setList] = React.useState([]);
+  const [number, setNumber] = React.useState(3);
+  const [pathValue, setPathValue] = React.useState("scripts/run.sh");
+
+  return React.createElement(
+    "div",
+    null,
+    React.createElement(canvasModule.NumberField, {
+      label: "Draft number",
+      min: "-10",
+      step: "0.1",
+      value: number,
+      onChange(nextValue) {
+        changes.number.push(nextValue);
+        setNumber(nextValue);
+      },
+    }),
+    React.createElement(
+      "button",
+      { type: "button", onClick: () => setNumber(11) },
+      "Update number externally",
+    ),
+    React.createElement(canvasModule.ListField, {
+      label: "Draft list",
+      value: list,
+      onChange(nextValue) {
+        changes.list.push(nextValue);
+        setList(nextValue);
+      },
+    }),
+    React.createElement(canvasModule.KeyValueField, {
+      label: "Draft key/value",
+      value: keyValue,
+      onChange(nextValue) {
+        changes.keyValue.push(nextValue);
+        setKeyValue(nextValue);
+      },
+    }),
+    React.createElement(canvasModule.TextField, {
+      label: "Draft path",
+      pathBasePath: "/workspace",
+      pathPicker: true,
+      value: pathValue,
+      onChange(nextValue) {
+        changes.path.push(nextValue);
+        setPathValue(nextValue);
+      },
+    }),
+  );
 }
 
 function workflowFixture({ id = "demo", name = "Demo", label = "Run command", status = "Ready" } = {}) {
@@ -3452,6 +4655,8 @@ function workflowFixture({ id = "demo", name = "Demo", label = "Run command", st
       },
     ],
     sourcePath: `/tmp/${id}.toml`,
+    projectRoot: "/workspace",
+    projectName: "workspace",
   };
 }
 
@@ -3468,6 +4673,26 @@ function jsonResponse(url, payload, { method = "GET", ok = true, status = ok ? 2
       json: async () => payload,
     };
   };
+}
+
+function saveWorkflowResponse() {
+  return (url, options = {}) => {
+    if (!url.startsWith("/api/workflows/") || options.method !== "PUT") return null;
+    const workflow = JSON.parse(options.body);
+    return {
+      ok: true,
+      status: 200,
+      json: async () => ({ workflow }),
+    };
+  };
+}
+
+function createDeferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function streamResponse(chunks) {
@@ -3492,6 +4717,41 @@ function streamResponse(chunks) {
   });
 }
 
+function controlledStreamResponse(chunks) {
+  const pendingReads = chunks.map(() => createDeferred());
+  return {
+    releaseNext() {
+      const nextRead = pendingReads.find((deferred) => !deferred.released);
+      if (!nextRead) return;
+      nextRead.released = true;
+      nextRead.resolve();
+    },
+    response(url) {
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader() {
+            let index = 0;
+            return {
+              async read() {
+                if (index >= chunks.length) return { done: true, value: undefined };
+                const deferred = pendingReads[index];
+                await deferred.promise;
+                const value = new TextEncoder().encode(chunks[index]);
+                index += 1;
+                return { done: false, value };
+              },
+            };
+          },
+        },
+        json: async () => ({}),
+        url,
+      };
+    },
+  };
+}
+
 function createFetchMock(handlers) {
   const calls = [];
   const fetchMock = async (url, options = {}) => {
@@ -3506,6 +4766,72 @@ function createFetchMock(handlers) {
   return fetchMock;
 }
 
+async function exerciseDialogFamily(renderDialog, desktop = {}) {
+  function DialogFamilyHarness() {
+    const [open, setOpen] = React.useState(false);
+    return React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(
+        "button",
+        {
+          "aria-label": "Open dialog family",
+          onClick: () => setOpen(true),
+          type: "button",
+        },
+        "Open",
+      ),
+      open ? renderDialog(() => setOpen(false)) : null,
+    );
+  }
+
+  const dom = await mountReact(
+    React.createElement(DialogFamilyHarness),
+    createFetchMock([]),
+    { desktop },
+  );
+  const opener = dom.byLabel("Open dialog family");
+  await dom.focus(opener);
+  await dom.click(opener);
+  await dom.flush();
+
+  const dialog = allElements(dom.container).find(
+    (element) => element.getAttribute?.("role") === "dialog",
+  );
+  assert.ok(dialog, "Expected the family to render a dialog");
+  assert.equal(dialog.getAttribute("aria-modal"), "true");
+  assert.ok(dialog.getAttribute("aria-labelledby"));
+  assert.ok(dialog.getAttribute("aria-describedby"));
+  assert.equal(dialog.contains(document.activeElement), true, "Initial focus escaped the dialog");
+
+  const focusable = allElements(dialog).filter(
+    (element) =>
+      !element.disabled &&
+      ["BUTTON", "INPUT", "SELECT", "TEXTAREA"].includes(element.tagName),
+  );
+  assert.ok(focusable.length > 0, "Expected at least one focusable dialog control");
+  const first = focusable[0];
+  const last = focusable.at(-1);
+
+  await dom.focus(last);
+  await dom.dispatchWindow("keydown", { key: "Tab" });
+  assert.equal(document.activeElement, first, "Tab did not wrap to the first control");
+
+  await dom.focus(first);
+  await dom.dispatchWindow("keydown", { key: "Tab", shiftKey: true });
+  assert.equal(document.activeElement, last, "Shift+Tab did not wrap to the last control");
+
+  await dom.dispatchWindow("keydown", { key: "Escape" });
+  assert.equal(document.activeElement, opener, "Focus did not return to the opener");
+  assert.equal(
+    allElements(dom.container).some((element) => element.getAttribute?.("role") === "dialog"),
+    false,
+    "Escape did not close the dialog",
+  );
+
+  await dom.unmount();
+}
+
 async function mountReact(element, fetchMock, { desktop = {} } = {}) {
   const dom = installTestDom();
   const { createRoot } = require("react-dom/client");
@@ -3516,19 +4842,6 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
   globalThis.window.goferDesktop = desktop;
   globalThis.window.goferUpdates = undefined;
   globalThis.window.confirm = () => true;
-  const windowListeners = {};
-  globalThis.window.addEventListener = (type, listener) => {
-    windowListeners[type] = [...(windowListeners[type] ?? []), listener];
-  };
-  globalThis.window.removeEventListener = (type, listener) => {
-    windowListeners[type] = (windowListeners[type] ?? []).filter((candidate) => candidate !== listener);
-  };
-  globalThis.window.dispatchEvent = (event) => {
-    for (const listener of windowListeners[event.type] ?? []) {
-      listener(event);
-    }
-    return true;
-  };
   globalThis.window.requestAnimationFrame = (callback) => {
     callback();
     return 1;
@@ -3552,63 +4865,56 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
         reactProps(elementNode).onChange?.({ target: elementNode, currentTarget: elementNode });
       });
     },
-    async blur(elementNode) {
-      await React.act(async () => {
-        reactProps(elementNode).onBlur?.(testEvent(elementNode));
-      });
-    },
     async click(elementNode) {
       await React.act(async () => {
         reactProps(elementNode).onClick?.(testEvent(elementNode));
       });
     },
-    async flush(ms = 0) {
-      if (ms > 0) {
-        dom.runTimers(ms);
-      }
+    async blur(elementNode) {
       await React.act(async () => {
+        reactProps(elementNode).onBlur?.(testEvent(elementNode));
+        elementNode.blur();
+      });
+    },
+    async dispatchWindow(type, patch = {}) {
+      await React.act(async () => {
+        const event = Object.assign(new TestEvent(type), {
+          defaultPrevented: false,
+          preventDefault() {
+            this.defaultPrevented = true;
+          },
+          stopPropagation() {},
+          ...patch,
+        });
+        for (const listener of document.listeners[type] ?? []) {
+          listener(event);
+        }
+        await Promise.resolve();
+      });
+    },
+    async flush(ms = 0) {
+      await React.act(async () => {
+        if (ms > 0) {
+          dom.runTimers(ms);
+        }
         await Promise.resolve();
         await Promise.resolve();
+      });
+    },
+    async focus(elementNode) {
+      await React.act(async () => {
+        elementNode.focus();
+        reactProps(elementNode).onFocus?.(testEvent(elementNode));
+      });
+    },
+    async keyDown(elementNode, key, patch = {}) {
+      await React.act(async () => {
+        reactProps(elementNode).onKeyDown?.(testEvent(elementNode, { key, ...patch }));
       });
     },
     async pointer(elementNode, handlerName, patch = {}) {
       await React.act(async () => {
         reactProps(elementNode)[handlerName]?.(testEvent(elementNode, patch));
-      });
-    },
-    async documentPointerDown(targetNode) {
-      await React.act(async () => {
-        document.dispatchEvent({
-          bubbles: true,
-          cancelable: true,
-          target: targetNode,
-          type: "pointerdown",
-        });
-      });
-    },
-    async keyDown(key, patch = {}) {
-      await React.act(async () => {
-        const event = {
-          defaultPrevented: false,
-          key,
-          preventDefault() {
-            this.defaultPrevented = true;
-          },
-          target: document.body,
-          type: "keydown",
-          ...patch,
-        };
-        globalThis.window.dispatchEvent(event);
-      });
-    },
-    async drop(elementNode, patch = {}) {
-      await React.act(async () => {
-        reactProps(elementNode).onDrop?.(testEvent(elementNode, patch));
-      });
-    },
-    async focus(elementNode) {
-      await React.act(async () => {
-        reactProps(elementNode).onFocus?.(testEvent(elementNode));
       });
     },
     async unmount() {
@@ -3642,11 +4948,6 @@ async function mountReact(element, fetchMock, { desktop = {} } = {}) {
     byTitle(title) {
       const match = allElements(container).find((node) => node.getAttribute?.("title") === title);
       assert.ok(match, `Unable to find title: ${title}`);
-      return match;
-    },
-    byTestId(testId) {
-      const match = allElements(container).find((node) => node.getAttribute?.("data-testid") === testId);
-      assert.ok(match, `Unable to find test id: ${testId}`);
       return match;
     },
     byLabel(label) {
@@ -3708,12 +5009,12 @@ function reactProps(node) {
 }
 
 function installTestDom() {
+  const previousNavigatorDescriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   const previous = {
     document: globalThis.document,
     fetch: globalThis.fetch,
     HTMLElement: globalThis.HTMLElement,
     HTMLIFrameElement: globalThis.HTMLIFrameElement,
-    navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator"),
     Node: globalThis.Node,
     SVGElement: globalThis.SVGElement,
     window: globalThis.window,
@@ -3748,22 +5049,15 @@ function installTestDom() {
   globalThis.SVGElement = TestElement;
   Object.defineProperty(globalThis, "navigator", {
     configurable: true,
-    enumerable: true,
     value: windowObject.navigator,
     writable: true,
   });
 
   return {
     restore() {
-      globalThis.document = previous.document;
-      globalThis.fetch = previous.fetch;
-      globalThis.HTMLElement = previous.HTMLElement;
-      globalThis.HTMLIFrameElement = previous.HTMLIFrameElement;
-      globalThis.Node = previous.Node;
-      globalThis.SVGElement = previous.SVGElement;
-      globalThis.window = previous.window;
-      if (previous.navigator) {
-        Object.defineProperty(globalThis, "navigator", previous.navigator);
+      Object.assign(globalThis, previous);
+      if (previousNavigatorDescriptor) {
+        Object.defineProperty(globalThis, "navigator", previousNavigatorDescriptor);
       } else {
         delete globalThis.navigator;
       }
@@ -3826,13 +5120,6 @@ class TestNode {
 
   removeEventListener(type, listener) {
     this.listeners[type] = (this.listeners[type] ?? []).filter((candidate) => candidate !== listener);
-  }
-
-  dispatchEvent(event) {
-    for (const listener of this.listeners[event.type] ?? []) {
-      listener(event);
-    }
-    return true;
   }
 
   insertBefore(node, beforeNode) {
@@ -3993,6 +5280,15 @@ function allElements(root) {
     }
   }
   return elements;
+}
+
+function matchingLiveRegions(container, { politeness, role, text }) {
+  return allElements(container).filter(
+    (element) =>
+      element.getAttribute?.("aria-live") === politeness &&
+      element.getAttribute?.("role") === role &&
+      textOf(element).includes(text),
+  );
 }
 
 function directText(node) {

@@ -52,6 +52,7 @@ from gofer.core.operations import (
     TriggerEventsFanSource,
     WriteFileOperation,
 )
+from gofer.core.structured_output import OutputFieldOperator
 from gofer.core.workflow import AgenticWorkflow, ScheduleConfig, WorkflowConfig
 
 runner = CliRunner()
@@ -460,13 +461,17 @@ def test_loop_cell_supported_sources(op: Any, expected: str) -> None:
 # ── _condition_label ──────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("condition,expected", [
-    (EdgeConditionType.ON_SUCCESS, "✓"),
-    (EdgeConditionType.ON_FAILURE, "✗"),
-    (EdgeConditionType.OUTPUT_MATCHES, "~"),
-    (EdgeConditionType.AFTER_LOOP, "↧"),
-    (EdgeConditionType.ALWAYS, " "),
-])
+@pytest.mark.parametrize(
+    "condition,expected",
+    [
+        (EdgeConditionType.ON_SUCCESS, "✓"),
+        (EdgeConditionType.ON_FAILURE, "✗"),
+        (EdgeConditionType.OUTPUT_MATCHES, "~"),
+        (EdgeConditionType.OUTPUT_FIELD, "ƒ"),
+        (EdgeConditionType.AFTER_LOOP, "↧"),
+        (EdgeConditionType.ALWAYS, " "),
+    ],
+)
 def test_condition_label(condition: EdgeConditionType, expected: str) -> None:
     assert _condition_label(condition) == expected
 
@@ -694,9 +699,7 @@ def test_render_workflow_with_schedule() -> None:
 
 def test_render_workflow_shows_multiple_agents() -> None:
     wf = AgenticWorkflow(WorkflowConfig(id="agent-wf", name="Agent Workflow"))
-    wf.register_agent(
-        AgentConfig(agent_id="codex", subscription="codex", working_dir=Path("/tmp"))
-    )
+    wf.register_agent(AgentConfig(agent_id="codex", subscription="codex", working_dir=Path("/tmp")))
     wf.register_agent(
         AgentConfig(agent_id="claude", subscription="claude_code", working_dir=Path("/tmp"))
     )
@@ -707,6 +710,64 @@ def test_render_workflow_shows_multiple_agents() -> None:
 
     assert "1 node" in buf.getvalue()
     assert "2 agents" in buf.getvalue()
+
+
+def test_render_workflow_shows_structured_schemas_and_predicate_explanation() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"verdict": {"type": "string"}},
+    }
+    wf = AgenticWorkflow(
+        WorkflowConfig(
+            id="typed",
+            name="Typed",
+            output_schemas={"review_result": schema},
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="named",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="reviewer",
+                working_dir=Path("."),
+                output_schema="review_result",
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="inline",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="reviewer",
+                working_dir=Path("."),
+                output_schema=schema,
+            ),
+        )
+    )
+    wf.then(
+        "named",
+        "inline",
+        EdgeConfig(
+            from_node="named",
+            to_node="inline",
+            condition=EdgeConditionType.OUTPUT_FIELD,
+            field="verdict",
+            operator=OutputFieldOperator.EQUALS,
+            value="approved",
+        ),
+    )
+
+    buf = io.StringIO()
+    console = Console(file=buf, force_terminal=False, highlight=False, width=240)
+    render_workflow(wf, console)
+    output = buf.getvalue()
+
+    assert "review_result:" in output
+    assert "inline:" in output
+    assert '"verdict"' in output
+    assert 'verdict equals "approved"' in output
 
 
 def test_render_workflow_shows_retry_and_timeout() -> None:

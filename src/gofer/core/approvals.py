@@ -73,6 +73,7 @@ class ApprovalRequest:
     workflow_path: str | None = None
     log_path: str | None = None
     checkpoint_path: str | None = None
+    subject_manifest_id: str | None = None
     waiter_seen_at: str | None = None
     waiter_pid: int | None = None
     resume_claimed_at: str | None = None
@@ -93,6 +94,7 @@ class ApprovalRequest:
             "workflowPath": self.workflow_path,
             "logPath": self.log_path,
             "checkpointPath": self.checkpoint_path,
+            "subjectManifestId": self.subject_manifest_id,
             "waiterSeenAt": self.waiter_seen_at,
             "waiterPid": self.waiter_pid,
             "resumeClaimedAt": self.resume_claimed_at,
@@ -132,6 +134,9 @@ class ApprovalRequest:
             log_path=str(data.get("logPath") or data.get("log_path") or "") or None,
             checkpoint_path=(
                 str(data.get("checkpointPath") or data.get("checkpoint_path") or "") or None
+            ),
+            subject_manifest_id=(
+                str(data.get("subjectManifestId") or data.get("subject_manifest_id") or "") or None
             ),
             waiter_seen_at=(
                 str(data.get("waiterSeenAt") or data.get("waiter_seen_at") or "") or None

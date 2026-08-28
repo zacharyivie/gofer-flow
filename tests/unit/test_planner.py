@@ -37,7 +37,6 @@ from gofer.core.operations import (
 )
 from gofer.core.planner import build_execution_plan
 from gofer.core.resources import ResourceLimits
-from gofer.core.usage import LlmUsageBudget
 from gofer.core.workflow import (
     AgenticWorkflow,
     FilesystemAccessEntry,
@@ -65,7 +64,6 @@ def test_plan_command_script_file_agent_and_conditional_edges(
             id="plan-demo",
             name="Plan Demo",
             resource_limits=ResourceLimits(max_fanout_items=5, max_files_scanned=20),
-            llm_budget=LlmUsageBudget(max_agent_calls=2),
             max_total_node_runs=25,
         )
     )
@@ -184,7 +182,6 @@ def test_plan_command_script_file_agent_and_conditional_edges(
     assert plan["startNodes"] == ["command", "copy", "delete", "move", "read", "write"]
     assert plan["resourceLimits"]["max_fanout_items"] == 5
     assert plan["executionLimits"]["maxTotalNodeRuns"] == 25
-    assert plan["usageBudget"] == {"enabled": True, "max_agent_calls": 2}
     assert plan["validation"]["ok"] is False
     assert any(
         item["message"].startswith("Script path") for item in plan["validation"]["diagnostics"]
@@ -260,9 +257,15 @@ def test_plan_command_script_file_agent_and_conditional_edges(
             "extraPaths": [str(extra_dir.resolve())],
         }
     ]
-    assert "command.inputs.prior=read.output" in plan["unresolvedDynamicValues"]
+    prior_binding = next(
+        binding
+        for binding in plan["bindings"]
+        if binding["destinationNode"] == "command" and binding["destinationField"] == "inputs.prior"
+    )
+    assert prior_binding["expression"] == "read.output"
+    assert prior_binding["status"] == "invalid"
     command_node = plan["generations"][0]["nodes"][0]
-    assert command_node["unresolvedDynamicValues"] == ["command.inputs.prior=read.output"]
+    assert command_node["bindings"] == [prior_binding]
     assert {
         "from": "script",
         "to": "agent",
@@ -439,7 +442,7 @@ def test_plan_count_fan_out_resolves_numeric_string_count() -> None:
         {"index": "2"},
     ]
     assert fan_out["warnings"] == []
-    assert plan["unresolvedDynamicValues"] == []
+    assert plan["bindings"] == []
 
 
 def test_plan_agent_dynamic_count_reports_fan_out_estimate() -> None:
@@ -646,10 +649,12 @@ def test_plan_http_request_reports_host_dynamic_values_and_missing_secret(
         "sources": ["node:create"],
         "envNames": ["GOFER_SECRET_API_TOKEN", "API_TOKEN"],
     } in plan["secretReadiness"]
-    assert (
-        "create.url=https://api.example.test/issues/{{trigger.issue_id}}"
-        in plan["unresolvedDynamicValues"]
+    issue_binding = next(
+        binding for binding in plan["bindings"] if binding["destinationField"] == "operation.url"
     )
+    assert issue_binding["expression"] == "trigger.issue_id"
+    assert issue_binding["status"] == "optional"
+    assert issue_binding["coercion"] == "string"
 
 
 def test_plan_reports_present_secret_readiness(monkeypatch: MonkeyPatch) -> None:
@@ -1047,7 +1052,7 @@ def test_plan_tabular_fan_out_xlsx_rows_with_dates_are_serializable(
     assert fan_out["sampleItems"][0]["_row"] == ('{"name": "one", "created": "2026-06-24"}')
 
 
-def test_plan_unresolved_dynamic_values_ignore_literal_dotted_strings(
+def test_plan_bindings_ignore_literal_dotted_strings(
     tmp_path: Path,
 ) -> None:
     workflow = AgenticWorkflow(WorkflowConfig(id="dotted-literals", name="Dotted Literals"))
@@ -1097,12 +1102,16 @@ def test_plan_unresolved_dynamic_values_ignore_literal_dotted_strings(
 
     plan = build_execution_plan(workflow)
 
-    assert plan["unresolvedDynamicValues"] == [
-        "agent.input_mapping.loop_path=loop.current.path",
-        "agent.input_mapping.prior=read.text",
-        "command.inputs.event=trigger.value",
-        "command.inputs.prior=read.output",
-    ]
+    assert {
+        (binding["destinationNode"], binding["destinationField"], binding["expression"])
+        for binding in plan["bindings"]
+    } == {
+        ("agent", "operation.input_mapping.loop_path", "loop.current.path"),
+        ("agent", "operation.input_mapping.prior", "read.text"),
+        ("command", "inputs.event", "trigger.value"),
+        ("command", "inputs.prior", "read.output"),
+    }
+    assert all("notes.md" not in binding["expression"] for binding in plan["bindings"])
 
 
 def test_plan_reports_missing_paths_without_executing(tmp_path: Path) -> None:

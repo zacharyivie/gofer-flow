@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 import pytest
@@ -17,7 +17,7 @@ def isolated_gofer_data_dir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Path:
-    """Keep tests from touching the developer's real Gofer data directory."""
+    """Keep tests from touching the developer's real Taskurotta data directory."""
     env_root = tmp_path / "gofer-env"
     home = env_root / "home"
     xdg_data = env_root / "xdg-data"
@@ -42,12 +42,14 @@ class FakeSubscription(Subscription):
         exit_code: int = 0,
         thoughts: list[str] | None = None,
         message: str | None = None,
+        on_execute: Callable[[Path], Awaitable[None] | None] | None = None,
     ) -> None:
         self.calls: list[dict[str, object]] = []
         self._output = output
         self._exit_code = exit_code
         self._thoughts = thoughts or []
         self._message = message
+        self._on_execute = on_execute
 
     def _build_command(
         self,
@@ -76,16 +78,22 @@ class FakeSubscription(Subscription):
         on_thought: Callable[[str], None] | None = None,
         provider_settings: ResolvedProviderSettings | None = None,
     ) -> AgentResult:
-        self.calls.append({
-            "prompt": prompt,
-            "working_dir": working_dir,
-            "tools": tools,
-            "mcp_servers": mcp_servers,
-            "env": env,
-            "extra_paths": extra_paths or [],
-            "max_output_bytes": max_output_bytes,
-            "provider_settings": provider_settings,
-        })
+        if self._on_execute is not None:
+            callback_result = self._on_execute(working_dir)
+            if callback_result is not None:
+                await callback_result
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "working_dir": working_dir,
+                "tools": tools,
+                "mcp_servers": mcp_servers,
+                "env": env,
+                "extra_paths": extra_paths or [],
+                "max_output_bytes": max_output_bytes,
+                "provider_settings": provider_settings,
+            }
+        )
         return AgentResult(
             agent_id="",
             success=self._exit_code == 0,

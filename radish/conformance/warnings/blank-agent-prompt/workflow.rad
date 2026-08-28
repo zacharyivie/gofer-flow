@@ -1,0 +1,8 @@
+Radish: 1
+
+Workflow:
+  name: Blank agent prompt
+
+Node review:
+  type: agent
+  provider: codex

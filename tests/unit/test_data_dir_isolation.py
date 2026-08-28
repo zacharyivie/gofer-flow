@@ -103,9 +103,7 @@ def test_registry_defaults_stay_under_isolated_data_dir(
     agents = list_all_agents()
 
     assert found.config.id == "registered"
-    assert [(wf.config.id, agent.agent_id) for wf, agent in agents] == [
-        ("registered", "writer")
-    ]
+    assert [(wf.config.id, agent.agent_id) for wf, agent in agents] == [("registered", "writer")]
 
 
 def test_scheduler_default_paths_stay_under_isolated_data_dir(

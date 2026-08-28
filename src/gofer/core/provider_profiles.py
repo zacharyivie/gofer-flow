@@ -6,7 +6,7 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, field_validator
 
 from gofer.utils.paths import get_data_dir
 
@@ -36,7 +36,10 @@ class ProviderProfile(BaseModel):
     subscription: ProfileSubscription
     model: str | None = None
     timeout: float | None = None
-    reasoning: str | None = None
+    effort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("effort", "reasoning"),
+    )
     approval_mode: ApprovalMode | None = None
     sandbox_mode: SandboxMode | None = None
     extra_args: list[str] = Field(default_factory=list)
@@ -69,7 +72,10 @@ class ResolvedProviderSettings(BaseModel):
     subscription: ProfileSubscription
     model: str | None = None
     timeout: float | None = None
-    reasoning: str | None = None
+    effort: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("effort", "reasoning"),
+    )
     approval_mode: ApprovalMode | None = None
     sandbox_mode: SandboxMode | None = None
     extra_args: list[str] = Field(default_factory=list)
@@ -192,9 +198,7 @@ def provider_profile_from_ui_payload(
         name: value
         for name, value in raw_env.items()
         if not (
-            is_sensitive_env_name(name)
-            and value == MASKED_SECRET_VALUE
-            and name in secret_refs
+            is_sensitive_env_name(name) and value == MASKED_SECRET_VALUE and name in secret_refs
         )
     }
     env.update(preserved_env)
@@ -223,7 +227,9 @@ def resolve_provider_settings(
     agent_subscription: ProfileSubscription,
     profile_name: str | None,
     agent_model: str | None = None,
+    agent_effort: str | None = None,
     operation_model: str | None = None,
+    operation_effort: str | None = None,
     operation_profile: str | None = None,
     operation_timeout: float | None = None,
     data_dir: Path | None = None,
@@ -248,7 +254,7 @@ def resolve_provider_settings(
             if operation_timeout is not None
             else (profile.timeout if profile else None)
         ),
-        reasoning=profile.reasoning if profile else None,
+        effort=operation_effort or agent_effort or (profile.effort if profile else None),
         approval_mode=profile.approval_mode if profile else None,
         sandbox_mode=profile.sandbox_mode if profile else None,
         extra_args=list(profile.extra_args) if profile else [],
@@ -280,11 +286,6 @@ def validate_provider_settings(settings: ResolvedProviderSettings) -> None:
                 "Codex provider profiles do not support MCP server flags; "
                 "configure MCP servers on a Claude Code profile or on the agent"
             )
-        if settings.reasoning:
-            raise ValueError(
-                "Codex provider profiles do not support reasoning/effort; "
-                "remove reasoning from the profile"
-            )
         if settings.approval_mode not in (None, "default"):
             raise ValueError(
                 "Codex provider profiles do not support approval_mode; "
@@ -292,11 +293,6 @@ def validate_provider_settings(settings: ResolvedProviderSettings) -> None:
             )
         return
     if settings.subscription == "claude_code":
-        if settings.reasoning:
-            raise ValueError(
-                "Claude Code provider profiles do not support reasoning/effort; "
-                "remove reasoning from the profile or use a Codex profile"
-            )
         if settings.sandbox_mode not in (None, "default"):
             raise ValueError(
                 "Claude Code provider profiles do not support sandbox_mode; "
@@ -321,8 +317,7 @@ def validate_provider_settings(settings: ResolvedProviderSettings) -> None:
             )
         if settings.api_key_secret and settings.api_key_env:
             raise ValueError(
-                "Direct API provider profiles must use api_key_secret or api_key_env, "
-                "not both"
+                "Direct API provider profiles must use api_key_secret or api_key_env, not both"
             )
 
 
@@ -333,7 +328,7 @@ def validate_provider_profile(profile: ProviderProfile) -> None:
             subscription=profile.subscription,
             model=profile.model,
             timeout=profile.timeout,
-            reasoning=profile.reasoning,
+            effort=profile.effort,
             approval_mode=profile.approval_mode,
             sandbox_mode=profile.sandbox_mode,
             extra_args=list(profile.extra_args),

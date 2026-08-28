@@ -1,1 +1,1 @@
-"""HTTP support for the Gofer Flow React UI."""
+"""HTTP support for the Taskurotta React UI."""

@@ -236,11 +236,7 @@ def _json_body(body: bytes) -> dict[str, Any]:
 
 
 def _safe_provider_options(options: dict[str, Any]) -> dict[str, Any]:
-    return {
-        key: value
-        for key, value in options.items()
-        if key not in {"api", "anthropic_version"}
-    }
+    return {key: value for key, value in options.items() if key not in {"api", "anthropic_version"}}
 
 
 def _openai_message(payload: dict[str, Any]) -> str:

@@ -1,4 +1,4 @@
-/* global window */
+/* global process */
 
 const bridgeCalls = [];
 
@@ -7,6 +7,11 @@ function recordBridgeCall(method, payload) {
 }
 
 const selectedPath = "/workspace/inputs";
+const apiBaseArgument = process.argv.find((value) => value.startsWith("--gofer-api-base-url="));
+
+if (apiBaseArgument) {
+  window.goferApiBaseUrl = apiBaseArgument.slice("--gofer-api-base-url=".length);
+}
 
 window.__goferBridgeCalls = bridgeCalls;
 

@@ -17,6 +17,7 @@ from gofer.core.bundles import (
 )
 from gofer.core.resources import ResourceLimits
 from gofer.core.validation import validate_workflow_file
+from gofer.core.workflow import AgenticWorkflow
 
 
 def _write_bundle_source(base: Path) -> Path:
@@ -84,6 +85,145 @@ def test_export_import_bundle_round_trips_and_validates(tmp_path: Path) -> None:
     assert (target_dir / "hello.toml").exists()
     assert (target_dir / "prompts" / "hello.md").read_text() == "Say {{secret.API_TOKEN}}\n"
     assert validate_workflow_file(target_dir / "hello.toml", data_dir=target_dir).ok
+
+
+def test_bundle_round_trips_structured_output_schemas_and_predicates(tmp_path: Path) -> None:
+    source_dir = tmp_path / "source"
+    target_dir = tmp_path / "target"
+    source_dir.mkdir()
+    workflow_path = source_dir / "typed.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "typed"
+name = "Typed"
+
+[workflow.output_schemas.result]
+"$ref" = "#/$defs/result"
+
+[workflow.output_schemas.result."$defs".result]
+type = "object"
+required = ["verdict"]
+
+[workflow.output_schemas.result."$defs".result.properties.verdict]
+type = "string"
+
+[agents.reviewer]
+subscription = "codex"
+working_dir = "."
+
+[[nodes]]
+id = "review"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+output_schema = "result"
+
+[[nodes]]
+id = "done"
+type = "bash_command"
+command = "true"
+
+[[edges]]
+from = "review"
+to = "done"
+condition = "output_field"
+field = "verdict"
+operator = "equals"
+value = "approved"
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "typed.gof.zip"
+
+    export_workflow_bundle(workflow_path, bundle_path)
+    with zipfile.ZipFile(bundle_path) as archive:
+        bundled = archive.read("workflow.toml").decode("utf-8")
+    assert "output_schemas" in bundled
+    assert 'condition = "output_field"' in bundled
+
+    import_workflow_bundle(bundle_path, data_dir=target_dir)
+    imported = AgenticWorkflow.from_file(target_dir / "typed.toml")
+    edge = imported.graph.get_edge_config("review", "done")
+    assert imported.config.output_schemas["result"]["$ref"] == "#/$defs/result"
+    assert edge.field == "verdict"
+    assert edge.operator is not None and edge.operator.value == "equals"
+
+
+def test_bundle_round_trips_workflow_scopes_and_invocation_bindings(tmp_path: Path) -> None:
+    source_dir = tmp_path / "scope-source"
+    target_dir = tmp_path / "scope-target"
+    source_dir.mkdir()
+    workflow_path = source_dir / "scoped.toml"
+    workflow_path.write_text(
+        """
+[workflow]
+id = "scoped"
+name = "Scoped"
+
+[workflow.inputs.project_dir]
+type = "path"
+required = true
+
+[workflow.inputs.child_id]
+type = "string"
+default = "child"
+
+[workflow.variables.attempt]
+type = "number"
+initial = 1
+
+[workflow.schedule]
+cron_expression = "0 9 * * *"
+inputs = { project_dir = "/scheduled" }
+
+[workflow.watch]
+path = "incoming"
+inputs = { project_dir = "/watched" }
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+
+[workflow.webhooks.default.input_bindings]
+project_dir = "{{trigger.payload.project_dir}}"
+
+[[nodes]]
+id = "workflow-child"
+type = "workflow"
+workflow_id = "{{inputs.child_id}}"
+input_bindings = { project_dir = "{{inputs.project_dir}}" }
+
+[[nodes]]
+id = "subflow-child"
+type = "subflow"
+component_id = "{{inputs.child_id}}"
+input_bindings = { project_dir = "{{inputs.project_dir}}" }
+output_contract = { attempt = "{{vars.attempt}}" }
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    bundle_path = tmp_path / "scoped.gof.zip"
+
+    export_workflow_bundle(workflow_path, bundle_path)
+    import_workflow_bundle(bundle_path, data_dir=target_dir)
+
+    imported = AgenticWorkflow.from_file(target_dir / "scoped.toml")
+    assert imported.config.inputs["project_dir"].required
+    assert imported.config.variables["attempt"].initial == 1
+    assert imported.config.schedule is not None
+    assert imported.config.schedule.inputs == {"project_dir": "/scheduled"}
+    assert imported.config.watch is not None
+    assert imported.config.watch.inputs == {"project_dir": "/watched"}
+    assert imported.config.webhooks["default"].input_bindings == {
+        "project_dir": "{{trigger.payload.project_dir}}"
+    }
+    workflow_call = imported.graph._nodes["workflow-child"].operation
+    subflow_call = imported.graph._nodes["subflow-child"].operation
+    assert workflow_call.input_bindings == {"project_dir": "{{inputs.project_dir}}"}
+    assert subflow_call.input_bindings == {"project_dir": "{{inputs.project_dir}}"}
 
 
 def test_import_bundle_conflicts_rename_workflow_and_asset_paths(tmp_path: Path) -> None:
@@ -327,8 +467,7 @@ message = "ok"
     assert manifest.triggers[0]["riskReasons"] == "unauthenticated_allowed"
     assert any("allows unauthenticated requests" in warning for warning in plan.risk_warnings)
     assert any(
-        "allows unauthenticated requests" in warning
-        for warning in plan.to_dict()["riskWarnings"]
+        "allows unauthenticated requests" in warning for warning in plan.to_dict()["riskWarnings"]
     )
 
 

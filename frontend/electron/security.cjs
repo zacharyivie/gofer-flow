@@ -69,7 +69,7 @@ function createIpcSecurity({
       roots.push(grantedRoot);
     }
     if (!isPathInsideAnyRoot(candidate, roots, { mustExist })) {
-      throw new Error("Path is outside the approved Gofer desktop roots.");
+      throw new Error("Path is outside the approved Taskurotta desktop roots.");
     }
     return candidate;
   }
@@ -93,12 +93,19 @@ function createIpcSecurity({
     const candidate = resolveCandidatePath(currentPath, getDataDir());
     if (grantId) {
       try {
-        return resolveAllowedPath(currentPath, { grantId, mustExist: false });
+        return existingPickerDirectory(
+          resolveAllowedPath(currentPath, { grantId, mustExist: false }),
+          getDataDir(),
+        );
       } catch {
         // The picker is allowed to start outside approved roots; selecting a path
         // creates an explicit grant before any read/write operation can use it.
       }
     }
+    return existingPickerDirectory(candidate, getDataDir());
+  }
+
+  function existingPickerDirectory(candidate, fallbackPath) {
     if (fs.existsSync(candidate)) {
       try {
         return fs.statSync(candidate).isDirectory() ? candidate : path.dirname(candidate);
@@ -106,7 +113,6 @@ function createIpcSecurity({
         return path.dirname(candidate);
       }
     }
-
     let parent = path.dirname(candidate);
     while (parent && parent !== path.dirname(parent)) {
       if (fs.existsSync(parent)) {
@@ -114,8 +120,7 @@ function createIpcSecurity({
       }
       parent = path.dirname(parent);
     }
-
-    return path.resolve(getDataDir());
+    return path.resolve(fallbackPath);
   }
 
   function grantForPath(targetPath) {

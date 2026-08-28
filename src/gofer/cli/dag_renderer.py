@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING
 
 from rich.console import Console, ConsoleRenderable, Group, RichCast
@@ -16,7 +17,6 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
-    DashboardItemsFanSource,
     DeleteFileOperation,
     DirectoryFanSource,
     FileOperation,
@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from gofer.core.workflow import AgenticWorkflow
 
 _BOX_HEIGHT = 4  # lines per node box (top border + title + detail + bottom border)
-_BOX_GAP = 1     # blank lines between boxes in a generation column
+_BOX_GAP = 1  # blank lines between boxes in a generation column
 _BOX_WIDTH = 26  # inner width of node panel
 
 
@@ -50,6 +50,8 @@ def render_workflow(wf: AgenticWorkflow, console: Console) -> None:
     _render_header(wf, console)
     _render_dag(wf, console)
     _render_node_table(wf, console)
+    _render_schema_table(wf, console)
+    _render_edge_table(wf, console)
 
 
 # ── Header ───────────────────────────────────────────────────────────────────
@@ -214,8 +216,6 @@ def _op_detail(op: Operation) -> str:
             return f"×{op.source.count}"
         if isinstance(op.source, TriggerEventsFanSource):
             return "trigger events"
-        if isinstance(op.source, DashboardItemsFanSource):
-            return f"dashboard {op.source.dashboard}/{op.source.component}"
         if isinstance(op.source, InfiniteFanSource):
             return "until BREAK"
     if isinstance(op, BreakOperation):
@@ -231,6 +231,8 @@ def _condition_label(condition: EdgeConditionType) -> str:
         EdgeConditionType.ON_SUCCESS: "✓",
         EdgeConditionType.ON_FAILURE: "✗",
         EdgeConditionType.OUTPUT_MATCHES: "~",
+        EdgeConditionType.OUTPUT_NO_MATCH: "≁",
+        EdgeConditionType.OUTPUT_FIELD: "ƒ",
         EdgeConditionType.AFTER_LOOP: "↧",
         EdgeConditionType.ALWAYS: " ",
     }[condition]
@@ -306,8 +308,6 @@ def _loop_cell(op: Operation) -> str:
         return f"count={op.source.count}"
     if isinstance(op.source, TriggerEventsFanSource):
         return "trigger events"
-    if isinstance(op.source, DashboardItemsFanSource):
-        return f"dashboard/{op.source.component}"
     if isinstance(op.source, InfiniteFanSource):
         return "infinite"
     return "—"
@@ -315,7 +315,12 @@ def _loop_cell(op: Operation) -> str:
 
 def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
     table = Table(
-        "Node", "Type", "Detail", "Loop", "Retry", "Timeout",
+        "Node",
+        "Type",
+        "Detail",
+        "Loop",
+        "Retry",
+        "Timeout",
         title="[bold]Nodes[/bold]",
         show_lines=False,
         header_style="bold",
@@ -337,4 +342,62 @@ def _render_node_table(wf: AgenticWorkflow, console: Console) -> None:
                 timeout,
             )
 
+    console.print(table)
+
+
+def _output_schema_detail(op: Operation, wf: AgenticWorkflow) -> str:
+    if not isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
+        return "—"
+    declaration = op.output_schema
+    if declaration is None:
+        return "—"
+    if isinstance(declaration, str):
+        schema = wf.config.output_schemas.get(declaration)
+        if schema is None:
+            return f"{declaration} (missing)"
+        return f"{declaration}: {json.dumps(schema, sort_keys=True)}"
+    return f"inline: {json.dumps(declaration, sort_keys=True)}"
+
+
+def _render_schema_table(wf: AgenticWorkflow, console: Console) -> None:
+    rows = [
+        (node.node_id, _output_schema_detail(node.operation, wf))
+        for node in wf.graph.nodes_in_order()
+        if isinstance(node.operation, (AgentOperation, CommonLlmTaskOperation))
+        and node.operation.output_schema is not None
+    ]
+    if not rows:
+        return
+    table = Table(
+        "Producer",
+        "Output Schema",
+        title="[bold]Structured Outputs[/bold]",
+        show_lines=False,
+        header_style="bold",
+    )
+    for node_id, schema in rows:
+        table.add_row(node_id, schema)
+    console.print(table)
+
+
+def _render_edge_table(wf: AgenticWorkflow, console: Console) -> None:
+    if not wf.graph._edges:
+        return
+    table = Table(
+        "From",
+        "To",
+        "Condition",
+        "Explanation",
+        title="[bold]Edges[/bold]",
+        show_lines=False,
+        header_style="bold",
+    )
+    for from_id, to_id in wf.graph._graph.edges():
+        edge = wf.graph.get_edge_config(from_id, to_id)
+        table.add_row(
+            from_id,
+            to_id,
+            edge.condition.value,
+            edge.explanation(),
+        )
     console.print(table)

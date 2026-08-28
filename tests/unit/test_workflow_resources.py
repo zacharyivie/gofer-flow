@@ -28,27 +28,31 @@ def test_validate_surfaces_resource_risk_warnings(tmp_path: Path) -> None:
             resource_limits=ResourceLimits(max_fanout_items=2, max_files_scanned=2),
         )
     )
-    workflow.add_operation(GraphNode(
-        node_id="fanout",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=DirectoryFanSource(
-                type="directory",
-                path=docs,
-                glob="*.txt",
-                include_content=True,
+    workflow.add_operation(
+        GraphNode(
+            node_id="fanout",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(
+                    type="directory",
+                    path=docs,
+                    glob="*.txt",
+                    include_content=True,
+                ),
             ),
-        ),
-    ))
-    workflow.add_operation(GraphNode(
-        node_id="index",
-        operation=LocalVectorizeOperation(
-            type=OperationType.LOCAL_VECTORIZE,
-            source_path=docs,
-            index_path=tmp_path / "index.json",
-            glob="*.txt",
-        ),
-    ))
+        )
+    )
+    workflow.add_operation(
+        GraphNode(
+            node_id="index",
+            operation=LocalVectorizeOperation(
+                type=OperationType.LOCAL_VECTORIZE,
+                source_path=docs,
+                index_path=tmp_path / "index.json",
+                glob="*.txt",
+            ),
+        )
+    )
 
     with pytest.warns(UserWarning) as warnings:
         workflow.validate()

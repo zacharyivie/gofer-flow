@@ -126,8 +126,8 @@ updateTextFile("packaging/arch/.SRCINFO", (text) => {
 
   next = replaceOnce(
     next,
-    /source_x86_64 = Gofer-Flow-.+-x86_64\.AppImage::https:\/\/github\.com\/doonk\/gofer-flow\/releases\/download\/v[^/]+\/Gofer-Flow-.+-x86_64\.AppImage/,
-    `source_x86_64 = Gofer-Flow-${version}-x86_64.AppImage::https://github.com/doonk/gofer-flow/releases/download/v${version}/Gofer-Flow-${version}-x86_64.AppImage`,
+    /source_x86_64 = Taskurotta-.+-x86_64\.AppImage::https:\/\/github\.com\/doonk\/gofer-flow\/releases\/download\/v[^/]+\/Taskurotta-.+-x86_64\.AppImage/,
+    `source_x86_64 = Taskurotta-${version}-x86_64.AppImage::https://github.com/doonk/gofer-flow/releases/download/v${version}/Taskurotta-${version}-x86_64.AppImage`,
     ".SRCINFO AppImage source URL",
   );
 
@@ -190,7 +190,7 @@ updateTextFile("packaging/arch-cli/.SRCINFO", (text) => {
   return next;
 });
 
-console.log(`Bumped Gofer Flow version to ${version}.`);
+console.log(`Bumped Taskurotta version to ${version}.`);
 for (const update of updates) {
   console.log(`- ${update}`);
 }

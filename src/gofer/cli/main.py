@@ -4,17 +4,32 @@ from pathlib import Path
 
 import typer
 
-from gofer.cli.commands import agent, dashboard, doctor, provider, runner, schedule, watch, workflow
+from gofer.cli.commands import (
+    agent,
+    doctor,
+    provider,
+    radish,
+    runner,
+    schedule,
+    schema,
+    watch,
+    workflow,
+)
 
-app = typer.Typer(name="gof", help="Gofer Flow", no_args_is_help=True)
+app = typer.Typer(
+    name="gof",
+    help="Taskurotta. For machine-readable authoring help, run: gof schema --format json",
+    no_args_is_help=True,
+)
 app.add_typer(workflow.app, name="workflow")
 app.add_typer(agent.app, name="agent")
-app.add_typer(dashboard.app, name="dashboard")
 app.add_typer(provider.app, name="provider")
 app.add_typer(runner.app, name="runner")
 app.add_typer(schedule.app, name="schedule")
 app.add_typer(watch.app, name="watch")
+app.add_typer(radish.app, name="radish")
 app.command("doctor")(doctor.doctor)
+app.command("schema")(schema.schema_command)
 
 ui_app = typer.Typer(help="Run the workflow studio API", no_args_is_help=True)
 app.add_typer(ui_app, name="ui")
@@ -31,7 +46,7 @@ def serve_ui(
     data_dir: Path | None = typer.Option(
         None,
         "--data-dir",
-        help="Gofer Flow app data directory for workflows, logs, schedules, and chat state.",
+        help="Taskurotta app data directory for workflows, logs, schedules, and chat state.",
     ),
 ) -> None:
     """Serve JSON endpoints used by the React workflow studio."""

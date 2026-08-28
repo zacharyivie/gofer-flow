@@ -166,6 +166,134 @@ command = 'printf "%s" "$MESSAGE"'
 
 
 @pytest.mark.anyio
+async def test_webhook_trigger_binds_required_workflow_inputs(tmp_path: Path) -> None:
+    (tmp_path / "input-hook.toml").write_text(
+        """
+[workflow]
+id = "input-hook"
+name = "Input Hook"
+
+[workflow.inputs.issue]
+type = "number"
+required = true
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+
+[workflow.webhooks.default.input_bindings]
+issue = "{{trigger.payload.issue.number}}"
+
+[[nodes]]
+id = "echo"
+type = "bash_command"
+command = 'printf "%s" "{{inputs.issue}}"'
+""".strip(),
+        encoding="utf-8",
+    )
+
+    result = await trigger_workflow_payload(
+        "input-hook",
+        "default",
+        tmp_path,
+        payload={"issue": {"number": 42}},
+    )
+
+    assert result["run"]["success"] is True
+    assert result["run"]["inputs"] == {"issue": 42}
+    assert result["run"]["nodeOutputs"]["echo"]["output"] == "42"
+
+
+@pytest.mark.anyio
+async def test_webhook_replay_preserves_explicit_inputs(tmp_path: Path) -> None:
+    (tmp_path / "explicit-input-hook.toml").write_text(
+        """
+[workflow]
+id = "explicit-input-hook"
+name = "Explicit Input Hook"
+
+[workflow.inputs.environment]
+required = true
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+
+[[nodes]]
+id = "echo"
+type = "bash_command"
+command = 'printf "%s" "{{inputs.environment}}"'
+""".strip(),
+        encoding="utf-8",
+    )
+    original = await trigger_workflow_payload(
+        "explicit-input-hook",
+        "default",
+        tmp_path,
+        payload={},
+        inputs={"environment": "staging"},
+    )
+
+    replayed = await replay_workflow_trigger_payload(
+        "explicit-input-hook",
+        str(original["runId"]),
+        tmp_path,
+    )
+
+    assert replayed["run"]["success"] is True
+    assert replayed["run"]["inputs"] == {"environment": "staging"}
+    assert replayed["run"]["nodeOutputs"]["echo"]["output"] == "staging"
+
+
+@pytest.mark.anyio
+async def test_webhook_replay_restores_secret_explicit_inputs_without_plaintext(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "secret-input-hook.toml").write_text(
+        """
+[workflow]
+id = "secret-input-hook"
+name = "Secret Input Hook"
+
+[workflow.inputs.token]
+type = "secret"
+required = true
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+
+[[nodes]]
+id = "echo"
+type = "bash_command"
+command = 'printf "%s" "{{inputs.token}}"'
+""".strip(),
+        encoding="utf-8",
+    )
+    original = await trigger_workflow_payload(
+        "secret-input-hook",
+        "default",
+        tmp_path,
+        payload={},
+        inputs={"token": "replay-token-314"},
+    )
+    sidecar = (tmp_path / "logs" / "secret-input-hook" / str(original["runId"])).with_suffix(
+        ".trigger.json"
+    )
+    assert "replay-token-314" not in sidecar.read_text(encoding="utf-8")
+
+    replayed = await replay_workflow_trigger_payload(
+        "secret-input-hook",
+        str(original["runId"]),
+        tmp_path,
+    )
+
+    assert replayed["run"]["success"] is True
+    assert replayed["run"]["inputs"] == {"token": "***"}
+    assert replayed["run"]["nodeOutputs"]["echo"]["output"] == "***"
+
+
+@pytest.mark.anyio
 async def test_webhook_trigger_allows_explicit_unauthenticated_opt_in(
     tmp_path: Path,
 ) -> None:

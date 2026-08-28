@@ -248,12 +248,20 @@ function writeTextFile(options = {}) {
 }
 
 function selectPath(options = {}) {
-  return invokeDesktop("gofer:select-path", {
+  const payload = {
     currentPath:
       typeof options.currentPath === "string" ? options.currentPath : "",
-    directoryOnly: options.directoryOnly === true,
     grantId: grantForPath(options.currentPath),
-  }).then((payload) => (payload && typeof payload.path === "string" ? payload.path : null));
+  };
+  if (options.directoryOnly === true) {
+    payload.directoryOnly = true;
+  }
+  if (options.fileOnly === true) {
+    payload.fileOnly = true;
+  }
+  return invokeDesktop("gofer:select-path", payload).then((payload) =>
+    payload && typeof payload.path === "string" ? payload.path : null
+  );
 }
 
 contextBridge.exposeInMainWorld("goferUpdates", {

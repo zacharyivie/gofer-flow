@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import csv
 import json
 import re
@@ -9,6 +10,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from gofer.core.agent import configured_extra_paths
+from gofer.core.bindings import binding_contract, inspect_workflow_bindings
 from gofer.core.graph import EdgeConditionType, GraphNode
 from gofer.core.llm_prompts import common_llm_task_prompt
 from gofer.core.network_policy import network_policy_warnings
@@ -39,6 +41,7 @@ from gofer.core.operations import (
     ReadFileOperation,
     ShellScriptOperation,
     StartOperation,
+    SubflowOperation,
     TabularFanSource,
     TriggerEventsFanSource,
     WorkflowCallOperation,
@@ -49,6 +52,7 @@ from gofer.core.provider_profiles import (
     resolve_provider_settings,
     validate_provider_settings,
 )
+from gofer.core.references import parse_exact_reference
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
 from gofer.core.secrets import (
     secret_reference_names as workflow_secret_reference_names,
@@ -56,9 +60,11 @@ from gofer.core.secrets import (
 from gofer.core.secrets import (
     workflow_secret_readiness,
 )
-from gofer.core.usage import LlmUsageBudget, LlmUsageTotals, budget_violations, estimate_tokens
+from gofer.core.structured_output import resolve_output_schema
+from gofer.core.usage import LlmUsageTotals, estimate_tokens
 from gofer.core.validation import validate_workflow
 from gofer.core.workflow import AgenticWorkflow, FilesystemAccessEntry
+from gofer.prompts.manager import PromptManager
 
 SAMPLE_LIMIT = 5
 SECRET_REF_PATTERN = re.compile(
@@ -83,17 +89,36 @@ def build_execution_plan(
     workflow_path: Path | None = None,
     data_dir: Path | None = None,
     trigger_context: dict[str, Any] | None = None,
+    invocation_inputs: dict[str, Any] | None = None,
     sample_limit: int = SAMPLE_LIMIT,
 ) -> dict[str, Any]:
     """Build a read-only preview of workflow execution impact."""
+    if invocation_inputs is not None:
+        workflow = _workflow_with_invocation_scope(workflow, invocation_inputs)
     limits = workflow.config.resource_limits or DEFAULT_RESOURCE_LIMITS
     path_base = workflow_path.parent if workflow_path is not None else None
     profile_data_dir = data_dir if data_dir is not None else path_base
     warnings = workflow.resource_warnings(path_base)
     warnings.extend(_webhook_risk_warnings(workflow))
+    bindings = inspect_workflow_bindings(
+        workflow,
+        workflow_path=workflow_path,
+        data_dir=data_dir,
+    )
+    bindings_by_node: dict[str, list[dict[str, Any]]] = {}
+    for binding in bindings:
+        bindings_by_node.setdefault(binding.destination_node, []).append(binding.to_dict())
     plan: dict[str, Any] = {
         "workflowId": workflow.config.id,
         "workflowName": workflow.config.name,
+        "inputs": {
+            name: declaration.model_dump(mode="json", exclude_none=True)
+            for name, declaration in workflow.config.declared_inputs.items()
+        },
+        "initialVariables": {
+            name: "***" if declaration.secret else declaration.initial
+            for name, declaration in workflow.config.variables.items()
+        },
         "startNodes": _start_nodes(workflow),
         "generations": [],
         "edges": _edge_plan(workflow),
@@ -109,15 +134,16 @@ def build_execution_plan(
         "requiredSecrets": [],
         "secretReadiness": [],
         "providerRequirements": [],
+        "filesystemRequirements": [],
         "projectedLlmUsage": LlmUsageTotals().to_dict(),
-        "usageBudget": _usage_budget_plan(workflow.config.llm_budget),
         "resourceLimits": limits.model_dump(),
         "executionLimits": {
             "maxTotalNodeRuns": workflow.config.max_total_node_runs,
             "runContinuously": workflow.config.run_continuously,
         },
         "triggerContext": _trigger_plan(workflow, trigger_context, path_base),
-        "unresolvedDynamicValues": [],
+        "bindingContract": binding_contract(),
+        "bindings": [binding.to_dict() for binding in bindings],
     }
     if path_base is not None:
         plan["pathResolutionBase"] = str(path_base)
@@ -143,7 +169,7 @@ def build_execution_plan(
         ],
         set[str],
     ] = {}
-    dynamic_values: set[str] = set()
+    filesystem_requirements: dict[str, dict[str, Any]] = {}
     fan_out_multipliers: dict[str, int] = {}
 
     for generation_index, generation in enumerate(workflow.graph.topological_generations()):
@@ -163,6 +189,7 @@ def build_execution_plan(
                 trigger_context=trigger_context or {},
                 sample_limit=sample_limit,
                 inherited_fan_out=inherited_fan_out,
+                bindings=bindings_by_node.get(node.node_id, []),
             )
             planned_nodes.append(node_plan)
             plan["destructiveActions"].extend(node_plan["destructiveActions"])
@@ -191,7 +218,7 @@ def build_execution_plan(
             for secret in node_plan["requiredSecrets"]:
                 secret_names.add(secret)
             for requirement in node_plan["providerRequirements"]:
-                key = (
+                provider_key = (
                     str(requirement["agentId"]),
                     str(requirement["subscription"]),
                     (
@@ -215,10 +242,12 @@ def build_execution_plan(
                     ),
                     bool(requirement["available"]),
                 )
-                provider_keys.setdefault(key, set()).update(
+                provider_keys.setdefault(provider_key, set()).update(
                     str(path) for path in requirement.get("extraPaths", [])
                 )
-            dynamic_values.update(node_plan["unresolvedDynamicValues"])
+            for requirement in node_plan["filesystemRequirements"]:
+                filesystem_key = json.dumps(requirement, sort_keys=True, default=str)
+                filesystem_requirements[filesystem_key] = requirement
             fan_out_multipliers[node.node_id] = _successor_fan_out_multiplier(
                 inherited_fan_out,
                 node_plan.get("fanOut"),
@@ -265,41 +294,64 @@ def build_execution_plan(
         if timeout is not None:
             provider_requirement["timeout"] = timeout
         plan["providerRequirements"].append(provider_requirement)
-    plan["unresolvedDynamicValues"] = sorted(dynamic_values)
-    budget = workflow.config.llm_budget
-    usage = plan["projectedLlmUsage"]
-    if budget.max_agent_calls is not None and usage["agent_calls"] > budget.max_agent_calls:
-        plan["warnings"].append(
-            "Projected LLM usage exceeds workflow max_agent_calls "
-            f"({usage['agent_calls']} > {budget.max_agent_calls})"
-        )
-    if (
-        budget.max_estimated_tokens is not None
-        and usage["total_tokens"] > budget.max_estimated_tokens
-    ):
-        plan["warnings"].append(
-            "Projected LLM usage exceeds workflow max_estimated_tokens "
-            f"({usage['total_tokens']} > {budget.max_estimated_tokens})"
-        )
-    if (
-        budget.max_estimated_cost is not None
-        and usage["estimated_cost"] > budget.max_estimated_cost
-    ):
-        plan["warnings"].append(
-            "Projected LLM usage exceeds workflow max_estimated_cost "
-            f"({usage['estimated_cost']:.6f} > {budget.max_estimated_cost:.6f})"
-        )
-    if (
-        budget.max_agent_time_seconds is not None
-        and usage["agent_time_seconds"] > budget.max_agent_time_seconds
-    ):
-        plan["warnings"].append(
-            "Projected LLM usage exceeds workflow max_agent_time_seconds "
-            f"({usage['agent_time_seconds']:.2f} > "
-            f"{budget.max_agent_time_seconds:.2f})"
-        )
+    plan["filesystemRequirements"] = [
+        filesystem_requirements[key] for key in sorted(filesystem_requirements)
+    ]
     plan["warnings"] = sorted(set(plan["warnings"]))
     return plan
+
+
+def _workflow_with_invocation_scope(
+    workflow: AgenticWorkflow,
+    inputs: dict[str, Any],
+) -> AgenticWorkflow:
+    """Render a disposable planning copy without exposing invocation secrets."""
+
+    planned = copy.deepcopy(workflow)
+    safe_inputs = {
+        name: (
+            "***"
+            if planned.config.declared_inputs.get(name)
+            and planned.config.declared_inputs[name].is_secret
+            else value
+        )
+        for name, value in inputs.items()
+    }
+    variables: dict[str, Any] = {}
+    for name, declaration in planned.config.variables.items():
+        context = {"inputs": safe_inputs, "params": safe_inputs, "vars": variables}
+        variables[name] = (
+            "***" if declaration.secret else _render_plan_scope_value(declaration.initial, context)
+        )
+        declaration.initial = variables[name]
+    context = {"inputs": safe_inputs, "params": safe_inputs, "vars": variables}
+    for node in planned.graph.nodes_in_order():
+        payload = _render_plan_scope_value(node.operation.model_dump(by_alias=True), context)
+        if isinstance(payload, dict):
+            planned.graph._nodes[node.node_id] = node.model_copy(
+                update={"operation": node.operation.__class__.model_validate(payload)}
+            )
+    return planned
+
+
+def _render_plan_scope_value(value: object, context: dict[str, Any]) -> object:
+    if isinstance(value, Path):
+        return _render_plan_scope_value(str(value), context)
+    if isinstance(value, str):
+        exact = parse_exact_reference(value)
+        if exact is not None and value.strip().startswith("{{"):
+            selected: object = context
+            for part in exact.split("."):
+                if not isinstance(selected, dict) or part not in selected:
+                    return value
+                selected = selected[part]
+            return selected
+        return PromptManager._interpolate(value, context)
+    if isinstance(value, dict):
+        return {str(key): _render_plan_scope_value(item, context) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_render_plan_scope_value(item, context) for item in value]
+    return value
 
 
 def _start_nodes(workflow: AgenticWorkflow) -> list[str]:
@@ -320,13 +372,6 @@ def _conditional_branches(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
     ]
 
 
-def _usage_budget_plan(budget: LlmUsageBudget) -> dict[str, Any]:
-    return {
-        "enabled": budget.enabled(),
-        **budget.model_dump(exclude_none=True),
-    }
-
-
 def _edge_plan(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
     edges = []
     for from_id, to_id in workflow.graph._graph.edges():
@@ -334,15 +379,25 @@ def _edge_plan(workflow: AgenticWorkflow) -> list[dict[str, Any]]:
         label = edge.condition.value
         if edge.condition == EdgeConditionType.OUTPUT_MATCHES and edge.output_pattern:
             label = f"output_matches:{edge.output_pattern}"
-        edges.append(
-            {
-                "from": from_id,
-                "to": to_id,
-                "condition": edge.condition.value,
-                "label": label,
-                "outputPattern": edge.output_pattern,
-            }
-        )
+        elif edge.condition == EdgeConditionType.OUTPUT_FIELD:
+            label = edge.explanation()
+        item: dict[str, Any] = {
+            "from": from_id,
+            "to": to_id,
+            "condition": edge.condition.value,
+            "label": label,
+            "outputPattern": edge.output_pattern,
+        }
+        if edge.condition == EdgeConditionType.OUTPUT_FIELD:
+            item.update(
+                {
+                    "field": edge.field,
+                    "operator": edge.operator.value if edge.operator is not None else None,
+                    "value": edge.value,
+                    "explanation": edge.explanation(),
+                }
+            )
+        edges.append(item)
     return edges
 
 
@@ -455,6 +510,7 @@ def _node_plan(
     trigger_context: dict[str, Any],
     sample_limit: int,
     inherited_fan_out: int = 1,
+    bindings: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     op = node.operation
     detail = _operation_detail(workflow, node, path_base)
@@ -487,6 +543,7 @@ def _node_plan(
         warnings.extend(str(warning) for warning in fan_out.get("warnings", []))
     required_secrets = _required_secrets(op, workflow, path_base, data_dir)
     provider_requirements = _provider_requirements(op, workflow, path_base, data_dir)
+    filesystem_requirements = _filesystem_requirements(op, path_base)
     projected_llm_usage = _projected_llm_usage(
         op,
         workflow,
@@ -495,17 +552,6 @@ def _node_plan(
         node.node_id,
         inherited_fan_out,
     )
-    if projected_llm_usage is not None and isinstance(
-        op,
-        (AgentOperation, CommonLlmTaskOperation),
-    ):
-        warnings.extend(
-            _projected_budget_warnings(
-                projected_llm_usage,
-                op.llm_budget,
-                scope=f"node '{node.node_id}' LLM budget",
-            )
-        )
     for requirement in provider_requirements:
         for error in requirement.get("validationErrors", []):
             warnings.append(str(error))
@@ -514,8 +560,6 @@ def _node_plan(
             warnings.append(
                 f"Provider CLI '{binary}' is not available for agent {requirement['agentId']}"
             )
-    unresolved = _unresolved_values(node, workflow)
-
     return {
         "id": node.node_id,
         "label": node.label or node.node_id,
@@ -529,6 +573,7 @@ def _node_plan(
         "fanOut": fan_out,
         "requiredSecrets": required_secrets,
         "providerRequirements": provider_requirements,
+        "filesystemRequirements": filesystem_requirements,
         "projectedLlmUsage": projected_llm_usage,
         "workingDir": _working_dir(op, workflow, path_base),
         "retryCount": node.retry_count,
@@ -538,7 +583,22 @@ def _node_plan(
         "awaitAllInputs": node.await_all_inputs,
         "onFailure": node.on_failure,
         "inputs": dict(node.inputs),
-        "unresolvedDynamicValues": unresolved,
+        "bindings": bindings or [],
+        "outputSchema": (
+            resolve_output_schema(op.output_schema, workflow.config.output_schemas)[1]
+            if isinstance(op, (AgentOperation, CommonLlmTaskOperation))
+            and op.output_schema is not None
+            else None
+        ),
+        "outputSchemaName": (
+            op.output_schema
+            if isinstance(op, (AgentOperation, CommonLlmTaskOperation))
+            and isinstance(op.output_schema, str)
+            else None
+        ),
+        "repairAttempts": (
+            op.repair_attempts if isinstance(op, (AgentOperation, CommonLlmTaskOperation)) else 0
+        ),
     }
 
 
@@ -587,35 +647,6 @@ def _projected_llm_usage(
         "profile": agent.profile,
         "model": agent.model,
     }
-
-
-def _projected_budget_warnings(
-    usage: dict[str, object],
-    budget: LlmUsageBudget,
-    *,
-    scope: str,
-) -> list[str]:
-    totals = LlmUsageTotals(
-        agent_calls=_int_usage_value(usage.get("agent_calls")),
-        input_tokens=_int_usage_value(usage.get("input_tokens")),
-        output_tokens=_int_usage_value(usage.get("output_tokens")),
-        total_tokens=_int_usage_value(usage.get("total_tokens")),
-        estimated_cost=_float_usage_value(usage.get("estimated_cost")),
-        agent_time_seconds=_float_usage_value(usage.get("agent_time_seconds")),
-    )
-    return [f"Projected {warning}" for warning in budget_violations(totals, budget, scope=scope)]
-
-
-def _int_usage_value(value: object) -> int:
-    if isinstance(value, int | float | str):
-        return int(value)
-    return 0
-
-
-def _float_usage_value(value: object) -> float:
-    if isinstance(value, int | float | str):
-        return float(value)
-    return 0.0
 
 
 def _historical_llm_usage_average(
@@ -738,6 +769,9 @@ def _operation_detail(
         return f"notify {op.channel}: {op.title}"
     if isinstance(op, WorkflowCallOperation):
         return f"run workflow {op.workflow_id}"
+    if isinstance(op, SubflowOperation):
+        version = f"@{op.version}" if op.version else ""
+        return f"subflow {op.component_id}{version}"
     if isinstance(op, AgentOperation):
         parts = [op.agent_id]
         if op.skill_name:
@@ -1773,6 +1807,7 @@ def _required_secrets(
     workflow: AgenticWorkflow,
     path_base: Path | None,
     data_dir: Path | None,
+    seen_components: set[Path] | None = None,
 ) -> list[str]:
     values: dict[str, str] = {}
     profile_secrets: set[str] = set()
@@ -1786,8 +1821,10 @@ def _required_secrets(
                 agent_subscription=agent.subscription,
                 profile_name=agent.profile,
                 agent_model=agent.model,
+                agent_effort=agent.effort,
                 operation_profile=op.profile,
                 operation_model=op.model,
+                operation_effort=op.effort,
                 operation_timeout=op.timeout,
                 data_dir=data_dir,
             )
@@ -1804,8 +1841,10 @@ def _required_secrets(
                 agent_subscription=agent.subscription,
                 profile_name=agent.profile,
                 agent_model=agent.model,
+                agent_effort=agent.effort,
                 operation_profile=op.profile,
                 operation_model=op.model,
+                operation_effort=op.effort,
                 operation_timeout=op.timeout,
                 data_dir=data_dir,
             )
@@ -1818,6 +1857,22 @@ def _required_secrets(
         for field, value in _iter_strings(op.model_dump(by_alias=True)):
             values[field] = value
     elif isinstance(op, NotificationOperation):
+        for field, value in _iter_strings(op.model_dump()):
+            values[field] = value
+    elif isinstance(op, SubflowOperation):
+        component, _component_path = _subflow_component_for_plan(op, path_base)
+        if component is not None and component.component is not None:
+            profile_secrets.update(component.component.secret_requirements)
+            profile_secrets.update(
+                _nested_subflow_secrets(
+                    component,
+                    _component_path,
+                    data_dir,
+                    seen_components,
+                )
+            )
+        for secret in op.secret_requirements:
+            profile_secrets.add(secret)
         for field, value in _iter_strings(op.model_dump()):
             values[field] = value
     return sorted(
@@ -1837,7 +1892,27 @@ def _provider_requirements(
     workflow: AgenticWorkflow,
     path_base: Path | None,
     data_dir: Path | None,
+    seen_components: set[Path] | None = None,
 ) -> list[dict[str, Any]]:
+    if isinstance(op, SubflowOperation):
+        component, component_path = _subflow_component_for_plan(op, path_base)
+        component_requirements: list[dict[str, Any]] = []
+        if component is not None and component.component is not None:
+            component_requirements = component.component.provider_requirements
+        source_path = str(component_path) if component_path is not None else None
+        requirements = [
+            _subflow_provider_requirement(requirement, op, path_base, source_path)
+            for requirement in [*component_requirements, *op.provider_requirements]
+        ]
+        requirements.extend(
+            _nested_subflow_provider_requirements(
+                component,
+                component_path,
+                data_dir,
+                seen_components,
+            )
+        )
+        return requirements
     if isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
         agent = workflow.agents.get(op.agent_id)
         if agent is None:
@@ -1846,8 +1921,10 @@ def _provider_requirements(
             agent_subscription=agent.subscription,
             profile_name=agent.profile,
             agent_model=agent.model,
+            agent_effort=agent.effort,
             operation_profile=op.profile,
             operation_model=op.model,
+            operation_effort=op.effort,
             operation_timeout=op.timeout,
             data_dir=data_dir,
         )
@@ -1877,6 +1954,303 @@ def _provider_requirements(
             requirement["validationErrors"] = validation_errors
         return [requirement]
     return []
+
+
+def _subflow_provider_requirement(
+    requirement: dict[str, Any],
+    op: SubflowOperation,
+    path_base: Path | None,
+    source_path: str | None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "agentId": requirement.get("agentId") or requirement.get("agent_id") or "subflow",
+        "subscription": (
+            requirement.get("subscription") or requirement.get("provider") or "component"
+        ),
+        "profile": requirement.get("profile"),
+        "model": requirement.get("model"),
+        "timeout": requirement.get("timeout"),
+        "workingDir": str(path_base or Path(".")),
+        "binary": requirement.get("binary"),
+        "available": True,
+        "directApi": False,
+        "apiBaseUrl": None,
+        "extraPaths": [],
+        "componentId": op.component_id,
+    }
+    if source_path is not None:
+        item["sourcePath"] = source_path
+    return item
+
+
+def _filesystem_requirements(
+    op: object,
+    path_base: Path | None,
+    seen_components: set[Path] | None = None,
+) -> list[dict[str, Any]]:
+    if not isinstance(op, SubflowOperation):
+        return []
+    component, component_path = _subflow_component_for_plan(op, path_base)
+    requirements: list[dict[str, Any]] = []
+    if component is not None and component.component is not None:
+        for component_entry in component.component.filesystem_access:
+            requirements.append(
+                _subflow_filesystem_requirement(
+                    component_entry.model_dump(mode="json", exclude_none=True),
+                    op,
+                    source="component",
+                    component_path=component_path,
+                )
+            )
+    for node_requirement in op.filesystem_access:
+        requirements.append(
+            _subflow_filesystem_requirement(
+                node_requirement,
+                op,
+                source="node",
+                component_path=component_path,
+            )
+        )
+    requirements.extend(
+        _subflow_internal_filesystem_requirements(
+            component,
+            component_path,
+            op,
+        )
+    )
+    requirements.extend(
+        _nested_subflow_filesystem_requirements(
+            component,
+            component_path,
+            seen_components,
+        )
+    )
+    return requirements
+
+
+def _subflow_internal_filesystem_requirements(
+    component: AgenticWorkflow | None,
+    component_path: Path | None,
+    op: SubflowOperation,
+) -> list[dict[str, Any]]:
+    if component is None or component_path is None:
+        return []
+    requirements: list[dict[str, Any]] = []
+    nested_base = component_path.parent
+    for node in component.graph.nodes_in_order():
+        if isinstance(node.operation, SubflowOperation):
+            continue
+        for requirement in _operation_filesystem_requirement_items(
+            node.operation,
+            nested_base,
+        ):
+            item = _subflow_filesystem_requirement(
+                requirement,
+                op,
+                source="internal_node",
+                component_path=component_path,
+            )
+            item["nodeId"] = node.node_id
+            item["field"] = requirement.get("field")
+            item["resolvedPath"] = requirement.get("resolvedPath")
+            requirements.append(item)
+    return requirements
+
+
+def _nested_subflow_secrets(
+    component: AgenticWorkflow | None,
+    component_path: Path | None,
+    data_dir: Path | None,
+    seen_components: set[Path] | None,
+) -> set[str]:
+    if component is None or component_path is None:
+        return set()
+    resolved_component_path = _resolved_for_access(component_path)
+    seen = set(seen_components or set())
+    if resolved_component_path in seen:
+        return set()
+    seen.add(resolved_component_path)
+    nested_base = component_path.parent
+    secrets: set[str] = set()
+    for node in component.graph.nodes_in_order():
+        secrets.update(
+            _required_secrets(
+                node.operation,
+                component,
+                nested_base,
+                data_dir,
+                seen,
+            )
+        )
+    return secrets
+
+
+def _nested_subflow_provider_requirements(
+    component: AgenticWorkflow | None,
+    component_path: Path | None,
+    data_dir: Path | None,
+    seen_components: set[Path] | None,
+) -> list[dict[str, Any]]:
+    if component is None or component_path is None:
+        return []
+    resolved_component_path = _resolved_for_access(component_path)
+    seen = set(seen_components or set())
+    if resolved_component_path in seen:
+        return []
+    seen.add(resolved_component_path)
+    nested_base = component_path.parent
+    requirements: list[dict[str, Any]] = []
+    for node in component.graph.nodes_in_order():
+        requirements.extend(
+            _provider_requirements(
+                node.operation,
+                component,
+                nested_base,
+                data_dir,
+                seen,
+            )
+        )
+    return requirements
+
+
+def _nested_subflow_filesystem_requirements(
+    component: AgenticWorkflow | None,
+    component_path: Path | None,
+    seen_components: set[Path] | None,
+) -> list[dict[str, Any]]:
+    if component is None or component_path is None:
+        return []
+    resolved_component_path = _resolved_for_access(component_path)
+    seen = set(seen_components or set())
+    if resolved_component_path in seen:
+        return []
+    seen.add(resolved_component_path)
+    nested_base = component_path.parent
+    requirements: list[dict[str, Any]] = []
+    for node in component.graph.nodes_in_order():
+        requirements.extend(_filesystem_requirements(node.operation, nested_base, seen))
+    return requirements
+
+
+def _operation_filesystem_requirement_items(
+    op: object,
+    path_base: Path | None,
+) -> list[dict[str, Any]]:
+    requirements: list[dict[str, Any]] = []
+
+    def add(
+        path: Path,
+        permission: Literal["read", "write", "execute"],
+        field: str,
+    ) -> None:
+        requirements.append(
+            {
+                "path": str(path),
+                "read": permission == "read",
+                "write": permission == "write",
+                "execute": permission == "execute",
+                "field": field,
+                "resolvedPath": str(_resolve_path(path, path_base)),
+            }
+        )
+
+    if isinstance(op, PythonScriptOperation | ShellScriptOperation):
+        add(op.script_path, "execute", "operation.script_path")
+    elif isinstance(op, ReadFileOperation):
+        add(op.path, "read", "operation.path")
+    elif isinstance(op, WriteFileOperation):
+        add(op.path, "write", "operation.path")
+    elif isinstance(op, CopyFileOperation):
+        add(op.source_path, "read", "operation.source_path")
+        add(op.destination_path, "write", "operation.destination_path")
+    elif isinstance(op, MoveFileOperation):
+        add(op.source_path, "write", "operation.source_path")
+        add(op.destination_path, "write", "operation.destination_path")
+    elif isinstance(op, DeleteFileOperation):
+        add(op.path, "write", "operation.path")
+    elif isinstance(op, FileOperation):
+        add(op.path, "read", "operation.path")
+    elif isinstance(op, FolderOperation):
+        add(op.path, "read", "operation.path")
+    elif isinstance(op, OpenResourceOperation):
+        if _open_resource_target_is_local_path(op):
+            add(Path(op.target), "read", "operation.target")
+    elif isinstance(op, PromptFileOperation):
+        if op.template_path is not None:
+            add(op.template_path, "read", "operation.template_path")
+        add(op.output_path, "write", "operation.output_path")
+    elif isinstance(op, LocalVectorizeOperation):
+        index_path = _resolve_path(op.index_path, path_base)
+        add(op.source_path, "read", "operation.source_path")
+        add(op.index_path, "write", "operation.index_path")
+        add(index_path.parent, "write", "operation.index_path")
+        add(_default_vector_entries_path(index_path), "write", "operation.index_path")
+    elif isinstance(op, LocalSearchOperation):
+        add(op.index_path, "read", "operation.index_path")
+
+    source = op.source if isinstance(op, LoopOperation) else None
+    if isinstance(source, TabularFanSource):
+        add(source.path, "read", "operation.source.path")
+    elif isinstance(source, DirectoryFanSource):
+        add(source.path, "read", "operation.source.path")
+
+    return requirements
+
+
+def _subflow_filesystem_requirement(
+    requirement: dict[str, Any],
+    op: SubflowOperation,
+    *,
+    source: str,
+    component_path: Path | None,
+) -> dict[str, Any]:
+    item = {
+        "path": str(requirement.get("path") or ""),
+        "read": bool(requirement.get("read", True)),
+        "write": bool(requirement.get("write", True)),
+        "execute": bool(requirement.get("execute", False)),
+        "componentId": op.component_id,
+        "source": source,
+    }
+    if component_path is not None:
+        item["sourcePath"] = str(component_path)
+    return item
+
+
+def _subflow_component_for_plan(
+    op: SubflowOperation,
+    path_base: Path | None,
+) -> tuple[AgenticWorkflow | None, Path | None]:
+    if path_base is None:
+        return None, None
+    if op.source_path is not None:
+        source = op.source_path.expanduser()
+        candidate = source if source.is_absolute() else path_base / source
+        if not candidate.exists():
+            return None, candidate
+        try:
+            return AgenticWorkflow.from_file(candidate), candidate
+        except Exception:
+            return None, candidate
+    component_id = op.component_id.strip()
+    candidate = path_base / f"{component_id}.toml"
+    if candidate.exists():
+        try:
+            workflow = AgenticWorkflow.from_file(candidate)
+        except Exception:
+            workflow = None
+        if workflow is not None and (
+            workflow.component is None or workflow.component.id == component_id
+        ):
+            return workflow, candidate
+    for path in sorted(path_base.rglob("*.toml")):
+        try:
+            workflow = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        if workflow.component is not None and workflow.component.id == component_id:
+            return workflow, path
+    return None, None
 
 
 def _provider_binary(subscription: str) -> str | None:

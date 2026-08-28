@@ -27,13 +27,23 @@ from gofer.core.provider_profiles import (
     validate_provider_settings,
 )
 from gofer.core.resources import ResourceLimits
-from gofer.core.usage import LlmUsageBudget
 
 
 class ScheduleConfig(BaseModel):
     cron_expression: str
     timezone: str = "UTC"
     params: dict[str, Any] = Field(default_factory=dict)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def invocation_inputs(self) -> dict[str, Any]:
+        overlap = set(self.params) & set(self.inputs)
+        if overlap:
+            raise ValueError(
+                "Schedule input(s) supplied in both inputs and params: "
+                + ", ".join(sorted(overlap))
+            )
+        return {**self.params, **self.inputs}
 
 
 class WatchConfig(BaseModel):
@@ -44,6 +54,16 @@ class WatchConfig(BaseModel):
     mode: Literal["batch", "queue", "fanout"] = "batch"
     max_concurrency: int = 1
     params: dict[str, Any] = Field(default_factory=dict)
+    inputs: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def invocation_inputs(self) -> dict[str, Any]:
+        overlap = set(self.params) & set(self.inputs)
+        if overlap:
+            raise ValueError(
+                "Watch input(s) supplied in both inputs and params: " + ", ".join(sorted(overlap))
+            )
+        return {**self.params, **self.inputs}
 
 
 ParameterType = Literal[
@@ -57,6 +77,7 @@ ParameterType = Literal[
     "datetime",
     "file",
     "folder",
+    "path",
     "enum",
     "secret",
 ]
@@ -76,7 +97,8 @@ class WorkflowParameterConfig(BaseModel):
     max: float | None = None
     min_length: int | None = None
     max_length: int | None = None
-    pattern: str | None = None
+    pattern: str | None = Field(default=None, json_schema_extra={"format": "regex"})
+    secret: bool = False
 
     @model_validator(mode="after")
     def _validate_schema(self) -> WorkflowParameterConfig:
@@ -85,6 +107,19 @@ class WorkflowParameterConfig(BaseModel):
         if self.pattern:
             re.compile(self.pattern)
         return self
+
+    @property
+    def is_secret(self) -> bool:
+        return self.secret or self.type == "secret"
+
+
+class WorkflowVariableConfig(BaseModel):
+    """The declaration for one mutable, invocation-scoped workflow variable."""
+
+    type: ParameterType | Literal["object", "array", "any"] = "any"
+    initial: Any = None
+    description: str | None = None
+    secret: bool = False
 
 
 class WebhookTriggerConfig(BaseModel):
@@ -99,6 +134,7 @@ class WebhookTriggerConfig(BaseModel):
     concurrency_policy: Literal["allow", "reject_if_running"] = "allow"
     sensitive_payload_fields: list[str] = Field(default_factory=list)
     store_raw_payload: bool = False
+    input_bindings: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
@@ -128,16 +164,16 @@ class FilesystemAccessEntry(BaseModel):
 class WorkflowCanvasGroup(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
-    id: str
+    id: str = Field(pattern=r"[A-Za-z0-9_.:-]{1,128}")
     label: str
-    color: str = "#0f766e"
+    color: str = Field(default="#0f766e", pattern=r"#[0-9A-Fa-f]{6}")
     node_ids: list[str] = Field(default_factory=list, alias="nodeIds")
     x: int = 0
     y: int = 0
-    width: int = 360
-    height: int = 240
+    width: int = Field(default=360, ge=80)
+    height: int = Field(default=240, ge=80)
     collapsed: bool = False
-    opacity: float = 0.08
+    opacity: float = Field(default=0.08, ge=0, le=1)
 
     @field_validator("id")
     @classmethod
@@ -176,6 +212,33 @@ class WorkflowMetadata(BaseModel):
     canvas: WorkflowCanvasMetadata = Field(default_factory=WorkflowCanvasMetadata)
 
 
+class WorkflowComponentConfig(BaseModel):
+    id: str
+    description: str = ""
+    version: str = "0.1.0"
+    inputs: dict[str, WorkflowParameterConfig] = Field(default_factory=dict)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    filesystem_access: list[FilesystemAccessEntry] = Field(default_factory=list)
+    provider_requirements: list[dict[str, str]] = Field(default_factory=list)
+    secret_requirements: list[str] = Field(default_factory=list)
+
+    @field_validator("id")
+    @classmethod
+    def _validate_id(cls, value: str) -> str:
+        return validate_workflow_id(value)
+
+    @field_validator("inputs")
+    @classmethod
+    def _validate_input_names(
+        cls,
+        value: dict[str, WorkflowParameterConfig],
+    ) -> dict[str, WorkflowParameterConfig]:
+        for name in value:
+            if not PARAMETER_NAME_PATTERN.fullmatch(name):
+                raise ValueError(f"Component input {name!r} must match [A-Za-z_][A-Za-z0-9_]*")
+        return value
+
+
 class WorkflowConfig(BaseModel):
     id: str
     name: str
@@ -183,19 +246,41 @@ class WorkflowConfig(BaseModel):
     watch: WatchConfig | None = None
     webhooks: dict[str, WebhookTriggerConfig] = Field(default_factory=dict)
     parameters: dict[str, WorkflowParameterConfig] = Field(default_factory=dict)
+    inputs: dict[str, WorkflowParameterConfig] = Field(default_factory=dict)
+    variables: dict[str, WorkflowVariableConfig] = Field(default_factory=dict)
     resource_limits: ResourceLimits = Field(default_factory=ResourceLimits)
-    llm_budget: LlmUsageBudget = Field(default_factory=LlmUsageBudget)
     run_continuously: bool = False
     max_total_node_runs: int = 1000
     filesystem_access: list[FilesystemAccessEntry] = Field(default_factory=list)
     metadata: WorkflowMetadata = Field(default_factory=WorkflowMetadata)
+    output_schemas: dict[str, dict[str, Any]] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
     def _validate_id(cls, value: str) -> str:
         return validate_workflow_id(value)
 
-    @field_validator("parameters")
+    @field_validator("variables", mode="before")
+    @classmethod
+    def _coerce_variable_declarations(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        return {
+            name: (
+                declaration
+                if isinstance(declaration, WorkflowVariableConfig)
+                or (
+                    isinstance(declaration, dict)
+                    and any(
+                        key in declaration for key in ("type", "initial", "description", "secret")
+                    )
+                )
+                else {"initial": declaration}
+            )
+            for name, declaration in value.items()
+        }
+
+    @field_validator("parameters", "inputs", "variables")
     @classmethod
     def _validate_parameter_names(
         cls,
@@ -203,10 +288,24 @@ class WorkflowConfig(BaseModel):
     ) -> dict[str, WorkflowParameterConfig]:
         for name in value:
             if not PARAMETER_NAME_PATTERN.fullmatch(name):
-                raise ValueError(
-                    f"Parameter name {name!r} must match [A-Za-z_][A-Za-z0-9_]*"
-                )
+                raise ValueError(f"Parameter name {name!r} must match [A-Za-z_][A-Za-z0-9_]*")
         return value
+
+    @model_validator(mode="after")
+    def _validate_input_aliases(self) -> WorkflowConfig:
+        conflicts = sorted(set(self.inputs) & set(self.parameters))
+        for name in conflicts:
+            if self.inputs[name] != self.parameters[name]:
+                raise ValueError(
+                    f"Workflow input '{name}' is declared differently in inputs and parameters"
+                )
+        return self
+
+    @property
+    def declared_inputs(self) -> dict[str, WorkflowParameterConfig]:
+        """Canonical inputs, including legacy ``parameters`` declarations."""
+
+        return {**self.parameters, **self.inputs}
 
 
 WORKFLOW_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
@@ -214,9 +313,7 @@ WORKFLOW_ID_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,127}")
 
 def validate_workflow_id(value: str) -> str:
     if not WORKFLOW_ID_PATTERN.fullmatch(value):
-        raise ValueError(
-            "Workflow id must match [a-z0-9][a-z0-9-]{0,127}"
-        )
+        raise ValueError("Workflow id must match [a-z0-9][a-z0-9-]{0,127}")
     return value
 
 
@@ -226,14 +323,27 @@ def resolve_workflow_parameters(
     defaults: dict[str, Any] | None = None,
     *,
     allow_missing_required: bool = False,
+    invocation_id: str = "preflight",
+    node_id: str = "<invocation>",
 ) -> dict[str, Any]:
     values: dict[str, Any] = {}
     provided = provided or {}
     defaults = defaults or {}
-    unknown = sorted(set(provided) - set(config.parameters))
+    declared = config.declared_inputs
+    unknown = sorted(set(provided) - set(declared))
     if unknown:
-        raise ValueError(f"Unknown workflow parameter(s): {', '.join(unknown)}")
-    for name, parameter in config.parameters.items():
+        field_path = f"inputs.{unknown[0]}"
+        raise ValueError(
+            _workflow_input_diagnostic(
+                config,
+                invocation_id,
+                node_id,
+                field_path,
+                "declared workflow input name",
+                f"unknown workflow input(s): {', '.join(unknown)}",
+            )
+        )
+    for name, parameter in declared.items():
         if name in provided:
             raw = provided[name]
         elif name in defaults:
@@ -244,12 +354,47 @@ def resolve_workflow_parameters(
             if parameter.required:
                 if allow_missing_required:
                     continue
-                raise ValueError(f"Missing required workflow parameter: {name}")
+                raise ValueError(
+                    _workflow_input_diagnostic(
+                        config,
+                        invocation_id,
+                        node_id,
+                        f"inputs.{name}",
+                        parameter.type,
+                        f"missing required workflow input '{name}'",
+                    )
+                )
             if raw == "" and parameter.type in {"string", "text", "multiline"}:
                 values[name] = ""
             continue
-        values[name] = _coerce_parameter_value(name, parameter, raw)
+        try:
+            values[name] = _coerce_parameter_value(name, parameter, raw)
+        except ValueError as exc:
+            raise ValueError(
+                _workflow_input_diagnostic(
+                    config,
+                    invocation_id,
+                    node_id,
+                    f"inputs.{name}",
+                    parameter.type,
+                    str(exc),
+                )
+            ) from exc
     return values
+
+
+def _workflow_input_diagnostic(
+    config: WorkflowConfig,
+    invocation_id: str,
+    node_id: str,
+    field_path: str,
+    expected_type: str,
+    detail: str,
+) -> str:
+    return (
+        f"Workflow '{config.id}' invocation '{invocation_id}', node '{node_id}', "
+        f"field '{field_path}': {detail}; expected type '{expected_type}'"
+    )
 
 
 def masked_workflow_parameters(
@@ -258,9 +403,43 @@ def masked_workflow_parameters(
 ) -> dict[str, Any]:
     return {
         name: "***"
-        if config.parameters.get(name) and config.parameters[name].type == "secret"
+        if config.declared_inputs.get(name) and config.declared_inputs[name].is_secret
         else value
         for name, value in params.items()
+    }
+
+
+def coerce_workflow_variable(
+    name: str,
+    declaration: WorkflowVariableConfig,
+    value: Any,
+) -> Any:
+    if value is None:
+        return None
+    if declaration.type == "any":
+        return value
+    if declaration.type == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"Workflow variable '{name}' must be an object")
+        return value
+    if declaration.type == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"Workflow variable '{name}' must be an array")
+        return value
+    return _coerce_parameter_value(
+        name,
+        WorkflowParameterConfig(type=declaration.type),
+        value,
+    )
+
+
+def masked_workflow_variables(
+    config: WorkflowConfig,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        name: "***" if config.variables.get(name) and config.variables[name].secret else value
+        for name, value in variables.items()
     }
 
 
@@ -302,33 +481,31 @@ def _coerce_parameter_value(
                     if isinstance(value, datetime)
                     else datetime.fromisoformat(str(value)).isoformat()
                 )
-            case "file" | "folder" | "string" | "text" | "multiline" | "secret":
+            case "file" | "folder" | "path" | "string" | "text" | "multiline" | "secret":
                 coerced = str(value)
             case "enum":
                 coerced = value
             case _:
                 coerced = value
     except ValueError as exc:
-        raise ValueError(
-            f"Workflow parameter '{name}' must be a valid {parameter.type}"
-        ) from exc
+        raise ValueError(f"Workflow input '{name}' must be a valid {parameter.type}") from exc
     if parameter.type == "enum" and coerced not in parameter.choices:
         choices = ", ".join(str(choice) for choice in parameter.choices)
-        raise ValueError(f"Workflow parameter '{name}' must be one of: {choices}")
-    if parameter.type in {"string", "text", "multiline", "file", "folder", "secret"}:
+        raise ValueError(f"Workflow input '{name}' must be one of: {choices}")
+    if parameter.type in {"string", "text", "multiline", "file", "folder", "path", "secret"}:
         text = str(coerced)
         if parameter.min_length is not None and len(text) < parameter.min_length:
-            raise ValueError(f"Workflow parameter '{name}' is shorter than {parameter.min_length}")
+            raise ValueError(f"Workflow input '{name}' is shorter than {parameter.min_length}")
         if parameter.max_length is not None and len(text) > parameter.max_length:
-            raise ValueError(f"Workflow parameter '{name}' is longer than {parameter.max_length}")
+            raise ValueError(f"Workflow input '{name}' is longer than {parameter.max_length}")
         if parameter.pattern and re.search(parameter.pattern, text) is None:
-            raise ValueError(f"Workflow parameter '{name}' does not match required pattern")
+            raise ValueError(f"Workflow input '{name}' does not match required pattern")
     if parameter.type == "number":
         number = float(coerced)
         if parameter.min is not None and number < parameter.min:
-            raise ValueError(f"Workflow parameter '{name}' must be >= {parameter.min}")
+            raise ValueError(f"Workflow input '{name}' must be >= {parameter.min}")
         if parameter.max is not None and number > parameter.max:
-            raise ValueError(f"Workflow parameter '{name}' must be <= {parameter.max}")
+            raise ValueError(f"Workflow input '{name}' must be <= {parameter.max}")
     return coerced
 
 
@@ -337,8 +514,11 @@ _op_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 _GRAPH_NODE_FIELDS = {
     "allow_failure",
     "await_all_inputs",
+    "fail_fast",
+    "for_each",
     "inputs",
     "label",
+    "max_concurrency",
     "pipe_output",
     "retry_count",
     "retry_delay_seconds",
@@ -364,8 +544,13 @@ def _resolve_config_path(path: Path, path_base: Path | None) -> Path:
 
 
 class AgenticWorkflow:
-    def __init__(self, config: WorkflowConfig) -> None:
+    def __init__(
+        self,
+        config: WorkflowConfig,
+        component: WorkflowComponentConfig | None = None,
+    ) -> None:
         self.config = config
+        self.component = component
         self.graph = WorkflowGraph()
         self.agents: dict[str, AgentConfig] = {}
 
@@ -391,6 +576,42 @@ class AgenticWorkflow:
         path_base = workflow_path.parent if workflow_path is not None else None
         profile_data_dir = data_dir if data_dir is not None else path_base
         self.graph.validate()
+        available_variables: set[str] = set()
+        secret_values = {
+            name
+            for name, declaration in self.config.declared_inputs.items()
+            if declaration.is_secret
+        }
+        for name, declaration in self.config.variables.items():
+            serialized_initial = str(declaration.initial)
+            derives_secret = False
+            for expression in re.findall(r"\{\{\s*([^{}]+?)\s*\}\}", serialized_initial):
+                parts = expression.strip().split(".")
+                if parts[0] in {"inputs", "params"} and (
+                    len(parts) < 2 or parts[1] not in self.config.declared_inputs
+                ):
+                    raise ValueError(
+                        f"Initial value for workflow variable '{name}' references unknown "
+                        f"input '{'.'.join(parts[1:]) or '<missing>'}'"
+                    )
+                if parts[0] == "vars" and (len(parts) < 2 or parts[1] not in available_variables):
+                    raise ValueError(
+                        f"Initial value for workflow variable '{name}' references unavailable "
+                        f"variable '{'.'.join(parts[1:]) or '<missing>'}'. Variables may only "
+                        "reference earlier declarations."
+                    )
+                if len(parts) >= 2 and parts[0] in {"inputs", "params", "vars"}:
+                    derives_secret = derives_secret or parts[1] in secret_values
+                if parts[0] == "secret":
+                    derives_secret = True
+            if derives_secret and not declaration.secret:
+                raise ValueError(
+                    f"Workflow variable '{name}' derives from a secret input or variable and "
+                    "must declare secret = true"
+                )
+            if declaration.secret:
+                secret_values.add(name)
+            available_variables.add(name)
         for agent in self.agents.values():
             configured_extra_paths(agent, path_base)
         for node in self.graph.nodes_in_order():
@@ -402,8 +623,10 @@ class AgenticWorkflow:
                         agent_subscription=provider_agent.subscription,
                         profile_name=provider_agent.profile,
                         agent_model=provider_agent.model,
+                        agent_effort=provider_agent.effort,
                         operation_profile=op.profile,
                         operation_model=op.model,
+                        operation_effort=op.effort,
                         operation_timeout=op.timeout,
                         data_dir=profile_data_dir,
                     )
@@ -411,22 +634,16 @@ class AgenticWorkflow:
                     missing_secrets = unresolved_provider_secret_refs(settings)
                     if missing_secrets:
                         names = ", ".join(missing_secrets)
-                        profile = (
-                            f" '{settings.profile_name}'"
-                            if settings.profile_name
-                            else ""
-                        )
+                        profile = f" '{settings.profile_name}'" if settings.profile_name else ""
                         raise ValueError(
-                            f"Provider profile{profile} has missing secret "
-                            f"reference(s): {names}"
+                            f"Provider profile{profile} has missing secret reference(s): {names}"
                         )
         node_ids = {node.node_id for node in self.graph.nodes_in_order()}
         for group in self.config.metadata.canvas.groups:
             unknown = sorted(set(group.node_ids) - node_ids)
             if unknown:
                 raise ValueError(
-                    f"Canvas group '{group.id}' references unknown node(s): "
-                    f"{', '.join(unknown)}"
+                    f"Canvas group '{group.id}' references unknown node(s): {', '.join(unknown)}"
                 )
         missing_auth_webhooks = [
             trigger_id
@@ -500,9 +717,7 @@ class AgenticWorkflow:
                 )
                 if source_path.exists() and source_path.is_dir():
                     iterator = (
-                        source_path.rglob(op.glob)
-                        if op.recursive
-                        else source_path.glob(op.glob)
+                        source_path.rglob(op.glob) if op.recursive else source_path.glob(op.glob)
                     )
                     scanned = _count_paths_until(iterator, limits.max_files_scanned + 1)
                     if scanned > limits.max_files_scanned:
@@ -534,7 +749,13 @@ class AgenticWorkflow:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> AgenticWorkflow:
+        data = _without_dashboard_nodes(data)
         wf_data = data["workflow"]
+        if "llm_budget" in wf_data:
+            raise ValueError(
+                "workflow.llm_budget has been removed; configure usage limits with the "
+                "model provider instead"
+            )
         schedule = None
         if "schedule" in wf_data:
             schedule = ScheduleConfig(**wf_data["schedule"])
@@ -546,6 +767,22 @@ class AgenticWorkflow:
             for trigger_id, trigger_data in wf_data.get("webhooks", {}).items()
             if isinstance(trigger_data, dict)
         }
+        raw_inputs = wf_data.get("inputs", {})
+        raw_parameters = wf_data.get("parameters", {})
+        overlap = sorted(set(raw_inputs) & set(raw_parameters))
+        if overlap:
+            raise ValueError(
+                "Workflow input(s) cannot be declared in both inputs and parameters: "
+                + ", ".join(overlap)
+            )
+
+        def _variable_config(value: Any) -> WorkflowVariableConfig:
+            if isinstance(value, dict) and any(
+                key in value for key in ("type", "initial", "description", "secret")
+            ):
+                return WorkflowVariableConfig(**value)
+            return WorkflowVariableConfig(initial=value)
+
         config = WorkflowConfig(
             id=wf_data["id"],
             name=wf_data["name"],
@@ -554,11 +791,19 @@ class AgenticWorkflow:
             webhooks=webhooks,
             parameters={
                 str(name): WorkflowParameterConfig(**param_data)
-                for name, param_data in wf_data.get("parameters", {}).items()
+                for name, param_data in raw_parameters.items()
                 if isinstance(param_data, dict)
             },
+            inputs={
+                str(name): WorkflowParameterConfig(**input_data)
+                for name, input_data in raw_inputs.items()
+                if isinstance(input_data, dict)
+            },
+            variables={
+                str(name): _variable_config(variable_data)
+                for name, variable_data in wf_data.get("variables", {}).items()
+            },
             resource_limits=ResourceLimits(**wf_data.get("resource_limits", {})),
-            llm_budget=LlmUsageBudget(**wf_data.get("llm_budget", {})),
             run_continuously=bool(wf_data.get("run_continuously", False)),
             max_total_node_runs=wf_data.get("max_total_node_runs", 1000),
             filesystem_access=[
@@ -567,8 +812,44 @@ class AgenticWorkflow:
                 if isinstance(entry, dict)
             ],
             metadata=WorkflowMetadata(**wf_data.get("metadata", {})),
+            output_schemas={
+                str(name): schema
+                for name, schema in wf_data.get("output_schemas", {}).items()
+                if isinstance(schema, dict)
+            },
         )
-        workflow = cls(config)
+        component = None
+        if isinstance(data.get("component"), dict):
+            component_data = dict(data["component"])
+            component = WorkflowComponentConfig(
+                id=str(component_data.get("id") or config.id),
+                description=str(component_data.get("description") or ""),
+                version=str(component_data.get("version") or "0.1.0"),
+                inputs={
+                    str(name): WorkflowParameterConfig(**param_data)
+                    for name, param_data in component_data.get("inputs", {}).items()
+                    if isinstance(param_data, dict)
+                },
+                outputs={
+                    str(name): value for name, value in component_data.get("outputs", {}).items()
+                }
+                if isinstance(component_data.get("outputs", {}), dict)
+                else {},
+                filesystem_access=[
+                    FilesystemAccessEntry(**entry)
+                    for entry in component_data.get("filesystem_access", [])
+                    if isinstance(entry, dict)
+                ],
+                provider_requirements=[
+                    {str(k): str(v) for k, v in entry.items()}
+                    for entry in component_data.get("provider_requirements", [])
+                    if isinstance(entry, dict)
+                ],
+                secret_requirements=[
+                    str(item) for item in component_data.get("secret_requirements", [])
+                ],
+            )
+        workflow = cls(config, component=component)
 
         for agent_id, agent_data in data.get("agents", {}).items():
             workflow.register_agent(AgentConfig(agent_id=agent_id, **agent_data))
@@ -579,6 +860,11 @@ class AgenticWorkflow:
         for node_data in data.get("nodes", []):
             node_data = dict(node_data)
             node_id = node_data.pop("id")
+            removed_fields = sorted({"change_tracking", "llm_budget"} & node_data.keys())
+            if removed_fields:
+                raise ValueError(
+                    f"Node '{node_id}' uses removed field(s): {', '.join(removed_fields)}"
+                )
 
             # Extract GraphNode-level fields before passing to operation adapter
             node_kwargs: dict[str, Any] = {}
@@ -606,6 +892,9 @@ class AgenticWorkflow:
                 to_node=edge["to"],
                 condition=condition,
                 output_pattern=edge.get("output_pattern"),
+                field=edge.get("field"),
+                operator=edge.get("operator"),
+                value=edge.get("value"),
             )
             workflow.then(edge["from"], edge["to"], edge_config)
 
@@ -637,6 +926,7 @@ class AgenticWorkflow:
                 "name": self.config.name,
             }
         }
+
         def _paths_to_str(obj: Any) -> Any:
             if isinstance(obj, Path):
                 return str(obj)
@@ -664,12 +954,31 @@ class AgenticWorkflow:
                 name: parameter.model_dump(exclude_defaults=True, exclude_none=True)
                 for name, parameter in self.config.parameters.items()
             }
+        if self.config.inputs:
+            data["workflow"]["inputs"] = {
+                name: input_.model_dump(exclude_defaults=True, exclude_none=True)
+                for name, input_ in self.config.inputs.items()
+            }
+        if self.config.variables:
+            variables: dict[str, Any] = {}
+            for name, variable in self.config.variables.items():
+                if (
+                    variable.type == "any"
+                    and variable.initial is not None
+                    and variable.description is None
+                    and not variable.secret
+                ):
+                    variables[name] = variable.initial
+                else:
+                    variables[name] = variable.model_dump(
+                        exclude_defaults=True,
+                        exclude_none=True,
+                    )
+            data["workflow"]["variables"] = variables
+        if self.config.output_schemas:
+            data["workflow"]["output_schemas"] = self.config.output_schemas
         if self.config.resource_limits != ResourceLimits():
             data["workflow"]["resource_limits"] = self.config.resource_limits.model_dump()
-        if self.config.llm_budget.enabled():
-            data["workflow"]["llm_budget"] = self.config.llm_budget.model_dump(
-                exclude_none=True
-            )
         if self.config.run_continuously:
             data["workflow"]["run_continuously"] = True
         if self.config.max_total_node_runs != 1000:
@@ -683,6 +992,13 @@ class AgenticWorkflow:
             data["workflow"]["metadata"] = self.config.metadata.model_dump(
                 exclude_defaults=True,
                 exclude_none=True,
+            )
+        if self.component is not None:
+            data["component"] = _paths_to_str(
+                self.component.model_dump(
+                    exclude_defaults=True,
+                    exclude_none=True,
+                )
             )
 
         if self.agents:
@@ -713,6 +1029,12 @@ class AgenticWorkflow:
                 node_dict["label"] = node.label
             if node.inputs:
                 node_dict["inputs"] = node.inputs
+            if node.for_each:
+                node_dict["for_each"] = node.for_each
+            if node.max_concurrency != 1:
+                node_dict["max_concurrency"] = node.max_concurrency
+            if node.fail_fast is not False:
+                node_dict["fail_fast"] = node.fail_fast
             if node.pipe_output:
                 node_dict["pipe_output"] = True
             if node.allow_failure:
@@ -736,9 +1058,47 @@ class AgenticWorkflow:
                 edge_dict["condition"] = edge_cfg.condition.value
             if edge_cfg.output_pattern is not None:
                 edge_dict["output_pattern"] = edge_cfg.output_pattern
+            if edge_cfg.field is not None:
+                edge_dict["field"] = edge_cfg.field
+            if edge_cfg.operator is not None:
+                edge_dict["operator"] = edge_cfg.operator.value
+            if edge_cfg.condition == EdgeConditionType.OUTPUT_FIELD and edge_cfg.value is not None:
+                edge_dict["value"] = edge_cfg.value
             edges.append(edge_dict)
 
         if edges:
             data["edges"] = edges
 
         path.write_bytes(_tomli_w.dumps(data).encode())
+
+
+def _without_dashboard_nodes(data: dict[str, Any]) -> dict[str, Any]:
+    """Drop retired dashboard nodes and their edges from legacy workflow data."""
+    cleaned = dict(data)
+    removed_ids = {
+        str(node.get("id"))
+        for node in data.get("nodes", [])
+        if isinstance(node, dict)
+        and (
+            node.get("type") == "dashboard_item"
+            or (
+                node.get("type") == "loop"
+                and isinstance(node.get("source"), dict)
+                and node["source"].get("type") == "dashboard_items"
+            )
+        )
+    }
+    if not removed_ids:
+        return cleaned
+    cleaned["nodes"] = [
+        node
+        for node in data.get("nodes", [])
+        if not isinstance(node, dict) or str(node.get("id")) not in removed_ids
+    ]
+    cleaned["edges"] = [
+        edge
+        for edge in data.get("edges", [])
+        if not isinstance(edge, dict)
+        or (str(edge.get("from")) not in removed_ids and str(edge.get("to")) not in removed_ids)
+    ]
+    return cleaned

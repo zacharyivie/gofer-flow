@@ -7,7 +7,7 @@ import re
 import shutil
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import typer
 from rich.console import Console
@@ -31,9 +31,6 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     CopyFileOperation,
     CountFanSource,
-    DashboardItemOperation,
-    DashboardItemsFanSource,
-    DashboardUpdateInstruction,
     DeleteFileOperation,
     DirectoryFanSource,
     FailOperation,
@@ -70,6 +67,7 @@ from gofer.core.revisions import (
 )
 from gofer.core.run_outputs import write_run_node_outputs_payload
 from gofer.core.secrets import workflow_secret_readiness
+from gofer.core.structured_output import OutputFieldOperator
 from gofer.core.templates import (
     create_workflow_from_template,
     list_workflow_templates,
@@ -291,7 +289,7 @@ def _prompt_missing_params(wf: AgenticWorkflow, params: dict[str, Any]) -> dict[
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         return params
     prompted = dict(params)
-    for name, spec in wf.config.parameters.items():
+    for name, spec in wf.config.declared_inputs.items():
         if name in prompted or spec.default is not None or not spec.required:
             continue
         if spec.type == "boolean":
@@ -410,15 +408,6 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
             f"max_node_runs={execution_limits.get('maxTotalNodeRuns')}"
         )
 
-    usage_budget = plan.get("usageBudget") or {}
-    if isinstance(usage_budget, dict) and usage_budget.get("enabled"):
-        budget_parts = [
-            f"{key}={value}"
-            for key, value in usage_budget.items()
-            if key != "enabled" and value is not None
-        ]
-        console.print("[bold]Usage budget:[/bold] " + ", ".join(budget_parts))
-
     projected_usage = plan.get("projectedLlmUsage") or {}
     if isinstance(projected_usage, dict) and projected_usage.get("agent_calls"):
         console.print(
@@ -428,9 +417,9 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
             f"cost~${float(projected_usage.get('estimated_cost') or 0.0):.6f}"
         )
 
-    parameters = plan.get("parameters") or {}
+    parameters = plan.get("inputs") or plan.get("parameters") or {}
     if isinstance(parameters, dict) and parameters:
-        console.print("[bold]Workflow parameters:[/bold]")
+        console.print("[bold]Workflow inputs:[/bold]")
         for name, value in parameters.items():
             console.print(f"  • {name}={value}")
 
@@ -463,11 +452,7 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
                 f"  • {branch.get('from')} -> {branch.get('to')} when {branch.get('label')}"
             )
 
-    unresolved = plan.get("unresolvedDynamicValues") or []
-    if unresolved:
-        console.print("[yellow]Unresolved dynamic values:[/yellow]")
-        for value in unresolved:
-            console.print(f"  • {value}")
+    _print_binding_report(plan.get("bindings") or [])
 
     for generation in plan.get("generations") or []:
         table = Table(title=f"Generation {generation['index']}", show_lines=False)
@@ -486,14 +471,6 @@ def _print_execution_plan(plan: dict[str, Any]) -> None:
                     samples = [_format_plan_sample(item) for item in fan_out["sampleItems"]]
                     fan_text += f" samples={'; '.join(samples)}"
             impact = "; ".join(node.get("sideEffects") or []) or node.get("detail", "")
-            if node.get("unresolvedDynamicValues"):
-                impact = "; ".join(
-                    [
-                        impact,
-                        "unresolved: "
-                        + ", ".join(str(value) for value in node["unresolvedDynamicValues"]),
-                    ]
-                ).strip("; ")
             policy_parts = []
             if node.get("timeoutSeconds") is not None:
                 policy_parts.append(f"timeout={node.get('timeoutSeconds')}s")
@@ -566,11 +543,31 @@ def _print_validate_http_diagnostics(plan: dict[str, Any]) -> None:
             "[yellow]Required secrets:[/yellow] "
             + ", ".join(_secret_name(item) for item in required_secrets)
         )
-    unresolved = plan.get("unresolvedDynamicValues") or []
-    if unresolved:
-        console.print("[yellow]Unresolved dynamic values:[/yellow]")
-        for value in unresolved:
-            console.print(f"  • {value}")
+
+
+def _print_binding_report(bindings: list[dict[str, Any]]) -> None:
+    if not bindings:
+        return
+    console.print("[bold]Runtime bindings:[/bold]")
+    for binding in bindings:
+        status = str(binding.get("status") or "runtime-bound")
+        color = "red" if status in {"invalid", "type-incompatible"} else "cyan"
+        destination = f"{binding.get('destinationNode')}.{binding.get('destinationField')}"
+        source = str(binding.get("expression") or "")
+        source_type = str(binding.get("sourceType") or "unknown")
+        destination_type = str(binding.get("destinationType") or "unknown")
+        phase = str(binding.get("resolutionPhase") or "runtime")
+        coercion = str(binding.get("coercion") or "none")
+        line = (
+            f"  • [{color}]{status}[/{color}] {destination} <- {source} "
+            f"({source_type} -> {destination_type}, {phase}"
+        )
+        if coercion != "none":
+            line += f", {coercion} coercion"
+        readiness = binding.get("readiness")
+        if readiness:
+            line += f", secret {readiness}"
+        console.print(line + f") [dim]{binding.get('id') or ''}[/dim]")
 
 
 def _format_plan_sample(item: Any) -> str:
@@ -652,14 +649,16 @@ def _parse_json_dict(value: str | None, option_name: str) -> dict[str, object]:
     return parsed
 
 
-def _parse_dashboard_updates(values: list[str] | None) -> list[DashboardUpdateInstruction]:
-    updates: list[DashboardUpdateInstruction] = []
-    for value in values or []:
-        parsed = _parse_json_value(value, "--dashboard-update-json")
-        if not isinstance(parsed, dict):
-            raise typer.BadParameter("--dashboard-update-json must be a JSON object")
-        updates.append(DashboardUpdateInstruction.model_validate(parsed))
-    return updates
+def _parse_output_schema(value: str | None) -> str | dict[str, object] | None:
+    if value is None or not value.strip():
+        return None
+    stripped = value.strip()
+    if not stripped.startswith("{"):
+        return stripped
+    parsed = _parse_json_value(stripped, "--output-schema")
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter("--output-schema JSON must be an object")
+    return parsed
 
 
 def _save_workflow(wf: AgenticWorkflow, path: Path) -> None:
@@ -681,9 +680,6 @@ def _fan_source_from_options(
     fan_include_content: bool,
     fan_max_concurrency: int,
     fan_fail_fast: bool,
-    dashboard_name: str | None,
-    dashboard_component: str | None,
-    dashboard_filter: str | None,
 ) -> Any | None:
     if fan_source is None:
         return None
@@ -693,7 +689,7 @@ def _fan_source_from_options(
         count = int(fan_count) if fan_count.isdigit() else fan_count
         return CountFanSource(
             type="count",
-            count=count,
+            count=cast(Any, count),
             max_concurrency=fan_max_concurrency,
             fail_fast=fan_fail_fast,
         )
@@ -724,24 +720,10 @@ def _fan_source_from_options(
             max_concurrency=fan_max_concurrency,
             fail_fast=fan_fail_fast,
         )
-    if normalized in {"dashboard-items", "dashboard_items"}:
-        if not dashboard_name:
-            raise typer.BadParameter("--dashboard is required for dashboard-items fan-out")
-        if not dashboard_component:
-            raise typer.BadParameter("--component is required for dashboard-items fan-out")
-        return DashboardItemsFanSource(
-            type="dashboard_items",
-            dashboard=dashboard_name,
-            component=dashboard_component,
-            filter=dashboard_filter,
-            max_concurrency=fan_max_concurrency,
-            fail_fast=fan_fail_fast,
-        )
     if normalized == "infinite":
         return InfiniteFanSource(type="infinite")
     raise typer.BadParameter(
-        "--fan-source must be one of count, tabular, directory, trigger-events, "
-        "dashboard-items, infinite"
+        "--fan-source must be one of count, tabular, directory, trigger-events, infinite"
     )
 
 
@@ -780,6 +762,8 @@ def _operation_from_options(
     dynamic_count: str,
     memory: str,
     input_mapping: dict[str, str],
+    output_schema: str | dict[str, object] | None,
+    repair_attempts: int,
     env: dict[str, str],
     args: list[str],
     create_dirs: bool,
@@ -830,16 +814,6 @@ def _operation_from_options(
     notification_retry_statuses: list[int],
     notification_expected_statuses: list[int],
     notification_network_allowlist: list[str],
-    dashboard_action: str,
-    dashboard_name: str | None,
-    dashboard_component: str | None,
-    dashboard_item_id: str | None,
-    dashboard_item: dict[str, object],
-    dashboard_patch: dict[str, object],
-    dashboard_filter: str | dict[str, object] | None,
-    dashboard_field: str,
-    dashboard_value: object | None,
-    dashboard_updates: list[DashboardUpdateInstruction],
 ) -> Operation:
     normalized = node_type.replace("-", "_")
     match normalized:
@@ -951,7 +925,7 @@ def _operation_from_options(
             return OpenResourceOperation(
                 type=OperationType.OPEN_RESOURCE,
                 target=target,
-                resource_type=resource_type,  # type: ignore[arg-type]
+                resource_type=resource_type,
                 args=args,
             )
         case OperationType.PROMPT_FILE:
@@ -977,15 +951,17 @@ def _operation_from_options(
             return CommonLlmTaskOperation(
                 type=OperationType.COMMON_LLM_TASK,
                 agent_id=agent_id,
-                task=task,  # type: ignore[arg-type]
+                task=task,
                 target=target_text,
                 instructions=instructions,
                 working_dir=working_dir,
                 profile=profile,
                 model=model,
                 timeout=provider_timeout,
-                memory=memory,  # type: ignore[arg-type]
+                memory=memory,
                 input_mapping=input_mapping,
+                output_schema=output_schema,
+                repair_attempts=repair_attempts,
             )
         case OperationType.LOCAL_VECTORIZE:
             if source_path is None or index_path is None:
@@ -1002,7 +978,7 @@ def _operation_from_options(
                 index_path=index_path,
                 glob=fan_glob,
                 recursive=recursive,
-                mode=vector_mode,  # type: ignore[arg-type]
+                mode=vector_mode,
             )
         case OperationType.LOCAL_SEARCH:
             if index_path is None:
@@ -1036,7 +1012,7 @@ def _operation_from_options(
                     retry_on_statuses=http_retry_statuses,
                 ),
                 expected_statuses=http_expected_statuses,
-                response_mode=http_response_mode,  # type: ignore[arg-type]
+                response_mode=http_response_mode,
                 output_mapping=http_output_mapping,
                 secret_fields=http_secret_fields,
             )
@@ -1049,7 +1025,7 @@ def _operation_from_options(
                 type=OperationType.APPROVAL_GATE,
                 message=message,
                 timeout_seconds=approval_timeout_seconds,
-                timeout_decision=approval_timeout_decision,  # type: ignore[arg-type]
+                timeout_decision=approval_timeout_decision,
                 approvers=approval_approvers,
                 notify=approval_notify,
                 notification_title=notification_title,
@@ -1065,8 +1041,8 @@ def _operation_from_options(
                 type=OperationType.NOTIFICATION,
                 title=notification_title,
                 body=notification_body or message,
-                channel=notification_channel,  # type: ignore[arg-type]
-                urgency=notification_urgency,  # type: ignore[arg-type]
+                channel=notification_channel,
+                urgency=notification_urgency,
                 webhook_url=notification_webhook_url,
                 headers=notification_headers,
                 payload=notification_payload,
@@ -1085,27 +1061,6 @@ def _operation_from_options(
                 ),
                 expected_statuses=notification_expected_statuses,
                 network_allowlist=notification_network_allowlist,
-            )
-        case OperationType.DASHBOARD_ITEM:
-            if dashboard_name is None or dashboard_component is None:
-                raise typer.BadParameter(
-                    "--dashboard and --component are required for dashboard_item nodes"
-                )
-            if dashboard_action not in {"read", "add", "update", "delete", "move"}:
-                raise typer.BadParameter(
-                    "--dashboard-action must be one of read, add, update, delete, move"
-                )
-            return DashboardItemOperation(
-                type=OperationType.DASHBOARD_ITEM,
-                action=dashboard_action,  # type: ignore[arg-type]
-                dashboard=dashboard_name,
-                component=dashboard_component,
-                item_id=dashboard_item_id,
-                item=dashboard_item,
-                patch=dashboard_patch,
-                filter=dashboard_filter,
-                field=dashboard_field,
-                value=dashboard_value,
             )
         case OperationType.AGENT:
             if agent_id is None or working_dir is None:
@@ -1127,9 +1082,10 @@ def _operation_from_options(
                 model=model,
                 timeout=provider_timeout,
                 skill_name=skill_name,
-                memory=memory,  # type: ignore[arg-type]
+                memory=memory,
                 input_mapping=input_mapping,
-                dashboard_updates=dashboard_updates,
+                output_schema=output_schema,
+                repair_attempts=repair_attempts,
             )
     raise typer.BadParameter(
         "node type must be one of "
@@ -1137,7 +1093,7 @@ def _operation_from_options(
         "agent, read_file, write_file, "
         "copy_file, move_file, delete_file, file, folder, open_resource, prompt_file, "
         "common_llm_task, local_vectorize, local_search, http_request, "
-        "approval_gate, notification, dashboard_item"
+        "approval_gate, notification"
     )
 
 
@@ -1161,6 +1117,16 @@ def run(
         "--params-json",
         help="Workflow parameters as a JSON object",
     ),
+    input_: list[str] | None = typer.Option(
+        None,
+        "--input",
+        help="Workflow input as KEY=VALUE. May be repeated.",
+    ),
+    inputs_json: str | None = typer.Option(
+        None,
+        "--inputs-json",
+        help="Workflow inputs as a JSON object",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Execute a workflow by name or file path."""
@@ -1176,9 +1142,22 @@ def run(
     _print_agent_access_summary(wf, workflow_path.parent)
     trigger_context = _parse_trigger_context(trigger_json)
     try:
+        legacy_values = _parse_param_values(param, params_json)
+        input_values = _parse_param_values(input_, inputs_json)
+        overlap = sorted(set(legacy_values) & set(input_values))
+        if overlap:
+            raise ValueError(
+                "Inputs cannot be supplied with both --input and --param: " + ", ".join(overlap)
+            )
         run_parameters = resolve_workflow_parameters(
             wf.config,
-            _prompt_missing_params(wf, _parse_param_values(param, params_json)),
+            _prompt_missing_params(
+                wf,
+                {
+                    **legacy_values,
+                    **input_values,
+                },
+            ),
         )
     except ValueError as exc:
         console.print(f"[red]{exc}[/red]")
@@ -1190,8 +1169,10 @@ def run(
             workflow_path=workflow_path,
             data_dir=profile_data_dir,
             trigger_context=trigger_context,
+            invocation_inputs=run_parameters,
         )
-        plan["parameters"] = run_parameters
+        plan["inputs"] = masked_workflow_parameters(wf.config, run_parameters)
+        plan["parameters"] = plan["inputs"]
         _print_execution_plan(plan)
         return
     if wf.config.run_continuously:
@@ -1440,6 +1421,12 @@ def plan(
         "--params-json",
         help="Workflow parameters as a JSON object",
     ),
+    input_: list[str] | None = typer.Option(
+        None, "--input", help="Workflow input as KEY=VALUE. May be repeated."
+    ),
+    inputs_json: str | None = typer.Option(
+        None, "--inputs-json", help="Workflow inputs as a JSON object"
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Preview execution order, fan-out, provider calls, and side effects."""
@@ -1447,9 +1434,16 @@ def plan(
         wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
         profile_data_dir = data_dir or get_data_dir()
         trigger_context = _parse_trigger_context(trigger_json)
+        legacy_values = _parse_param_values(param, params_json)
+        input_values = _parse_param_values(input_, inputs_json)
+        overlap = sorted(set(legacy_values) & set(input_values))
+        if overlap:
+            raise ValueError(
+                "Inputs cannot be supplied with both --input and --param: " + ", ".join(overlap)
+            )
         run_parameters = resolve_workflow_parameters(
             wf.config,
-            _parse_param_values(param, params_json),
+            {**legacy_values, **input_values},
             allow_missing_required=True,
         )
         plan_payload = build_execution_plan(
@@ -1457,8 +1451,10 @@ def plan(
             workflow_path=workflow_path,
             data_dir=profile_data_dir,
             trigger_context=trigger_context,
+            invocation_inputs=run_parameters,
         )
-        plan_payload["parameters"] = masked_workflow_parameters(wf.config, run_parameters)
+        plan_payload["inputs"] = masked_workflow_parameters(wf.config, run_parameters)
+        plan_payload["parameters"] = plan_payload["inputs"]
     except Exception as exc:
         console.print(f"[red]Plan failed: {exc}[/red]")
         raise typer.Exit(1)
@@ -1844,6 +1840,11 @@ def validate(
         "--json",
         help="Emit machine-readable JSON diagnostics",
     ),
+    explain_bindings: bool = typer.Option(
+        False,
+        "--explain-bindings",
+        help="Explain reference producers, types, coercion, and resolution phases",
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
     """Validate a workflow by name or file path."""
@@ -1852,7 +1853,8 @@ def validate(
         profile_data_dir = data_dir or get_data_dir()
         report = validate_workflow_file(workflow_path, data_dir=profile_data_dir)
         if json_output:
-            console.print(json.dumps(report.to_dict(), indent=2))
+            sys.stdout.write(json.dumps(report.to_dict(), indent=2))
+            sys.stdout.write("\n")
             if not report.ok:
                 raise typer.Exit(1)
             return
@@ -1861,9 +1863,13 @@ def validate(
                 console.print(f"[red]✗[/red] {diagnostic.message}")
             for diagnostic in report.warnings:
                 console.print(f"[yellow]![/yellow] {diagnostic.message}")
+            if explain_bindings:
+                _print_binding_report([binding.to_dict() for binding in report.bindings])
             raise typer.Exit(1)
         for diagnostic in report.warnings:
             console.print(f"[yellow]![/yellow] {diagnostic.message}")
+        if explain_bindings:
+            _print_binding_report([binding.to_dict() for binding in report.bindings])
         wf.validate(workflow_path, profile_data_dir)
         _print_validate_http_diagnostics(
             build_execution_plan(
@@ -1877,7 +1883,7 @@ def validate(
         if isinstance(exc, typer.Exit):
             raise
         if json_output:
-            console.print(
+            sys.stdout.write(
                 json.dumps(
                     {
                         "ok": False,
@@ -1897,6 +1903,7 @@ def validate(
                     indent=2,
                 )
             )
+            sys.stdout.write("\n")
             raise typer.Exit(1)
         console.print(f"[red]✗[/red] Validation failed: {exc}")
         raise typer.Exit(1)
@@ -2544,6 +2551,18 @@ def add_node(
     input_mapping_json: str | None = typer.Option(
         None, "--input-mapping-json", help="Agent input mapping JSON object"
     ),
+    output_schema: str | None = typer.Option(
+        None,
+        "--output-schema",
+        help="Named output schema or inline JSON Schema object for agent/common LLM nodes",
+    ),
+    repair_attempts: int = typer.Option(
+        0,
+        "--repair-attempts",
+        min=0,
+        max=3,
+        help="Structured-output repair attempts for agent/common LLM nodes",
+    ),
     variable: list[str] | None = typer.Option(
         None, "--variable", help="Prompt template variable KEY=CTX_PATH_OR_VALUE"
     ),
@@ -2578,7 +2597,7 @@ def add_node(
     fan_source: str | None = typer.Option(
         None,
         "--fan-source",
-        help="loop source: count, tabular, directory, trigger-events, dashboard-items, or infinite",
+        help="loop source: count, tabular, directory, trigger-events, or infinite",
     ),
     fan_count: str = typer.Option("1", "--fan-count"),
     fan_path: Path | None = typer.Option(None, "--fan-path"),
@@ -2625,7 +2644,7 @@ def add_node(
         False, "--notify", help="Send a desktop notification for approval_gate"
     ),
     notification_title: str = typer.Option(
-        "Gofer Flow notification", "--title", help="Notification or approval title"
+        "Taskurotta notification", "--title", help="Notification or approval title"
     ),
     notification_body: str = typer.Option("", "--notification-body", help="Notification body"),
     notification_channel: str = typer.Option("desktop", "--channel", help="Notification channel"),
@@ -2678,39 +2697,13 @@ def add_node(
     notification_network_allowlist: list[str] | None = typer.Option(
         None, "--notification-network-allowlist", help="Allowed webhook host or CIDR"
     ),
-    dashboard_action: str = typer.Option(
-        "read", "--dashboard-action", help="Dashboard item action: read, add, update, delete, move"
-    ),
-    dashboard_name: str | None = typer.Option(
-        None, "--dashboard", help="Dashboard name or ID for dashboard_item nodes"
-    ),
-    dashboard_component: str | None = typer.Option(
-        None, "--component", help="Dashboard component ID for dashboard_item nodes"
-    ),
-    dashboard_item_id: str | None = typer.Option(
-        None, "--item-id", help="Dashboard item ID for update/delete/move"
-    ),
-    dashboard_item_json: str | None = typer.Option(
-        None, "--item-json", help="Dashboard item JSON object for add"
-    ),
-    dashboard_patch_json: str | None = typer.Option(
-        None, "--patch-json", help="Dashboard patch JSON object for update"
-    ),
-    dashboard_filter: str | None = typer.Option(
-        None, "--filter", help="Dashboard read filter, such as status=backlog"
-    ),
-    dashboard_field: str = typer.Option("status", "--field", help="Dashboard move field"),
-    dashboard_value_json: str | None = typer.Option(
-        None, "--value-json", help="Dashboard move value as JSON"
-    ),
-    dashboard_update_json: list[str] | None = typer.Option(
-        None,
-        "--dashboard-update-json",
-        help="Agent dashboard write-back instruction JSON object; repeatable",
-    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Add or replace a workflow node."""
+    """Add or replace a workflow node.
+
+    Machine-readable options and operation fields: gof schema --command
+    workflow.add-node and gof schema --operation TYPE.
+    """
     try:
         wf, workflow_path = _resolve_workflow_with_path(workflow, data_dir)
     except KeyError as exc:
@@ -2754,6 +2747,8 @@ def add_node(
             dynamic_count=dynamic_count,
             memory=memory,
             input_mapping=mapping,
+            output_schema=_parse_output_schema(output_schema),
+            repair_attempts=repair_attempts,
             env=_parse_key_values(env, "--env"),
             args=arg or [],
             create_dirs=create_dirs,
@@ -2773,9 +2768,6 @@ def add_node(
                 fan_include_content,
                 fan_max_concurrency,
                 fan_fail_fast,
-                dashboard_name,
-                dashboard_component,
-                dashboard_filter,
             ),
             http_method=http_method,
             http_url=http_url,
@@ -2821,16 +2813,6 @@ def add_node(
             notification_retry_statuses=notification_retry_status or [],
             notification_expected_statuses=notification_expected_status or [200, 201, 202, 204],
             notification_network_allowlist=notification_network_allowlist or [],
-            dashboard_action=dashboard_action,
-            dashboard_name=dashboard_name,
-            dashboard_component=dashboard_component,
-            dashboard_item_id=dashboard_item_id,
-            dashboard_item=_parse_json_dict(dashboard_item_json, "--item-json"),
-            dashboard_patch=_parse_json_dict(dashboard_patch_json, "--patch-json"),
-            dashboard_filter=dashboard_filter,
-            dashboard_field=dashboard_field,
-            dashboard_value=_parse_json_value(dashboard_value_json, "--value-json"),
-            dashboard_updates=_parse_dashboard_updates(dashboard_update_json),
         )
         wf.add_operation(
             GraphNode(
@@ -2881,9 +2863,21 @@ def add_edge(
     output_pattern: str | None = typer.Option(
         None, "--output-pattern", help="Regex for output_matches condition"
     ),
+    field: str | None = typer.Option(
+        None, "--field", help="Structured result field for output_field condition"
+    ),
+    operator: str | None = typer.Option(
+        None, "--operator", help="Typed predicate operator for output_field condition"
+    ),
+    value: str | None = typer.Option(
+        None, "--value", help="JSON comparison value for output_field condition"
+    ),
     data_dir: Path | None = typer.Option(None, "--data-dir", hidden=True),
 ) -> None:
-    """Add or replace a workflow edge."""
+    """Add or replace a workflow edge.
+
+    Machine-readable options and fields: gof schema --command workflow.add-edge.
+    """
     try:
         wf, path = _resolve_workflow_with_path(workflow, data_dir)
         edge_condition = EdgeConditionType(condition)
@@ -2895,6 +2889,9 @@ def add_edge(
                 to_node=to_node,
                 condition=edge_condition,
                 output_pattern=output_pattern,
+                field=field,
+                operator=OutputFieldOperator(operator) if operator is not None else None,
+                value=json.loads(value) if value is not None else None,
             ),
         )
     except Exception as exc:
@@ -3245,7 +3242,7 @@ def recipe_watch_folder_summarize(
 
     prompt_file.parent.mkdir(parents=True, exist_ok=True)
     prompt_file.write_text(
-        """Summarize this changed file for a Gofer Flow user.
+        """Summarize this changed file for a Taskurotta user.
 
 Event kind: {{kind}}
 File path: {{path}}

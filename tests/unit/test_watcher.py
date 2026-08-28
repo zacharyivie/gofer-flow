@@ -672,10 +672,7 @@ def test_workflow_watcher_scan_stops_at_file_limit(
 
 def test_workflow_watcher_diff_caps_event_count(tmp_path: Path) -> None:
     watcher = WorkflowWatcher(poll_interval_seconds=0.01)
-    current = {
-        str(tmp_path / f"{index}.txt"): (index, index)
-        for index in range(5)
-    }
+    current = {str(tmp_path / f"{index}.txt"): (index, index) for index in range(5)}
     dropped: list[int] = []
 
     events = watcher._diff_events(  # noqa: SLF001
@@ -694,10 +691,7 @@ def test_workflow_watcher_diff_reports_all_drops_when_queue_limit_is_zero(
     tmp_path: Path,
 ) -> None:
     watcher = WorkflowWatcher(poll_interval_seconds=0.01)
-    current = {
-        str(tmp_path / f"{index}.txt"): (index, index)
-        for index in range(3)
-    }
+    current = {str(tmp_path / f"{index}.txt"): (index, index) for index in range(3)}
     dropped: list[int] = []
 
     events = watcher._diff_events(  # noqa: SLF001

@@ -25,6 +25,7 @@ class AgentConfig(BaseModel):
     working_dir: Path
     profile: str | None = None
     model: str | None = None
+    effort: str | None = None
     pricing: LlmPricing = Field(default_factory=LlmPricing)
     prompt_path: Path | None = None
     tools: list[str] = Field(default_factory=list)
@@ -42,6 +43,7 @@ class AgentResult(BaseModel):
     thoughts: list[str] = Field(default_factory=list)
     message: str | None = None
     prompt: str | None = None
+    current_prompt: str | None = None
     provider: str | None = None
     profile: str | None = None
     model: str | None = None
@@ -58,6 +60,7 @@ class Agent:
         context: dict[str, object] | None = None,
         cancel_event: threading.Event | None = None,
         prompt_override: str | None = None,
+        prompt_suffix: str | None = None,
         memory: list[dict[str, str]] | None = None,
         max_output_bytes: int | None = None,
         timeout: float | None = None,
@@ -81,6 +84,9 @@ class Agent:
         if row := ctx.get("_row"):
             prompt_text = f"{prompt_text}\n\n{row}"
         current_prompt = prompt_text
+        if prompt_suffix:
+            prompt_text = f"{prompt_text}\n\n{prompt_suffix}".strip()
+            current_prompt = prompt_text
         if memory:
             prompt_text = format_agent_memory(memory, current_prompt)
         extra_paths = configured_extra_paths(self._config)
@@ -122,6 +128,7 @@ class Agent:
             thoughts=result.thoughts,
             message=result.message,
             prompt=prompt_text,
+            current_prompt=current_prompt,
             provider=result.provider
             or (provider_settings.subscription if provider_settings else self._config.subscription),
             profile=result.profile
@@ -185,14 +192,11 @@ def configured_extra_paths(
     for configured_path in config.extra_paths:
         path = _resolve_config_path(configured_path, path_base)
         if not path.exists():
-            raise ValueError(
-                f"Agent '{config.agent_id}' extra_paths entry does not exist: {path}"
-            )
+            raise ValueError(f"Agent '{config.agent_id}' extra_paths entry does not exist: {path}")
         resolved_path = path.resolve()
         if not resolved_path.is_dir():
             raise ValueError(
-                f"Agent '{config.agent_id}' extra_paths entry is not a directory: "
-                f"{path}"
+                f"Agent '{config.agent_id}' extra_paths entry is not a directory: {path}"
             )
         if resolved_path in seen:
             continue
@@ -212,6 +216,5 @@ def _resolve_config_path(path: Path, path_base: Path | None) -> Path:
 def _accepts_execute_kwarg(subscription: Subscription, name: str) -> bool:
     parameters = inspect.signature(subscription.execute).parameters
     return name in parameters or any(
-        parameter.kind == inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters.values()
+        parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
     )

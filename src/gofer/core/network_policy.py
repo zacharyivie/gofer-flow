@@ -153,11 +153,7 @@ def resolve_host_addresses(host: str, port: int | None) -> Iterable[str]:
         records = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
     except OSError:
         return ()
-    return {
-        record[4][0]
-        for record in records
-        if record[4] and isinstance(record[4][0], str)
-    }
+    return {record[4][0] for record in records if record[4] and isinstance(record[4][0], str)}
 
 
 def network_policy_warnings(url: str, allowlist: Iterable[str] = ()) -> list[str]:

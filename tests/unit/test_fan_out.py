@@ -97,11 +97,13 @@ def test_load_tabular_xlsx_converts_headers_and_values(
     class Worksheet:
         def iter_rows(self, values_only: bool = False) -> Iterator[tuple[object, ...]]:
             assert values_only is True
-            return iter([
-                ("name", 2, None),
-                ("alice", 30, True),
-                ("bob", None, False),
-            ])
+            return iter(
+                [
+                    ("name", 2, None),
+                    ("alice", 30, True),
+                    ("bob", None, False),
+                ]
+            )
 
     class Workbook:
         active = Worksheet()
@@ -193,6 +195,7 @@ def test_resolve_fan_items_tabular_rejects_too_many_rows_during_load(
 
 def test_resolve_fan_items_count() -> None:
     from gofer.core.executor import ExecutionContext
+
     ctx = ExecutionContext()
     items = _resolve_fan_items(CountFanSource(type="count", count=3), ctx)
     assert items == [{"index": "0"}, {"index": "1"}, {"index": "2"}]
@@ -200,17 +203,15 @@ def test_resolve_fan_items_count() -> None:
 
 def test_resolve_fan_items_count_defaults_blank_values_to_one() -> None:
     from gofer.core.executor import ExecutionContext
+
     ctx = ExecutionContext()
-    assert _resolve_fan_items(CountFanSource(type="count", count=None), ctx) == [
-        {"index": "0"}
-    ]
-    assert _resolve_fan_items(CountFanSource(type="count", count=""), ctx) == [
-        {"index": "0"}
-    ]
+    assert _resolve_fan_items(CountFanSource(type="count", count=None), ctx) == [{"index": "0"}]
+    assert _resolve_fan_items(CountFanSource(type="count", count=""), ctx) == [{"index": "0"}]
 
 
 def test_resolve_fan_items_count_reports_bad_dynamic_path() -> None:
     from gofer.core.executor import ExecutionContext
+
     ctx = ExecutionContext()
     with pytest.raises(ValueError, match="Cannot resolve dynamic_count path"):
         _resolve_fan_items(CountFanSource(type="count", count="missing.data.count"), ctx)
@@ -218,6 +219,7 @@ def test_resolve_fan_items_count_reports_bad_dynamic_path() -> None:
 
 def test_resolve_fan_items_directory(tmp_path: Path) -> None:
     from gofer.core.executor import ExecutionContext
+
     (tmp_path / "a.py").write_text("pass")
     (tmp_path / "b.py").write_text("pass")
     (tmp_path / "skip.txt").write_text("skip")
@@ -234,6 +236,7 @@ def test_resolve_fan_items_directory(tmp_path: Path) -> None:
 
 def test_resolve_fan_items_directory_include_content(tmp_path: Path) -> None:
     from gofer.core.executor import ExecutionContext
+
     (tmp_path / "hello.txt").write_text("hello world")
     ctx = ExecutionContext()
     source = DirectoryFanSource(type="directory", path=tmp_path, include_content=True)
@@ -243,6 +246,7 @@ def test_resolve_fan_items_directory_include_content(tmp_path: Path) -> None:
 
 def test_resolve_fan_items_directory_rejects_too_many_items(tmp_path: Path) -> None:
     from gofer.core.executor import ExecutionContext
+
     for index in range(3):
         (tmp_path / f"{index}.txt").write_text("x")
     source = DirectoryFanSource(type="directory", path=tmp_path, glob="*.txt")
@@ -306,6 +310,7 @@ def test_resolve_fan_items_directory_limits_scanned_paths(tmp_path: Path) -> Non
 
 def test_resolve_fan_items_trigger_content_rejects_large_file(tmp_path: Path) -> None:
     from gofer.core.executor import ExecutionContext
+
     changed = tmp_path / "changed.txt"
     changed.write_text("abcdef")
     ctx = ExecutionContext(trigger={"events": [{"path": str(changed)}]})
@@ -326,12 +331,14 @@ def _make_agent_workflow(tmp_path: Path, sub: FakeSubscription) -> tuple[Agentic
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Process: {{file_name}}")
     wf = AgenticWorkflow(WorkflowConfig(id="fw", name="Fan Test"))
-    wf.register_agent(AgentConfig(
-        agent_id="proc",
-        subscription="claude_code",
-        working_dir=tmp_path,
-        prompt_path=prompt,
-    ))
+    wf.register_agent(
+        AgentConfig(
+            agent_id="proc",
+            subscription="claude_code",
+            working_dir=tmp_path,
+            prompt_path=prompt,
+        )
+    )
     return wf, "claude_code"
 
 
@@ -343,22 +350,26 @@ async def test_tabular_fan_out_spawns_one_agent_per_row(tmp_path: Path) -> None:
     data.write_text('{"file_name": "r1"}\n{"file_name": "r2"}\n{"file_name": "r3"}\n')
 
     prompt = tmp_path / "prompt.md"
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=TabularFanSource(type="tabular", path=data, max_concurrency=2),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=data, max_concurrency=2),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
     result = await WorkflowExecutor(
         wf,
@@ -380,22 +391,26 @@ async def test_directory_fan_out_spawns_one_agent_per_file(tmp_path: Path) -> No
 
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Process: {{file_path}}")
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=DirectoryFanSource(type="directory", path=files_dir, max_concurrency=2),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=files_dir, max_concurrency=2),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
     result = await WorkflowExecutor(
         wf,
@@ -453,22 +468,26 @@ async def test_fan_out_max_concurrency_respected(tmp_path: Path) -> None:
     data.write_text("\n".join(json.dumps({"i": k}) for k in range(10)) + "\n")
 
     prompt = tmp_path / "prompt.md"
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=TabularFanSource(type="tabular", path=data, max_concurrency=3),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(type="tabular", path=data, max_concurrency=3),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
     result = await WorkflowExecutor(
         wf,
@@ -527,22 +546,26 @@ async def test_directory_loop_defaults_to_sequential_execution(tmp_path: Path) -
 
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Process {{file_path}}")
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=DirectoryFanSource(type="directory", path=files_dir),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=DirectoryFanSource(type="directory", path=files_dir),
+            ),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
 
     result = await WorkflowExecutor(
@@ -589,27 +612,31 @@ async def test_fan_out_failures_aggregate_when_fail_fast_false(tmp_path: Path) -
     data.write_text("\n".join(json.dumps({"i": k}) for k in range(4)) + "\n")
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Process {{i}}")
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=TabularFanSource(
-                type="tabular",
-                path=data,
-                fail_fast=False,
-                max_concurrency=2,
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(
+                    type="tabular",
+                    path=data,
+                    fail_fast=False,
+                    max_concurrency=2,
+                ),
             ),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
 
     result = await WorkflowExecutor(
@@ -649,24 +676,28 @@ async def test_fan_out_fail_fast(tmp_path: Path) -> None:
     data.write_text('{"x": 1}\n{"x": 2}\n{"x": 3}\n')
 
     prompt = tmp_path / "prompt.md"
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=TabularFanSource(
-                type="tabular", path=data, fail_fast=True, max_concurrency=1
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(
+                    type="tabular", path=data, fail_fast=True, max_concurrency=1
+                ),
             ),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
     result = await WorkflowExecutor(
         wf,
@@ -718,27 +749,31 @@ async def test_fan_out_fail_fast_cancels_pending_iterations(tmp_path: Path) -> N
     data.write_text("\n".join(json.dumps({"i": k}) for k in range(6)) + "\n")
     prompt = tmp_path / "prompt.md"
     prompt.write_text("Process {{i}}")
-    wf.add_operation(GraphNode(
-        node_id="loop",
-        operation=LoopOperation(
-            type=OperationType.LOOP,
-            source=TabularFanSource(
-                type="tabular",
-                path=data,
-                fail_fast=True,
-                max_concurrency=3,
+    wf.add_operation(
+        GraphNode(
+            node_id="loop",
+            operation=LoopOperation(
+                type=OperationType.LOOP,
+                source=TabularFanSource(
+                    type="tabular",
+                    path=data,
+                    fail_fast=True,
+                    max_concurrency=3,
+                ),
             ),
-        ),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="agent",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
-            agent_id="proc",
-            prompt_path=prompt,
-            working_dir=tmp_path,
-        ),
-    ))
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="agent",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="proc",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("loop", "agent")
 
     with anyio.fail_after(2):

@@ -1,0 +1,8 @@
+{
+  "$schema": "../schemas/provider-contract.schema.json",
+  "contract_version": 1,
+  "provider_id": "codex",
+  "runtime_subscription": "codex",
+  "default_model": "gpt-5.6-sol",
+  "default_effort": "high"
+}

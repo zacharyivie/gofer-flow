@@ -96,15 +96,15 @@ def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path)
 
     arch_pkgbuild = (repo / "packaging" / "arch" / "PKGBUILD").read_text(encoding="utf8")
     assert "pkgver=1.2.3" in arch_pkgbuild
-    assert "Gofer-Flow-${pkgver}-x86_64.AppImage" in arch_pkgbuild
+    assert "Taskurotta-${pkgver}-x86_64.AppImage" in arch_pkgbuild
     assert appimage_sha.lower() in arch_pkgbuild
 
     arch_srcinfo = (repo / "packaging" / "arch" / ".SRCINFO").read_text(encoding="utf8")
     assert "pkgver = 1.2.3" in arch_srcinfo
     assert (
-        "source_x86_64 = Gofer-Flow-1.2.3-x86_64.AppImage::"
+        "source_x86_64 = Taskurotta-1.2.3-x86_64.AppImage::"
         "https://github.com/doonk/gofer-flow/releases/download/v1.2.3/"
-        "Gofer-Flow-1.2.3-x86_64.AppImage"
+        "Taskurotta-1.2.3-x86_64.AppImage"
     ) in arch_srcinfo
     assert f"sha256sums_x86_64 = {appimage_sha.lower()}" in arch_srcinfo
 

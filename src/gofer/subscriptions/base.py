@@ -12,6 +12,7 @@ from typing import Any
 from gofer.core.agent import AgentResult
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS
+from gofer.core.thoughts import summarize_thought
 from gofer.utils.process import stream_subprocess
 
 
@@ -65,13 +66,19 @@ class Subscription(ABC):
                     payloads = _json_payloads(text)
                     if payloads:
                         for thought in _live_thoughts_from_payloads(payloads):
+                            thought = summarize_thought(thought)
+                            if not thought:
+                                continue
                             thought_chunks.append(thought)
                             if on_thought is not None:
                                 on_thought(thought)
                     else:
-                        thought_chunks.append(text)
+                        thought = summarize_thought(text)
+                        if not thought:
+                            continue
+                        thought_chunks.append(thought)
                         if on_thought is not None:
-                            on_thought(text)
+                            on_thought(thought)
                     if event["stream"] == "stdout":
                         stdout_chunks.append(text)
                     else:
@@ -96,7 +103,7 @@ class Subscription(ABC):
 
     def _prompt_file_instruction(self, prompt_path: Path) -> str:
         return (
-            "Read the complete Gofer Flow agent prompt from this file, "
+            "Read the complete Taskurotta agent prompt from this file, "
             f"then follow it exactly: {prompt_path}"
         )
 

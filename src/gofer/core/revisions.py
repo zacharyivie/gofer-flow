@@ -223,11 +223,9 @@ def prune_workflow_revisions(
     removed: list[str] = []
     for index, revision in enumerate(revisions):
         too_many = retention.max_revisions >= 0 and index >= retention.max_revisions
-        too_old = (
-            retention.max_age_days >= 0
-            and _parse_datetime(revision.created_at)
-            < now - timedelta(days=retention.max_age_days)
-        )
+        too_old = retention.max_age_days >= 0 and _parse_datetime(
+            revision.created_at
+        ) < now - timedelta(days=retention.max_age_days)
         if too_many or too_old:
             revision.path.unlink(missing_ok=True)
             removed.append(revision.revision_id)
@@ -252,6 +250,8 @@ def summarize_workflow_diff(before_toml: str, after_toml: str) -> list[str]:
     for key in ("id", "name", "schedule", "watch", "webhooks", "parameters", "run_continuously"):
         if before_workflow.get(key) != after_workflow.get(key):
             summary.append(f"workflow {key} changed")
+    if before.get("component") != after.get("component"):
+        summary.extend(_component_changes(before.get("component", {}), after.get("component", {})))
     summary.extend(_mapping_changes("agent", before.get("agents", {}), after.get("agents", {})))
     summary.extend(_node_changes(before.get("nodes", []), after.get("nodes", [])))
     summary.extend(_edge_changes(before.get("edges", []), after.get("edges", [])))
@@ -318,7 +318,57 @@ def _mapping_changes(label: str, before: object, after: object) -> list[str]:
 
 
 def _node_changes(before: object, after: object) -> list[str]:
-    return _mapping_changes("node", _items_by_id(before), _items_by_id(after))
+    before_nodes = _items_by_id(before)
+    after_nodes = _items_by_id(after)
+    changes: list[str] = []
+    for key in sorted(set(after_nodes) - set(before_nodes)):
+        changes.append(f"node added: {key}")
+    for key in sorted(set(before_nodes) - set(after_nodes)):
+        changes.append(f"node removed: {key}")
+    for key in sorted(set(before_nodes) & set(after_nodes)):
+        if before_nodes[key] == after_nodes[key]:
+            continue
+        before_node = before_nodes[key]
+        after_node = after_nodes[key]
+        if (
+            isinstance(before_node, dict)
+            and isinstance(after_node, dict)
+            and before_node.get("type") == "subflow"
+            and after_node.get("type") == "subflow"
+            and _subflow_reference(before_node) != _subflow_reference(after_node)
+            and _without_subflow_reference(before_node) == _without_subflow_reference(after_node)
+        ):
+            changes.append(f"subflow reference changed: {key}")
+        else:
+            changes.append(f"node changed: {key}")
+    return changes
+
+
+def _component_changes(before: object, after: object) -> list[str]:
+    before_map = before if isinstance(before, dict) else {}
+    after_map = after if isinstance(after, dict) else {}
+    if not before_map and after_map:
+        return [f"subflow definition added: {after_map.get('id', 'component')}"]
+    if before_map and not after_map:
+        return [f"subflow definition removed: {before_map.get('id', 'component')}"]
+    component_id = after_map.get("id") or before_map.get("id") or "component"
+    return [f"subflow definition changed: {component_id}"]
+
+
+def _subflow_reference(node: dict[str, Any]) -> tuple[object, object, object]:
+    return (
+        node.get("component_id"),
+        node.get("version"),
+        node.get("source_path"),
+    )
+
+
+def _without_subflow_reference(node: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: value
+        for key, value in node.items()
+        if key not in {"component_id", "version", "source_path"}
+    }
 
 
 def _edge_changes(before: object, after: object) -> list[str]:

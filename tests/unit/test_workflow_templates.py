@@ -56,9 +56,7 @@ def test_template_preview_reports_inputs_nodes_and_provider_assumptions() -> Non
     assert preview.name == "markdown-folder-summary"
     assert preview.required_inputs[0]["name"] == "folder"
     assert any(node["type"] == "loop" for node in preview.generated_nodes)
-    assert preview.provider_assumptions == [
-        {"agentId": "summarizer", "subscription": "codex"}
-    ]
+    assert preview.provider_assumptions == [{"agentId": "summarizer", "subscription": "codex"}]
 
 
 def test_ui_api_lists_and_creates_template_workflow(tmp_path: Path) -> None:

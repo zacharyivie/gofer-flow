@@ -79,8 +79,10 @@ def create(
         )
     subscription = subscription.strip()
     if subscription not in _SUBSCRIPTION_CHOICES:
-        console.print(f"[red]Invalid subscription '{subscription}'. "
-                      f"Choose from: {', '.join(_SUBSCRIPTION_CHOICES)}[/red]")
+        console.print(
+            f"[red]Invalid subscription '{subscription}'. "
+            f"Choose from: {', '.join(_SUBSCRIPTION_CHOICES)}[/red]"
+        )
         raise typer.Exit(1)
 
     if not working_dir:
@@ -101,7 +103,7 @@ def create(
     tools_list = [t.strip() for t in tools.split(",")] if tools else []
     mcp_list = [s.strip() for s in mcp_servers.split(",")] if mcp_servers else []
     env_dict: dict[str, str] = {}
-    for pair in (env or []):
+    for pair in env or []:
         if "=" not in pair:
             console.print(f"[red]Invalid --env value '{pair}': expected KEY=VALUE[/red]")
             raise typer.Exit(1)
@@ -199,8 +201,10 @@ def edit(
     if subscription is not None:
         subscription = subscription.strip()
         if subscription not in _SUBSCRIPTION_CHOICES:
-            console.print(f"[red]Invalid subscription '{subscription}'. "
-                          f"Choose from: {', '.join(_SUBSCRIPTION_CHOICES)}[/red]")
+            console.print(
+                f"[red]Invalid subscription '{subscription}'. "
+                f"Choose from: {', '.join(_SUBSCRIPTION_CHOICES)}[/red]"
+            )
             raise typer.Exit(1)
         cfg = cfg.model_copy(update={"subscription": subscription})
 
@@ -281,9 +285,7 @@ def rm(
         raise typer.Exit(1)
 
     if not yes:
-        typer.confirm(
-            f"Remove agent '{agent_id}' from workflow '{wf.config.id}'?", abort=True
-        )
+        typer.confirm(f"Remove agent '{agent_id}' from workflow '{wf.config.id}'?", abort=True)
 
     prompt_path = cfg.prompt_path
     del wf.agents[agent_id]

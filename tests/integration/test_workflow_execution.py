@@ -5,7 +5,11 @@ from pathlib import Path
 from gofer.core.agent import AgentConfig
 from gofer.core.executor import WorkflowExecutor
 from gofer.core.graph import GraphNode
-from gofer.core.operations import AgentOperation, BashCommandOperation, OperationType
+from gofer.core.operations import (
+    AgentOperation,
+    BashCommandOperation,
+    OperationType,
+)
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
 from tests.conftest import FakeSubscription
 
@@ -16,25 +20,31 @@ async def test_multi_node_workflow_with_agent(tmp_path: Path) -> None:
     sub = FakeSubscription(output="summary: lots of changes")
 
     wf = AgenticWorkflow(WorkflowConfig(id="ci", name="CI"))
-    wf.register_agent(AgentConfig(
-        agent_id="summarizer",
-        subscription="claude_code",
-        working_dir=tmp_path,
-        prompt_path=prompt,
-    ))
-    wf.add_operation(GraphNode(
-        node_id="setup",
-        operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo setup"),
-    ))
-    wf.add_operation(GraphNode(
-        node_id="summarize",
-        operation=AgentOperation(
-            type=OperationType.AGENT,
+    wf.register_agent(
+        AgentConfig(
             agent_id="summarizer",
-            prompt_path=prompt,
+            subscription="claude_code",
             working_dir=tmp_path,
-        ),
-    ))
+            prompt_path=prompt,
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="setup",
+            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo setup"),
+        )
+    )
+    wf.add_operation(
+        GraphNode(
+            node_id="summarize",
+            operation=AgentOperation(
+                type=OperationType.AGENT,
+                agent_id="summarizer",
+                prompt_path=prompt,
+                working_dir=tmp_path,
+            ),
+        )
+    )
     wf.then("setup", "summarize")
 
     result = await WorkflowExecutor(wf, {"claude_code": sub}).run()
@@ -47,10 +57,14 @@ async def test_multi_node_workflow_with_agent(tmp_path: Path) -> None:
 async def test_parallel_nodes_all_run(tmp_path: Path) -> None:
     wf = AgenticWorkflow(WorkflowConfig(id="par", name="Parallel"))
     for name in ["root", "left", "right", "merge"]:
-        wf.add_operation(GraphNode(
-            node_id=name,
-            operation=BashCommandOperation(type=OperationType.BASH_COMMAND, command="echo " + name),
-        ))
+        wf.add_operation(
+            GraphNode(
+                node_id=name,
+                operation=BashCommandOperation(
+                    type=OperationType.BASH_COMMAND, command="echo " + name
+                ),
+            )
+        )
     wf.then("root", "left")
     wf.then("root", "right")
     wf.then("left", "merge")

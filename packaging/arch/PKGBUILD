@@ -1,8 +1,8 @@
-# Maintainer: Gofer Flow <maintainers@goferflow.local>
+# Maintainer: Taskurotta <maintainers@goferflow.local>
 pkgname=gofer-flow
 pkgver=0.1.2
 pkgrel=1
-pkgdesc="Local workflow automation studio for Gofer Flow"
+pkgdesc="Local workflow automation studio for Taskurotta"
 arch=("x86_64")
 url="https://github.com/doonk/gofer-flow"
 license=("Apache-2.0")
@@ -17,7 +17,7 @@ depends=(
 )
 options=(!strip)
 source_x86_64=(
-  "Gofer-Flow-${pkgver}-x86_64.AppImage::${url}/releases/download/v${pkgver}/Gofer-Flow-${pkgver}-x86_64.AppImage"
+  "Taskurotta-${pkgver}-x86_64.AppImage::${url}/releases/download/v${pkgver}/Taskurotta-${pkgver}-x86_64.AppImage"
 )
 source=(
   "gofer-flow"
@@ -30,7 +30,7 @@ sha256sums=('d47d296d0ee293e7f2bc46c6997dd44b327c0699548c71b1d80abed020d97973'
 sha256sums_x86_64=('ecd0abe89a201104dc68cf2263f75cfa71e8e0ccef324ee6d33597a57f3222ce')
 
 package() {
-  install -Dm755 "${srcdir}/Gofer-Flow-${pkgver}-x86_64.AppImage" \
+  install -Dm755 "${srcdir}/Taskurotta-${pkgver}-x86_64.AppImage" \
     "${pkgdir}/opt/gofer-flow/gofer-flow.AppImage"
   install -Dm755 "${srcdir}/gofer-flow" "${pkgdir}/usr/bin/gofer-flow"
   install -Dm644 "${srcdir}/gofer-flow.desktop" \

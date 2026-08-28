@@ -9,6 +9,7 @@ import threading
 import tomllib
 import urllib.parse
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast, overload
@@ -24,31 +25,6 @@ from gofer.core.bundles import (
     export_workflow_bundle,
     import_workflow_bundle,
     preview_workflow_bundle,
-)
-from gofer.core.dashboards import (
-    DashboardComponentType,
-    DashboardError,
-    add_component,
-    add_item,
-    add_section,
-    create_dashboard,
-    delete_component,
-    delete_dashboard,
-    delete_item,
-    delete_section,
-    duplicate_dashboard,
-    list_dashboards,
-    list_items,
-    load_dashboard,
-    move_item,
-    rename_dashboard,
-    set_component_content,
-    set_component_display,
-    set_component_schema,
-    set_component_title,
-    set_component_views,
-    update_item,
-    update_section,
 )
 from gofer.core.executor import (
     ResumeOptions,
@@ -67,6 +43,7 @@ from gofer.core.operations import (
     NotificationOperation,
     Operation,
     OperationType,
+    SubflowOperation,
 )
 from gofer.core.planner import build_execution_plan
 from gofer.core.provider_profiles import (
@@ -76,6 +53,7 @@ from gofer.core.provider_profiles import (
     save_provider_profiles,
     validate_provider_profile_name,
 )
+from gofer.core.references import parse_exact_reference
 from gofer.core.resources import (
     DEFAULT_RESOURCE_LIMITS,
     ResourceLimits,
@@ -101,7 +79,7 @@ from gofer.core.templates import (
     list_workflow_templates,
     preview_workflow_template,
 )
-from gofer.core.usage import LlmUsageBudget, summarize_node_outputs
+from gofer.core.usage import summarize_node_outputs
 from gofer.core.validation import (
     validate_workflow,
     validate_workflow_data,
@@ -111,11 +89,28 @@ from gofer.core.workflow import (
     AgenticWorkflow,
     FilesystemAccessEntry,
     WebhookTriggerConfig,
+    WorkflowComponentConfig,
     WorkflowConfig,
     WorkflowMetadata,
+    WorkflowParameterConfig,
+    WorkflowVariableConfig,
     masked_workflow_parameters,
     resolve_workflow_parameters,
     validate_workflow_id,
+)
+from gofer.prompts.manager import PromptManager
+from gofer.radish.artifacts import RadishArtifactError, compile_radish_file
+from gofer.radish.diagnostics import RadishError
+from gofer.radish.editor import (
+    DEFAULT_RADISH_EDITOR_SERVICE,
+)
+from gofer.radish.preflight import run_preflight
+from gofer.radish.run_service import RadishRunArtifactError, RadishRunResult, run_radish_file
+from gofer.radish.workspaces import (
+    RadishWorkspaceError,
+    RegisteredWorkflow,
+    create_registered_workflow,
+    list_registered_workflows,
 )
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
@@ -126,6 +121,8 @@ from gofer.utils.run_state import (
     request_workflow_run_stop,
     request_workflow_stop,
 )
+
+_UNSET = object()
 
 
 class WorkflowAlreadyExistsError(ValueError):
@@ -176,10 +173,6 @@ class WorkflowBundleError(ValueError):
     pass
 
 
-class DashboardUiError(ValueError):
-    pass
-
-
 _operation_adapter: TypeAdapter[Operation] = TypeAdapter(Operation)
 _subscriptions = {
     "claude_code": ClaudeCodeSubscription(),
@@ -199,18 +192,20 @@ RUN_TRIGGER_SUFFIX = ".trigger.json"
 RETENTION_SETTINGS_FILE = "retention.json"
 DEFAULT_RETENTION_SETTINGS = {"keepDays": 14, "keepFailedDays": 30, "keepLast": 100}
 INDEX_VERSION = 1
+WORKFLOW_INDEX_PAYLOAD_VERSION = 5
 WORKFLOW_INDEX_FILE = "workflows.json"
 RUN_INDEX_PREFIX = "runs-"
 
 
 def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
-    """Return serializable workflow summaries for the React UI."""
+    """Return registered Radish workflow summaries for Studio."""
     base = _data_dir(data_dir)
     workflows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
 
     if not base.exists():
         return {
+            "authoringLanguage": "radish",
             "dataDir": str(base),
             "workflows": workflows,
             "errors": errors,
@@ -220,28 +215,29 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
     workflow_index = _read_workflow_index(base)
     index_entries = _workflow_index_entries(workflow_index)
     index_changed = False
-    for path in sorted(base.glob("*.toml")):
-        cached = _workflow_index_payload(base, index_entries.get(path.name), path)
+    workflow_paths = sorted(base.rglob("*.toml"))
+    for path in workflow_paths:
+        index_key = _workflow_index_key(base, path)
+        cached = _workflow_index_payload(base, index_entries.get(index_key), path)
         if cached is not None:
             workflows.append(cached)
             continue
         try:
             workflow = AgenticWorkflow.from_file(path)
         except Exception as exc:
-            error = {"path": path.name, "message": str(exc)}
+            error = {"path": index_key, "message": str(exc)}
             errors.append(error)
-            payload = invalid_workflow_payload(path, str(exc))
+            payload = invalid_workflow_payload(path, str(exc), base)
             workflows.append(payload)
-            index_entries[path.name] = _workflow_index_entry(path, payload)
+            index_entries[index_key] = _workflow_index_entry(path, payload)
             index_changed = True
             continue
-
-        payload = workflow_to_payload(workflow, path)
+        payload = workflow_to_payload(workflow, path, source_base=base)
         workflows.append(payload)
-        index_entries[path.name] = _workflow_index_entry(path, payload)
+        index_entries[index_key] = _workflow_index_entry(path, payload)
         index_changed = True
 
-    existing_names = {path.name for path in base.glob("*.toml")}
+    existing_names = {_workflow_index_key(base, path) for path in workflow_paths}
     stale_names = [name for name in index_entries if name not in existing_names]
     for name in stale_names:
         index_entries.pop(name, None)
@@ -249,11 +245,159 @@ def list_workflow_payloads(data_dir: Path | None = None) -> dict[str, Any]:
     if index_changed:
         _write_workflow_index(base, index_entries)
 
+    try:
+        registered = list_registered_workflows(registry_dir=base)
+    except RadishWorkspaceError as exc:
+        errors.append({"path": "workspace-registry.json", "message": str(exc)})
+        registered = ()
+    legacy_ids = {str(workflow.get("id", "")).lower() for workflow in workflows}
+    for registered_workflow in registered:
+        if registered_workflow.workflow_id.lower() in legacy_ids:
+            errors.append(
+                {
+                    "path": str(registered_workflow.entrypoint),
+                    "message": (
+                        f"Registered Radish workflow ID {registered_workflow.workflow_id!r} "
+                        "conflicts with a legacy workflow ID."
+                    ),
+                }
+            )
+            continue
+        workflows.append(_registered_radish_payload(registered_workflow, base))
+
     return {
+        "authoringLanguage": "radish",
         "dataDir": str(base),
         "workflows": workflows,
         "errors": errors,
         "promptAgentIds": prompt_agent_ids(base),
+    }
+
+
+def create_registered_workflow_payload(
+    name: str,
+    project_root: Path,
+    *,
+    registry_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Create a registered Radish workflow and return its read-only studio summary."""
+    base = _data_dir(registry_dir)
+    try:
+        registered = create_registered_workflow(project_root, name, registry_dir=base)
+    except (RadishWorkspaceError, RadishArtifactError, RadishError) as exc:
+        raise WorkflowCreateError(str(exc)) from exc
+    return _registered_radish_payload(registered, base)
+
+
+def open_radish_document_payload(workflow_id: str, data_dir: Path | None = None) -> dict[str, Any]:
+    """Open one registered Radish workflow for Studio editing."""
+    return DEFAULT_RADISH_EDITOR_SERVICE.open_document(
+        workflow_id,
+        data_dir=_data_dir(data_dir),
+    )
+
+
+def analyze_radish_document_payload(
+    workflow_id: str,
+    source: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Analyze an unsaved Radish buffer without changing the workflow file."""
+    return DEFAULT_RADISH_EDITOR_SERVICE.analyze_document(
+        workflow_id,
+        source,
+        data_dir=_data_dir(data_dir),
+    )
+
+
+def save_radish_document_payload(
+    workflow_id: str,
+    source: str,
+    expected_revision: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Save a Radish buffer if its on-disk revision still matches."""
+    return DEFAULT_RADISH_EDITOR_SERVICE.save_document(
+        workflow_id,
+        source,
+        expected_revision,
+        data_dir=_data_dir(data_dir),
+    )
+
+
+def mutate_radish_document_payload(
+    workflow_id: str,
+    mutations: list[dict[str, Any]],
+    expected_revision: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Apply targeted graph edits to a registered Radish source document."""
+    return DEFAULT_RADISH_EDITOR_SERVICE.mutate_document(
+        workflow_id,
+        mutations,
+        expected_revision,
+        data_dir=_data_dir(data_dir),
+    )
+
+
+def save_radish_metadata_payload(
+    workflow_id: str,
+    metadata: dict[str, Any],
+    expected_revision: str,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Save workflow editor metadata with optimistic concurrency."""
+    return DEFAULT_RADISH_EDITOR_SERVICE.save_metadata(
+        workflow_id,
+        metadata,
+        expected_revision,
+        data_dir=_data_dir(data_dir),
+    )
+
+
+def _registered_radish_payload(
+    workflow: RegisteredWorkflow,
+    registry_dir: Path,
+) -> dict[str, Any]:
+    status = "Ready"
+    validation_error = None
+    try:
+        artifact = compile_radish_file(
+            workflow.entrypoint,
+            data_dir=registry_dir,
+            workflow_id=workflow.workflow_id,
+        )
+        node_count = len(artifact.ir["nodes"])
+        edge_count = sum(len(node["routes"]) for node in artifact.ir["nodes"])
+        inputs = _radish_workflow_inputs(artifact.ir["workflow"]["inputs"])
+    except (RadishArtifactError, RadishError) as exc:
+        status = "Error"
+        validation_error = str(exc)
+        node_count = 0
+        edge_count = 0
+        inputs = {}
+    return {
+        "id": workflow.workflow_id,
+        "name": workflow.name,
+        "description": f"{node_count} Radish nodes, {edge_count} routes.",
+        "status": status,
+        "updatedAt": _updated_at(workflow.entrypoint),
+        "sourcePath": str(workflow.entrypoint),
+        "sourceFormat": "radish",
+        "readOnly": False,
+        "projectRoot": str(workflow.project_root),
+        "projectName": workflow.project_root.name or str(workflow.project_root),
+        "workflowRoot": str(workflow.workflow_root),
+        "schedule": None,
+        "watch": None,
+        "parameters": {},
+        "inputs": inputs,
+        "agents": {},
+        "nodes": [],
+        "edges": [],
+        "filesystemAccess": [],
+        "invalid": validation_error is not None,
+        "validationError": validation_error,
     }
 
 
@@ -279,246 +423,6 @@ def runner_queue_payload(data_dir: Path | None = None) -> dict[str, Any]:
     }
 
 
-def dashboard_payload(data_dir: Path | None = None) -> dict[str, Any]:
-    try:
-        dashboards = list_dashboards(_data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {
-        "dashboards": [dashboard.model_dump(mode="json", by_alias=True) for dashboard in dashboards]
-    }
-
-
-def create_dashboard_payload(
-    name: str,
-    data_dir: Path | None = None,
-    dashboard_id: str | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = create_dashboard(name, _data_dir(data_dir), dashboard_id)
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def update_dashboard_payload(
-    dashboard_id: str,
-    data_dir: Path | None = None,
-    *,
-    name: str | None = None,
-    duplicate: bool = False,
-) -> dict[str, Any]:
-    try:
-        dashboard = (
-            duplicate_dashboard(dashboard_id, _data_dir(data_dir), name)
-            if duplicate
-            else rename_dashboard(dashboard_id, name or "", _data_dir(data_dir))
-        )
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def delete_dashboard_payload(dashboard_id: str, data_dir: Path | None = None) -> dict[str, Any]:
-    try:
-        delete_dashboard(dashboard_id, _data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"deleted": dashboard_id}
-
-
-def add_dashboard_section_payload(
-    dashboard_id: str,
-    title: str,
-    data_dir: Path | None = None,
-    section_id: str | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = add_section(dashboard_id, title, _data_dir(data_dir), section_id)
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def update_dashboard_section_payload(
-    dashboard_id: str,
-    section_id: str,
-    data_dir: Path | None = None,
-    *,
-    title: str | None = None,
-    layout: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = update_section(
-            dashboard_id,
-            section_id,
-            _data_dir(data_dir),
-            title=title,
-            layout=layout,
-        )
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def delete_dashboard_section_payload(
-    dashboard_id: str,
-    section_id: str,
-    data_dir: Path | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = delete_section(dashboard_id, section_id, _data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def add_dashboard_component_payload(
-    dashboard_id: str,
-    section_id: str,
-    title: str,
-    component_type: DashboardComponentType,
-    data_dir: Path | None = None,
-    component_id: str | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = add_component(
-            dashboard_id,
-            section_id,
-            title,
-            component_type,
-            _data_dir(data_dir),
-            component_id,
-        )
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def delete_dashboard_component_payload(
-    dashboard_id: str,
-    component_id: str,
-    data_dir: Path | None = None,
-) -> dict[str, Any]:
-    try:
-        dashboard = delete_component(dashboard_id, component_id, _data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def update_dashboard_component_payload(
-    dashboard_id: str,
-    component_id: str,
-    data_dir: Path | None = None,
-    *,
-    content: str | None = None,
-    display: dict[str, Any] | None = None,
-    schema: dict[str, Any] | None = None,
-    title: str | None = None,
-    views: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    try:
-        if title is not None:
-            dashboard = set_component_title(
-                dashboard_id,
-                component_id,
-                title,
-                _data_dir(data_dir),
-            )
-        elif content is not None:
-            dashboard = set_component_content(
-                dashboard_id,
-                component_id,
-                content,
-                _data_dir(data_dir),
-            )
-        elif schema is not None:
-            dashboard = set_component_schema(
-                dashboard_id,
-                component_id,
-                schema,
-                _data_dir(data_dir),
-            )
-        elif views is not None:
-            dashboard = set_component_views(dashboard_id, component_id, views, _data_dir(data_dir))
-        elif display is not None:
-            dashboard = set_component_display(
-                dashboard_id,
-                component_id,
-                display,
-                _data_dir(data_dir),
-            )
-        else:
-            dashboard = load_dashboard(dashboard_id, _data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
-def dashboard_items_payload(
-    dashboard_id: str,
-    component_id: str,
-    data_dir: Path | None = None,
-    filter_rule: str | None = None,
-) -> dict[str, Any]:
-    try:
-        items = list_items(dashboard_id, component_id, _data_dir(data_dir), filter_rule)
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"items": items}
-
-
-def mutate_dashboard_item_payload(
-    dashboard_id: str,
-    component_id: str,
-    action: str,
-    body: dict[str, Any],
-    data_dir: Path | None = None,
-) -> dict[str, Any]:
-    try:
-        if action == "add":
-            item = add_item(
-                dashboard_id,
-                component_id,
-                dict(body.get("item") or {}),
-                _data_dir(data_dir),
-            )
-        elif action == "update":
-            item = update_item(
-                dashboard_id,
-                component_id,
-                str(body.get("itemId") or body.get("id") or ""),
-                dict(body.get("patch") or body.get("item") or {}),
-                _data_dir(data_dir),
-            )
-        elif action == "delete":
-            item = delete_item(
-                dashboard_id,
-                component_id,
-                str(body.get("itemId") or body.get("id") or ""),
-                _data_dir(data_dir),
-            )
-        elif action == "move":
-            item = move_item(
-                dashboard_id,
-                component_id,
-                str(body.get("itemId") or body.get("id") or ""),
-                str(body.get("field") or "status"),
-                body.get("value"),
-                _data_dir(data_dir),
-            )
-        else:
-            raise DashboardUiError(f"Unsupported dashboard item action: {action}")
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    try:
-        dashboard = load_dashboard(dashboard_id, _data_dir(data_dir))
-    except DashboardError as exc:
-        raise DashboardUiError(str(exc)) from exc
-    return {"item": item, "dashboard": dashboard.model_dump(mode="json", by_alias=True)}
-
-
 def queue_workflow_run_payload(
     workflow_id: str,
     data_dir: Path | None = None,
@@ -538,16 +442,20 @@ def queue_workflow_run_payload(
     except Exception as exc:
         raise RunnerQueueError(str(exc)) from exc
     queued_parameters = dict(parameters or {})
-    workflow_params = queued_parameters.get("workflowParams")
+    workflow_params = queued_parameters.get(
+        "workflowInputs", queued_parameters.get("workflowParams")
+    )
     if workflow_params is None:
         workflow_params = {}
     if not isinstance(workflow_params, dict):
-        raise RunnerQueueError("workflowParams must be an object")
+        raise RunnerQueueError("workflowInputs must be an object")
     try:
-        queued_parameters["workflowParams"] = resolve_workflow_parameters(
+        resolved_inputs = resolve_workflow_parameters(
             workflow.config,
             workflow_params,
         )
+        queued_parameters["workflowInputs"] = resolved_inputs
+        queued_parameters["workflowParams"] = resolved_inputs
     except ValueError as exc:
         raise RunnerQueueError(str(exc)) from exc
     queued = RunnerQueueStore(base).enqueue(
@@ -741,9 +649,17 @@ def _workflow_index_entry(
 ) -> dict[str, Any]:
     return {
         **_file_index_stat(path),
+        "payloadVersion": WORKFLOW_INDEX_PAYLOAD_VERSION,
         "latestRun": latest_run,
         "payload": _workflow_payload_with_latest_run(payload, latest_run),
     }
+
+
+def _workflow_index_key(base: Path, path: Path) -> str:
+    try:
+        return path.relative_to(base).as_posix()
+    except ValueError:
+        return path.name
 
 
 def _workflow_index_latest_run_matches(base: Path, entry: dict[str, Any]) -> bool:
@@ -762,7 +678,11 @@ def _workflow_index_latest_run_matches(base: Path, entry: dict[str, Any]) -> boo
 
 
 def _workflow_index_payload(base: Path, entry: Any, path: Path) -> dict[str, Any] | None:
-    if not isinstance(entry, dict) or not _index_stat_matches(entry, path):
+    if (
+        not isinstance(entry, dict)
+        or entry.get("payloadVersion") != WORKFLOW_INDEX_PAYLOAD_VERSION
+        or not _index_stat_matches(entry, path)
+    ):
         return None
     if not _workflow_index_latest_run_matches(base, entry):
         return None
@@ -773,7 +693,8 @@ def _workflow_index_payload(base: Path, entry: Any, path: Path) -> dict[str, Any
 def _upsert_workflow_index(base: Path, path: Path, payload: dict[str, Any]) -> None:
     entries = _workflow_index_entries(_read_workflow_index(base))
     workflow_id = str(payload.get("id") or _slugify(path.stem))
-    existing = entries.get(path.name)
+    index_key = _workflow_index_key(base, path)
+    existing = entries.get(index_key)
     latest_run = None
     if isinstance(existing, dict) and _workflow_index_latest_run_matches(base, existing):
         existing_latest_run = existing.get("latestRun")
@@ -786,7 +707,7 @@ def _upsert_workflow_index(base: Path, path: Path, payload: dict[str, Any]) -> N
             _run_index_entries(_read_run_index(base, workflow_id)),
         )
     try:
-        entries[path.name] = _workflow_index_entry(path, payload, latest_run)
+        entries[index_key] = _workflow_index_entry(path, payload, latest_run)
     except OSError:
         return
     _write_workflow_index(base, entries)
@@ -863,19 +784,25 @@ def _latest_run_metadata_from_index_entries(
     return _latest_run_index_metadata(log_path, summary)
 
 
-def invalid_workflow_payload(path: Path, message: str) -> dict[str, Any]:
+def invalid_workflow_payload(
+    path: Path,
+    message: str,
+    source_base: Path | None = None,
+) -> dict[str, Any]:
     workflow_id = _slugify(path.stem)
+    project_root, project_name = _workflow_project_identity(path, source_base)
     return {
         "id": workflow_id,
         "name": path.stem.replace("-", " ").replace("_", " ").title(),
         "description": f"Invalid workflow TOML: {message}",
         "status": "Error",
         "updatedAt": _updated_at(path),
-        "sourcePath": path.name,
+        "sourcePath": _workflow_source_path(path, source_base),
+        "projectRoot": str(project_root),
+        "projectName": project_name,
         "schedule": None,
         "watch": None,
         "resourceLimits": _model_dump(DEFAULT_RESOURCE_LIMITS),
-        "llmBudget": _model_dump(LlmUsageBudget()),
         "runContinuously": False,
         "maxTotalNodeRuns": 1000,
         "tags": ["error", "invalid"],
@@ -934,7 +861,7 @@ def create_workflow_payload(
     workflow = AgenticWorkflow(WorkflowConfig(id=workflow_id, name=workflow_name))
     workflow.to_file(path)
     capture_workflow_revision(path, base, source="create", author="ui")
-    payload = workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path, source_base=base)
     _upsert_workflow_index(base, path, payload)
     return payload
 
@@ -960,7 +887,7 @@ def import_workflow_payload(content: str, data_dir: Path | None = None) -> dict[
     except Exception as exc:
         raise WorkflowCreateError(str(exc)) from exc
 
-    payload = workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path, source_base=base)
     _upsert_workflow_index(base, path, payload)
     return payload
 
@@ -1082,7 +1009,7 @@ def rename_workflow_payload(
     workflow = AgenticWorkflow.from_file(path)
     workflow.config.name = workflow_name
     workflow.to_file(path)
-    payload = workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path, source_base=base)
     _upsert_workflow_index(base, path, payload)
     return payload
 
@@ -1185,13 +1112,15 @@ def update_workflow_payload(
 
     base = _data_dir(data_dir)
     base.mkdir(parents=True, exist_ok=True)
-    path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowUpdateError)
+    path = _workflow_toml_path_for_update(workflow_id, payload, base)
     if not path.exists():
         raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")
 
     try:
         audit_metadata = _workflow_audit_metadata(payload.pop("auditMetadata", None))
         workflow = AgenticWorkflow.from_file(path)
+        payload = _restore_masked_scope_declaration_secrets(payload, workflow)
+        payload = _restore_masked_trigger_input_secrets(payload, workflow)
         payload = _restore_masked_http_secrets(payload, workflow)
         payload = _restore_masked_notification_secrets(payload, workflow)
         payload = _restore_masked_webhook_secrets(payload, workflow)
@@ -1209,7 +1138,7 @@ def update_workflow_payload(
     except Exception as exc:
         raise WorkflowUpdateError(str(exc)) from exc
 
-    payload = workflow_to_payload(workflow, path)
+    payload = workflow_to_payload(workflow, path, source_base=base)
     _upsert_workflow_index(base, path, payload)
     return payload
 
@@ -1351,8 +1280,29 @@ async def run_workflow_payload(
     trigger_context: dict[str, Any] | None = None,
     parameters: dict[str, Any] | None = None,
     resume_options: ResumeOptions | None = None,
+    inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    registered = _registered_radish_workflow(workflow_id, base)
+    if registered is not None:
+        supplied_inputs = _merged_run_inputs(parameters, inputs, WorkflowRunError)
+        if dry_run:
+            return _radish_plan_payload(
+                registered,
+                base,
+                trigger_context=trigger_context,
+                error_cls=WorkflowRunError,
+            )
+        try:
+            radish_result = await run_radish_file(
+                registered.entrypoint,
+                workflow_inputs=supplied_inputs,
+                trigger_events=([trigger_context] if trigger_context else None),
+                data_dir=base,
+            )
+        except (RadishArtifactError, RadishError, RadishRunArtifactError, OSError) as exc:
+            raise WorkflowRunError(str(exc)) from exc
+        return _radish_run_payload(radish_result)
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowRunError)
     if not path.exists():
         raise WorkflowRunError(f"Workflow '{workflow_id}' not found")
@@ -1363,7 +1313,11 @@ async def run_workflow_payload(
         raise WorkflowRunError(str(exc)) from exc
     resource_warnings = workflow.resource_warnings(path.parent)
     try:
-        run_parameters = resolve_workflow_parameters(workflow.config, parameters)
+        if parameters and inputs and set(parameters) & set(inputs):
+            raise WorkflowRunError("Inputs cannot be supplied in both inputs and parameters")
+        run_parameters = resolve_workflow_parameters(
+            workflow.config, {**(parameters or {}), **(inputs or {})}
+        )
     except ValueError as exc:
         raise WorkflowRunError(str(exc)) from exc
 
@@ -1373,8 +1327,10 @@ async def run_workflow_payload(
             workflow_path=path,
             data_dir=base,
             trigger_context=trigger_context,
+            invocation_inputs=run_parameters,
         )
         plan["parameters"] = masked_workflow_parameters(workflow.config, run_parameters)
+        plan["inputs"] = plan["parameters"]
         return plan
 
     try:
@@ -1409,10 +1365,12 @@ async def run_workflow_payload(
             data_dir=base,
             cancel_event=cancel_event,
             stop_file=_workflow_stop_file(workflow_id, base, error_cls=WorkflowRunError),
-            run_log_update_callback=lambda updated_workflow_id, log_path: _write_run_summary_payload(
-                base,
-                updated_workflow_id,
-                log_path,
+            run_log_update_callback=lambda updated_workflow_id, log_path: (
+                _write_run_summary_payload(
+                    base,
+                    updated_workflow_id,
+                    log_path,
+                )
             ),
         ).with_trigger_context(trigger_context or {})
         executor = executor.with_parameters(run_parameters)
@@ -1458,6 +1416,8 @@ async def run_workflow_payload(
         "resourceWarnings": resource_warnings,
         "usageSummary": result.usage_summary,
         "parameters": result.parameters,
+        "inputs": result.inputs,
+        "variables": result.variables,
         "nodeOutputs": node_outputs,
         "nodeOutputsTruncated": node_outputs_truncated,
         "nodeOutputsMaxBytes": workflow.config.resource_limits.max_api_log_response_bytes,
@@ -1507,6 +1467,7 @@ async def trigger_workflow_payload(
     headers: dict[str, Any] | None = None,
     source: str | None = None,
     token: str | None = None,
+    inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowTriggerError)
@@ -1538,11 +1499,25 @@ async def trigger_workflow_payload(
         sensitive_payload_fields=set(trigger_config.sensitive_payload_fields),
         store_raw_payload=trigger_config.store_raw_payload,
     )
+    configured_inputs = _render_trigger_input_bindings(
+        trigger_config.input_bindings,
+        trigger_context,
+        workflow_id=workflow_id,
+        trigger_id=trigger_id,
+    )
+    overlap = sorted(set(configured_inputs) & set(inputs or {}))
+    if overlap:
+        raise WorkflowTriggerError(
+            "Webhook inputs cannot be supplied both explicitly and through input_bindings: "
+            + ", ".join(overlap)
+        )
+    run_inputs = {**configured_inputs, **(inputs or {})}
     run = await run_workflow_payload(
         workflow_id,
         base,
         dry_run=False,
         trigger_context=trigger_context,
+        inputs=run_inputs,
     )
     log_path_value = run.get("logPath")
     run_id = Path(str(log_path_value)).name if log_path_value else None
@@ -1567,6 +1542,7 @@ async def trigger_workflow_payload(
         if trigger_config.store_raw_payload
         else trigger_context["sanitizedPayload"],
         "payloadSanitized": not trigger_config.store_raw_payload,
+        "inputs": masked_workflow_parameters(workflow.config, inputs or {}),
         "replayNotice": (
             "Webhook payload was sanitized before replay storage; sensitive fields are "
             "masked and replay will use the masked values."
@@ -1575,6 +1551,23 @@ async def trigger_workflow_payload(
         ),
     }
     if log_path is not None:
+        secret_explicit_inputs = {
+            name: value
+            for name, value in (inputs or {}).items()
+            if workflow.config.declared_inputs.get(name)
+            and workflow.config.declared_inputs[name].is_secret
+        }
+        if secret_explicit_inputs:
+            checkpoint_codec = WorkflowExecutor(
+                workflow,
+                {},
+                log_base_dir=_safe_path(base, "logs", error_cls=WorkflowTriggerError),
+                data_dir=base,
+            )
+            replay["sensitiveInputs"] = checkpoint_codec._seal_snapshot_secrets(
+                log_path.with_suffix(".trigger.json"),
+                {"inputs": secret_explicit_inputs, "variables": {}},
+            )
         _write_run_trigger_payload(log_path, replay)
         _write_run_summary_payload(base, workflow_id, log_path)
     return {
@@ -1609,8 +1602,8 @@ async def replay_workflow_trigger_payload(
     replay_trigger_id = trigger_id or str(replay.get("triggerId") or "default")
     replay_token = token
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowTriggerError)
+    workflow = AgenticWorkflow.from_file(path)
     try:
-        workflow = AgenticWorkflow.from_file(path)
         config = workflow.config.webhooks.get(replay_trigger_id)
         if config is not None:
             expected_token = _webhook_expected_token(config)
@@ -1622,6 +1615,21 @@ async def replay_workflow_trigger_payload(
         if require_token:
             raise
         replay_token = None
+    replay_inputs = cast(dict[str, Any], replay.get("inputs") or {})
+    sealed_inputs = replay.get("sensitiveInputs")
+    if sealed_inputs is not None:
+        checkpoint_codec = WorkflowExecutor(
+            workflow,
+            {},
+            log_base_dir=_safe_path(base, "logs", error_cls=WorkflowTriggerError),
+            data_dir=base,
+        )
+        sensitive_scope = checkpoint_codec._open_snapshot_secrets(
+            log_path.with_suffix(".trigger.json"), sealed_inputs
+        )
+        restored = sensitive_scope.get("inputs")
+        if isinstance(restored, dict):
+            replay_inputs.update(restored)
     return await trigger_workflow_payload(
         workflow_id,
         replay_trigger_id,
@@ -1630,6 +1638,7 @@ async def replay_workflow_trigger_payload(
         headers=cast(dict[str, Any], replay.get("headers") or {}),
         source=f"replay:{run_id}",
         token=replay_token,
+        inputs=replay_inputs,
     )
 
 
@@ -1638,16 +1647,28 @@ def workflow_plan_payload(
     data_dir: Path | None = None,
     trigger_context: dict[str, Any] | None = None,
     parameters: dict[str, Any] | None = None,
+    inputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    registered = _registered_radish_workflow(workflow_id, base)
+    if registered is not None:
+        _merged_run_inputs(parameters, inputs, WorkflowPlanError)
+        return _radish_plan_payload(
+            registered,
+            base,
+            trigger_context=trigger_context,
+            error_cls=WorkflowPlanError,
+        )
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowPlanError)
     if not path.exists():
         raise WorkflowPlanError(f"Workflow '{workflow_id}' not found")
     try:
         workflow = AgenticWorkflow.from_file(path)
+        if parameters and inputs and set(parameters) & set(inputs):
+            raise WorkflowPlanError("Inputs cannot be supplied in both inputs and parameters")
         run_parameters = resolve_workflow_parameters(
             workflow.config,
-            parameters,
+            {**(parameters or {}), **(inputs or {})},
             allow_missing_required=True,
         )
         plan = build_execution_plan(
@@ -1655,8 +1676,10 @@ def workflow_plan_payload(
             workflow_path=path,
             data_dir=base,
             trigger_context=trigger_context,
+            invocation_inputs=run_parameters,
         )
         plan["parameters"] = masked_workflow_parameters(workflow.config, run_parameters)
+        plan["inputs"] = plan["parameters"]
         return plan
     except Exception as exc:
         raise WorkflowPlanError(str(exc)) from exc
@@ -1870,10 +1893,12 @@ def _resume_decided_approval(
                 workflow_path=workflow_path,
                 data_dir=base,
                 approval_store=store,
-                run_log_update_callback=lambda updated_workflow_id, log_path: _write_run_summary_payload(
-                    base,
-                    updated_workflow_id,
-                    log_path,
+                run_log_update_callback=lambda updated_workflow_id, log_path: (
+                    _write_run_summary_payload(
+                        base,
+                        updated_workflow_id,
+                        log_path,
+                    )
                 ),
             ).resume_from_approval,
             request,
@@ -2163,12 +2188,64 @@ def _webhook_trigger_context(
     return context
 
 
+def _render_trigger_input_bindings(
+    bindings: dict[str, Any],
+    trigger_context: dict[str, Any],
+    *,
+    workflow_id: str,
+    trigger_id: str,
+) -> dict[str, Any]:
+    context: dict[str, object] = {"trigger": trigger_context}
+
+    def render(value: object, field_path: str) -> object:
+        if isinstance(value, str):
+            expression = parse_exact_reference(value)
+            if expression is not None and value.strip().startswith("{{"):
+                selected: object = context
+                for part in expression.split("."):
+                    if not isinstance(selected, dict) or part not in selected:
+                        raise WorkflowTriggerError(
+                            f"Workflow '{workflow_id}' webhook '{trigger_id}' field "
+                            f"'{field_path}' has unresolved reference '{expression}'"
+                        )
+                    selected = selected[part]
+                return selected
+            rendered = PromptManager._interpolate(value, context)
+            unresolved = re.search(r"\{\{\s*([^{}]+?)\s*\}\}", rendered)
+            if unresolved is not None:
+                raise WorkflowTriggerError(
+                    f"Workflow '{workflow_id}' webhook '{trigger_id}' field "
+                    f"'{field_path}' has unresolved reference "
+                    f"'{unresolved.group(1).strip()}'"
+                )
+            return rendered
+        if isinstance(value, dict):
+            return {str(key): render(item, f"{field_path}.{key}") for key, item in value.items()}
+        if isinstance(value, list):
+            return [render(item, f"{field_path}.{index}") for index, item in enumerate(value)]
+        return value
+
+    return {name: render(value, f"input_bindings.{name}") for name, value in bindings.items()}
+
+
 def workflow_run_events_payload(
     workflow_id: str,
     run_id: str,
     data_dir: Path | None = None,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    radish_directory = _radish_run_directory(base, workflow_id)
+    if radish_directory.exists():
+        path = _radish_run_artifact_path(base, workflow_id, run_id)
+        payload = _radish_artifact_ui_payload(_read_radish_run_artifact(path), path)
+        return {
+            "workflowId": workflow_id,
+            "runId": run_id,
+            "logPath": str(path),
+            "status": payload["status"],
+            "runEvents": payload["runEvents"],
+            "runNodes": payload["runNodes"],
+        }
     log_path = _workflow_run_log_path(
         workflow_id,
         run_id,
@@ -2413,9 +2490,61 @@ def _node_output_data_payload(value: Any, limits: ResourceLimits, label: str) ->
     return value
 
 
+def _radish_run_directory(base: Path, workflow_id: str) -> Path:
+    safe_id = _validate_storage_workflow_id(workflow_id, WorkflowLogError)
+    return base / "radish" / "runs" / safe_id
+
+
+def _radish_run_artifact_paths(base: Path, workflow_id: str) -> list[Path]:
+    directory = _radish_run_directory(base, workflow_id)
+    if not directory.exists():
+        return []
+    return sorted(
+        (path for path in directory.glob("*.json") if path.is_file()),
+        key=lambda path: (path.stat().st_mtime_ns, path.name),
+        reverse=True,
+    )
+
+
+def _read_radish_run_artifact(path: Path) -> dict[str, Any]:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise WorkflowLogError(f"Could not read Radish run artifact {path.name}: {exc}") from exc
+    if not isinstance(document, dict) or document.get("run_artifact_version") != 1:
+        raise WorkflowLogError(f"Invalid Radish run artifact {path.name}.")
+    return document
+
+
+def _radish_run_artifact_path(base: Path, workflow_id: str, run_id: str) -> Path:
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", run_id) is None:
+        raise WorkflowLogError(f"Invalid run ID {run_id!r}.")
+    candidate = _radish_run_directory(base, workflow_id) / f"{run_id.removesuffix('.json')}.json"
+    if not candidate.exists() or not candidate.is_file():
+        raise WorkflowLogError(f"Run log {run_id!r} not found")
+    return candidate
+
+
+def _radish_run_summary(document: Mapping[str, Any], path: Path) -> dict[str, Any]:
+    return {
+        "id": str(document["run_id"]),
+        "logPath": str(path),
+        "status": "success" if document["status"] == "passed" else "error",
+        "startedAt": document.get("started_at"),
+        "finishedAt": document.get("finished_at"),
+        "durationSeconds": float(document.get("duration_ms", 0)) / 1000,
+        "triggerType": "manual",
+        "hasTriggerReplay": False,
+    }
+
+
 def latest_workflow_log_payload(workflow_id: str, data_dir: Path | None = None) -> dict[str, Any]:
     base = _data_dir(data_dir)
     _validate_storage_workflow_id(workflow_id, WorkflowLogError)
+    radish_paths = _radish_run_artifact_paths(base, workflow_id)
+    if radish_paths:
+        path = radish_paths[0]
+        return _radish_artifact_ui_payload(_read_radish_run_artifact(path), path)
     limits = _workflow_resource_limits(workflow_id, base)
     log_dir = _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowLogError)
     if not log_dir.exists():
@@ -2730,7 +2859,7 @@ def _log_run_summary(
             if "success" in terminal
             else (stored or {}).get("success", status == "success")
         ),
-        "triggerType": (stored or {}).get("triggerType") or _run_trigger_type(log_path),
+        "triggerType": _run_trigger_type(log_path),
         "triggerId": trigger_payload.get("triggerId"),
         "hasTriggerReplay": bool(trigger_payload),
         "nodeCount": len(nodes) if nodes else (stored or {}).get("nodeCount", 0),
@@ -2773,6 +2902,37 @@ def list_workflow_run_logs_payload(
     started_before: datetime | None = None,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    radish_paths = _radish_run_artifact_paths(base, workflow_id)
+    if radish_paths:
+        runs = [_radish_run_summary(_read_radish_run_artifact(path), path) for path in radish_paths]
+        if status:
+            runs = [run for run in runs if run["status"] == status]
+        if trigger_type:
+            runs = [run for run in runs if run["triggerType"] == trigger_type]
+        if search:
+            query = search.lower()
+            runs = [
+                run
+                for run in runs
+                if query in str(run["id"]).lower() or query in str(run["status"]).lower()
+            ]
+        if started_after or started_before:
+            runs = [
+                run for run in runs if _run_started_at_in_range(run, started_after, started_before)
+            ]
+        total = len(runs)
+        page_offset = max(0, offset)
+        page_limit = max(0, limit) if limit is not None else None
+        selected = (
+            runs[page_offset : page_offset + page_limit]
+            if page_limit is not None
+            else runs[page_offset:]
+        )
+        return {
+            "workflowId": workflow_id,
+            "runs": selected,
+            "pagination": {"offset": page_offset, "limit": page_limit, "total": total},
+        }
     log_dir = _workflow_storage_dir(
         base,
         "logs",
@@ -2894,6 +3054,21 @@ def workflow_run_log_payload(
     include_details: bool = True,
 ) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    radish_directory = _radish_run_directory(base, workflow_id)
+    if radish_directory.exists():
+        path = _radish_run_artifact_path(base, workflow_id, run_id)
+        document = _read_radish_run_artifact(path)
+        payload = _radish_artifact_ui_payload(document, path)
+        if not include_details:
+            return {
+                "workflowId": workflow_id,
+                "runId": run_id,
+                "logPath": str(path),
+                "startedAt": document.get("started_at"),
+                "status": payload["status"],
+                "logText": payload["logText"],
+            }
+        return payload
     limits = _workflow_resource_limits(workflow_id, base)
     log_path = _workflow_run_log_path(
         workflow_id,
@@ -3124,6 +3299,12 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
             id=str(trigger_id),
             **_without(item, "id"),
         )
+    component_payload = payload.get("component")
+    component = (
+        WorkflowComponentConfig(**component_payload)
+        if isinstance(component_payload, dict) and component_payload.get("id")
+        else None
+    )
     workflow = AgenticWorkflow(
         WorkflowConfig(
             id=str(payload["id"]),
@@ -3131,9 +3312,10 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
             schedule=payload.get("schedule"),
             watch=payload.get("watch"),
             webhooks=webhooks,
-            parameters=payload.get("parameters") or {},
+            parameters=(payload.get("parameters") or {}) if not payload.get("inputs") else {},
+            inputs=payload.get("inputs") or {},
+            variables=payload.get("variables") or {},
             resource_limits=ResourceLimits(**(payload.get("resourceLimits") or {})),
-            llm_budget=LlmUsageBudget(**(payload.get("llmBudget") or {})),
             run_continuously=bool(payload.get("runContinuously", False)),
             max_total_node_runs=int(payload.get("maxTotalNodeRuns") or 1000),
             filesystem_access=[
@@ -3142,7 +3324,13 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
                 if isinstance(item, dict) and item.get("path")
             ],
             metadata=WorkflowMetadata(**(payload.get("metadata") or {})),
-        )
+            output_schemas={
+                str(name): schema
+                for name, schema in (payload.get("outputSchemas") or {}).items()
+                if isinstance(schema, dict)
+            },
+        ),
+        component=component,
     )
 
     for agent_id, agent_data in (payload.get("agents") or {}).items():
@@ -3155,6 +3343,8 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
             agent_data.pop("profile", None)
         if not agent_data.get("model"):
             agent_data.pop("model", None)
+        if not agent_data.get("effort"):
+            agent_data.pop("effort", None)
         workflow.register_agent(
             AgentConfig(agent_id=str(agent_id), **_without(agent_data, "agent_id"))
         )
@@ -3177,6 +3367,9 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
                 pipe_output=bool(settings.get("pipeOutput", False)),
                 allow_failure=bool(settings.get("allowFailure", False)),
                 await_all_inputs=bool(settings.get("awaitAllInputs", True)),
+                for_each=str(settings.get("forEach") or "") or None,
+                max_concurrency=settings.get("maxConcurrency") or 1,
+                fail_fast=settings.get("failFast", False),
                 retry_count=int(settings.get("retryCount") or 0),
                 retry_delay_seconds=float(settings.get("retryDelaySeconds") or 1.0),
                 timeout_seconds=_optional_float(settings.get("timeoutSeconds")),
@@ -3197,6 +3390,9 @@ def workflow_from_payload(payload: dict[str, Any]) -> AgenticWorkflow:
                 to_node=to_node,
                 condition=condition,
                 output_pattern=edge_data.get("outputPattern") or None,
+                field=edge_data.get("field") or None,
+                operator=edge_data.get("operator") or None,
+                value=edge_data.get("value"),
             ),
         )
 
@@ -3214,19 +3410,26 @@ def _workflow_payload_to_validation_data(payload: dict[str, Any]) -> dict[str, A
         workflow_data["watch"] = payload.get("watch")
     if payload.get("parameters"):
         workflow_data["parameters"] = payload.get("parameters")
+    if payload.get("inputs"):
+        workflow_data["inputs"] = payload.get("inputs")
+    if payload.get("variables"):
+        workflow_data["variables"] = payload.get("variables")
     if payload.get("runContinuously"):
         workflow_data["run_continuously"] = bool(payload.get("runContinuously"))
     if payload.get("maxTotalNodeRuns") is not None:
         workflow_data["max_total_node_runs"] = payload.get("maxTotalNodeRuns")
     if payload.get("resourceLimits"):
         workflow_data["resource_limits"] = payload.get("resourceLimits")
-    if payload.get("llmBudget"):
-        workflow_data["llm_budget"] = payload.get("llmBudget")
     if payload.get("filesystemAccess"):
         workflow_data["filesystem_access"] = payload.get("filesystemAccess")
     if payload.get("metadata"):
         workflow_data["metadata"] = payload.get("metadata")
+    if payload.get("outputSchemas"):
+        workflow_data["output_schemas"] = payload.get("outputSchemas")
 
+    component_data = (
+        payload.get("component") if isinstance(payload.get("component"), dict) else None
+    )
     nodes: list[dict[str, Any]] = []
     for node in payload.get("nodes") or []:
         if not isinstance(node, dict):
@@ -3248,15 +3451,164 @@ def _workflow_payload_to_validation_data(payload: dict[str, Any]) -> dict[str, A
                 "to": edge.get("to"),
                 "condition": edge.get("condition") or "always",
                 "output_pattern": edge.get("outputPattern"),
+                "field": edge.get("field"),
+                "operator": edge.get("operator"),
+                "value": edge.get("value"),
             }
         )
 
-    return {
+    data = {
         "workflow": workflow_data,
         "agents": payload.get("agents") or {},
         "nodes": nodes,
         "edges": edges,
     }
+    if component_data:
+        data["component"] = component_data
+    return data
+
+
+def _restore_masked_input_declarations(
+    declarations: object,
+    existing: dict[str, WorkflowParameterConfig],
+) -> object:
+    if not isinstance(declarations, dict):
+        return declarations
+    restored: dict[str, Any] = {}
+    for name, declaration in declarations.items():
+        if not isinstance(declaration, dict):
+            restored[str(name)] = declaration
+            continue
+        item = dict(declaration)
+        previous = existing.get(str(name))
+        incoming_is_secret = item.get("type") == "secret" or item.get("secret") is True
+        if (
+            item.get("default") == "***"
+            and incoming_is_secret
+            and previous is not None
+            and previous.is_secret
+        ):
+            item["default"] = previous.default
+        restored[str(name)] = item
+    return restored
+
+
+def _restore_masked_variable_declarations(
+    declarations: object,
+    existing: dict[str, WorkflowVariableConfig],
+) -> object:
+    if not isinstance(declarations, dict):
+        return declarations
+    restored: dict[str, Any] = {}
+    for name, declaration in declarations.items():
+        if not isinstance(declaration, dict):
+            restored[str(name)] = declaration
+            continue
+        item = dict(declaration)
+        previous = existing.get(str(name))
+        if (
+            item.get("initial") == "***"
+            and item.get("secret") is True
+            and previous is not None
+            and previous.secret
+        ):
+            item["initial"] = previous.initial
+        restored[str(name)] = item
+    return restored
+
+
+def _restore_masked_scope_declaration_secrets(
+    payload: dict[str, Any],
+    existing: AgenticWorkflow,
+) -> dict[str, Any]:
+    restored = dict(payload)
+    if "parameters" in payload:
+        restored["parameters"] = _restore_masked_input_declarations(
+            payload.get("parameters"), existing.config.parameters
+        )
+    if "inputs" in payload:
+        restored["inputs"] = _restore_masked_input_declarations(
+            payload.get("inputs"), existing.config.declared_inputs
+        )
+    if "variables" in payload:
+        restored["variables"] = _restore_masked_variable_declarations(
+            payload.get("variables"), existing.config.variables
+        )
+    component_payload = payload.get("component")
+    if isinstance(component_payload, dict) and existing.component is not None:
+        restored_component = dict(component_payload)
+        if "inputs" in component_payload:
+            restored_component["inputs"] = _restore_masked_input_declarations(
+                component_payload.get("inputs"), existing.component.inputs
+            )
+        restored["component"] = restored_component
+    return restored
+
+
+def _restore_masked_invocation_inputs(
+    values: object,
+    existing: dict[str, Any],
+    declarations: dict[str, WorkflowParameterConfig],
+    incoming_secret_names: set[str],
+) -> object:
+    if not isinstance(values, dict):
+        return values
+    return {
+        str(name): (
+            existing[str(name)]
+            if value == "***"
+            and str(name) in existing
+            and str(name) in incoming_secret_names
+            and declarations.get(str(name)) is not None
+            and declarations[str(name)].is_secret
+            else value
+        )
+        for name, value in values.items()
+    }
+
+
+def _incoming_secret_input_names(
+    payload: dict[str, Any],
+    existing: dict[str, WorkflowParameterConfig],
+) -> set[str]:
+    if "parameters" not in payload and "inputs" not in payload:
+        return {name for name, declaration in existing.items() if declaration.is_secret}
+    declarations: dict[str, Any] = {}
+    for field_name in ("parameters", "inputs"):
+        values = payload.get(field_name)
+        if isinstance(values, dict):
+            declarations.update(values)
+    return {
+        str(name)
+        for name, declaration in declarations.items()
+        if isinstance(declaration, dict)
+        and (declaration.get("type") == "secret" or declaration.get("secret") is True)
+    }
+
+
+def _restore_masked_trigger_input_secrets(
+    payload: dict[str, Any],
+    existing: AgenticWorkflow,
+) -> dict[str, Any]:
+    restored = dict(payload)
+    declarations = existing.config.declared_inputs
+    incoming_secret_names = _incoming_secret_input_names(payload, declarations)
+    for field_name in ("schedule", "watch"):
+        trigger_payload = payload.get(field_name)
+        existing_config = getattr(existing.config, field_name)
+        if not isinstance(trigger_payload, dict) or existing_config is None:
+            continue
+        restored_trigger = dict(trigger_payload)
+        for input_field in ("params", "inputs"):
+            if input_field in trigger_payload:
+                restored_trigger[input_field] = _restore_masked_invocation_inputs(
+                    trigger_payload.get(input_field),
+                    getattr(existing_config, input_field),
+                    declarations,
+                    incoming_secret_names,
+                )
+        restored[field_name] = restored_trigger
+    return restored
 
 
 def _restore_masked_http_secrets(
@@ -3305,12 +3657,21 @@ def _restore_masked_webhook_secrets(
 
     restored = dict(payload)
     restored_webhooks: dict[str, Any] = {}
+    declarations = existing.config.declared_inputs
+    incoming_secret_names = _incoming_secret_input_names(payload, declarations)
     for trigger_id, item in webhook_payload.items():
         if not isinstance(item, dict):
             restored_webhooks[str(trigger_id)] = item
             continue
         existing_config = existing.config.webhooks.get(str(trigger_id))
         restored_item = dict(item)
+        if existing_config is not None and "input_bindings" in item:
+            restored_item["input_bindings"] = _restore_masked_invocation_inputs(
+                item.get("input_bindings"),
+                existing_config.input_bindings,
+                declarations,
+                incoming_secret_names,
+            )
         if (
             existing_config is not None
             and restored_item.get("tokenConfigured")
@@ -3480,7 +3841,12 @@ def _restore_masked_http_value(
     return value
 
 
-def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> dict[str, Any]:
+def workflow_to_payload(
+    workflow: AgenticWorkflow,
+    path: Path | None = None,
+    *,
+    source_base: Path | None = None,
+) -> dict[str, Any]:
     generations = workflow.graph.topological_generations()
     node_positions: dict[str, tuple[int, int]] = {}
     for generation_index, generation in enumerate(generations):
@@ -3495,7 +3861,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
     for generation in generations:
         for node in generation:
             x, y = node_positions[node.node_id]
-            operation = _ui_operation_payload(node.operation)
+            operation = _ui_operation_payload(node.operation, path, source_base)
             nodes.append(
                 {
                     "id": node.node_id,
@@ -3508,6 +3874,9 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
                         "pipeOutput": node.pipe_output,
                         "allowFailure": node.allow_failure,
                         "awaitAllInputs": node.await_all_inputs,
+                        "forEach": node.for_each,
+                        "maxConcurrency": node.max_concurrency,
+                        "failFast": node.fail_fast,
                         "retryCount": node.retry_count,
                         "retryDelaySeconds": node.retry_delay_seconds,
                         "timeoutSeconds": node.timeout_seconds,
@@ -3521,19 +3890,26 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
     for index, (from_id, to_id) in enumerate(workflow.graph._graph.edges()):
         config = workflow.graph.get_edge_config(from_id, to_id)
         condition = str(config.condition)
-        edges.append(
-            {
-                "id": f"{from_id}-{to_id}-{index}",
-                "from": from_id,
-                "to": to_id,
-                "label": _edge_label(condition, config.output_pattern),
-                "condition": condition,
-                "outputPattern": config.output_pattern,
-            }
-        )
+        item: dict[str, Any] = {
+            "id": f"{from_id}-{to_id}-{index}",
+            "from": from_id,
+            "to": to_id,
+            "label": config.explanation(),
+            "condition": condition,
+            "outputPattern": config.output_pattern,
+        }
+        if config.condition == EdgeConditionType.OUTPUT_FIELD:
+            item.update(
+                {
+                    "field": config.field,
+                    "operator": (config.operator.value if config.operator is not None else None),
+                    "value": config.value,
+                }
+            )
+        edges.append(item)
 
-    schedule = _trigger_config_payload(workflow.config.schedule)
-    watch = _trigger_config_payload(workflow.config.watch)
+    schedule = _trigger_config_payload(workflow.config.schedule, workflow.config.declared_inputs)
+    watch = _trigger_config_payload(workflow.config.watch, workflow.config.declared_inputs)
     status = _latest_run_status(workflow.config.id, path)
     tags = [status.lower()]
     operation_types = sorted({str(node["type"]) for node in nodes})
@@ -3545,6 +3921,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         else validate_workflow(workflow)
     )
     validation_diagnostics = [item.to_dict() for item in validation_report.diagnostics]
+    validation_bindings = [item.to_dict() for item in validation_report.bindings]
     secret_readiness = [
         item.to_dict()
         for item in workflow_secret_readiness(
@@ -3553,6 +3930,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
             data_dir=path.parent if path is not None else None,
         )
     ]
+    project_root, project_name = _workflow_project_identity(path, source_base)
 
     return {
         "id": workflow.config.id,
@@ -3560,22 +3938,35 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
         "description": _workflow_description(workflow, schedule, watch),
         "status": status,
         "updatedAt": _updated_at(path),
-        "sourcePath": path.name if path else None,
+        "sourcePath": _workflow_source_path(path, source_base),
+        "projectRoot": str(project_root),
+        "projectName": project_name,
         "schedule": schedule,
         "watch": watch,
         "parameters": {
-            name: spec.model_dump(mode="json", exclude_none=True)
+            name: _ui_input_declaration_payload(spec)
             for name, spec in workflow.config.parameters.items()
         },
-        "webhooks": _webhook_config_payload(workflow.config.webhooks),
+        "inputs": {
+            name: _ui_input_declaration_payload(spec)
+            for name, spec in workflow.config.declared_inputs.items()
+        },
+        "variables": {
+            name: _ui_variable_declaration_payload(spec)
+            for name, spec in workflow.config.variables.items()
+        },
+        "outputSchemas": workflow.config.output_schemas,
+        "webhooks": _webhook_config_payload(
+            workflow.config.webhooks, workflow.config.declared_inputs
+        ),
         "resourceLimits": _model_dump(workflow.config.resource_limits),
-        "llmBudget": _model_dump(workflow.config.llm_budget),
         "resourceWarnings": workflow.resource_warnings(),
         "healthWarnings": [
             item.to_dict() for item in health_diagnostics if item.severity == "warning"
         ],
         "healthErrors": [item.to_dict() for item in health_diagnostics if item.severity == "error"],
         "validationDiagnostics": validation_diagnostics,
+        "validationBindings": validation_bindings,
         "secretReadiness": secret_readiness,
         "validationWarnings": [
             item for item in validation_diagnostics if item.get("severity") == "warning"
@@ -3589,6 +3980,7 @@ def workflow_to_payload(workflow: AgenticWorkflow, path: Path | None = None) -> 
             entry.model_dump(mode="json", exclude_none=True)
             for entry in workflow.config.filesystem_access
         ],
+        "component": _ui_component_payload(workflow.component),
         "metadata": _model_dump(workflow.config.metadata),
         "tags": tags,
         "agents": {
@@ -3614,17 +4006,100 @@ def _model_dump(model: BaseModel | None) -> dict[str, Any] | None:
     return model.model_dump(mode="json", exclude_none=True, by_alias=True)
 
 
-def _trigger_config_payload(model: BaseModel | None) -> dict[str, Any] | None:
-    payload = _model_dump(model)
-    if payload is not None and payload.get("params") == {}:
-        payload.pop("params", None)
+def _ui_input_declaration_payload(spec: WorkflowParameterConfig) -> dict[str, Any]:
+    payload = spec.model_dump(mode="json", exclude_none=True)
+    if spec.is_secret and "default" in payload:
+        payload["default"] = "***"
     return payload
 
 
-def _webhook_config_payload(webhooks: dict[str, Any]) -> dict[str, Any]:
+def _ui_variable_declaration_payload(spec: WorkflowVariableConfig) -> dict[str, Any]:
+    payload = spec.model_dump(mode="json", exclude_none=True)
+    if spec.secret and "initial" in payload:
+        payload["initial"] = "***"
+    return payload
+
+
+def _ui_component_payload(component: WorkflowComponentConfig | None) -> dict[str, Any] | None:
+    payload = _model_dump(component)
+    if payload is None or component is None:
+        return payload
+    payload["inputs"] = {
+        name: _ui_input_declaration_payload(spec) for name, spec in component.inputs.items()
+    }
+    return payload
+
+
+def _workflow_source_path(path: Path | None, source_base: Path | None = None) -> str | None:
+    if path is None:
+        return None
+    if source_base is not None:
+        try:
+            return path.relative_to(source_base).as_posix()
+        except ValueError:
+            pass
+    return path.name
+
+
+def _workflow_project_identity(
+    path: Path | None,
+    source_base: Path | None = None,
+) -> tuple[Path, str]:
+    if path is None:
+        root = source_base.resolve() if source_base is not None else Path.cwd().resolve()
+        return root, root.name or str(root)
+    resolved = path.resolve()
+    parts = resolved.parts
+    if ".taskurotta" in parts:
+        marker = parts.index(".taskurotta")
+        root = Path(*parts[:marker])
+    elif source_base is not None:
+        root = source_base.resolve()
+    else:
+        root = resolved.parent
+    return root, root.name or str(root)
+
+
+def _masked_invocation_inputs(
+    values: dict[str, Any],
+    declarations: dict[str, WorkflowParameterConfig],
+) -> dict[str, Any]:
+    return {
+        name: (
+            "***" if declarations.get(name) is not None and declarations[name].is_secret else value
+        )
+        for name, value in values.items()
+    }
+
+
+def _trigger_config_payload(
+    model: BaseModel | None,
+    declarations: dict[str, WorkflowParameterConfig] | None = None,
+) -> dict[str, Any] | None:
+    payload = _model_dump(model)
+    if payload is None:
+        return None
+    for field_name in ("params", "inputs"):
+        values = payload.get(field_name)
+        if isinstance(values, dict):
+            payload[field_name] = _masked_invocation_inputs(values, declarations or {})
+    if payload.get("params") == {}:
+        payload.pop("params", None)
+    if payload.get("inputs") == {}:
+        payload.pop("inputs", None)
+    return payload
+
+
+def _webhook_config_payload(
+    webhooks: dict[str, Any],
+    declarations: dict[str, WorkflowParameterConfig] | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     for trigger_id, config in webhooks.items():
         item = config.model_dump(mode="json", exclude_none=True)
+        input_bindings = item.get("input_bindings")
+        if isinstance(input_bindings, dict):
+            item["input_bindings"] = _masked_invocation_inputs(input_bindings, declarations or {})
         item["tokenConfigured"] = bool(item.pop("token", None) or item.get("token_env"))
         item["riskReasons"] = _webhook_payload_risk_reasons(config)
         item["risk"] = "high" if item["riskReasons"] else "normal"
@@ -3643,13 +4118,79 @@ def _webhook_payload_risk_reasons(config: WebhookTriggerConfig) -> list[str]:
     return reasons
 
 
-def _ui_operation_payload(operation: Operation) -> dict[str, Any]:
+def _ui_operation_payload(
+    operation: Operation,
+    workflow_path: Path | None = None,
+    source_base: Path | None = None,
+) -> dict[str, Any]:
     data = _model_dump(operation)
     if isinstance(operation, HttpRequestOperation):
         return _masked_http_operation_payload(operation, data)
     if isinstance(operation, NotificationOperation):
         return _masked_notification_operation_payload(operation, data)
+    if isinstance(operation, SubflowOperation):
+        preview = _subflow_preview_payload(operation, workflow_path, source_base)
+        if preview:
+            data["component"] = preview
     return data
+
+
+def _subflow_preview_payload(
+    operation: SubflowOperation,
+    workflow_path: Path | None,
+    source_base: Path | None = None,
+) -> dict[str, Any] | None:
+    if workflow_path is None:
+        return None
+    base = workflow_path.parent
+    component_path: Path | None = None
+    if operation.source_path is not None:
+        source = operation.source_path.expanduser()
+        component_path = source if source.is_absolute() else base / source
+    elif operation.component_id.strip():
+        candidate = base / f"{operation.component_id.strip()}.toml"
+        if candidate.exists():
+            component_path = candidate
+        else:
+            for path in sorted(base.rglob("*.toml")):
+                try:
+                    workflow = AgenticWorkflow.from_file(path)
+                except Exception:
+                    continue
+                if (
+                    workflow.component is not None
+                    and workflow.component.id == operation.component_id
+                ):
+                    component_path = path
+                    break
+    if component_path is None or not component_path.exists():
+        return None
+    try:
+        workflow = AgenticWorkflow.from_file(component_path)
+    except Exception:
+        return None
+    nodes: list[dict[str, Any]] = []
+    for node in workflow.graph.nodes_in_order():
+        nodes.append(
+            {
+                "id": node.node_id,
+                "label": node.label or _node_label(node.node_id),
+                "type": str(node.operation.type),
+                "meta": _operation_meta(_model_dump(node.operation)),
+            }
+        )
+    edges = [{"from": from_id, "to": to_id} for from_id, to_id in workflow.graph._graph.edges()]
+    return {
+        "id": workflow.component.id if workflow.component else workflow.config.id,
+        "workflowId": workflow.config.id,
+        "version": workflow.component.version if workflow.component else "",
+        "sourcePath": _workflow_source_path(component_path, source_base),
+        "description": workflow.component.description if workflow.component else "",
+        "inputs": (_ui_component_payload(workflow.component) or {}).get("inputs", {}),
+        "outputs": _model_dump(workflow.component).get("outputs", {}) if workflow.component else {},
+        "nodes": nodes,
+        "edges": edges,
+    }
 
 
 def _masked_notification_operation_payload(
@@ -3872,12 +4413,19 @@ def _clean_operation_data(data: dict[str, Any]) -> dict[str, Any]:
             data.pop("profile", None)
         if not data.get("model"):
             data.pop("model", None)
+        if not data.get("effort"):
+            data.pop("effort", None)
         if data.get("timeout") in ("", None):
             data.pop("timeout", None)
     if op_type == OperationType.PROMPT_FILE and not data.get("template_path"):
         data.pop("template_path", None)
     if op_type == OperationType.WORKFLOW:
         data["workflow_id"] = str(data.get("workflow_id") or "").strip()
+    if op_type == OperationType.SUBFLOW:
+        data["component_id"] = str(data.get("component_id") or "").strip()
+        for optional in ("version", "source_path"):
+            if not data.get(optional):
+                data.pop(optional, None)
     return data
 
 
@@ -3885,6 +4433,303 @@ def _slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9-]", "-", value.lower())
     slug = re.sub(r"-+", "-", slug).strip("-")
     return slug or "workflow"
+
+
+def _registered_radish_workflow(
+    workflow_id: str,
+    data_dir: Path,
+) -> RegisteredWorkflow | None:
+    try:
+        safe_id = validate_workflow_id(workflow_id)
+    except ValueError:
+        return None
+    if (data_dir / f"{safe_id}.toml").is_file():
+        return None
+    canonical = workflow_id.lower()
+    try:
+        matches = [
+            workflow
+            for workflow in list_registered_workflows(registry_dir=data_dir)
+            if workflow.workflow_id.lower() == canonical
+        ]
+    except RadishWorkspaceError:
+        return None
+    return matches[0] if len(matches) == 1 else None
+
+
+def _merged_run_inputs(
+    parameters: dict[str, Any] | None,
+    inputs: dict[str, Any] | None,
+    error_cls: type[ValueError],
+) -> dict[str, Any]:
+    overlap = set(parameters or {}) & set(inputs or {})
+    if overlap:
+        names = ", ".join(sorted(overlap))
+        raise error_cls(f"Inputs cannot be supplied twice: {names}")
+    return {**(parameters or {}), **(inputs or {})}
+
+
+def _radish_workflow_inputs(items: list[dict[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for item in items:
+        schema = item["schema"]
+        schema_type = schema.get("type", "string")
+        if isinstance(schema_type, list):
+            schema_type = next((value for value in schema_type if value != "null"), "string")
+        choices = schema.get("enum")
+        result[item["name"]] = {
+            "type": "enum" if isinstance(choices, list) else schema_type,
+            "required": bool(item["required"]),
+            **({"choices": choices} if isinstance(choices, list) else {}),
+            **({"default": item["default"]["value"]} if item["default"]["present"] else {}),
+            "schema": schema,
+        }
+    return result
+
+
+def _radish_plan_payload(
+    workflow: RegisteredWorkflow,
+    data_dir: Path,
+    *,
+    trigger_context: dict[str, Any] | None,
+    error_cls: type[ValueError],
+) -> dict[str, Any]:
+    try:
+        compiled = compile_radish_file(
+            workflow.entrypoint,
+            data_dir=data_dir,
+            workflow_id=workflow.workflow_id,
+            project_root=workflow.project_root,
+        )
+        deployment = run_preflight(compiled.ir, data_dir=data_dir)
+    except (RadishArtifactError, RadishError, OSError) as exc:
+        raise error_cls(str(exc)) from exc
+
+    diagnostics = [
+        *compiled.diagnostics,
+        *(diagnostic.to_json() for diagnostic in deployment.diagnostics),
+    ]
+    error_diagnostics = [
+        diagnostic for diagnostic in diagnostics if diagnostic.get("severity") == "error"
+    ]
+    warning_diagnostics = [
+        diagnostic for diagnostic in diagnostics if diagnostic.get("severity") == "warning"
+    ]
+    nodes = compiled.ir["nodes"]
+    providers = []
+    for node in nodes:
+        resolution = node["resolutions"]["provider"]
+        if resolution is None:
+            continue
+        unavailable = any(
+            diagnostic.get("details", {}).get("node") == node["id"]
+            and diagnostic.get("severity") == "error"
+            for diagnostic in diagnostics
+        )
+        providers.append(
+            {
+                "agentId": node["id"],
+                "subscription": resolution["provider_id"],
+                "binary": resolution["provider_id"],
+                "available": not unavailable,
+                "workingDir": node["configuration"].get("working_dir", "."),
+                "profile": resolution["profile"],
+                "model": resolution["model"],
+                "timeout": (
+                    node["execution"]["timeout_ms"] / 1000
+                    if node["execution"]["timeout_ms"] is not None
+                    else None
+                ),
+                "extraPaths": node["configuration"].get("extra_paths", []),
+            }
+        )
+
+    destructive_effects = {"command", "filesystem_write", "network", "state_write"}
+    destructive_actions = [
+        f"{node['id']}: "
+        + ", ".join(
+            effect.replace("_", " ") for effect in node["effects"] if effect in destructive_effects
+        )
+        for node in nodes
+        if destructive_effects & set(node["effects"])
+    ]
+    required_secrets = sorted(
+        {
+            str(diagnostic["details"]["secret"])
+            for diagnostic in diagnostics
+            if diagnostic.get("details", {}).get("secret")
+        }
+    )
+    return {
+        "kind": "radish",
+        "runnable": bool(nodes) and deployment.ready,
+        "blockingDiagnostics": [item["message"] for item in error_diagnostics],
+        "warnings": [item["message"] for item in warning_diagnostics],
+        "destructiveActions": destructive_actions,
+        "providerRequirements": providers,
+        "requiredSecrets": required_secrets,
+        "bindings": [],
+        "triggerContext": trigger_context or {},
+        "generations": [
+            {
+                "index": 0,
+                "nodes": [
+                    {
+                        "id": node["id"],
+                        "label": node["id"],
+                        "type": node["type"],
+                        "detail": _radish_node_detail(node),
+                        "sideEffects": [effect.replace("_", " ") for effect in node["effects"]],
+                        "workingDir": node["configuration"].get("working_dir"),
+                        "bindings": [],
+                    }
+                    for node in nodes
+                ],
+            }
+        ],
+        "diagnostics": diagnostics,
+        "inputs": _radish_workflow_inputs(compiled.ir["workflow"]["inputs"]),
+        "compilationFingerprint": compiled.ir["source"]["compilation_fingerprint"],
+    }
+
+
+def _radish_node_detail(node: dict[str, Any]) -> str:
+    configuration = node["configuration"]
+    for field in (
+        "command",
+        "script_path",
+        "path",
+        "source_path",
+        "target",
+        "url",
+        "workflow_id",
+        "workflow_path",
+        "prompt_path",
+    ):
+        value = configuration.get(field)
+        if value not in (None, ""):
+            return str(value)
+    return str(node["runtime_handler"])
+
+
+def _radish_run_payload(result: RadishRunResult) -> dict[str, Any]:
+    return _radish_artifact_ui_payload(result.document, result.path)
+
+
+def _radish_artifact_ui_payload(document: Mapping[str, Any], path: Path) -> dict[str, Any]:
+    node_outputs = {
+        node_id: {
+            "success": True,
+            "output": json.dumps(output, ensure_ascii=False, default=str),
+            "data": output,
+        }
+        for node_id, output in document["latest_node_outputs"].items()
+    }
+    run_nodes: dict[str, dict[str, Any]] = {}
+    for record in document["runs"]:
+        node_id = record["node_id"]
+        output = record["output"]
+        error = record["error"]
+        success = record["outcome"] != "failure"
+        output_text = json.dumps(output, ensure_ascii=False, default=str)
+        exit_code = output.get("exit_code") if isinstance(output, Mapping) else None
+        stdout = output.get("stdout") if isinstance(output, Mapping) else None
+        stderr = output.get("stderr") if isinstance(output, Mapping) else None
+        error_message = error.get("message") if isinstance(error, Mapping) else None
+        node_outputs[node_id] = {
+            "success": success,
+            "output": output_text,
+            "data": output,
+            "exitCode": exit_code,
+            "error": error_message,
+        }
+        duration_ms = record["duration_ms"]
+        run_nodes[node_id] = {
+            "nodeId": node_id,
+            "status": "error" if not success else "success",
+            "startedAt": record["started_at"],
+            "finishedAt": record["finished_at"],
+            "durationMs": duration_ms,
+            "durationSeconds": duration_ms / 1000,
+            "exitCode": exit_code,
+            "error": error,
+            "message": error_message,
+            "runNumber": record["run_number"],
+            "activationLineageId": record["activation_lineage_id"],
+            "activationGroupId": record["activation_group_id"],
+            "attempts": [
+                {
+                    "attempt": 1,
+                    "runNumber": record["run_number"],
+                    "durationSeconds": duration_ms / 1000,
+                    "exitCode": exit_code,
+                    "output": output_text,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "error": error_message,
+                }
+            ],
+            "data": {"message": error_message},
+        }
+    return {
+        "workflowId": document["workflow"]["id"],
+        "runId": document["run_id"],
+        "success": document["status"] == "passed",
+        "status": "success" if document["status"] == "passed" else "error",
+        "logPath": str(path),
+        "logText": json.dumps(document, ensure_ascii=False, indent=2, default=str),
+        "nodeOutputs": node_outputs,
+        "runNodes": run_nodes,
+        "runEvents": _radish_ui_events(document),
+        "outputs": document["outputs"],
+        "diagnostics": document["diagnostics"],
+        "error": document["error"],
+        "radishRun": document,
+    }
+
+
+def _radish_event_message(event: Mapping[str, Any]) -> str:
+    event_type = str(event.get("type") or "event")
+    if event_type == "node_completed":
+        return f"Activation {event.get('run_number')} {event.get('outcome')}."
+    if event_type == "workflow_completed":
+        return f"Workflow {event.get('status')}."
+    return "Workflow started."
+
+
+def _radish_ui_events(document: Mapping[str, Any]) -> list[dict[str, Any]]:
+    runs = {
+        (record["node_id"], record["run_number"]): record for record in document.get("runs", [])
+    }
+    result: list[dict[str, Any]] = []
+    for event in document["events"]:
+        record = runs.get((event.get("node_id"), event.get("run_number")))
+        result.append(
+            {
+                "sequence": event["sequence"],
+                "type": event["type"],
+                "occurredAt": event["at"],
+                "nodeId": event.get("node_id") or "workflow",
+                "attempt": event.get("run_number"),
+                "outcome": event.get("outcome"),
+                "status": (
+                    "completed"
+                    if event.get("outcome") in {"success", "allowed_failure"}
+                    else "failed"
+                    if event.get("outcome") == "failure"
+                    else "completed"
+                    if event.get("status") == "passed"
+                    else "failed"
+                    if event.get("status")
+                    else "started"
+                ),
+                "message": _radish_event_message(event),
+                "activationLineageId": record.get("activation_lineage_id") if record else None,
+                "activationGroupId": record.get("activation_group_id") if record else None,
+                "durationMs": record.get("duration_ms") if record else None,
+            }
+        )
+    return result
 
 
 def _data_dir(data_dir: Path | None) -> Path:
@@ -3931,6 +4776,46 @@ def _workflow_toml_path(
 ) -> Path:
     safe_id = _validate_storage_workflow_id(workflow_id, error_cls)
     return _safe_path(base, f"{safe_id}.toml", error_cls=error_cls)
+
+
+def _workflow_toml_path_for_update(
+    workflow_id: str,
+    payload: dict[str, Any],
+    base: Path,
+) -> Path:
+    safe_id = _validate_storage_workflow_id(workflow_id, WorkflowUpdateError)
+    source_path = payload.get("sourcePath")
+    if isinstance(source_path, str) and source_path.strip():
+        path = _safe_path(base, source_path, error_cls=WorkflowUpdateError)
+        if path.suffix != ".toml":
+            raise WorkflowUpdateError("Invalid workflow source path")
+        if path.exists():
+            try:
+                workflow = AgenticWorkflow.from_file(path)
+            except Exception as exc:
+                raise WorkflowUpdateError(str(exc)) from exc
+            if workflow.config.id != safe_id:
+                raise WorkflowUpdateError("Workflow source path does not match workflow id")
+        return path
+
+    direct_path = _workflow_toml_path(safe_id, base, error_cls=WorkflowUpdateError)
+    if direct_path.exists():
+        return direct_path
+
+    matches: list[Path] = []
+    for path in sorted(base.rglob("*.toml")):
+        try:
+            workflow = AgenticWorkflow.from_file(path)
+        except Exception:
+            continue
+        if workflow.config.id == safe_id:
+            matches.append(path)
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise WorkflowUpdateError(f"Workflow '{workflow_id}' has multiple source files")
+    return direct_path
 
 
 def _workflow_storage_dir(
@@ -4044,6 +4929,8 @@ def _operation_meta(operation: dict[str, Any]) -> str:
             return f"loop {source.get('type', 'items')}"
         case OperationType.WORKFLOW:
             return f"run workflow {operation.get('workflow_id', 'workflow')}"
+        case OperationType.SUBFLOW:
+            return f"subflow {operation.get('component_id', 'component')}"
         case OperationType.BREAK:
             return operation.get("message") or "break loop"
     return str(operation.get("type", "operation"))

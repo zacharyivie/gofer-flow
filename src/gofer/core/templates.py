@@ -113,9 +113,7 @@ def create_workflow_from_template(
     data_dir = data_dir.resolve()
     data_dir.mkdir(parents=True, exist_ok=True)
     requested_name = (
-        workflow_name.strip()
-        if workflow_name and workflow_name.strip()
-        else definition.title
+        workflow_name.strip() if workflow_name and workflow_name.strip() else definition.title
     )
     workflow_id = _unique_workflow_id(_slugify(requested_name), data_dir)
     if workflow_id != _slugify(requested_name):

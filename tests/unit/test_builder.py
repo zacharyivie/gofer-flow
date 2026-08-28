@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +113,7 @@ def test_builder_creates_metadata_schedule_and_watcher_with_defaulted_numbers(
             "bad-int",
             "bad-float",
             False,
+            False,
             True,
         ],
     )
@@ -144,7 +146,7 @@ def test_builder_cancels_on_required_metadata_prompt(monkeypatch: Any) -> None:
 def test_builder_save_confirmation_can_cancel(monkeypatch: Any) -> None:
     _patch_questionary(
         monkeypatch,
-        ["Draft Flow", DEFAULT, False, False, False, False],
+        ["Draft Flow", DEFAULT, False, False, False, False, False],
     )
 
     assert builder_mod.WorkflowBuilder().run() is None
@@ -256,7 +258,7 @@ def test_builder_uses_existing_agent(monkeypatch: Any, tmp_path: Path) -> None:
     builder = _blank_builder()
     _patch_questionary(
         monkeypatch,
-        ["agent", "agent", "existing", "reviewer (agents)", True],
+        ["agent", "agent", "existing", "reviewer (agents)", False, True],
     )
 
     builder._ask_one_node()
@@ -289,6 +291,7 @@ def test_builder_falls_back_to_new_agent_and_parses_prompt_tools_and_mcp(
             "Summarize {{input}}",
             "Read, Write",
             "filesystem, github",
+            False,
             True,
         ],
     )
@@ -399,6 +402,79 @@ def test_builder_edges_cover_conditions_and_reject_self_loop_and_cycle(
     assert ("c", "a") not in edges
 
 
+def test_builder_authors_named_structured_output_workflow(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    schema = {
+        "type": "object",
+        "properties": {"score": {"type": "number"}},
+        "required": ["score"],
+    }
+    existing = AgentConfig(
+        agent_id="reviewer",
+        subscription="codex",
+        prompt_path=tmp_path / "review.md",
+        working_dir=tmp_path,
+    )
+    source_workflow = AgenticWorkflow(WorkflowConfig(id="agents", name="Agents"))
+    source_workflow.register_agent(existing)
+    monkeypatch.setattr(builder_mod, "list_all_agents", lambda: [(source_workflow, existing)])
+    builder = _blank_builder()
+
+    _patch_questionary(
+        monkeypatch,
+        [True, "review-result", json.dumps(schema), False],
+    )
+    builder._ask_output_schemas()
+    _patch_questionary(
+        monkeypatch,
+        [
+            "review",
+            "agent",
+            "existing",
+            "reviewer (agents)",
+            True,
+            "named schema",
+            "review-result",
+            "2",
+            False,
+        ],
+    )
+    builder._ask_one_node()
+    assert builder._workflow is not None
+    builder._workflow.add_operation(
+        GraphNode(
+            node_id="publish",
+            operation=BashCommandOperation(
+                type=OperationType.BASH_COMMAND, command="echo published"
+            ),
+        )
+    )
+    _patch_questionary(
+        monkeypatch,
+        [
+            True,
+            "review",
+            "publish",
+            "output_field",
+            "score",
+            "greater_than",
+            "7",
+            False,
+        ],
+    )
+    builder._ask_edges()
+
+    operation = builder._workflow.graph._nodes["review"].operation
+    assert isinstance(operation, AgentOperation)
+    assert operation.output_schema == "review-result"
+    assert operation.repair_attempts == 2
+    loaded = _round_trip(builder._workflow, tmp_path / "structured-builder.toml")
+    assert loaded.config.output_schemas["review-result"] == schema
+    assert loaded.graph._edges[("review", "publish")].value == 7
+
+
 def test_workflow_build_cli_writes_output(monkeypatch: Any, tmp_path: Path) -> None:
     output = tmp_path / "built.toml"
     _patch_questionary(
@@ -406,6 +482,7 @@ def test_workflow_build_cli_writes_output(monkeypatch: Any, tmp_path: Path) -> N
         [
             "CLI Flow",
             DEFAULT,
+            False,
             False,
             False,
             True,

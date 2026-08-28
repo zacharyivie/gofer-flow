@@ -13,24 +13,6 @@ class LlmPricing(BaseModel):
     chars_per_token: float = 4.0
 
 
-class LlmUsageBudget(BaseModel):
-    max_agent_calls: int | None = None
-    max_estimated_tokens: int | None = None
-    max_estimated_cost: float | None = None
-    max_agent_time_seconds: float | None = None
-
-    def enabled(self) -> bool:
-        return any(
-            value is not None
-            for value in (
-                self.max_agent_calls,
-                self.max_estimated_tokens,
-                self.max_estimated_cost,
-                self.max_agent_time_seconds,
-            )
-        )
-
-
 class LlmUsageEstimate(BaseModel):
     provider: str
     profile: str | None = None
@@ -61,13 +43,6 @@ class LlmUsageTotals:
         self.total_tokens += usage.total_tokens
         self.estimated_cost += usage.estimated_cost
         self.agent_time_seconds += usage.duration_seconds
-
-    def subtract(self, usage: LlmUsageEstimate) -> None:
-        self.input_tokens -= usage.input_tokens
-        self.output_tokens -= usage.output_tokens
-        self.total_tokens -= usage.total_tokens
-        self.estimated_cost -= usage.estimated_cost
-        self.agent_time_seconds -= usage.duration_seconds
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -164,47 +139,6 @@ def usage_from_metadata(
     )
 
 
-def budget_violations(
-    totals: LlmUsageTotals,
-    budget: LlmUsageBudget | None,
-    *,
-    scope: str,
-) -> list[str]:
-    if budget is None:
-        return []
-    violations = []
-    if budget.max_agent_calls is not None and totals.agent_calls > budget.max_agent_calls:
-        violations.append(
-            f"{scope} max_agent_calls exceeded "
-            f"({totals.agent_calls} > {budget.max_agent_calls})"
-        )
-    if (
-        budget.max_estimated_tokens is not None
-        and totals.total_tokens > budget.max_estimated_tokens
-    ):
-        violations.append(
-            f"{scope} max_estimated_tokens exceeded "
-            f"({totals.total_tokens} > {budget.max_estimated_tokens})"
-        )
-    if (
-        budget.max_estimated_cost is not None
-        and totals.estimated_cost > budget.max_estimated_cost
-    ):
-        violations.append(
-            f"{scope} max_estimated_cost exceeded "
-            f"({totals.estimated_cost:.6f} > {budget.max_estimated_cost:.6f})"
-        )
-    if (
-        budget.max_agent_time_seconds is not None
-        and totals.agent_time_seconds > budget.max_agent_time_seconds
-    ):
-        violations.append(
-            f"{scope} max_agent_time_seconds exceeded "
-            f"({totals.agent_time_seconds:.2f} > {budget.max_agent_time_seconds:.2f})"
-        )
-    return violations
-
-
 def summarize_node_outputs(
     node_outputs: dict[str, Any],
     node_runs: dict[str, list[Any]] | None = None,
@@ -225,28 +159,8 @@ def summarize_node_outputs(
         data = output.get("data") if isinstance(output, dict) else getattr(output, "data", {})
         if not isinstance(data, dict):
             continue
-        budget = data.get("budget")
-        budget_violations_ = (
-            budget.get("violations", []) if isinstance(budget, dict) else []
-        )
         usage = data.get("usage")
         if not isinstance(usage, dict):
-            if budget_violations_:
-                nodes.append({
-                    "node_id": node_id,
-                    "agent_id": data.get("agent_id"),
-                    "provider": None,
-                    "profile": None,
-                    "model": None,
-                    "prompt_length": 0,
-                    "output_length": 0,
-                    "total_tokens": 0,
-                    "estimated_cost": 0.0,
-                    "duration_seconds": 0.0,
-                    "estimated": True,
-                    "source": None,
-                    "budget_violations": budget_violations_,
-                })
             continue
         total_tokens = int(usage.get("total_tokens") or usage.get("totalTokens") or 0)
         input_tokens = int(usage.get("input_tokens") or usage.get("inputTokens") or 0)
@@ -261,31 +175,29 @@ def summarize_node_outputs(
         totals.total_tokens += total_tokens
         totals.estimated_cost += cost
         totals.agent_time_seconds += duration
-        nodes.append({
-            "node_id": node_id,
-            "agent_id": data.get("agent_id"),
-            "provider": usage.get("provider"),
-            "profile": usage.get("profile"),
-            "model": usage.get("model"),
-            "prompt_length": prompt_length,
-            "output_length": output_length,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": total_tokens,
-            "estimated_cost": cost,
-            "duration_seconds": duration,
-            "estimated": usage.get("estimated", True),
-            "source": usage.get("source"),
-            "budget_violations": budget_violations_,
-        })
+        nodes.append(
+            {
+                "node_id": node_id,
+                "agent_id": data.get("agent_id"),
+                "provider": usage.get("provider"),
+                "profile": usage.get("profile"),
+                "model": usage.get("model"),
+                "prompt_length": prompt_length,
+                "output_length": output_length,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "total_tokens": total_tokens,
+                "estimated_cost": cost,
+                "duration_seconds": duration,
+                "estimated": usage.get("estimated", True),
+                "source": usage.get("source"),
+            }
+        )
     return {
         "totals": totals.to_dict(),
         "nodes": nodes,
         "most_expensive_nodes": sorted(nodes, key=_node_cost, reverse=True)[:5],
         "slowest_nodes": sorted(nodes, key=_node_duration, reverse=True)[:5],
-        "budget_failures": [
-            node for node in nodes if node.get("budget_violations")
-        ],
     }
 
 

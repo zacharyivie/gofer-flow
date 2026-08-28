@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
+from gofer.core.provider_capabilities import resolve_provider_executable
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions.base import Subscription
 
@@ -18,7 +18,7 @@ class ClaudeCodeSubscription(Subscription):
     ) -> list[str]:
         _validate_claude_settings(provider_settings)
         cmd = [
-            shutil.which("claude") or "claude",
+            resolve_provider_executable("claude_code") or "claude",
             "--print",
             "--output-format",
             "stream-json",
@@ -26,6 +26,8 @@ class ClaudeCodeSubscription(Subscription):
         if provider_settings:
             if provider_settings.model:
                 cmd += ["--model", provider_settings.model]
+            if provider_settings.effort:
+                cmd += ["--effort", provider_settings.effort]
             if provider_settings.approval_mode not in (None, "default"):
                 approval_mode = provider_settings.approval_mode
                 if approval_mode is not None:
@@ -44,7 +46,7 @@ class ClaudeCodeSubscription(Subscription):
         return cmd
 
     def is_available(self) -> bool:
-        return shutil.which("claude") is not None
+        return resolve_provider_executable("claude_code") is not None
 
 
 def _validate_claude_settings(settings: ResolvedProviderSettings | None) -> None:
@@ -54,7 +56,5 @@ def _validate_claude_settings(settings: ResolvedProviderSettings | None) -> None
         raise ValueError(
             f"Claude Code subscription cannot run provider profile for '{settings.subscription}'"
         )
-    if settings.reasoning:
-        raise ValueError("Claude Code profiles do not support reasoning/effort")
     if settings.sandbox_mode not in (None, "default"):
         raise ValueError("Claude Code profiles do not support sandbox_mode")

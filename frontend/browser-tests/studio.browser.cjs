@@ -1,4 +1,4 @@
-/* global __dirname, Buffer, clearTimeout, console, CSS, document, Event, MouseEvent, process, setTimeout, window */
+/* global __dirname, clearTimeout, console, document, getComputedStyle, localStorage, MouseEvent, process, self, setTimeout */
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -9,57 +9,26 @@ const { app, BrowserWindow } = require("electron");
 
 const frontendRoot = path.resolve(__dirname, "..");
 const distRoot = path.join(frontendRoot, "dist");
-const TEST_TIMEOUT_MS = 45000;
+const timeout = setTimeout(() => fail(new Error("Browser studio smoke test timed out.")), 30000);
 
 let server;
-let baseUrl;
 let windowRef;
-const rendererMessages = [];
-
-const state = {
-  approvals: [
-    {
-      approvers: ["ops"],
-      message: "Approve deploy to production?",
-      nodeId: "approval",
-      requestedAt: "2026-06-27T10:00:00Z",
-      runId: "run-1",
-      status: "pending",
-      timeoutSeconds: 300,
-    },
-  ],
-  calls: [],
-  retention: {
-    keepDays: 30,
-    keepFailedDays: 90,
-    keepLast: 20,
-  },
-  workflow: workflowFixture(),
-};
-
-const timeout = setTimeout(() => {
-  fail(new Error("Browser studio regression test timed out."));
-}, TEST_TIMEOUT_MS);
-
-process.on("unhandledRejection", fail);
-process.on("uncaughtException", fail);
 
 app.disableHardwareAcceleration();
 app.commandLine.appendSwitch("disable-gpu");
-app.commandLine.appendSwitch("disable-gpu-compositing");
-app.commandLine.appendSwitch("disable-gpu-rasterization");
 app.commandLine.appendSwitch("disable-dev-shm-usage");
 app.commandLine.appendSwitch("no-sandbox");
 app.commandLine.appendSwitch("disable-setuid-sandbox");
 
+process.on("unhandledRejection", fail);
+process.on("uncaughtException", fail);
 app.whenReady().then(run).catch(fail);
 
 async function run() {
-  server = await startServer();
-
+  const baseUrl = await startServer();
   windowRef = new BrowserWindow({
     width: 1440,
-    height: 950,
+    height: 900,
     show: false,
     webPreferences: {
       contextIsolation: false,
@@ -68,208 +37,827 @@ async function run() {
       sandbox: false,
     },
   });
-  windowRef.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    rendererMessages.push({ level, line, message, sourceId });
-    if (level >= 2) {
-      console.error(`Renderer console: ${message} (${sourceId}:${line})`);
-    }
-  });
-  windowRef.webContents.on(
-    "did-fail-load",
-    (_event, errorCode, errorDescription, validatedURL) => {
-      rendererMessages.push({
-        level: 3,
-        line: 0,
-        message: `did-fail-load ${errorCode}: ${errorDescription}`,
-        sourceId: validatedURL,
-      });
-    },
-  );
 
-  await loadApp();
-  await runDesktopGraphRegression();
-  await runCompactLayoutRegression();
+  await windowRef.loadURL(baseUrl);
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Search workflows']"))));
+  if (process.env.GOFER_MONACO_ONLY === "1") {
+    await exerciseMonacoEditor();
+    await exercisePackagedMonacoWorker(baseUrl);
+    clearTimeout(timeout);
+    console.log("Browser Monaco regression test passed.");
+    await cleanup(0);
+    return;
+  }
+  await exerciseCreateDialog();
+  await exerciseDesignRegressions();
+  await exerciseKeyboardGraphAndResizers();
+  await exerciseMonacoEditor();
+  await exercisePackagedMonacoWorker(baseUrl);
 
   clearTimeout(timeout);
-  console.log("Browser studio regression tests passed.");
+  console.log("Browser studio accessibility smoke test passed.");
   await cleanup(0);
 }
 
-async function loadApp() {
-  await windowRef.loadURL(baseUrl);
+async function exerciseMonacoEditor() {
+  await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .some((button) => button.textContent.includes("Radish editor"))));
+  await evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .find((button) => button.textContent.includes("Radish editor")).click());
+  await waitFor(() => evaluate(() => [...document.querySelectorAll("article")]
+    .some((node) => node.textContent.includes("Prepare"))));
+  await evaluate(() => document.querySelector("button[title='Run workflow now']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[role='dialog']"))));
+  assert.equal(await evaluate(() => document.querySelector("[role='dialog']").textContent.includes("prepare")), true);
+  await evaluate(() => [...document.querySelectorAll("[role='dialog'] button")]
+    .find((button) => button.textContent.trim() === "Run workflow").click());
+  await waitFor(() => evaluate(() => !document.querySelector("[role='dialog']")));
+  await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .some((button) => button.textContent.includes("Radish editor") && button.textContent.includes("Success"))));
+  await waitFor(() => evaluate(() => !document.querySelector("button[role='tab'][title*='Code view']")?.disabled));
+  await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
+    .find((button) => button.textContent.trim() === "Code").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector(".monaco-editor"))));
+  assert.equal(await evaluate(() => document.querySelector("[aria-label='Search files']")?.placeholder), "Search files");
+  await waitFor(() => evaluate(() => [...document.querySelectorAll(".view-line")]
+    .some((line) => line.textContent.includes("Radish"))));
+  await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
+    .find((button) => button.textContent.trim() === "Graph").click());
+  assert.equal(await evaluate(() => Boolean(document.querySelector(".monaco-editor"))), true);
+  await waitFor(() => evaluate(() => [...document.querySelectorAll("article")]
+    .some((node) => node.textContent.includes("Prepare"))));
+  assert.equal(await evaluate(() => document.body.textContent.includes("Radish graph preview")), true);
+}
+
+async function exercisePackagedMonacoWorker(baseUrl) {
+  const httpWindow = windowRef;
+  const packagedWindow = new BrowserWindow({
+    width: 1440,
+    height: 900,
+    show: false,
+    webPreferences: {
+      additionalArguments: [`--gofer-api-base-url=${baseUrl}`],
+      contextIsolation: false,
+      nodeIntegration: false,
+      preload: path.join(__dirname, "studio-preload-mock.cjs"),
+      sandbox: false,
+    },
+  });
+  await packagedWindow.loadFile(path.join(distRoot, "index.html"));
+  windowRef = packagedWindow;
+  if (httpWindow && !httpWindow.isDestroyed()) httpWindow.destroy();
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Search workflows']"))));
+  await waitFor(() => evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .some((button) => button.textContent.includes("Radish editor"))));
+  await evaluate(() => [...document.querySelectorAll("[role='button']")]
+    .find((button) => button.textContent.includes("Radish editor")).click());
+  await evaluate(() => [...document.querySelectorAll("button[role='tab']")]
+    .find((button) => button.textContent.trim() === "Code").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector(".monaco-editor"))));
+  const workerResult = await evaluate(() => {
+    try {
+      const worker = self.MonacoEnvironment.getWorker();
+      worker.terminate();
+      return { ok: true };
+    } catch (error) {
+      return { error: String(error), ok: false };
+    }
+  });
+  assert.equal(workerResult.ok, true, workerResult.error);
+}
+
+async function exerciseDesignRegressions() {
   await evaluate(() => {
-    window.confirm = () => true;
+    const workflowScroll = document.querySelector("[aria-label='Search workflows']")
+      .closest("aside")
+      .querySelector(".workflow-scrollbar");
+    workflowScroll.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 120,
+      clientY: 180,
+    }));
   });
-  await waitFor(() => textIncludes("Demo workflow"), "workflow list loaded");
-  await waitFor(
-    async () => (await count("[data-testid='workflow-node']")) >= 3,
-    "workflow nodes rendered",
-    7000,
-    browserDiagnosticSnapshot,
+  await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("button")]
+    .find((button) => button.textContent.includes("Create group")))));
+  await evaluate(() => [...document.querySelectorAll("button")]
+    .find((button) => button.textContent.includes("Create group")).click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("input[value='New group']"))));
+  await evaluate(() => {
+    const input = document.querySelector("input[value='New group']");
+    input.blur();
+  });
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='New group workflows']"))));
+
+  await evaluate(() => {
+    const workflow = [...document.querySelectorAll("[draggable='true']")]
+      .find((item) => item.textContent.includes("Demo workflow"));
+    const target = document.querySelector("[aria-label='New group workflows']");
+    const values = new Map();
+    const transfer = {
+      effectAllowed: "all",
+      getData(type) { return values.get(type) ?? ""; },
+      setData(type, value) { values.set(type, value); },
+    };
+    const event = (type) => {
+      const nextEvent = new target.ownerDocument.defaultView.Event(type, { bubbles: true, cancelable: true });
+      Object.defineProperty(nextEvent, "dataTransfer", { value: transfer });
+      return nextEvent;
+    };
+    workflow.dispatchEvent(event("dragstart"));
+    target.dispatchEvent(event("dragover"));
+    target.dispatchEvent(event("drop"));
+  });
+  await waitFor(() => evaluate(() => {
+    const group = document.querySelector("[aria-label='New group workflows']");
+    const stored = JSON.parse(localStorage.getItem("gofer.workflowGroups"));
+    return group?.textContent.includes("Demo workflow") && stored?.assignments?.demo;
+  }));
+
+  await evaluate(() => {
+    const group = document.querySelector("[aria-label='New group workflows']");
+    group.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+      clientX: 140,
+      clientY: 150,
+    }));
+  });
+  await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("button")]
+    .find((button) => button.textContent.includes("Ungroup workflows")))));
+  assert.equal(
+    await evaluate(() => Boolean([...document.querySelectorAll("button")]
+      .find((button) => button.textContent.includes("Delete group")))),
+    false,
   );
-}
-
-async function runDesktopGraphRegression() {
-  await waitFor(() => textIncludes("Approval Required"), "approval overlay");
-  await waitFor(() => textIncludes("Approve deploy to production?"), "approval message");
-
-  await clickByTitle("Run workflow now");
-  await waitFor(() => runPreviewOpen(), "run preview dialog");
-  assert.equal(await textIncludes("Deletes /tmp/output.txt"), true);
-  assert.equal(await textIncludes("codex binary=codex"), true);
-  await closeRunPreview();
-  await waitFor(async () => !(await runPreviewOpen()), "run preview closes");
-
-  await clickByText("All runs");
-  await waitFor(() => textIncludes("Previous runs"), "run history opens");
-  assert.equal(await textIncludes("run-1"), true);
-  assert.equal(await textIncludes("Run timeline"), true);
-
-  await clickByTitle("Run retention settings");
-  await waitFor(() => textIncludes("Retention"), "retention controls open");
-  await clickByText("Preview");
-  await waitFor(() => lastCall("POST", "/api/workflows/demo/logs/prune"), "retention preview sent");
-
-  await clickByText("Add trusted directory");
-  await clickByTitle("Choose trusted directory");
-  await waitFor(() => bridgeCall("workspace.selectPath"), "desktop bridge path picker called");
-  await clickByText("Add");
-  await waitForSavedPayload(
-    (payload) =>
-      (payload.filesystemAccess ?? []).some(
-        (entry) => entry.path === "/workspace/inputs",
-      ),
-    "selected path serialized",
+  assert.equal(
+    await evaluate(() => Boolean([...document.querySelectorAll("button")]
+      .find((button) => button.textContent.includes("Ungroup workflows"))
+      ?.querySelector(".lucide-ungroup"))),
+    true,
   );
+  await evaluate(() => [...document.querySelectorAll("button")]
+    .find((button) => button.textContent.includes("Ungroup workflows")).click());
+  await waitFor(() => evaluate(() => {
+    const stored = JSON.parse(localStorage.getItem("gofer.workflowGroups"));
+    return !document.querySelector("[aria-label='New group workflows']")
+      && document.querySelector("[aria-label='Unfiled workflows']")?.textContent.includes("Demo workflow")
+      && !stored?.groups?.some((group) => group.name === "New group")
+      && !stored?.assignments?.demo;
+  }));
 
-  await dragSelector("[data-node-id='fetch']", 90, 45);
-
-  await clickByTitle("Add node");
-  await waitFor(async () => (await count("[data-testid='workflow-node']")) >= 4, "new node added");
-
-  await contextMenu("[data-node-id='fetch']");
-  await waitFor(() => exists("[data-testid='node-context-menu']"), "node menu opens");
-  await clickByText("Duplicate node");
-  await waitFor(() => textIncludes("Fetch data copy"), "node duplicated");
-
-  await clickByTitle("Zoom in");
-  await clickByTitle("Zoom out");
-  await clickByTitle("Fit graph");
-  await clickByTitle("Auto-layout graph");
-  await dragSelector("[data-testid='graph-minimap'] > div", 30, 18);
-
-  await waitForSavedPayload(
-    (payload) => payload.nodes.some((node) => node.id === "fetch" && node.x !== 0),
-    "dragged position serialized",
-  );
-}
-
-async function runCompactLayoutRegression() {
-  await windowRef.setSize(1180, 820);
-  await wait(250);
-  const layout = await evaluate(() => {
-    const viewport = { width: window.innerWidth, height: window.innerHeight };
-    const selectors = [
-      ["moreActions", "[title='More graph actions']"],
-      ["runNow", "[title='Run workflow now']"],
-      ["minimap", "[data-testid='graph-minimap']"],
-      ["search", "[aria-label='Search nodes']"],
-    ];
-    const controls = selectors.map(([name, selector]) => {
-      const element = document.querySelector(selector);
-      if (!element) return { name, missing: true };
-      const rect = element.getBoundingClientRect();
+  const pickerWidths = await evaluate(() => {
+    const textarea = document.querySelector("textarea[placeholder='Message this workflow']");
+    const chat = textarea.closest("aside");
+    const trigger = chat.querySelector(".model-picker-trigger");
+    const provider = trigger.querySelector("[data-model-picker-part='provider']");
+    const model = trigger.querySelector("[data-model-picker-part='model']");
+    const effort = trigger.querySelector("[data-model-picker-part='effort']");
+    const metrics = (segment) => {
+      const label = segment.querySelector("[data-picker-label]");
+      const segmentRect = segment.getBoundingClientRect();
+      const labelRect = label.getBoundingClientRect();
+      const style = getComputedStyle(segment);
       return {
-        bottom: rect.bottom,
-        height: rect.height,
-        left: rect.left,
-        name,
-        right: rect.right,
-        top: rect.top,
-        width: rect.width,
+        centerDelta: Math.abs(
+          (labelRect.left + labelRect.width / 2) - (segmentRect.left + segmentRect.width / 2),
+        ),
+        color: style.color,
+        fontFamily: style.fontFamily,
+        fontSize: style.fontSize,
+        fontWeight: style.fontWeight,
+        fullyVisible: label.scrollWidth <= label.clientWidth,
+        width: segmentRect.width,
       };
-    });
-    return { controls, viewport };
+    };
+    return {
+      composer: textarea.parentElement.getBoundingClientRect().width,
+      effortLeft: effort.getBoundingClientRect().left,
+      effortMetrics: metrics(effort),
+      effortText: effort.textContent.trim(),
+      modelLeft: model.getBoundingClientRect().left,
+      modelMetrics: metrics(model),
+      modelText: model.textContent.trim(),
+      providerLeft: provider.getBoundingClientRect().left,
+      providerMetrics: metrics(provider),
+      providerText: provider.textContent.trim(),
+      trigger: trigger.getBoundingClientRect().width,
+    };
   });
+  assert.ok(Math.abs(pickerWidths.trigger - pickerWidths.composer) < 1);
+  assert.equal(pickerWidths.providerText, "Codex");
+  assert.equal(pickerWidths.modelText, "GPT-5.6-Sol");
+  assert.equal(pickerWidths.effortText, "Medium");
+  assert.ok(pickerWidths.providerLeft < pickerWidths.modelLeft);
+  assert.ok(pickerWidths.modelLeft < pickerWidths.effortLeft);
+  const typography = ({ color, fontFamily, fontSize, fontWeight }) => ({
+    color,
+    fontFamily,
+    fontSize,
+    fontWeight,
+  });
+  assert.deepEqual(typography(pickerWidths.providerMetrics), typography(pickerWidths.modelMetrics));
+  assert.deepEqual(typography(pickerWidths.modelMetrics), typography(pickerWidths.effortMetrics));
+  assert.ok(pickerWidths.providerMetrics.centerDelta < 1);
+  assert.ok(pickerWidths.modelMetrics.centerDelta < 1);
+  assert.ok(pickerWidths.effortMetrics.centerDelta < 1);
+  assert.ok(pickerWidths.modelMetrics.width > pickerWidths.providerMetrics.width);
+  assert.ok(pickerWidths.providerMetrics.width > pickerWidths.effortMetrics.width);
+  assert.equal(pickerWidths.providerMetrics.fullyVisible, true);
+  assert.equal(pickerWidths.modelMetrics.fullyVisible, true);
+  assert.equal(pickerWidths.effortMetrics.fullyVisible, true);
 
-  assert.equal(layout.controls.length, 4);
-  for (const rect of layout.controls) {
-    assert.equal(rect.missing, undefined, `${rect.name} should render on mobile`);
-    assert.ok(rect.width > 0 && rect.height > 0);
-    assert.ok(rect.left >= 0, `${rect.name} left edge is clipped`);
-    assert.ok(rect.top >= 0, `${rect.name} top edge is clipped`);
-    assert.ok(
-      rect.right <= layout.viewport.width,
-      `${rect.name} right edge is clipped: right=${rect.right}, viewport=${layout.viewport.width}`,
-    );
-    assert.ok(
-      rect.bottom <= layout.viewport.height,
-      `${rect.name} bottom edge is clipped: bottom=${rect.bottom}, viewport=${layout.viewport.height}`,
-    );
+  await evaluate(() => document.querySelector("[data-picker-trigger='provider']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='provider']"))));
+  const providerMenuWidth = await evaluate(() =>
+    document.querySelector("[data-picker-menu='provider']").getBoundingClientRect().width,
+  );
+  assert.ok(
+    Math.abs(providerMenuWidth - pickerWidths.composer) <= 20,
+    `Provider menu width ${providerMenuWidth} did not match composer width ${pickerWidths.composer}`,
+  );
+  await evaluate(() => document.querySelector("[data-picker-trigger='provider']").click());
+
+  await evaluate(() => document.querySelector("[data-picker-trigger='model']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='model']"))));
+  assert.equal(await evaluate(() => Boolean(document.querySelector("input[placeholder='Search models']"))), false);
+  await evaluate(() => document.querySelector("[data-picker-trigger='model']").parentElement.classList.add("dark"));
+  await wait(200);
+  const darkModelState = await evaluate(() => {
+    const trigger = document.querySelector("[data-picker-trigger='model']");
+    return {
+      background: getComputedStyle(trigger).backgroundColor,
+      className: trigger.className,
+      expanded: trigger.getAttribute("aria-expanded"),
+      parentClassName: trigger.parentElement.className,
+    };
+  });
+  assert.equal(darkModelState.background, "rgb(42, 42, 42)", JSON.stringify(darkModelState));
+  await evaluate(() => document.querySelector("[data-picker-trigger='model']").parentElement.classList.remove("dark"));
+  await evaluate(() => [...document.querySelectorAll("[data-picker-menu='model'] [role='option']")]
+    .find((option) => option.textContent.trim() === "GPT-5.6-Luna").click());
+  await waitFor(() => evaluate(() =>
+    document.querySelector("[data-picker-trigger='model'] [data-picker-label]").textContent.trim() === "GPT-5.6-Luna"));
+  assert.equal(
+    await evaluate(() => document.querySelector("[data-picker-trigger='effort'] [data-picker-label]").textContent.trim()),
+    "Medium",
+  );
+
+  await evaluate(() => document.querySelector("[data-picker-trigger='effort']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='effort']"))));
+  const effortMenu = await evaluate(() => {
+    const menu = document.querySelector("[data-picker-menu='effort']");
+    const options = [...menu.querySelectorAll("[role='option']")];
+    return {
+      activeLabel: menu.querySelector("[role='option'][aria-selected='true']")?.textContent.trim(),
+      fitsWidth: menu.scrollWidth <= menu.clientWidth,
+      labels: options.map((option) => option.textContent.trim()),
+      optionCount: options.length,
+      optionTops: options.map((option) => Math.round(option.getBoundingClientRect().top)),
+    };
+  });
+  assert.equal(effortMenu.optionCount, 5);
+  assert.equal(new Set(effortMenu.optionTops).size, 5);
+  assert.equal(effortMenu.fitsWidth, true);
+  assert.deepEqual(effortMenu.labels, ["Low", "Medium (default)", "High", "X-high", "Max"]);
+  assert.equal(effortMenu.activeLabel, "Medium (default)");
+  await evaluate(() => document.querySelector("[data-picker-trigger='effort']").click());
+
+  await evaluate(() => document.querySelector("[data-picker-trigger='provider']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='provider']"))));
+  await evaluate(() => [...document.querySelectorAll("[data-picker-menu='provider'] [role='option']")]
+    .find((option) => option.textContent.includes("Claude Code")).click());
+  await waitFor(() => evaluate(() =>
+    document.querySelector("[data-picker-trigger='model'] [data-picker-label]").textContent.trim() === "Claude Sonnet 5"));
+  assert.equal(
+    await evaluate(() => document.querySelector("[data-picker-trigger='effort'] [data-picker-label]").textContent.trim()),
+    "High",
+  );
+  await evaluate(() => document.querySelector("[data-picker-trigger='model']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='model']"))));
+  const claudeModels = await evaluate(() =>
+    [...document.querySelectorAll("[data-picker-menu='model'] [role='option']")]
+      .map((option) => option.textContent.trim()));
+  assert.equal(claudeModels.includes("Default"), false);
+  assert.equal(claudeModels.includes("Claude Sonnet 5 (default)"), true);
+  await evaluate(() => document.querySelector("[data-picker-trigger='model']").click());
+  await evaluate(() => document.querySelector("[data-picker-trigger='effort']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-picker-menu='effort']"))));
+  assert.equal(
+    await evaluate(() => document.querySelector("[data-picker-menu='effort'] [aria-selected='true']").textContent.trim()),
+    "High (default)",
+  );
+  assert.equal(
+    await evaluate(() => [...document.querySelectorAll("[data-picker-menu='effort'] [role='option']")]
+      .some((option) => option.textContent.trim() === "Default")),
+    false,
+  );
+  await evaluate(() => document.querySelector("[data-picker-trigger='effort']").click());
+
+  assert.equal(await evaluate(() => Boolean(document.querySelector("button[title='New thread']"))), true);
+  assert.equal(await evaluate(() => Boolean(document.querySelector("button[title='Recent threads']"))), true);
+  await evaluate(() => document.querySelector("button[title='New thread']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("button[title='Back to recent threads']"))));
+  await evaluate(() => document.querySelector("button[title='Back to recent threads']").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[data-assistant-home]"))));
+  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Workflow assistant")), true);
+  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Ask about the selected workflow")), true);
+  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("Recent threads")), true);
+  assert.equal(await evaluate(() => document.querySelector("[data-assistant-home]").textContent.includes("New thread")), true);
+  assert.equal(await evaluate(() => Boolean(document.querySelector("button[title='Back to recent threads']"))), false);
+  await evaluate(() => document.querySelector("button[title='Recent threads']").click());
+  await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("p")]
+    .find((item) => item.textContent.trim() === "Recent threads"))));
+  await evaluate(() => document.querySelector("button[title='Recent threads']").click());
+
+  const composerLayout = await evaluate(() => {
+    const composer = document.querySelector("[data-chat-composer]");
+    const textarea = composer.querySelector("textarea");
+    const send = composer.querySelector("button[title='Send message']");
+    const composerRect = composer.getBoundingClientRect();
+    const textareaRect = textarea.getBoundingClientRect();
+    const sendRect = send.getBoundingClientRect();
+    return {
+      composer: { height: composerRect.height, width: composerRect.width },
+      sendInsideTextarea:
+        sendRect.left >= textareaRect.left &&
+        sendRect.right <= textareaRect.right &&
+        sendRect.top >= textareaRect.top &&
+        sendRect.bottom <= textareaRect.bottom,
+      textarea: { height: textareaRect.height, width: textareaRect.width },
+    };
+  });
+  assert.ok(Math.abs(composerLayout.textarea.width - composerLayout.composer.width) <= 2);
+  assert.ok(Math.abs(composerLayout.textarea.height - composerLayout.composer.height) <= 2);
+  assert.equal(composerLayout.sendInsideTextarea, true);
+
+  await evaluate(() => document.querySelector("button[title='Map']").click());
+  await evaluate(() => [...document.querySelectorAll("button")]
+    .find((button) => button.textContent.trim() === "Minimap").click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[title='Minimap'] > div"))));
+  const minimapFill = await evaluate(() => {
+    const surface = document.querySelector("[title='Minimap'] > div");
+    const container = surface.parentElement;
+    return {
+      containerHeight: container.clientHeight,
+      containerWidth: container.clientWidth,
+      surfaceHeight: surface.clientHeight,
+      surfaceWidth: surface.clientWidth,
+    };
+  });
+  assert.equal(minimapFill.surfaceWidth, minimapFill.containerWidth);
+  assert.equal(minimapFill.surfaceHeight, minimapFill.containerHeight);
+  await evaluate(() => [...document.querySelectorAll("button")]
+    .find((button) => button.textContent.trim() === "Outline").click());
+  await evaluate(() => document.querySelector("button[title='Map']").click());
+
+  await evaluate(() => document.querySelector("button[title='Show workflow settings and node inspector']").click());
+  await waitFor(() => evaluate(() => document.querySelectorAll("[role='tab']").length === 4));
+  assert.deepEqual(
+    await evaluate(() => [...document.querySelectorAll("[role='tab']")].map((tab) => tab.textContent.trim())),
+    ["General", "Triggers", "Variables", "Access"],
+  );
+  await evaluate(() => document.querySelector("button[title='Hide workflow settings and node inspector']").click());
+}
+
+async function exerciseKeyboardGraphAndResizers() {
+  await evaluate(() => document.querySelector("button[title='Map']").click());
+  const initialOutline = await evaluate(() => {
+    const outline = document.querySelector("[aria-label='Graph outline']");
+    const nodeButtons = [...outline.querySelectorAll("button[aria-label*=', status '")];
+    return {
+      nodeCount: nodeButtons.length,
+      firstDescription: nodeButtons[0]?.getAttribute("aria-label") || "",
+    };
+  });
+  assert.equal(initialOutline.nodeCount, 2);
+  assert.match(initialOutline.firstDescription, /incoming.*outgoing.*valid/);
+
+  await evaluate(() => {
+    const addNode = document.querySelector("[title='Add node']");
+    addNode.focus();
+  });
+  await pressFocusedKey("Enter");
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label^='New Step 1,']"),
+  )));
+  assert.equal(
+    await evaluate(() => document.activeElement.matches("[aria-label^='New Step 1,']")),
+    true,
+  );
+  await pressFocusedKey("Enter");
+  await waitFor(() => evaluate(() => document.activeElement.id === "workflow-inspector"));
+  assert.equal(
+    await evaluate(() => document.activeElement.id),
+    "workflow-inspector",
+  );
+  assert.deepEqual(
+    await evaluate(() => {
+      const tablist = document.querySelector("[aria-label='Node inspector sections']");
+      return [...tablist.querySelectorAll("[role='tab']")].map((tab) => ({
+        label: tab.textContent.trim(),
+        selected: tab.getAttribute("aria-selected"),
+        tabIndex: tab.getAttribute("tabindex"),
+      }));
+    }),
+    [
+      { label: "General", selected: "true", tabIndex: "0" },
+      { label: "Action", selected: "false", tabIndex: "-1" },
+      { label: "Inputs", selected: "false", tabIndex: "-1" },
+      { label: "Run", selected: "false", tabIndex: "-1" },
+      { label: "Edges", selected: "false", tabIndex: "-1" },
+    ],
+  );
+  await evaluate(() => {
+    document.querySelector("#node-tab-general").focus();
+  });
+  await pressFocusedKey("ArrowRight");
+  await waitFor(() => evaluate(() =>
+    document.querySelector("#node-tab-action").getAttribute("aria-selected") === "true",
+  ));
+  assert.equal(
+    await evaluate(() => document.querySelector("#node-tabpanel-general").hidden),
+    true,
+  );
+  await evaluate(() => document.querySelector("#node-tab-general").click());
+  await evaluate(() => {
+    const labelControl = [...document.querySelectorAll("#workflow-inspector label")]
+      .find((label) => label.querySelector("span")?.textContent === "Label")
+      ?.querySelector("input");
+    labelControl.focus();
+    labelControl.select();
+  });
+  await windowRef.webContents.insertText("Keyboard step");
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label^='Keyboard step,']"),
+  )));
+
+  await evaluate(() => {
+    document.querySelector("[aria-label^='Run command,']").focus();
+  });
+  await pressFocusedKey("C");
+  assert.match(
+    await evaluate(() => document.querySelector("[aria-label='Graph outline']").textContent),
+    /Connecting from Run command/,
+  );
+  await evaluate(() => {
+    document.querySelector("[aria-label^='Review output,']").focus();
+  });
+  await pressFocusedKey("Enter");
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label^='Run command to Review output, condition always']"),
+  )));
+  assert.equal(
+    await evaluate(() => document.activeElement.matches(
+      "[aria-label^='Run command to Review output, condition always']",
+    )),
+    true,
+  );
+  await pressFocusedKey("Enter");
+  await waitFor(() => evaluate(() => document.activeElement.id === "workflow-inspector"));
+  assert.equal(await evaluate(() => document.activeElement.id), "workflow-inspector");
+  await evaluate(() => {
+    const typeControl = [...document.querySelectorAll("#workflow-inspector label")]
+      .find((label) => label.querySelector("span")?.textContent === "Type")
+      ?.querySelector("select");
+    typeControl.focus();
+  });
+  await pressNativeKey("DOWN");
+  await pressNativeKey("DOWN");
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label^='Run command to Review output, condition on failure']"),
+  )));
+  await evaluate(() => {
+    document.querySelector("[aria-label^='Run command to Review output, condition on failure']").focus();
+  });
+  await pressFocusedKey("Delete");
+  await waitFor(() => evaluate(() => !document.querySelector(
+    "[aria-label^='Run command to Review output, condition on failure']",
+  )));
+  assert.equal(
+    await evaluate(() => document.activeElement.matches("[aria-label^='Run command,']")),
+    true,
+  );
+  await pressFocusedKey("D", ["control"]);
+  await waitFor(() => evaluate(() => Boolean(
+    document.querySelector("[aria-label^='Run command copy,']"),
+  )));
+  assert.equal(
+    await evaluate(() => document.activeElement.matches("[aria-label^='Run command copy,']")),
+    true,
+  );
+  await pressFocusedKey("Delete");
+  await waitFor(() => evaluate(() => !document.querySelector("[aria-label^='Run command copy,']")));
+  assert.equal(
+    await evaluate(() => document.activeElement.matches("[aria-label^='Keyboard step,']")),
+    true,
+  );
+
+  assert.deepEqual(
+    await evaluate(() => {
+      const separator = document.querySelector("[aria-label='Resize workflow settings and node inspector']");
+      return {
+        max: separator.getAttribute("aria-valuemax"),
+        min: separator.getAttribute("aria-valuemin"),
+        now: separator.getAttribute("aria-valuenow"),
+        orientation: separator.getAttribute("aria-orientation"),
+        role: separator.getAttribute("role"),
+      };
+    }),
+    { max: "520", min: "280", now: "340", orientation: "vertical", role: "separator" },
+  );
+  await evaluate(() => {
+    document.querySelector("[aria-label='Resize workflow settings and node inspector']").focus();
+  });
+  await pressFocusedKey("ArrowRight");
+  await waitFor(() => evaluate(() =>
+    document.querySelector("[aria-label='Resize workflow settings and node inspector']")
+      .getAttribute("aria-valuenow") === "350",
+  ));
+  await pressFocusedKey("Enter");
+  await waitFor(() => evaluate(() =>
+    document.querySelector("[aria-label='Resize workflow settings and node inspector']")
+      .getAttribute("aria-valuenow") === "340",
+  ));
+}
+
+async function exerciseCreateDialog() {
+  await evaluate(() => {
+    const opener = document.querySelector("[title='Create workflow']");
+    opener.focus();
+    opener.click();
+  });
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[role='dialog']"))));
+
+  const initialState = await evaluate(() => {
+    const dialog = document.querySelector("[role='dialog']");
+    return {
+      activeInside: dialog.contains(document.activeElement),
+      describedBy: dialog.getAttribute("aria-describedby"),
+      labelledBy: dialog.getAttribute("aria-labelledby"),
+      modal: dialog.getAttribute("aria-modal"),
+      name: dialog.getAttribute("aria-labelledby")
+        ? document.getElementById(dialog.getAttribute("aria-labelledby"))?.textContent
+        : "",
+    };
+  });
+  assert.equal(initialState.activeInside, true);
+  assert.equal(initialState.modal, "true");
+  assert.equal(initialState.name, "New workflow");
+  assert.ok(initialState.labelledBy);
+  assert.ok(initialState.describedBy);
+
+  const lastControlLabel = await evaluate(() => {
+    const dialog = document.querySelector("[role='dialog']");
+    const controls = [...dialog.querySelectorAll(
+      "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+    )];
+    const last = controls.at(-1);
+    last.dataset.browserSmokeLast = "true";
+    last.focus();
+    return last.textContent || last.getAttribute("aria-label") || last.tagName;
+  });
+  assert.ok(lastControlLabel);
+  await sendKey("Tab");
+  assert.equal(
+    await evaluate(() => {
+      const dialog = document.querySelector("[role='dialog']");
+      const first = dialog.querySelector(
+        "button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
+      );
+      return document.activeElement === first;
+    }),
+    true,
+  );
+
+  await sendKey("Escape");
+  await waitFor(() => evaluate(() => !document.querySelector("[role='dialog']")));
+  assert.equal(
+    await evaluate(() => document.activeElement?.getAttribute("title")),
+    "Create workflow",
+  );
+}
+
+async function sendKey(keyCode) {
+  await windowRef.webContents.executeJavaScript(
+    `document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: ${JSON.stringify(keyCode)} }))`,
+  );
+  await wait(40);
+}
+
+async function pressFocusedKey(keyCode, modifiers = []) {
+  await windowRef.webContents.executeJavaScript(`document.activeElement.dispatchEvent(new KeyboardEvent("keydown", {
+    bubbles: true,
+    cancelable: true,
+    ctrlKey: ${modifiers.includes("control")},
+    key: ${JSON.stringify(keyCode)},
+    metaKey: ${modifiers.includes("meta")},
+    shiftKey: ${modifiers.includes("shift")}
+  }))`);
+  await wait(60);
+}
+
+async function pressNativeKey(keyCode, modifiers = []) {
+  windowRef.webContents.sendInputEvent({ type: "keyDown", keyCode, modifiers });
+  windowRef.webContents.sendInputEvent({ type: "keyUp", keyCode, modifiers });
+  await wait(60);
+}
+
+async function startServer() {
+  server = http.createServer((request, response) => {
+    const url = new URL(request.url, "http://127.0.0.1");
+    if (url.pathname.startsWith("/api/")) {
+      response.setHeader("Access-Control-Allow-Origin", "*");
+      routeApi(url.pathname, response);
+      return;
+    }
+
+    const requestedPath = url.pathname === "/" ? "index.html" : url.pathname.slice(1);
+    const filePath = path.resolve(distRoot, requestedPath);
+    if (filePath !== distRoot && !filePath.startsWith(`${distRoot}${path.sep}`)) {
+      response.writeHead(404).end();
+      return;
+    }
+    fs.readFile(filePath, (error, data) => {
+      if (error) {
+        response.writeHead(404).end();
+        return;
+      }
+      const contentTypes = {
+        ".css": "text/css",
+        ".html": "text/html",
+        ".js": "text/javascript",
+        ".svg": "image/svg+xml",
+      };
+      response.writeHead(200, {
+        "Content-Type": contentTypes[path.extname(filePath)] || "application/octet-stream",
+      });
+      response.end(data);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  return `http://127.0.0.1:${address.port}/`;
+}
+
+function routeApi(pathname, response) {
+  if (pathname === "/api/workflows") {
+    json(response, {
+      dataDir: "/workspace",
+      promptAgentIds: [],
+      workflows: [workflowFixture(), radishWorkflowFixture()],
+    });
+    return;
   }
-
-  const minimap = layout.controls.find((rect) => rect.name === "minimap");
-  for (const rect of layout.controls.filter((candidate) => candidate.name !== "minimap")) {
-    assert.equal(rectsOverlap(minimap, rect), false, `minimap overlaps ${rect.name}`);
+  if (pathname === "/api/provider/capabilities") {
+    json(response, {
+      providers: [{
+        id: "codex",
+        displayName: "Codex",
+        available: true,
+        discoveryStatus: "ready",
+        defaultModel: "gpt-5.6-sol",
+        models: [{
+          id: "gpt-5.6-sol",
+          displayName: "GPT-5.6-Sol",
+          defaultEffort: "medium",
+          efforts: [
+            { id: "low", displayName: "Low" },
+            { id: "medium", displayName: "Medium" },
+            { id: "high", displayName: "High" },
+            { id: "xhigh", displayName: "X-high" },
+          ],
+        }, {
+          id: "gpt-5.6-luna",
+          displayName: "GPT-5.6-Luna",
+          defaultEffort: "medium",
+          efforts: [
+            { id: "low", displayName: "Low" },
+            { id: "medium", displayName: "Medium" },
+            { id: "high", displayName: "High" },
+            { id: "xhigh", displayName: "X-high" },
+            { id: "max", displayName: "Max" },
+          ],
+        }],
+      }, {
+        id: "claude_code",
+        displayName: "Claude Code",
+        available: true,
+        discoveryStatus: "ready",
+        defaultModel: "claude-sonnet-5",
+        models: [{
+          id: "claude-sonnet-5",
+          displayName: "Claude Sonnet 5",
+          defaultEffort: "high",
+          efforts: [
+            { id: "low", displayName: "Low" },
+            { id: "medium", displayName: "Medium" },
+            { id: "high", displayName: "High" },
+            { id: "xhigh", displayName: "X-high" },
+            { id: "max", displayName: "Max" },
+          ],
+        }, {
+          id: "default",
+          displayName: "Default",
+          defaultEffort: null,
+          efforts: [
+            { id: "low", displayName: "Low" },
+            { id: "medium", displayName: "Medium" },
+            { id: "high", displayName: "High" },
+            { id: "xhigh", displayName: "X-high" },
+            { id: "max", displayName: "Max" },
+          ],
+        }],
+      }],
+    });
+    return;
   }
-
-  await clickByTitle("Fit graph");
+  if (pathname === "/api/workflow-templates") {
+    json(response, { templates: [] });
+    return;
+  }
+  if (pathname === "/api/workflows/radish-editor/document") {
+    json(response, { document: radishDocumentFixture() });
+    return;
+  }
+  if (pathname === "/api/workflows/radish-editor/document/analyze") {
+    json(response, { document: radishDocumentFixture() });
+    return;
+  }
+  if (pathname === "/api/workflows/radish-editor/document/save") {
+    json(response, { document: radishDocumentFixture() });
+    return;
+  }
+  if (pathname === "/api/workflows/radish-editor/plan") {
+    json(response, {
+      plan: {
+        blockingDiagnostics: [],
+        destructiveActions: ["prepare: command"],
+        generations: [{
+          index: 0,
+          nodes: [{ id: "prepare", detail: "echo ready", sideEffects: ["command"], type: "bash-command" }],
+        }],
+        kind: "radish",
+        providerRequirements: [],
+        requiredSecrets: [],
+        runnable: true,
+        warnings: [],
+      },
+    });
+    return;
+  }
+  if (pathname === "/api/workflows/radish-editor/run") {
+    json(response, {
+      run: {
+        logPath: "/workspace/radish/run.json",
+        logText: "prepare: ready",
+        nodeOutputs: { prepare: { data: { stdout: "ready" }, output: "ready", success: true } },
+        runEvents: [],
+        runNodes: { prepare: { status: "success" } },
+        status: "success",
+        success: true,
+        workflowId: "radish-editor",
+      },
+    });
+    return;
+  }
+  if (pathname.endsWith("/logs")) {
+    json(response, { runs: [] });
+    return;
+  }
+  if (pathname.endsWith("/approvals")) {
+    json(response, { approvals: [] });
+    return;
+  }
+  if (pathname === "/api/doctor") {
+    json(response, { errors: [], warnings: [] });
+    return;
+  }
+  json(response, {});
 }
 
 function workflowFixture() {
   return {
     agents: {},
-    description: "Demo workflow",
-    edges: [
-      {
-        id: "edge_fetch_summarize",
-        from: "fetch",
-        to: "summarize",
-        condition: "on_success",
-        label: "on success",
-      },
-      {
-        id: "edge_summarize_approval",
-        from: "summarize",
-        to: "approval",
-        condition: "always",
-        label: "always",
-      },
-    ],
-    healthWarnings: ["Missing provider CLI: codex"],
+    edges: [],
     id: "demo",
     name: "Demo workflow",
     nodes: [
       {
-        id: "fetch",
-        label: "Fetch data",
-        operation: { command: "echo READY=1", type: "bash_command", working_dir: "" },
+        id: "step",
+        label: "Run command",
+        operation: { command: "echo hello", type: "bash_command", working_dir: "" },
         type: "bash_command",
-        x: 0,
-        y: 0,
+        x: 80,
+        y: 80,
       },
       {
-        id: "summarize",
-        label: "Summarize",
-        operation: { command: "cat summary.txt", type: "bash_command", working_dir: "" },
-        type: "bash_command",
-        x: 320,
-        y: 120,
-      },
-      {
-        id: "approval",
-        label: "Approve release",
-        operation: {
-          approvers: ["ops"],
-          message: "Approve deploy to production?",
-          notify: false,
-          timeout_decision: "reject",
-          timeout_seconds: 300,
-          type: "approval_gate",
-        },
-        type: "approval_gate",
-        x: 650,
-        y: 220,
+        id: "review",
+        label: "Review output",
+        operation: { agent_id: "reviewer", prompt: "Review", type: "agent" },
+        type: "agent",
+        x: 400,
+        y: 80,
       },
     ],
     parameters: {},
@@ -279,426 +867,96 @@ function workflowFixture() {
   };
 }
 
-async function startServer() {
-  const staticTypes = {
-    ".css": "text/css",
-    ".html": "text/html",
-    ".js": "text/javascript",
-    ".json": "application/json",
-    ".svg": "image/svg+xml",
+function radishWorkflowFixture() {
+  return {
+    agents: {},
+    edges: [],
+    id: "radish-editor",
+    name: "Radish editor",
+    nodes: [],
+    parameters: {},
+    projectName: "gofer-flow",
+    projectRoot: "/workspace/gofer-flow",
+    readOnly: true,
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/.taskurotta/radish-editor/workflow.rad",
+    status: "Ready",
+    tags: ["ready"],
+    workflowRoot: "/workspace/gofer-flow/.taskurotta/radish-editor",
   };
-
-  const nextServer = http.createServer(async (request, response) => {
-    const url = new URL(request.url, "http://127.0.0.1");
-    const method = request.method || "GET";
-    const body = await readBody(request);
-    state.calls.push({ body, method, path: url.pathname });
-
-    if (url.pathname.startsWith("/api/")) {
-      return routeApi(method, url.pathname, body, response);
-    }
-
-    const requestedPath = url.pathname === "/" ? "/index.html" : url.pathname;
-    const filePath = path.normalize(path.join(distRoot, requestedPath));
-    if (!filePath.startsWith(distRoot)) {
-      response.writeHead(404).end();
-      return;
-    }
-    fs.readFile(filePath, (error, data) => {
-      if (error) {
-        response.writeHead(404).end();
-        return;
-      }
-      response.writeHead(200, {
-        "Content-Type": staticTypes[path.extname(filePath)] || "application/octet-stream",
-      });
-      response.end(data);
-    });
-  });
-
-  await new Promise((resolve) => nextServer.listen(0, "127.0.0.1", resolve));
-  const address = nextServer.address();
-  baseUrl = `http://127.0.0.1:${address.port}/`;
-  return nextServer;
 }
 
-function routeApi(method, pathname, body, response) {
-  const decodedPath = decodeURIComponent(pathname);
-  if (method === "GET" && pathname === "/api/workflows") {
-    return json(response, { dataDir: "/workspace", promptAgentIds: [], workflows: [state.workflow] });
-  }
-  if (method === "GET" && pathname === "/api/dashboards") return json(response, { dashboards: [] });
-  if (method === "GET" && pathname === "/api/workflow-templates") return json(response, { templates: [] });
-  if (method === "GET" && pathname === "/api/doctor") {
-    return json(response, { errors: [], warnings: ["Missing provider CLI: codex"] });
-  }
-  if (method === "GET" && pathname === "/api/queue") return json(response, { runners: [] });
-  if (method === "GET" && pathname === "/api/provider/profiles") return json(response, { profiles: [] });
-  if (method === "GET" && pathname === "/api/chat/providers") return json(response, { providers: [] });
-  if (method === "GET" && pathname === "/api/workflows/demo/logs/latest") {
-    return json(response, {
-      log: {
-        logPath: "/workspace/.gofer/runs/run-1.log",
-        logText: "2026-06-27T10:00:00Z fetch success\n2026-06-27T10:00:02Z summarize success",
-        nodeOutputs: { fetch: { output: "READY=1" } },
-        runEvents: [
-          {
-            attempt: 1,
-            message: "fetch completed",
-            nodeId: "fetch",
-            status: "success",
-            timestamp: "2026-06-27T10:00:00Z",
-          },
-          {
-            attempt: 1,
-            message: "approval waiting",
-            nodeId: "approval",
-            status: "waiting",
-            timestamp: "2026-06-27T10:00:03Z",
-          },
-        ],
-      },
-    });
-  }
-  if (method === "GET" && pathname === "/api/workflows/demo/logs") {
-    return json(response, { runs: runHistory() });
-  }
-  if (method === "GET" && pathname === "/api/workflows/demo/approvals") {
-    return json(response, { approvals: state.approvals });
-  }
-  if (method === "GET" && pathname === "/api/workflows/demo/retention") {
-    return json(response, { settings: state.retention });
-  }
-  if (method === "PUT" && decodedPath === "/api/workflows/demo") {
-    state.workflow = { ...state.workflow, ...body };
-    return json(response, { workflow: state.workflow });
-  }
-  if (method === "PUT" && decodedPath === "/api/workflows/demo/retention") {
-    state.retention = { ...state.retention, ...body };
-    return json(response, { settings: state.retention });
-  }
-  if (method === "POST" && decodedPath === "/api/workflows/demo/logs/prune") {
-    return json(response, { runs: [{ id: "old-run" }], dryRun: Boolean(body?.dryRun) });
-  }
-  if (method === "POST" && decodedPath === "/api/workflows/demo/plan") {
-    return json(response, {
-      plan: {
-        destructiveActions: ["Deletes /tmp/output.txt"],
-        generations: [["fetch"], ["summarize"], ["approval"]],
-        providerRequirements: [
-          {
-            agentId: "analyst",
-            available: true,
-            binary: "codex",
-            subscription: "codex",
-            workingDir: "/workspace",
-          },
-        ],
-        requiredSecrets: ["OPENAI_API_KEY"],
-        triggerContext: body?.triggerContext ?? {},
-        unresolvedDynamicValues: [],
-        warnings: ["Dry run before release."],
-      },
-    });
-  }
-  if (method === "POST" && decodedPath === "/api/workflows/demo/run") {
-    return json(response, {
-      run: {
-        logPath: "/workspace/.gofer/runs/run-2.log",
-        logText: "run complete",
-        runEvents: [],
-        success: true,
-      },
-    });
-  }
-
-  return json(response, {}, 200);
-}
-
-function runHistory() {
-  return [
-    {
-      durationSeconds: 3,
-      hasTriggerReplay: true,
-      id: "run-1",
-      startedAt: "2026-06-27T10:00:00Z",
-      status: "waiting",
-      triggerId: "deploy-webhook",
+function radishDocumentFixture() {
+  const source = "Radish: 1\n\nWorkflow:\n  name: Radish editor\n\nNode prepare:\n  type: bash-command\n  command: echo ready\n";
+  return {
+    compilation: { fingerprint: "sha256:test", irVersion: 1, lastValidFingerprint: "sha256:test", state: "valid" },
+    diagnostics: [],
+    dirty: false,
+    graph: {
+      edges: [],
+      nodes: [{
+        configuration: { command: "echo ready" },
+        diagnostics: [],
+        execution: { allow_fail: false, max_concurrency: 1, retry_count: 0, retry_delay_ms: 0, timeout_ms: null },
+        id: "prepare",
+        label: "Prepare",
+        status: "valid",
+        type: "bash-command",
+      }],
     },
-    {
-      durationSeconds: 4,
-      id: "run-0",
-      startedAt: "2026-06-26T10:00:00Z",
-      status: "success",
-    },
-  ];
+    invalidRegions: [],
+    metadata: { metadataVersion: 1, canvas: { nodes: {}, pan: { x: 0, y: 0 }, zoom: 1 }, editor: { foldedDeclarations: [] } },
+    metadataRevision: "sha256:metadata",
+    preflight: { diagnostics: [], ready: true },
+    projectRoot: "/workspace/gofer-flow",
+    runnable: true,
+    savedRevision: "sha256:source",
+    source,
+    sourcePath: "/workspace/gofer-flow/.taskurotta/radish-editor/workflow.rad",
+    sourceRevision: "sha256:source",
+    workflow: { name: "Radish editor" },
+    workflowId: "radish-editor",
+  };
 }
 
-function json(response, payload, status = 200) {
-  response.writeHead(status, { "Content-Type": "application/json" });
+function json(response, payload) {
+  response.writeHead(200, { "Content-Type": "application/json" });
   response.end(JSON.stringify(payload));
 }
 
-function readBody(request) {
-  return new Promise((resolve) => {
-    const chunks = [];
-    request.on("data", (chunk) => chunks.push(chunk));
-    request.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      if (!text) {
-        resolve(null);
-        return;
-      }
-      try {
-        resolve(JSON.parse(text));
-      } catch {
-        resolve(text);
-      }
-    });
-  });
-}
-
-async function clickByTitle(title) {
-  const clicked = await evaluate((targetTitle) => {
-    const element = document.querySelector(`[title="${CSS.escape(targetTitle)}"]`);
-    if (!element) return false;
-    element.click();
-    return true;
-  }, title);
-  if (clicked) {
-    await wait(50);
-    return;
-  }
-
-  const openedOverflow = await evaluate(() => {
-    const overflowButton = document.querySelector('[title="More graph actions"]');
-    if (!overflowButton) return false;
-    overflowButton.click();
-    return true;
-  });
-
-  if (openedOverflow) {
-    await wait(50);
-  }
-
-  const clickedOverflowAction = openedOverflow
-    ? await evaluate((targetTitle) => {
-        const menu = document.querySelector("[data-testid='toolbar-overflow-menu']");
-        const item = [...(menu?.querySelectorAll("button") ?? [])].find(
-          (element) => element.textContent.trim() === targetTitle,
-        );
-        if (!item || item.disabled) return false;
-        item.click();
-        return true;
-      }, title)
-    : false;
-
-  if (!clickedOverflowAction) {
-    throw new Error(`Unable to find title: ${title}`);
-  }
-  await wait(50);
-}
-
-async function closeRunPreview() {
-  await evaluate(() => {
-    const heading = [...document.querySelectorAll("h2")].find((element) =>
-      element.textContent.includes("Run preview:"),
-    );
-    const dialog = heading?.closest(".fixed") ?? heading?.parentElement?.parentElement;
-    const button = dialog?.querySelector('button[title="Close"]');
-    if (!button) throw new Error("Unable to find run preview close button");
-    button.click();
-  });
-  await wait(50);
-}
-
-async function runPreviewOpen() {
-  return evaluate(() =>
-    [...document.querySelectorAll("h2")].some((element) =>
-      element.textContent.includes("Run preview: Demo workflow"),
-    ),
-  );
-}
-
-async function clickByText(text) {
-  const selector = await evaluate((targetText) => {
-    const candidates = [...document.querySelectorAll("button, [role='button']")];
-    const match = candidates.find((element) => element.textContent.trim() === targetText);
-    if (!match) return null;
-    const token = `browser-test-${Math.random().toString(36).slice(2)}`;
-    match.setAttribute("data-browser-test-click", token);
-    return `[data-browser-test-click="${token}"]`;
-  }, text);
-  assert.ok(selector, `Unable to find button text: ${text}`);
-  await evaluate((targetSelector) => {
-    const element = document.querySelector(targetSelector);
-    if (!element) throw new Error(`Unable to find selector: ${targetSelector}`);
-    element.click();
-  }, selector);
-  await wait(50);
-}
-
-async function clickSelector(selector) {
-  const rect = await elementRect(selector);
-  await mouse(rect.left + rect.width / 2, rect.top + rect.height / 2);
-}
-
-async function contextMenu(selector) {
-  await elementRect(selector);
-  await evaluate((targetSelector) => {
-    const element = document.querySelector(targetSelector);
-    const box = element.getBoundingClientRect();
-    element.dispatchEvent(
-      new MouseEvent("contextmenu", {
-        bubbles: true,
-        button: 2,
-        clientX: box.left + box.width / 2,
-        clientY: box.top + box.height / 2,
-      }),
-    );
-  }, selector);
-}
-
-async function dragSelector(selector, dx, dy) {
-  const rect = await elementRect(selector);
-  const startX = rect.left + rect.width / 2;
-  const startY = rect.top + rect.height / 2;
-  windowRef.webContents.sendInputEvent({ type: "mouseMove", x: startX, y: startY });
-  windowRef.webContents.sendInputEvent({ button: "left", clickCount: 1, type: "mouseDown", x: startX, y: startY });
-  await wait(50);
-  windowRef.webContents.sendInputEvent({ type: "mouseMove", x: startX + dx, y: startY + dy });
-  await wait(50);
-  windowRef.webContents.sendInputEvent({ button: "left", clickCount: 1, type: "mouseUp", x: startX + dx, y: startY + dy });
-  await wait(100);
-}
-
-async function mouse(x, y) {
-  windowRef.webContents.sendInputEvent({ type: "mouseMove", x, y });
-  windowRef.webContents.sendInputEvent({ button: "left", clickCount: 1, type: "mouseDown", x, y });
-  windowRef.webContents.sendInputEvent({ button: "left", clickCount: 1, type: "mouseUp", x, y });
-  await wait(50);
-}
-
-async function waitForSavedPayload(predicate, label) {
-  await waitFor(() => {
-    const payload = [...state.calls].reverse().find(
-      (call) => call.method === "PUT" && call.path === "/api/workflows/demo" && call.body,
-    )?.body;
-    return payload ? predicate(payload) : false;
-  }, label, 5000);
-}
-
-function lastCall(method, pathName) {
-  return state.calls.some((call) => call.method === method && call.path === pathName);
-}
-
-async function bridgeCall(method, payload) {
-  return evaluate(
-    ({ expectedMethod, expectedPayload }) =>
-      (window.__goferBridgeCalls ?? []).some(
-        (call) =>
-          call.method === expectedMethod &&
-          (expectedPayload === undefined || call.payload === expectedPayload),
-      ),
-    { expectedMethod: method, expectedPayload: payload },
-  );
-}
-
-function rectsOverlap(a, b) {
-  const gap = 1;
-  return !(
-    a.right <= b.left + gap ||
-    b.right <= a.left + gap ||
-    a.bottom <= b.top + gap ||
-    b.bottom <= a.top + gap
-  );
-}
-
-async function exists(selector) {
-  return evaluate((targetSelector) => Boolean(document.querySelector(targetSelector)), selector);
-}
-
-async function count(selector) {
-  return evaluate((targetSelector) => document.querySelectorAll(targetSelector).length, selector);
-}
-
-async function textIncludes(text) {
-  return evaluate((targetText) => document.body.textContent.includes(targetText), text);
-}
-
-async function elementRect(selector) {
-  const rect = await evaluate((targetSelector) => {
-    const element = document.querySelector(targetSelector);
-    if (!element) return null;
-    const box = element.getBoundingClientRect();
-    return { height: box.height, left: box.left, top: box.top, width: box.width };
-  }, selector);
-  assert.ok(rect, `Element not found: ${selector}`);
-  return rect;
-}
-
-async function waitFor(check, label, timeoutMs = 7000, diagnostics) {
-  const startedAt = Date.now();
-  let lastError;
-  while (Date.now() - startedAt < timeoutMs) {
+async function evaluate(callback) {
+  const result = await windowRef.webContents.executeJavaScript(`(() => {
     try {
-      if (await check()) return;
+      return { value: (${callback.toString()})() };
     } catch (error) {
-      lastError = error;
+      return { error: String(error?.stack || error) };
     }
-    await wait(100);
+  })()`);
+  if (result?.error) throw new Error(result.error);
+  return result?.value;
+}
+
+async function waitFor(predicate, delay = 25) {
+  const deadline = Date.now() + 7000;
+  while (Date.now() < deadline) {
+    if (await predicate()) return;
+    await wait(delay);
   }
-  const details = diagnostics ? await diagnostics() : "";
-  throw new Error(
-    `Timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ""}${details ? `\n${details}` : ""}`,
-  );
+  throw new Error("Timed out waiting for browser condition.");
 }
 
-function wait(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function evaluate(fn, arg) {
-  const source = `(${fn.toString()})(${JSON.stringify(arg)})`;
-  return windowRef.webContents.executeJavaScript(source, true);
-}
-
-async function browserDiagnosticSnapshot() {
-  const snapshot = await evaluate(() => {
-    const nodes = document.querySelectorAll("[data-testid='workflow-node']").length;
-    const canvas = Boolean(document.querySelector("[data-testid='dag-canvas']"));
-    const body = document.body.textContent.replace(/\s+/g, " ").trim().slice(0, 1200);
-    return { body, canvas, nodes, title: document.title, url: window.location.href };
-  });
-  const recentMessages = rendererMessages
-    .slice(-10)
-    .map((item) => `${item.message} (${item.sourceId}:${item.line})`)
-    .join("\n");
-  return [
-    `Browser snapshot: ${JSON.stringify(snapshot)}`,
-    recentMessages ? `Recent renderer messages:\n${recentMessages}` : "",
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-function cssEscape(value) {
-  return String(value).replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/'/g, "\\'");
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 async function cleanup(exitCode) {
-  try {
-    windowRef?.close();
-    await new Promise((resolve) => server?.close(resolve));
-  } finally {
-    process.exitCode = exitCode;
-    process.exit(exitCode);
-  }
+  if (windowRef && !windowRef.isDestroyed()) windowRef.destroy();
+  if (server) await new Promise((resolve) => server.close(resolve));
+  app.exit(exitCode);
 }
 
-function fail(error) {
+async function fail(error) {
   clearTimeout(timeout);
   console.error(error);
-  process.exitCode = 1;
-  cleanup(1);
+  await cleanup(1);
 }

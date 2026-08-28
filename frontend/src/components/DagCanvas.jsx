@@ -1,11 +1,9 @@
-import { createContext, useContext, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Bell,
   Braces,
   CalendarDays,
-  ChevronLeft,
-  ChevronRight,
   Check,
   ChevronDown,
   ChevronUp,
@@ -21,11 +19,12 @@ import {
   FileX,
   FolderOpen,
   Globe2,
-  Group,
   LocateFixed,
+  Layers,
   Loader2,
   Maximize2,
-  MoreVertical,
+  Minimize2,
+  MoreHorizontal,
   MoveRight,
   PencilLine,
   Play,
@@ -34,6 +33,7 @@ import {
   Repeat2,
   Route,
   Search,
+  Settings2,
   ShieldCheck,
   Sparkles,
   Square,
@@ -47,33 +47,18 @@ import {
 } from "lucide-react";
 
 import { apiUrl } from "../lib/api.js";
+import { Dialog } from "./Dialog.jsx";
+import GraphOutline from "./GraphOutline.jsx";
+import {
+  ProviderModelEffortFields,
+  useProviderCapabilities,
+} from "./ProviderModelEffortFields.jsx";
 
 const DEFAULT_RETENTION_SETTINGS = {
   keepDays: 14,
   keepFailedDays: 30,
   keepLast: 100,
 };
-const EMPTY_ARRAY = Object.freeze([]);
-const TOOLBAR_ACTION_GAP = 8;
-
-export function visibleToolbarActionCount(availableWidth, actionWidths, menuWidth, gap = TOOLBAR_ACTION_GAP) {
-  const widths = actionWidths.map((width) => Number(width) || 0);
-  const available = Number(availableWidth) || 0;
-  const overflowWidth = Number(menuWidth) || 0;
-  if (!widths.length) return 0;
-  if (widths.every((width) => width <= 0)) return widths.length;
-  if (available <= 0) return 0;
-
-  for (let count = widths.length; count >= 0; count -= 1) {
-    const visibleWidth = widths
-      .slice(0, count)
-      .reduce((total, width, index) => total + width + (index > 0 ? gap : 0), 0);
-    const needsOverflow = count < widths.length;
-    const totalWidth = visibleWidth + (needsOverflow ? overflowWidth + (count > 0 ? gap : 0) : 0);
-    if (totalWidth <= available) return count;
-  }
-  return 0;
-}
 
 const nodeStyles = {
   start: {
@@ -108,9 +93,9 @@ const nodeStyles = {
   },
   agent: {
     icon: Braces,
-    accent: "bg-teal-600",
-    border: "border-teal-200",
-    chip: "bg-teal-50 text-teal-700 border-teal-100",
+    accent: "bg-indigo-600",
+    border: "border-indigo-200",
+    chip: "bg-indigo-50 text-indigo-700 border-indigo-100",
   },
   bash_command: {
     icon: Command,
@@ -220,17 +205,14 @@ const nodeStyles = {
     border: "border-cyan-200",
     chip: "bg-cyan-50 text-cyan-700 border-cyan-100",
   },
-  workflow: {
-    icon: Route,
-    accent: "bg-teal-700",
-    border: "border-teal-200",
-    chip: "bg-teal-50 text-teal-700 border-teal-100",
-  },
 };
 
 const defaultSettings = {
   allowFailure: false,
   awaitAllInputs: true,
+  failFast: false,
+  forEach: "",
+  maxConcurrency: 1,
   pipeOutput: false,
   retryCount: 0,
   retryDelaySeconds: 1,
@@ -242,16 +224,10 @@ const graphWorldSize = 20000;
 const graphWorldOffset = graphWorldSize / 2;
 const nodeWidth = 220;
 const nodeHeight = 96;
-const groupMinWidth = 260;
-const groupMinHeight = 160;
-const collapsedGroupHeight = 76;
 const layoutColumnGap = 330;
 const layoutRowGap = 154;
 const minimapWidth = 124;
 const minimapHeight = 86;
-const defaultCanvasGroupOpacity = 0.08;
-const canvasGroupColors = ["#475569", "#2563eb", "#0f766e", "#7c3aed", "#b45309", "#be123c"];
-const PathTrustContext = createContext(null);
 const nodeStack = {
   base: 10,
   selected: 30,
@@ -301,11 +277,6 @@ export function defaultOperation(type, nodeNumber = 1) {
       return {
         type,
         source: defaultFanSource("count"),
-      };
-    case "workflow":
-      return {
-        type,
-        workflow_id: "",
       };
     case "bash_command":
       return {
@@ -453,12 +424,12 @@ export function defaultOperation(type, nodeNumber = 1) {
         timeout_decision: "timeout",
         approvers: [],
         notify: false,
-        notification_title: "Gofer Flow approval needed",
+        notification_title: "Taskurotta approval needed",
       };
     case "notification":
       return {
         type,
-        title: "Gofer Flow notification",
+        title: "Taskurotta notification",
         body: "",
         channel: "desktop",
         urgency: "normal",
@@ -477,18 +448,19 @@ export function defaultOperation(type, nodeNumber = 1) {
         expected_statuses: [200, 201, 202, 204],
         network_allowlist: [],
       };
-    case "dashboard_item":
+    case "workflow":
       return {
         type,
-        action: "move",
-        dashboard: "",
-        component: "",
-        item_id: "{{loop.current.item_id}}",
-        item: {},
-        patch: {},
-        filter: "",
-        field: "status",
-        value: "",
+        workflow_id: "",
+        input_bindings: {},
+      };
+    case "subflow":
+      return {
+        type,
+        component_id: "",
+        source_path: "",
+        input_bindings: {},
+        output_contract: {},
       };
     case "agent":
     default:
@@ -510,6 +482,7 @@ export function defaultAgentConfig(agentId, overrides = {}) {
     subscription: "codex",
     profile: "",
     model: "",
+    effort: "",
     working_dir: ".",
     prompt_path: "",
     tools: [],
@@ -530,12 +503,7 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
     case "break":
       return operation.message || "stop loop";
     case "loop":
-      if (operation.source?.type === "dashboard_items") {
-        return `loop dashboard ${operation.source.dashboard || "dashboard"}/${operation.source.component || "component"}`;
-      }
       return `loop ${operation.source?.type || "items"}`;
-    case "workflow":
-      return `run workflow ${operation.workflow_id || "workflow"}`;
     case "bash_command":
       return operation.command || commandNodeLabel.toLowerCase();
     case "python_script":
@@ -593,8 +561,6 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
         : "approval required";
     case "notification":
       return `${operation.channel || "desktop"} · ${operation.title || "notification"}`;
-    case "dashboard_item":
-      return `${operation.action || "read"} ${operation.dashboard || "dashboard"}/${operation.component || "component"}`;
     case "agent":
       if (operation.skill_name) return `${operation.agent_id || "agent"} · /${operation.skill_name}`;
       return operation.prompt_path
@@ -605,226 +571,43 @@ function nodeMetaFromOperation(operation = {}, pathBasePath = "") {
   }
 }
 
-export function buildInputSourceOptions(node, nodes, edges, dashboards = []) {
-  return flattenInputSourceGroups(buildInputSourceGroups(node, nodes, edges, dashboards));
-}
-
-export function buildInputSourceGroups(node, nodes, edges, dashboards = []) {
+function buildInputSourceOptions(node, nodes, edges) {
   const nodesById = Object.fromEntries(nodes.map((candidate) => [candidate.id, candidate]));
-  const ancestorNodes = findInputAncestorNodes(node, nodesById, edges);
-  const loopInputAncestorIds = new Set(
-    findLoopInputAncestors(node, nodesById, edges).map((ancestor) => ancestor.id),
-  );
-  const groups = [
-    {
-      id: "previous",
-      label: "Previous node",
-      options: [
-        ["previous.text", "text"],
-        ["previous.data.message", "message"],
-        ["previous.data.stdout", "stdout"],
-        ["previous.data.stderr", "stderr"],
-      ],
-    },
+  const upstreamNodes = edges
+    .filter((edge) => edge.to === node.id)
+    .map((edge) => nodesById[edge.from])
+    .filter(Boolean);
+  const options = [
+    ["previous.text", "Previous node text"],
+    ["previous.data.message", "Previous message"],
+    ["previous.data.stdout", "Previous stdout"],
+    ["previous.data.stderr", "Previous stderr"],
+    ["loop.current.file_path", "Loop current file path"],
+    ["loop.current.file_name", "Loop current file name"],
+    ["loop.current.file_stem", "Loop current file stem"],
+    ["loop.current.file_extension", "Loop current file extension"],
+    ["loop.current.directory", "Loop current directory"],
+    ["loop.current.parent_path", "Loop current parent path"],
+    ["loop.current.file_content", "Loop current file content"],
+    ["loop.current._row", "Loop current row JSON"],
+    ["loop.current.event_json", "Loop current event JSON"],
+    ["loop.current.kind", "Loop current event kind"],
+    ["loop.current.size", "Loop current file size"],
+    ["loop.current.mtime_ns", "Loop current modified time"],
+    ["loop.current.index", "Loop current index"],
   ];
 
-  ancestorNodes.forEach((ancestor) => {
-    const label = ancestor.label || ancestor.id;
-    const options = [];
-    if (ancestor.operation?.type === "loop" && loopInputAncestorIds.has(ancestor.id)) {
-      loopSourceInputOptions(ancestor.operation?.source, dashboards).forEach(([path, fieldLabel]) => {
-        options.push([path, stripInputSourcePrefix(fieldLabel, "Loop current ")]);
-      });
-    }
-    nodeOutputFields(ancestor, dashboards).forEach(([path, fieldLabel]) => {
-      options.push([`${ancestor.id}.${path}`, fieldLabel]);
-    });
-    const dedupedOptions = dedupeOptions(options);
-    if (dedupedOptions.length) {
-      groups.push({
-        id: ancestor.id,
-        label,
-        options: dedupedOptions,
-      });
-    }
-  });
-
-  return groups.filter((group) => group.options.length);
-}
-
-function flattenInputSourceGroups(groups = []) {
-  const options = [];
-  groups.forEach((group) => {
-    group.options.forEach(([value, label]) => {
-      options.push([value, group.id === "previous" ? label : `${group.label} ${label}`]);
+  upstreamNodes.forEach((upstream) => {
+    const label = upstream.label || upstream.id;
+    nodeOutputFields(upstream).forEach(([path, fieldLabel]) => {
+      options.push([`${upstream.id}.${path}`, `${label} ${fieldLabel}`]);
     });
   });
+
   return dedupeOptions(options);
 }
 
-function stripInputSourcePrefix(label = "", prefix = "") {
-  return label.startsWith(prefix) ? label.slice(prefix.length) : label;
-}
-
-function findInputAncestorNodes(node, nodesById, edges) {
-  const ancestors = [];
-  const visitedNodeIds = new Set();
-  const stack = [node.id];
-
-  while (stack.length > 0) {
-    const currentNodeId = stack.pop();
-    if (visitedNodeIds.has(currentNodeId)) continue;
-    visitedNodeIds.add(currentNodeId);
-
-    edges
-      .filter((edge) => edge.to === currentNodeId)
-      .forEach((edge) => {
-        const upstream = nodesById[edge.from];
-        if (!upstream) return;
-        if (!ancestors.some((ancestor) => ancestor.id === upstream.id)) {
-          ancestors.push(upstream);
-        }
-        stack.push(upstream.id);
-      });
-  }
-
-  return ancestors;
-}
-
-function findLoopInputAncestors(node, nodesById, edges) {
-  const loopAncestors = [];
-  const seenLoopIds = new Set();
-  const visitedNodeIds = new Set();
-  const stack = [node.id];
-  const incomingIterationEdges = edges.filter((edge) => edge.condition !== "after_loop");
-
-  while (stack.length > 0) {
-    const currentNodeId = stack.pop();
-    if (visitedNodeIds.has(currentNodeId)) continue;
-    visitedNodeIds.add(currentNodeId);
-
-    incomingIterationEdges
-      .filter((edge) => edge.to === currentNodeId)
-      .forEach((edge) => {
-        const upstream = nodesById[edge.from];
-        if (!upstream) return;
-        if (upstream.operation?.type === "loop" && !seenLoopIds.has(upstream.id)) {
-          seenLoopIds.add(upstream.id);
-          loopAncestors.push(upstream);
-        }
-        stack.push(upstream.id);
-      });
-  }
-
-  return loopAncestors;
-}
-
-function loopSourceInputOptions(source = {}, dashboards = []) {
-  switch (source?.type) {
-    case "count":
-    case "infinite":
-      return [["loop.current.index", "Loop current index"]];
-    case "directory": {
-      const options = [
-        ["loop.current.file_path", "Loop current file path"],
-        ["loop.current.file_name", "Loop current file name"],
-        ["loop.current.file_stem", "Loop current file stem"],
-        ["loop.current.file_extension", "Loop current file extension"],
-        ["loop.current.directory", "Loop current directory"],
-        ["loop.current.parent_path", "Loop current parent path"],
-        ["loop.current.size", "Loop current file size"],
-        ["loop.current.mtime_ns", "Loop current modified time"],
-      ];
-      if (source.include_content) {
-        options.push(["loop.current.file_content", "Loop current file content"]);
-      }
-      return options;
-    }
-    case "tabular":
-      return [
-        ["loop.current.index", "Loop current index"],
-        ["loop.current._row", "Loop current row JSON"],
-      ];
-    case "trigger_events": {
-      const options = [
-        ["loop.current.index", "Loop current index"],
-        ["loop.current.event_json", "Loop current event JSON"],
-        ["loop.current.kind", "Loop current event kind"],
-        ["loop.current.path", "Loop current event path"],
-        ["loop.current.file_path", "Loop current file path"],
-        ["loop.current.file_name", "Loop current file name"],
-        ["loop.current.directory", "Loop current directory"],
-      ];
-      if (source.include_content) {
-        options.push(["loop.current.file_content", "Loop current file content"]);
-      }
-      return options;
-    }
-    case "dashboard_items":
-      return [
-        ["loop.current.index", "Loop current index"],
-        ["loop.current.dashboard", "Loop current dashboard"],
-        ["loop.current.component", "Loop current component"],
-        ["loop.current.item_id", "Loop current dashboard item ID"],
-        ["loop.current.item_json", "Loop current dashboard item JSON"],
-        ...dashboardLoopItemFieldOptions(source, dashboards),
-      ];
-    default:
-      return [];
-  }
-}
-
-function dashboardLoopItemFieldOptions(source = {}, dashboards = []) {
-  const dashboard = dashboards.find(
-    (candidate) => candidate.id === source.dashboard || candidate.name === source.dashboard,
-  );
-  const component = dashboardComponentById(dashboard, source.component);
-  const fields = new Set([
-    ...Object.keys(component?.schema ?? {}),
-    ...(component?.items ?? []).flatMap((item) => Object.keys(item ?? {})),
-  ]);
-  return [...fields].sort().map((field) => [
-    `loop.current.item.${field}`,
-    `Loop current dashboard item ${field}`,
-  ]);
-}
-
-function loopOutputFields(source = {}, common = [], dashboards = []) {
-  const base = [
-    ...common,
-    ["items", "all items"],
-    ["data.count", "item count"],
-    ["data.source_type", "source type"],
-    ["data.max_concurrency", "max concurrency"],
-    ["data.fail_fast", "fail fast"],
-  ];
-  switch (source?.type) {
-    case "directory":
-      return [
-        ...base,
-        ["data.source_path", "source path"],
-        ["data.glob", "glob"],
-        ["data.include_content", "include file content"],
-      ];
-    case "tabular":
-      return [...base, ["data.source_path", "source path"]];
-    case "trigger_events":
-      return [...base, ["data.include_content", "include file content"]];
-    case "dashboard_items":
-      return [
-        ...base,
-        ["data.dashboard", "dashboard"],
-        ["data.component", "component"],
-        ["data.filter", "filter"],
-      ];
-    case "count":
-    case "infinite":
-    default:
-      return base;
-  }
-}
-
-export function nodeOutputFields(node, dashboards = []) {
+export function nodeOutputFields(node) {
   const type = node?.type || node?.operation?.type;
   const common = [
     ["text", "text"],
@@ -894,22 +677,21 @@ export function nodeOutputFields(node, dashboards = []) {
         ["data.directory", "directory"],
       ];
     case "loop":
-      return loopOutputFields(node?.operation?.source, common, dashboards);
-    case "workflow":
       return [
         ...common,
-        ["data.workflow_id", "workflow ID"],
-        ["data.workflow_name", "workflow name"],
-        ["data.log_path", "run log"],
-        ["data.duration_seconds", "duration seconds"],
+        ["items", "all items"],
+        ["data.count", "item count"],
+        ["data.source_type", "source type"],
+        ["data.source_path", "source path"],
+        ["data.glob", "glob"],
       ];
     case "agent":
     case "common_llm_task":
       return [
         ...common,
-        ["data.message", "agent message"],
+        ["data.message", "message"],
         ["data.agent_id", "agent ID"],
-        ["data.thoughts", "agent thoughts"],
+        ["data.thoughts", "thoughts"],
       ];
     case "local_vectorize":
       return [
@@ -945,18 +727,6 @@ export function nodeOutputFields(node, dashboards = []) {
         ["data.body", "body"],
         ["data.json", "JSON"],
         ["data.selected", "selected outputs"],
-      ];
-    case "dashboard_item":
-      return [
-        ...common,
-        ["items", "items"],
-        ["data.message", "message"],
-        ["data.dashboard", "dashboard"],
-        ["data.component", "component"],
-        ["data.count", "item count"],
-        ["data.items", "items"],
-        ["data.item", "item"],
-        ["data.selected", "selected item"],
       ];
     case "approval_gate":
       return [
@@ -1084,15 +854,15 @@ function uniqueAccessEntries(entries = []) {
   return entries
     .map((entry) => ({
       path: String(entry?.path ?? "").trim(),
-      read: true,
-      write: true,
-      execute: false,
+      read: entry?.read ?? true,
+      write: entry?.write ?? true,
+      execute: entry?.execute ?? false,
     }))
     .filter((entry) => {
-    const path = canonicalPath(entry?.path ?? "");
-    if (!path || seen.has(path)) return false;
-    seen.add(path);
-    return true;
+      const path = canonicalPath(entry?.path ?? "");
+      if (!path || seen.has(path)) return false;
+      seen.add(path);
+      return true;
     });
 }
 
@@ -1102,6 +872,25 @@ function mergeWorkflowFilesystemAccess(workflow, entries) {
 
 function clamp(value, min, max) {
   return Math.min(max, Math.max(min, value));
+}
+
+export function resizerValueForKey(
+  key,
+  currentValue,
+  { defaultValue, max, min, orientation = "vertical", shiftKey = false, step = 10 },
+) {
+  if (key === "Enter") return clamp(defaultValue, min, max);
+  if (key === "Home") return min;
+  if (key === "End") return max;
+  const amount = shiftKey ? step * 4 : step;
+  if (orientation === "horizontal") {
+    if (key === "ArrowUp") return clamp(currentValue + amount, min, max);
+    if (key === "ArrowDown") return clamp(currentValue - amount, min, max);
+  } else {
+    if (key === "ArrowRight") return clamp(currentValue + amount, min, max);
+    if (key === "ArrowLeft") return clamp(currentValue - amount, min, max);
+  }
+  return null;
 }
 
 function normalizedSelectionBox(selectionBox) {
@@ -1177,51 +966,22 @@ function structuredCloneCompatible(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
-function finiteNumber(value, fallback = 0) {
-  const number = Number(value);
-  return Number.isFinite(number) ? number : fallback;
-}
-
-function hexToRgba(hex, opacity = 1) {
-  const normalized = String(hex ?? "").replace("#", "");
-  if (!/^[0-9A-Fa-f]{6}$/.test(normalized)) {
-    return `rgba(71, 85, 105, ${clamp(opacity, 0, 1)})`;
-  }
-  const red = Number.parseInt(normalized.slice(0, 2), 16);
-  const green = Number.parseInt(normalized.slice(2, 4), 16);
-  const blue = Number.parseInt(normalized.slice(4, 6), 16);
-  return `rgba(${red}, ${green}, ${blue}, ${clamp(opacity, 0, 1)})`;
-}
-
-function nextAvailableGroupNumber(groups) {
-  const usedNumbers = new Set(
-    groups
-      .map((group) => String(group.id).match(/^group-(\d+)$/)?.[1])
-      .filter(Boolean)
-      .map(Number),
-  );
-  let nextNumber = 1;
-  while (usedNumbers.has(nextNumber)) {
-    nextNumber += 1;
-  }
-  return nextNumber;
-}
-
 export default function DagCanvas({
   approvalState,
-  dashboards = EMPTY_ARRAY,
   dataDir = "",
   logState,
   notice,
+  radishDocument = null,
   retentionSettings = DEFAULT_RETENTION_SETTINGS,
+  readOnly = false,
   runState,
   workflow,
-  workflows = EMPTY_ARRAY,
   onExportWorkflow,
   onImportWorkflow,
   onLoadLatestLog,
   onDecideApproval,
   onPruneRunLogs,
+  onRadishMutation,
   onRetentionSettingsChange,
   onRunWorkflow,
   onReplayRunLog,
@@ -1231,31 +991,27 @@ export default function DagCanvas({
   onStopWorkflow,
   onValidateWorkflow,
   onWorkflowChange,
-  onNavigateWorkflow,
-  onRenameWorkflow,
-  usedAgentIds = EMPTY_ARRAY,
+  usedAgentIds = [],
 }) {
   const canvasRef = useRef(null);
   const importInputRef = useRef(null);
-  const searchInputRef = useRef(null);
-  const toolbarActionGroupRef = useRef(null);
-  const toolbarMeasureRef = useRef(null);
-  const toolbarMenuRef = useRef(null);
   const nodeDragMovedRef = useRef(false);
   const nodeDragSelectionRef = useRef([]);
-  const groupDragRef = useRef(null);
   const [selectedNodeId, setSelectedNodeId] = useState();
   const [selectedNodeIds, setSelectedNodeIds] = useState([]);
-  const [selectedGroupId, setSelectedGroupId] = useState(null);
   const [draggingNodeId, setDraggingNodeId] = useState(null);
   const [panningPointerId, setPanningPointerId] = useState(null);
   const [selectionBox, setSelectionBox] = useState(null);
-  const [logCollapsed, setLogCollapsed] = useState(false);
-  const [inspectorCollapsed, setInspectorCollapsed] = useState(false);
+  const [logCollapsed, setLogCollapsed] = useState(true);
+  const [inspectorCollapsed, setInspectorCollapsed] = useState(true);
   const [inspectorWidth, setInspectorWidth] = useState(340);
   const [logHeight, setLogHeight] = useState(240);
   const [expandedFolderNodes, setExpandedFolderNodes] = useState({});
   const [providerProfiles, setProviderProfiles] = useState([]);
+  const {
+    capabilities: providerCapabilities,
+    refresh: refreshProviderCapabilities,
+  } = useProviderCapabilities();
 
   useEffect(() => {
     async function loadProviderProfiles() {
@@ -1276,15 +1032,18 @@ export default function DagCanvas({
   const [runMenuOpen, setRunMenuOpen] = useState(false);
   const [selectedEdgeId, setSelectedEdgeId] = useState(null);
   const [draftEdge, setDraftEdge] = useState(null);
+  const [keyboardConnectionFrom, setKeyboardConnectionFrom] = useState(null);
+  const [outlineFocusRequest, setOutlineFocusRequest] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
-  const [searchQuery, setSearchQuery] = useState("");
-  const [searchMatchIndex, setSearchMatchIndex] = useState(0);
   const [minimapDragging, setMinimapDragging] = useState(false);
+  const [mapOpen, setMapOpen] = useState(false);
+  const [mapTab, setMapTab] = useState("outline");
+  const [graphFullscreen, setGraphFullscreen] = useState(false);
   const [nodeContextMenu, setNodeContextMenu] = useState(null);
   const [nodeRenameDialog, setNodeRenameDialog] = useState(null);
-  const [toolbarMenuOpen, setToolbarMenuOpen] = useState(false);
-  const [visibleToolbarActions, setVisibleToolbarActions] = useState(null);
   const invalidWorkflow = Boolean(workflow.invalid);
+  const radishMode = Boolean(radishDocument);
+  const editingDisabled = invalidWorkflow || readOnly;
   const validationDiagnostics = workflowValidationDiagnostics(workflow);
   const blockingValidationErrors = validationDiagnostics.filter(
     (diagnostic) => diagnostic.severity === "error",
@@ -1294,30 +1053,13 @@ export default function DagCanvas({
     () =>
       (workflow.nodes ?? []).map((node) => {
         const forcedLabel = specialNodeLabel(node.type);
-        if (forcedLabel && node.label !== forcedLabel) {
-          return { ...node, label: forcedLabel };
-        }
-        if (node.type === "workflow") {
-          const targetWorkflow = workflows.find(
-            (candidate) => candidate.id === node.operation?.workflow_id,
-          );
-          const targetLabel = targetWorkflow?.name || node.label || "Workflow";
-          return targetLabel !== node.label ? { ...node, label: targetLabel } : node;
-        }
-        return node;
+        return forcedLabel && node.label !== forcedLabel
+          ? { ...node, label: forcedLabel }
+          : node;
       }),
-    [workflow.nodes, workflows],
+    [workflow.nodes],
   );
-  const workflowEdges = workflow.edges ?? [];
-  const canvasGroups = useMemo(() => normalizeCanvasGroups(workflow), [workflow]);
-  const visibleWorkflowNodes = useMemo(
-    () => visibleNodesForGroups(workflowNodes, canvasGroups),
-    [canvasGroups, workflowNodes],
-  );
-  const visibleWorkflowEdges = useMemo(
-    () => visibleEdgesForGroups(workflowEdges, visibleWorkflowNodes),
-    [visibleWorkflowNodes, workflowEdges],
-  );
+  const workflowEdges = useMemo(() => workflow.edges ?? [], [workflow.edges]);
   const edgeDiagnostics = useMemo(
     () => diagnosticsByTarget(validationDiagnostics, "edge"),
     [validationDiagnostics],
@@ -1326,12 +1068,8 @@ export default function DagCanvas({
     () => diagnosticsByTarget(validationDiagnostics, "node"),
     [validationDiagnostics],
   );
-  const searchMatches = useMemo(
-    () => matchingNodeIds(workflowNodes, searchQuery),
-    [searchQuery, workflowNodes],
-  );
+
   const selectedNode = workflowNodes.find((node) => node.id === selectedNodeId);
-  const selectedGroup = canvasGroups.find((group) => group.id === selectedGroupId);
   const selectedEdge = workflowEdges.find((edge) => edge.id === selectedEdgeId);
   const runResult = runState?.result?.workflowId === workflow.id ? runState.result : null;
   const historicalNodeOutputs = logState?.nodeOutputs ?? null;
@@ -1387,6 +1125,27 @@ export default function DagCanvas({
   const nodeStatuses = useMemo(() => {
     return getNodeStatuses(workflowNodes, runResult, workflowLogText, runNodes, runEvents);
   }, [runEvents, runNodes, runResult, workflowNodes, workflowLogText]);
+  const graphAnnouncement = useMemo(() => {
+    if (keyboardConnectionFrom) {
+      const source = nodesById[keyboardConnectionFrom];
+      return `Connection started from ${source?.label ?? keyboardConnectionFrom}. Choose a target node and press Enter.`;
+    }
+    if (selectedNode) {
+      const incoming = workflowEdges.filter((edge) => edge.to === selectedNode.id);
+      const outgoing = workflowEdges.filter((edge) => edge.from === selectedNode.id);
+      const diagnostics = nodeDiagnostics[selectedNode.id] ?? [];
+      const validation = diagnostics.some((item) => item.severity === "error")
+        ? "validation error"
+        : diagnostics.some((item) => item.severity === "warning")
+          ? "validation warning"
+          : "valid";
+      return `${selectedNode.label} selected. Status ${nodeStatuses[selectedNode.id] ?? "not run"}. ${incoming.length} incoming and ${outgoing.length} outgoing connections. ${validation}.`;
+    }
+    if (selectedEdge) {
+      return `Connection selected from ${nodesById[selectedEdge.from]?.label ?? selectedEdge.from} to ${nodesById[selectedEdge.to]?.label ?? selectedEdge.to}. Condition ${selectedEdge.label ?? selectedEdge.condition ?? "always"}.`;
+    }
+    return "";
+  }, [keyboardConnectionFrom, nodeDiagnostics, nodeStatuses, nodesById, selectedEdge, selectedNode, workflowEdges]);
   const currentWorkflowRunning =
     runState?.running && runState.workflowId === workflow.id;
   const workflowHasRunningRuns = currentWorkflowRunning || logState?.runs?.some(
@@ -1397,48 +1156,74 @@ export default function DagCanvas({
     : workflowHasRunningRuns
       ? "Start another workflow run"
       : "Run workflow now";
+  const deleteEdge = useCallback(
+    (edgeId) => {
+      const edgeIndex = workflowEdges.findIndex((edge) => edge.id === edgeId);
+      const deletedEdge = workflowEdges[edgeIndex];
+      const remainingEdges = workflowEdges.filter((edge) => edge.id !== edgeId);
+      const nextEdge = remainingEdges[Math.min(edgeIndex, remainingEdges.length - 1)];
+      const nextNode = deletedEdge ? nodesById[deletedEdge.from] : workflowNodes[0];
+
+      if (radishMode && deletedEdge) {
+        const routes = remainingEdges
+          .filter((edge) => edge.from === deletedEdge.from)
+          .map((edge) => radishRouteValue(edge, radishDocument?.source));
+        void onRadishMutation?.([
+          { kind: "set_routes", node: deletedEdge.from, routes },
+        ]);
+      } else {
+        onWorkflowChange({
+          ...workflow,
+          edges: remainingEdges,
+        });
+      }
+      if (selectedEdgeId === edgeId) {
+        if (nextEdge) {
+          setSelectedEdgeId(nextEdge.id);
+          setSelectedNodeId(undefined);
+          setSelectedNodeIds([]);
+          return `edge:${nextEdge.id}`;
+        }
+        setSelectedEdgeId(null);
+        setSelectedNodeId(nextNode?.id);
+        setSelectedNodeIds(nextNode ? [nextNode.id] : []);
+        return nextNode ? `node:${nextNode.id}` : null;
+      }
+      return null;
+    },
+    [
+      nodesById,
+      onRadishMutation,
+      onWorkflowChange,
+      radishDocument?.source,
+      radishMode,
+      selectedEdgeId,
+      workflow,
+      workflowEdges,
+      workflowNodes,
+    ],
+  );
 
   useEffect(() => {
     setSelectedNodeId(undefined);
     setSelectedNodeIds([]);
-    setSelectedGroupId(null);
     setSelectedEdgeId(null);
     setDraftEdge(null);
+    setKeyboardConnectionFrom(null);
+    setOutlineFocusRequest(null);
     setDraggingNodeId(null);
     setPanningPointerId(null);
     setSelectionBox(null);
-    setSearchQuery("");
-    setSearchMatchIndex(0);
-    const schedule = window.requestAnimationFrame ?? ((callback) => callback());
-    schedule(() => fitGraph());
+    setViewport({ x: 0, y: 0, scale: 1 });
   }, [workflow.id]);
-
-  useEffect(() => {
-    setSearchMatchIndex((currentIndex) =>
-      searchMatches.length ? Math.min(currentIndex, searchMatches.length - 1) : 0,
-    );
-  }, [searchMatches.length]);
-
-  useEffect(() => {
-    if (selectedGroupId && !canvasGroups.some((group) => group.id === selectedGroupId)) {
-      setSelectedGroupId(null);
-    }
-  }, [canvasGroups, selectedGroupId]);
 
   useEffect(() => {
     if (selectedNodeId && !nodesById[selectedNodeId]) {
       setSelectedNodeId(undefined);
     }
-    setSelectedNodeIds((currentIds) => {
-      const nextIds = currentIds.filter((nodeId) => Boolean(nodesById[nodeId]));
-      if (
-        nextIds.length === currentIds.length &&
-        nextIds.every((nodeId, index) => nodeId === currentIds[index])
-      ) {
-        return currentIds;
-      }
-      return nextIds;
-    });
+    setSelectedNodeIds((currentIds) =>
+      currentIds.filter((nodeId) => Boolean(nodesById[nodeId])),
+    );
   }, [nodesById, selectedNodeId]);
 
   useEffect(() => {
@@ -1449,7 +1234,7 @@ export default function DagCanvas({
 
   useEffect(() => {
     function handleKeyDown(event) {
-      if (!selectedEdgeId || event.defaultPrevented) return;
+      if (readOnly || !selectedEdgeId || event.defaultPrevented) return;
       const target = event.target;
       const tagName = target?.tagName?.toLowerCase?.();
       if (
@@ -1468,7 +1253,7 @@ export default function DagCanvas({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [selectedEdgeId, workflowEdges]);
+  }, [deleteEdge, readOnly, selectedEdgeId]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -1482,49 +1267,25 @@ export default function DagCanvas({
         tagName === "select";
 
       if (event.key === "Escape") {
-        setNodeRenameDialog(null);
-        setNodeContextMenu(null);
-        setToolbarMenuOpen(false);
+        if (graphFullscreen) {
+          setGraphFullscreen(false);
+          return;
+        }
         setDraftEdge(null);
         setSelectedEdgeId(null);
         setSelectedNodeId(undefined);
         setSelectedNodeIds([]);
-        setSelectedGroupId(null);
         setSelectionBox(null);
-        if (document.activeElement === searchInputRef.current) {
-          searchInputRef.current?.blur();
-        }
         return;
       }
 
       if (editingText) return;
 
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select?.();
-        return;
-      }
-
-      if (event.key === "/") {
-        event.preventDefault();
-        searchInputRef.current?.focus();
-        searchInputRef.current?.select?.();
-        return;
-      }
-
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
         event.preventDefault();
         setSelectedEdgeId(null);
-        setSelectedGroupId(null);
         setSelectedNodeIds(workflowNodes.map((node) => node.id));
         setSelectedNodeId(workflowNodes.at(-1)?.id);
-        return;
-      }
-
-      if ((event.key === "Delete" || event.key === "Backspace") && selectedNodeIds.length) {
-        event.preventDefault();
-        deleteSelectedNodesWithConfirmation();
         return;
       }
 
@@ -1578,7 +1339,7 @@ export default function DagCanvas({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [workflowNodes, selectedNodeIds]);
+  }, [graphFullscreen, workflowNodes, selectedNodeIds]);
 
   useEffect(() => {
     if (panningPointerId === null) return undefined;
@@ -1613,16 +1374,6 @@ export default function DagCanvas({
     const forcedLabel = specialNodeLabel(operation.type);
     if (forcedLabel) {
       nextNodePatch.label = forcedLabel;
-    }
-    if (
-      operation.type === "workflow" &&
-      Object.hasOwn(patch, "workflow_id") &&
-      operation.workflow_id
-    ) {
-      const targetWorkflow = workflows.find((candidate) => candidate.id === operation.workflow_id);
-      if (targetWorkflow?.name) {
-        nextNodePatch.label = targetWorkflow.name;
-      }
     }
     if (
       (operation.type === "file" || operation.type === "folder") &&
@@ -1696,20 +1447,9 @@ export default function DagCanvas({
         ? nextAgentNumber
         : workflowNodes.length + 1,
     );
-    if (type === "workflow") {
-      const targetWorkflow = workflows.find((candidate) => candidate.id !== workflow.id);
-      if (targetWorkflow) {
-        nextOperation.workflow_id = targetWorkflow.id;
-      }
-    }
     const nextNode = {
       type,
-      label:
-        specialNodeLabel(type) ??
-        (type === "workflow"
-          ? workflows.find((candidate) => candidate.id === nextOperation.workflow_id)?.name ||
-            "Workflow"
-          : nodesById[nodeId].label),
+      label: specialNodeLabel(type) ?? nodesById[nodeId].label,
       operation: nextOperation,
       settings: {
         ...defaultSettings,
@@ -1759,69 +1499,18 @@ export default function DagCanvas({
     };
   }
 
-  function viewportCenterNodePosition() {
-    const size = canvasViewportSize();
-    return {
-      x: (size.width / 2 - viewport.x) / viewport.scale - nodeWidth / 2,
-      y: (size.height / 2 - viewport.y) / viewport.scale - nodeHeight / 2,
-    };
-  }
-
   function fitNodes(nodes) {
     if (!nodes.length) return;
     setViewport(fitViewportToNodes(nodes, canvasViewportSize()));
   }
 
-  function currentFitItems() {
-    const collapsedGroups = canvasGroups
-      .filter((group) => group.collapsed)
-      .map(groupRectForViewport);
-    return [...visibleWorkflowNodes, ...collapsedGroups];
-  }
-
   function fitGraph() {
-    fitNodes(currentFitItems());
-  }
-
-  function focusSearchMatch(matchIndex = searchMatchIndex) {
-    if (!searchMatches.length) return;
-    const boundedIndex = ((matchIndex % searchMatches.length) + searchMatches.length) % searchMatches.length;
-    const nodeId = searchMatches[boundedIndex];
-    const node = workflowNodes.find((candidate) => candidate.id === nodeId);
-    if (!node) return;
-    const collapsedGroup = canvasGroups.find(
-      (group) => group.collapsed && group.nodeIds.includes(nodeId),
-    );
-    if (collapsedGroup) {
-      onWorkflowChange(updateCanvasGroup(workflow, collapsedGroup.id, { collapsed: false }));
-      setSelectedGroupId(collapsedGroup.id);
-    } else {
-      setSelectedGroupId(null);
-    }
-    setSearchMatchIndex(boundedIndex);
-    setSelectedEdgeId(null);
-    setSelectedNodeId(nodeId);
-    setSelectedNodeIds([nodeId]);
-    fitNodes([node]);
-  }
-
-  function handleSearchSubmit(event) {
-    event.preventDefault();
-    focusSearchMatch(searchMatchIndex);
-  }
-
-  function moveSearchMatch(delta) {
-    if (!searchMatches.length) return;
-    focusSearchMatch(searchMatchIndex + delta);
+    fitNodes(workflowNodes);
   }
 
   function fitSelection() {
     const selectedNodes = workflowNodes.filter((node) => selectedNodeIds.includes(node.id));
-    if (selectedGroup) {
-      fitNodes([groupRectForViewport(selectedGroup)]);
-      return;
-    }
-    fitNodes(selectedNodes.length ? selectedNodes : currentFitItems());
+    fitNodes(selectedNodes.length ? selectedNodes : workflowNodes);
   }
 
   function zoomViewport(multiplier) {
@@ -1845,109 +1534,46 @@ export default function DagCanvas({
     onWorkflowChange(nextWorkflow);
     const schedule = window.requestAnimationFrame ?? ((callback) => callback());
     schedule(() => {
-      const nextGroups = normalizeCanvasGroups(nextWorkflow);
-      fitNodes([
-        ...visibleNodesForGroups(nextWorkflow.nodes ?? [], nextGroups),
-        ...nextGroups.filter((group) => group.collapsed).map(groupRectForViewport),
-      ]);
+      fitNodes(nextWorkflow.nodes ?? []);
     });
   }
 
-  function addNode() {
-    const position = viewportCenterNodePosition();
+  function addNode(event) {
+    const nextNumber = nextAvailableNodeNumber(workflowNodes);
+    if (radishMode) {
+      const nodeId = `node-${nextNumber}`;
+      void Promise.resolve(onRadishMutation?.([
+        {
+          kind: "add_node",
+          node: nodeId,
+          node_type: "bash-command",
+          fields: { command: "" },
+        },
+      ])).then((document) => {
+        if (!document) return;
+        setSelectedNodeId(nodeId);
+        setSelectedNodeIds([nodeId]);
+        setSelectedEdgeId(null);
+        setInspectorCollapsed(false);
+      });
+      return;
+    }
     const nextWorkflow = addDefaultNodeToWorkflow(workflow, {
       usedAgentIds,
-      x: Math.round(position.x),
-      y: Math.round(position.y),
+      x: 180 + nextNumber * 34,
+      y: 180 + nextNumber * 24,
     });
     const newNode = nextWorkflow.nodes.at(-1);
     onWorkflowChange(nextWorkflow);
     setSelectedNodeId(newNode.id);
     setSelectedNodeIds([newNode.id]);
-    setSelectedGroupId(null);
-  }
-
-  function addGroup() {
-    if (!selectedNodeIds.length) return;
-    const nextWorkflow = createCanvasGroup(workflow, selectedNodeIds);
-    if (nextWorkflow === workflow) return;
-    const group = normalizeCanvasGroups(nextWorkflow).at(-1);
-    onWorkflowChange(nextWorkflow);
-    if (group) {
-      setSelectedGroupId(group.id);
-      setSelectedNodeId(undefined);
-      setSelectedNodeIds([]);
-      setSelectedEdgeId(null);
-    }
-  }
-
-  function updateGroup(groupId, patch) {
-    onWorkflowChange(updateCanvasGroup(workflow, groupId, patch));
-  }
-
-  function deleteGroup(groupId) {
-    onWorkflowChange(deleteCanvasGroup(workflow, groupId));
-    setSelectedGroupId((current) => (current === groupId ? null : current));
-  }
-
-  function duplicateGroup(groupId) {
-    const nextWorkflow = duplicateCanvasGroup(workflow, groupId);
-    const group = normalizeCanvasGroups(nextWorkflow).at(-1);
-    onWorkflowChange(nextWorkflow);
-    if (group) {
-      setSelectedGroupId(group.id);
-      setSelectedNodeId(undefined);
-      setSelectedNodeIds([]);
-      setSelectedEdgeId(null);
-    }
-  }
-
-  function handleGroupPointerDown(event, groupId, mode = "move") {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const group = canvasGroups.find((candidate) => candidate.id === groupId);
-    if (!group) return;
-    groupDragRef.current = {
-      groupId,
-      mode,
-      pointerId: event.pointerId,
-      group,
-    };
-    event.currentTarget.setPointerCapture?.(event.pointerId);
-    setSelectedGroupId(groupId);
-    setSelectedNodeId(undefined);
-    setSelectedNodeIds([]);
     setSelectedEdgeId(null);
-  }
-
-  function handleGroupPointerMove(event) {
-    const drag = groupDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    const dx = event.movementX / viewport.scale;
-    const dy = event.movementY / viewport.scale;
-    if (drag.mode === "resize") {
-      onWorkflowChange(
-        updateCanvasGroup(workflow, drag.groupId, {
-          width: drag.group.width + dx,
-          height: drag.group.height + dy,
-        }),
-      );
-      drag.group = { ...drag.group, width: drag.group.width + dx, height: drag.group.height + dy };
-      return;
+    if (event?.detail === 0) {
+      setOutlineFocusRequest((current) => ({
+        id: (current?.id ?? 0) + 1,
+        itemKey: `node:${newNode.id}`,
+      }));
     }
-    onWorkflowChange(moveCanvasGroup(workflow, drag.groupId, { x: dx, y: dy }));
-  }
-
-  function handleGroupPointerUp(event) {
-    const drag = groupDragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
-    event.preventDefault();
-    event.stopPropagation();
-    event.currentTarget.releasePointerCapture?.(event.pointerId);
-    groupDragRef.current = null;
   }
 
   async function applyValidationFix(fix) {
@@ -2124,7 +1750,6 @@ export default function DagCanvas({
     });
     setSelectedNodeId(newNodes.at(-1).id);
     setSelectedNodeIds(newNodes.map((node) => node.id));
-    setSelectedGroupId(null);
   }
 
   function trustPendingDroppedNodes(trustParents) {
@@ -2145,71 +1770,97 @@ export default function DagCanvas({
     setPendingTrustPrompt(null);
   }
 
-  function deleteSelectedItem() {
-    if (selectedGroup) {
-      deleteGroup(selectedGroup.id);
-      return;
-    }
+  function deleteSelectedNode() {
     if (!selectedNode) return;
     deleteNode(selectedNode.id);
   }
 
-  function deleteSelectedNodesWithConfirmation() {
-    const nodeIds = selectedNodeIds.filter((nodeId) => Boolean(nodesById[nodeId]));
-    if (!nodeIds.length) return;
-    const message =
-      nodeIds.length === 1
-        ? `Delete selected node "${nodesById[nodeIds[0]]?.label ?? nodeIds[0]}"?`
-        : `Delete ${nodeIds.length} selected nodes?`;
-    if (!window.confirm(message)) return;
-
-    const nodesToDelete = new Set(nodeIds);
-    const nextWorkflow = nodeIds.reduce(
-      (currentWorkflow, nodeId) => removeWorkflowNode(currentWorkflow, nodeId),
-      workflow,
-    );
-    const remainingNodes = nextWorkflow.nodes ?? [];
-    const nextSelectedId = remainingNodes.find((node) => !nodesToDelete.has(node.id))?.id;
-
-    onWorkflowChange(nextWorkflow);
-    setSelectedNodeId(nextSelectedId);
-    setSelectedNodeIds(nextSelectedId ? [nextSelectedId] : []);
-    setSelectedEdgeId(null);
-    setSelectedGroupId(null);
-    setNodeContextMenu((current) =>
-      current && nodesToDelete.has(current.nodeId) ? null : current,
-    );
-  }
-
   function deleteNode(nodeId) {
-    const nextWorkflow = removeWorkflowNode(workflow, nodeId);
-    const remainingNodes = nextWorkflow.nodes ?? [];
-    const nextSelectedId = remainingNodes[0]?.id;
+    const nodeIndex = workflowNodes.findIndex((node) => node.id === nodeId);
+    const remainingNodes = workflowNodes.filter((node) => node.id !== nodeId);
+    const nextSelectedId = remainingNodes[Math.min(nodeIndex, remainingNodes.length - 1)]?.id;
+    const deletingSelectedNode = selectedNodeId === nodeId || selectedNodeIds.includes(nodeId);
 
-    onWorkflowChange(nextWorkflow);
-    setSelectedNodeId((currentId) =>
-      currentId === nodeId ? nextSelectedId : currentId,
-    );
-    setSelectedNodeIds((currentIds) =>
-      currentIds.includes(nodeId)
-        ? nextSelectedId
-          ? [nextSelectedId]
-          : []
-        : currentIds,
-    );
+    if (radishMode) {
+      void onRadishMutation?.([{ kind: "delete_node", node: nodeId }]);
+    } else {
+      onWorkflowChange({
+        ...workflow,
+        nodes: remainingNodes,
+        edges: workflowEdges.filter(
+          (edge) => edge.from !== nodeId && edge.to !== nodeId,
+        ),
+      });
+    }
+    if (deletingSelectedNode) {
+      setSelectedNodeId(nextSelectedId);
+      setSelectedNodeIds(nextSelectedId ? [nextSelectedId] : []);
+      setSelectedEdgeId(null);
+    }
     setNodeContextMenu((current) => (current?.nodeId === nodeId ? null : current));
+    return deletingSelectedNode && nextSelectedId ? `node:${nextSelectedId}` : null;
   }
 
   function duplicateNode(nodeId) {
+    if (radishMode) {
+      const existing = new Set(workflowNodes.map((node) => node.id));
+      let suffix = 2;
+      let nextId = `${nodeId}-copy`;
+      while (existing.has(nextId)) {
+        nextId = `${nodeId}-copy-${suffix}`;
+        suffix += 1;
+      }
+      void Promise.resolve(onRadishMutation?.([
+        { kind: "duplicate_node", node: nodeId, name: nextId },
+      ])).then((document) => {
+        if (!document) return;
+        setSelectedNodeId(nextId);
+        setSelectedNodeIds([nextId]);
+        setSelectedEdgeId(null);
+      });
+      setNodeContextMenu(null);
+      return `node:${nextId}`;
+    }
     const nextWorkflow = duplicateWorkflowNode(workflow, nodeId, { usedAgentIds });
     const duplicatedNode = nextWorkflow.nodes.at(-1);
-    if (!duplicatedNode || nextWorkflow === workflow) return;
+    if (!duplicatedNode || nextWorkflow === workflow) return null;
     onWorkflowChange(nextWorkflow);
     setSelectedNodeId(duplicatedNode.id);
     setSelectedNodeIds([duplicatedNode.id]);
-    setSelectedGroupId(null);
     setSelectedEdgeId(null);
     setNodeContextMenu(null);
+    return `node:${duplicatedNode.id}`;
+  }
+
+  function selectOutlineNode(nodeId) {
+    setSelectedNodeId(nodeId);
+    setSelectedNodeIds([nodeId]);
+    setSelectedEdgeId(null);
+  }
+
+  function selectOutlineEdge(edgeId) {
+    setSelectedNodeId(undefined);
+    setSelectedNodeIds([]);
+    setSelectedEdgeId(edgeId);
+  }
+
+  function focusInspector() {
+    setInspectorCollapsed(false);
+    const inspector = document.getElementById("workflow-inspector");
+    if (inspector) {
+      inspector.focus();
+      return;
+    }
+    window.requestAnimationFrame?.(() => document.getElementById("workflow-inspector")?.focus());
+  }
+
+  function showWorkflowSettings() {
+    setSelectedNodeId(undefined);
+    setSelectedNodeIds([]);
+    setSelectedEdgeId(null);
+    setDraftEdge(null);
+    setKeyboardConnectionFrom(null);
+    focusInspector();
   }
 
   function renameNode(nodeId) {
@@ -2228,22 +1879,38 @@ export default function DagCanvas({
       setNodeRenameDialog(null);
       return;
     }
-    const node = nodesById[nodeId];
-    if (node?.type === "workflow" && node.operation?.workflow_id) {
-      Promise.resolve(onRenameWorkflow?.(node.operation.workflow_id, trimmedLabel)).then(
-        (renamedWorkflow) => {
-          if (renamedWorkflow?.id) {
-            updateNodeOperation(nodeId, { workflow_id: renamedWorkflow.id });
-          }
-        },
-      );
+    if (radishMode) {
+      void renameRadishNode(nodeId, trimmedLabel);
+    } else {
+      updateNode(nodeId, { label: trimmedLabel });
+      setSelectedNodeId(nodeId);
+      setSelectedNodeIds([nodeId]);
     }
-    updateNode(nodeId, { label: trimmedLabel });
-    setSelectedNodeId(nodeId);
-    setSelectedNodeIds([nodeId]);
-    setSelectedGroupId(null);
     setSelectedEdgeId(null);
     setNodeRenameDialog(null);
+  }
+
+  function renameRadishNode(nodeId, nextId) {
+    const trimmedId = String(nextId ?? "").trim();
+    if (!trimmedId || trimmedId === nodeId) return null;
+    const canonicalId = trimmedId.toLowerCase();
+    return Promise.resolve(
+      onRadishMutation?.([
+        { kind: "rename_node", node: nodeId, name: trimmedId },
+      ]),
+    ).then((document) => {
+      if (!document) {
+        return null;
+      }
+      const renamedId =
+        document.graph?.nodes?.find(
+          (candidate) => candidate.id.toLowerCase() === canonicalId,
+        )?.id ?? canonicalId;
+      setSelectedNodeId(renamedId);
+      setSelectedNodeIds([renamedId]);
+      setSelectedEdgeId(null);
+      return document;
+    });
   }
 
   function showNodeContextMenu(event, nodeId) {
@@ -2251,7 +1918,6 @@ export default function DagCanvas({
     event.stopPropagation();
     setSelectedNodeId(nodeId);
     setSelectedNodeIds([nodeId]);
-    setSelectedGroupId(null);
     setSelectedEdgeId(null);
     setNodeContextMenu({
       nodeId,
@@ -2269,8 +1935,8 @@ export default function DagCanvas({
     nodeDragSelectionRef.current = nextSelection;
     setSelectedNodeId(nodeId);
     setSelectedNodeIds(nextSelection);
-    setSelectedGroupId(null);
     setSelectedEdgeId(null);
+    setInspectorCollapsed(false);
     setDraggingNodeId(nodeId);
   }
 
@@ -2325,13 +1991,6 @@ export default function DagCanvas({
       const path = node.operation?.path;
       if (path) {
         setFilePreviewPath(resolveDisplayPath(path, dataDir));
-      }
-      return;
-    }
-
-    if (node.type === "workflow") {
-      if (node.operation?.workflow_id) {
-        onNavigateWorkflow?.(node.operation.workflow_id);
       }
       return;
     }
@@ -2546,12 +2205,7 @@ export default function DagCanvas({
   function viewportFromMinimapPointer(event) {
     const rect = event.currentTarget.getBoundingClientRect();
     const bounds = graphBounds(workflowNodes, 160);
-    const minimapScale = Math.min(
-      minimapWidth / Math.max(1, bounds.width),
-      minimapHeight / Math.max(1, bounds.height),
-    );
-    const worldX = bounds.left + (event.clientX - rect.left) / minimapScale;
-    const worldY = bounds.top + (event.clientY - rect.top) / minimapScale;
+    const { x: worldX, y: worldY } = minimapPointToWorld(event, rect, bounds);
     const size = canvasViewportSize();
     setViewport((current) => ({
       ...current,
@@ -2598,20 +2252,34 @@ export default function DagCanvas({
     zoomViewportAtPoint(size.width / 2, size.height / 2, zoomMultiplier);
   }
 
-  function deleteEdge(edgeId) {
-    onWorkflowChange({
-      ...workflow,
-      edges: workflowEdges.filter((edge) => edge.id !== edgeId),
-    });
-    setSelectedEdgeId((currentId) => (currentId === edgeId ? null : currentId));
-  }
-
-  function addEdge(fromNodeId, toNodeId, condition, outputPattern = null) {
-    if (!fromNodeId || !toNodeId) return;
+  function addEdge(
+    fromNodeId,
+    toNodeId,
+    condition,
+    outputPattern = null,
+    field = null,
+    operator = null,
+    value = null,
+  ) {
+    if (!fromNodeId || !toNodeId) return null;
 
     const nextCondition = condition || "always";
     const nextOutputPattern = nextCondition === "output_matches" ? outputPattern || "" : null;
     const nextEdgeId = uniqueEdgeId(workflowEdges, fromNodeId, toNodeId);
+    if (radishMode) {
+      const routes = [
+        ...workflowEdges
+          .filter((edge) => edge.from === fromNodeId)
+          .map((edge) => radishRouteValue(edge, radishDocument?.source)),
+        toNodeId,
+      ];
+      void onRadishMutation?.([{ kind: "set_routes", node: fromNodeId, routes }]);
+      setSelectedNodeId(undefined);
+      setSelectedNodeIds([]);
+      setSelectedEdgeId(nextEdgeId);
+      setKeyboardConnectionFrom(null);
+      return `edge:${nextEdgeId}`;
+    }
     onWorkflowChange({
       ...workflow,
       edges: [
@@ -2620,18 +2288,41 @@ export default function DagCanvas({
           id: nextEdgeId,
           from: fromNodeId,
           to: toNodeId,
-          label: edgeLabel(nextCondition, nextOutputPattern),
+          label: edgeLabel(
+            nextCondition,
+            nextOutputPattern,
+            field,
+            operator,
+            value,
+          ),
           condition: nextCondition,
           outputPattern: nextOutputPattern,
+          field: nextCondition === "output_field" ? field || "" : null,
+          operator: nextCondition === "output_field" ? operator || "equals" : null,
+          value: nextCondition === "output_field" ? value : null,
         },
       ],
     });
     setSelectedNodeId(undefined);
     setSelectedNodeIds([]);
     setSelectedEdgeId(nextEdgeId);
+    setKeyboardConnectionFrom(null);
+    return `edge:${nextEdgeId}`;
   }
 
   function updateEdge(edgeId, patch) {
+    if (radishMode) {
+      const edge = workflowEdges.find((candidate) => candidate.id === edgeId);
+      if (!edge) return;
+      const nextEdge = { ...edge, ...patch };
+      const routes = workflowEdges
+        .filter((candidate) => candidate.from === edge.from)
+        .map((candidate) =>
+          radishRouteValue(candidate.id === edgeId ? nextEdge : candidate, radishDocument?.source),
+        );
+      void onRadishMutation?.([{ kind: "set_routes", node: edge.from, routes }]);
+      return;
+    }
     onWorkflowChange({
       ...workflow,
       edges: workflowEdges.map((edge) => {
@@ -2639,7 +2330,13 @@ export default function DagCanvas({
         const nextEdge = { ...edge, ...patch };
         return {
           ...nextEdge,
-          label: edgeLabel(nextEdge.condition, nextEdge.outputPattern),
+          label: edgeLabel(
+            nextEdge.condition,
+            nextEdge.outputPattern,
+            nextEdge.field,
+            nextEdge.operator,
+            nextEdge.value,
+          ),
         };
       }),
     });
@@ -2699,161 +2396,51 @@ export default function DagCanvas({
     window.addEventListener("pointerup", handlePointerUp);
   }
 
-  const toolbarActions = [
-    {
-      disabled: invalidWorkflow,
-      icon: Plus,
-      label: "Add node",
-      onClick: addNode,
-    },
-    {
-      disabled: invalidWorkflow || !selectedNodeIds.length,
-      icon: Group,
-      label: selectedNodeIds.length ? "Create canvas group" : "Select nodes to group",
-      menuLabel: "Create canvas group",
-      onClick: addGroup,
-    },
-    {
-      icon: Route,
-      label: "Auto-layout graph",
-      onClick: applyAutoLayout,
-    },
-    {
-      icon: Maximize2,
-      label: "Fit graph",
-      onClick: fitGraph,
-    },
-    {
-      disabled: !selectedNodeIds.length,
-      icon: LocateFixed,
-      label: "Fit selection",
-      onClick: fitSelection,
-    },
-    {
-      icon: ZoomOut,
-      label: "Zoom out",
-      onClick: () => zoomViewport(0.88),
-    },
-    {
-      icon: ZoomIn,
-      label: "Zoom in",
-      onClick: () => zoomViewport(1.14),
-    },
-    {
-      icon: LocateFixed,
-      label: "Reset view",
-      onClick: () => setViewport({ x: 0, y: 0, scale: 1 }),
-    },
-    {
-      disabled: invalidWorkflow || (!selectedNode && !selectedGroup),
-      icon: Trash2,
-      label: "Delete selected item",
-      onClick: deleteSelectedItem,
-    },
-    {
-      icon: Upload,
-      label: "Import workflow TOML or bundle",
-      menuLabel: "Import workflow",
-      onClick: () => importInputRef.current?.click(),
-    },
-    {
-      disabled: invalidWorkflow,
-      icon: Download,
-      label: "Export workflow bundle",
-      onClick: onExportWorkflow,
-    },
-    {
-      disabled: invalidWorkflow,
-      icon: Check,
-      label: "Validate workflow",
-      onClick: onValidateWorkflow,
-    },
-  ];
-  const visibleToolbarActionCountValue = Math.min(
-    visibleToolbarActions ?? toolbarActions.length,
-    toolbarActions.length,
-  );
-  const visibleToolbarActionItems = toolbarActions.slice(0, visibleToolbarActionCountValue);
-  const overflowToolbarActionItems = toolbarActions.slice(visibleToolbarActionCountValue);
+  function handleInspectorResizeKeyDown(event) {
+    const nextWidth = resizerValueForKey(event.key, inspectorWidth, {
+      defaultValue: 340,
+      max: 520,
+      min: 280,
+      shiftKey: event.shiftKey,
+    });
+    if (nextWidth === null) return;
+    event.preventDefault();
+    setInspectorWidth(nextWidth);
+  }
 
-  useEffect(() => {
-    let frameId = 0;
-
-    function updateToolbarOverflow() {
-      window.cancelAnimationFrame?.(frameId);
-      frameId = window.requestAnimationFrame?.(() => {
-        const actionGroup = toolbarActionGroupRef.current;
-        const measureRoot = toolbarMeasureRef.current;
-        if (!actionGroup || !measureRoot) {
-          setVisibleToolbarActions(toolbarActions.length);
-          return;
-        }
-        if (typeof actionGroup.clientWidth !== "number") {
-          setVisibleToolbarActions(toolbarActions.length);
-          return;
-        }
-        const measuredElements = Array.from(measureRoot.childNodes ?? []).filter(
-          (node) => node.nodeType === 1,
-        );
-        const actionWidths = measuredElements
-          .filter((element) => element.getAttribute?.("data-toolbar-measure-action") !== null)
-          .map((element) => element.getBoundingClientRect().width);
-        const menuWidth =
-          measuredElements
-            .find((element) => element.getAttribute?.("data-toolbar-measure-menu") !== null)
-            ?.getBoundingClientRect().width ?? 0;
-        const nextCount = visibleToolbarActionCount(
-          actionGroup.clientWidth,
-          actionWidths,
-          menuWidth,
-          TOOLBAR_ACTION_GAP,
-        );
-        setVisibleToolbarActions((current) => (current === nextCount ? current : nextCount));
-        if (nextCount >= toolbarActions.length) {
-          setToolbarMenuOpen(false);
-        }
-      }) ?? window.setTimeout(() => {
-        setVisibleToolbarActions(toolbarActions.length);
-      }, 0);
-    }
-
-    updateToolbarOverflow();
-    const resizeObserver =
-      typeof ResizeObserver === "function" ? new ResizeObserver(updateToolbarOverflow) : null;
-    if (resizeObserver && toolbarActionGroupRef.current) {
-      resizeObserver.observe(toolbarActionGroupRef.current);
-    }
-    window.addEventListener("resize", updateToolbarOverflow);
-
-    return () => {
-      window.cancelAnimationFrame?.(frameId);
-      resizeObserver?.disconnect();
-      window.removeEventListener("resize", updateToolbarOverflow);
-    };
-  }, [toolbarActions.length]);
-
-  useEffect(() => {
-    if (!toolbarMenuOpen) return undefined;
-
-    function handlePointerDown(event) {
-      if (toolbarMenuRef.current?.contains(event.target)) return;
-      setToolbarMenuOpen(false);
-    }
-
-    document.addEventListener("pointerdown", handlePointerDown);
-    return () => document.removeEventListener("pointerdown", handlePointerDown);
-  }, [toolbarMenuOpen]);
+  function handleLogResizeKeyDown(event) {
+    const nextHeight = resizerValueForKey(event.key, logHeight, {
+      defaultValue: 240,
+      max: 420,
+      min: 140,
+      orientation: "horizontal",
+      shiftKey: event.shiftKey,
+    });
+    if (nextHeight === null) return;
+    event.preventDefault();
+    setLogHeight(nextHeight);
+  }
 
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
+    <div
+      className={`flex min-h-0 flex-1 flex-col ${
+        graphFullscreen ? "fixed inset-0 z-[100] bg-white" : ""
+      }`}
+      data-graph-fullscreen={graphFullscreen || undefined}
+    >
+      <div className="relative flex min-h-0 flex-1">
+        <div className="flex min-w-0 flex-1 flex-col">
         <div
-          className="relative z-20 flex shrink-0 items-center gap-2 overflow-visible border-b border-line bg-white px-6 py-2"
+          className="relative z-20 flex shrink-0 items-center gap-2 overflow-visible border-b border-line bg-white px-4 py-2"
           data-toolbar="graph-editor"
-          data-toolbar-row="primary"
         >
+          <div
+            className="flex min-w-0 items-center gap-2 overflow-visible"
+            data-toolbar-row="primary"
+          >
             <input
               ref={importInputRef}
-              accept=".toml,.zip,.gof"
+              accept={radishMode ? ".taskurotta" : ".toml,.zip,.gof"}
               className="hidden"
               type="file"
               onChange={(event) => {
@@ -2894,107 +2481,161 @@ export default function DagCanvas({
               onStopRun={onStopRunLog}
               selectedNodeId={selectedNodeId}
             />
-            <div
-              ref={toolbarActionGroupRef}
-              className="relative flex min-w-0 flex-1 items-center justify-start gap-2"
-            >
-              {visibleToolbarActionItems.map((action) => (
-                <ToolbarActionButton key={action.label} action={action} />
-              ))}
-              {overflowToolbarActionItems.length ? (
-                <div ref={toolbarMenuRef} className="relative shrink-0">
-                  <button
-                    className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-                    title="More graph actions"
-                    type="button"
-                    onClick={() => setToolbarMenuOpen((current) => !current)}
-                  >
-                    <MoreVertical size={17} />
-                  </button>
-                  {toolbarMenuOpen ? (
-                    <ToolbarOverflowMenu
-                      actions={overflowToolbarActionItems.map((action) => ({
-                        ...action,
-                        label: action.menuLabel ?? action.label,
-                      }))}
-                      onClose={() => setToolbarMenuOpen(false)}
-                    />
-                  ) : null}
+            <div className="relative shrink-0">
+              <button
+                className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+                disabled={invalidWorkflow}
+                title="Validate workflow"
+                type="button"
+                onClick={onValidateWorkflow}
+              >
+                <Check size={17} />
+              </button>
+              {notice?.message ? (
+                <div
+                  aria-atomic="true"
+                  aria-live={notice.type === "error" ? "assertive" : "polite"}
+                  className={`validation-pop absolute right-0 top-10 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
+                    notice.type === "error"
+                      ? "border-red-200 bg-red-50 text-red-700"
+                      : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                  }`}
+                  role={notice.type === "error" ? "alert" : "status"}
+                >
+                  {notice.message}
                 </div>
               ) : null}
-              <div
-                ref={toolbarMeasureRef}
-                aria-hidden="true"
-                className="pointer-events-none invisible absolute right-0 top-0 flex gap-2"
-              >
-                {toolbarActions.map((action) => (
-                  <ToolbarActionButton key={action.label} action={action} measure />
-                ))}
-                <button
-                  className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted"
-                  data-toolbar-measure-menu
-                  tabIndex={-1}
-                  type="button"
-                >
-                  <MoreVertical size={17} />
-                </button>
-              </div>
             </div>
-            <form
-              className="flex h-8 min-w-[8.5rem] max-w-[13rem] shrink items-center gap-1 rounded-lg border border-line bg-white px-2 text-xs focus-within:border-teal-500"
-              onSubmit={handleSearchSubmit}
+          </div>
+          <div
+            className="flex min-w-0 flex-1 items-center gap-2 overflow-visible [&>button]:shrink-0"
+            data-toolbar-row="secondary"
+          >
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={editingDisabled}
+              title="Add node"
+              type="button"
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  addNode({ detail: 0 });
+                }
+              }}
+              onClick={addNode}
             >
-              <Search size={14} className="shrink-0 text-muted" />
-              <input
-                ref={searchInputRef}
-                aria-label="Search nodes"
-                className="min-w-0 flex-1 bg-transparent text-xs outline-none"
-                placeholder="Search nodes"
-                value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
-              />
-              {searchQuery ? (
-                <span className="shrink-0 text-[11px] text-muted">
-                  {searchMatches.length ? searchMatchIndex + 1 : 0}/{searchMatches.length}
-                </span>
-              ) : null}
-              <button
-                className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-slate-100 hover:text-ink disabled:opacity-30"
-                disabled={!searchMatches.length}
-                title="Previous search match"
-                type="button"
-                onClick={() => moveSearchMatch(-1)}
+              <Plus size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              disabled={readOnly}
+              title={readOnly ? "Radish graph positions are managed in workflow metadata" : "Auto-layout graph"}
+              type="button"
+              onClick={applyAutoLayout}
+            >
+              <Route size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Fit graph"
+              type="button"
+              onClick={fitGraph}
+            >
+              <Maximize2 size={16} />
+            </button>
+            <button
+              className="hidden"
+              disabled={!selectedNodeIds.length}
+              title="Fit selection"
+              type="button"
+              onClick={fitSelection}
+            >
+              <LocateFixed size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Zoom out"
+              type="button"
+              onClick={() => zoomViewport(0.88)}
+            >
+              <ZoomOut size={17} />
+            </button>
+            <button
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              title="Zoom in"
+              type="button"
+              onClick={() => zoomViewport(1.14)}
+            >
+              <ZoomIn size={17} />
+            </button>
+            <button
+              className="hidden"
+              title="Reset view"
+              type="button"
+              onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
+            >
+              <LocateFixed size={17} />
+            </button>
+            <button
+              className="hidden"
+              disabled={invalidWorkflow || !selectedNode}
+              title="Delete selected node"
+              type="button"
+              onClick={deleteSelectedNode}
+            >
+              <Trash2 size={17} />
+            </button>
+            <button
+              className="hidden"
+              title="Import workflow TOML or bundle"
+              type="button"
+              onClick={() => importInputRef.current?.click()}
+            >
+              <Upload size={17} />
+            </button>
+            <button
+              className="hidden"
+              disabled={editingDisabled}
+              title="Export workflow bundle"
+              type="button"
+              onClick={onExportWorkflow}
+            >
+              <Download size={17} />
+            </button>
+            <details className="group/tools relative shrink-0">
+              <summary
+                className="grid h-8 w-8 list-none place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink [&::-webkit-details-marker]:hidden"
+                title="More graph actions"
               >
-                <ChevronUp size={13} />
-              </button>
-              <button
-                className="grid h-6 w-6 shrink-0 place-items-center rounded text-muted transition hover:bg-slate-100 hover:text-ink disabled:opacity-30"
-                disabled={!searchMatches.length}
-                title="Next search match"
-                type="button"
-                onClick={() => moveSearchMatch(1)}
-              >
-                <ChevronDown size={13} />
-              </button>
-            </form>
-            {notice?.message ? (
-              <div
-                className={`validation-pop absolute right-6 top-12 z-40 w-64 max-w-[calc(100vw-2rem)] rounded-lg border px-3 py-2 text-sm font-medium shadow-panel ${
-                  notice.type === "error"
-                    ? "border-red-200 bg-red-50 text-red-700"
-                    : "border-emerald-200 bg-emerald-50 text-emerald-700"
-                }`}
-              >
-                {notice.message}
+                <MoreHorizontal size={17} />
+              </summary>
+              <div className="absolute left-0 top-10 z-50 w-48 rounded-[10px] border border-line bg-white p-1 shadow-panel">
+                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50 disabled:opacity-40" disabled={!selectedNodeIds.length} type="button" onClick={fitSelection}>
+                  <LocateFixed size={14} /> Fit selection
+                </button>
+                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50" type="button" onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}>
+                  <LocateFixed size={14} /> Reset view
+                </button>
+                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50 disabled:opacity-40" disabled={editingDisabled || !selectedNode} type="button" onClick={deleteSelectedNode}>
+                  <Trash2 size={14} /> Delete selected node
+                </button>
+                {!radishMode ? (
+                  <>
+                    <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50" type="button" onClick={() => importInputRef.current?.click()}>
+                      <Upload size={14} /> Import legacy workflow
+                    </button>
+                    <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50 disabled:opacity-40" disabled={invalidWorkflow} type="button" onClick={onExportWorkflow}>
+                      <Download size={14} /> Export legacy workflow
+                    </button>
+                  </>
+                ) : null}
               </div>
-            ) : null}
+            </details>
+          </div>
         </div>
 
-      <div className="relative flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col">
         <div
           ref={canvasRef}
-          data-testid="dag-canvas"
           className={`relative min-h-0 flex-1 overflow-hidden bg-[#f9fbfd] bg-[radial-gradient(circle_at_1px_1px,#d5dee8_1px,transparent_0)] [touch-action:none] ${
             panningPointerId !== null ? "cursor-grabbing" : "cursor-default"
           }`}
@@ -3039,7 +2680,6 @@ export default function DagCanvas({
                   top: -graphWorldOffset,
                   width: graphWorldSize,
                   height: graphWorldSize,
-                  zIndex: 6,
                   pointerEvents: "none",
                 }}
                 viewBox={`0 0 ${graphWorldSize} ${graphWorldSize}`}
@@ -3057,7 +2697,7 @@ export default function DagCanvas({
                   </marker>
                 </defs>
                 <g transform={`translate(${graphWorldOffset} ${graphWorldOffset})`}>
-                  {visibleWorkflowEdges.map((edge) => {
+                  {workflowEdges.map((edge) => {
                     const from = nodesById[edge.from];
                     const to = nodesById[edge.to];
                     if (!from || !to) return null;
@@ -3087,8 +2727,8 @@ export default function DagCanvas({
                             event.stopPropagation();
                             setSelectedNodeId(undefined);
                             setSelectedNodeIds([]);
-                            setSelectedGroupId(null);
                             setSelectedEdgeId(edge.id);
+                            setInspectorCollapsed(false);
                           }}
                         />
                         <path
@@ -3101,7 +2741,7 @@ export default function DagCanvas({
                             )
                               ? "#dc2626"
                               : selectedEdgeId === edge.id
-                                ? "#0f766e"
+                                ? "#4f46e5"
                                 : "#718096"
                           }
                           strokeLinecap="round"
@@ -3116,12 +2756,18 @@ export default function DagCanvas({
                           x={geometry.label.x}
                           y={geometry.label.y}
                           className={`text-[12px] font-medium ${
-                            selectedEdgeId === edge.id ? "fill-teal-700" : "fill-slate-500"
+                            selectedEdgeId === edge.id ? "fill-indigo-700" : "fill-slate-500"
                           }`}
                           style={{ pointerEvents: "none" }}
                           textAnchor="middle"
                         >
-                          {edge.label}
+                          {edgeLabel(
+                            edge.displayLabel ?? edge.condition,
+                            edge.outputPattern,
+                            edge.field,
+                            edge.operator,
+                            edge.value,
+                          )}
                         </text>
                       </g>
                     );
@@ -3131,7 +2777,7 @@ export default function DagCanvas({
                       d={draftEdgePath(draftEdge)}
                       fill="none"
                       markerEnd="url(#arrowhead)"
-                      stroke="#0f766e"
+                      stroke="#4f46e5"
                       strokeDasharray="6 6"
                       strokeLinecap="round"
                       strokeWidth="3"
@@ -3145,25 +2791,7 @@ export default function DagCanvas({
                 <SelectionRectangle box={normalizedSelectionBox(selectionBox)} />
               ) : null}
 
-              {canvasGroups.map((group) => (
-                <WorkflowGroup
-                  key={group.id}
-                  group={group}
-                  selected={selectedGroupId === group.id}
-                  onChange={updateGroup}
-                  onSelect={(groupId) => {
-                    setSelectedGroupId(groupId);
-                    setSelectedNodeId(undefined);
-                    setSelectedNodeIds([]);
-                    setSelectedEdgeId(null);
-                  }}
-                  onPointerDown={handleGroupPointerDown}
-                  onPointerMove={handleGroupPointerMove}
-                  onPointerUp={handleGroupPointerUp}
-                />
-              ))}
-
-              {visibleWorkflowNodes.map((node) => (
+              {workflowNodes.map((node) => (
                 <WorkflowNode
                   key={node.id}
                   node={{
@@ -3180,6 +2808,7 @@ export default function DagCanvas({
                   expanded={Boolean(expandedFolderNodes[node.id])}
                   folderEntries={folderNodeEntries[node.id]}
                   diagnostics={nodeDiagnostics[node.id] ?? []}
+                  readOnly={readOnly}
                   onDelete={deleteNode}
                   onDoubleClick={handleNodeDoubleClick}
                   onConnectorPointerDown={handleConnectorPointerDown}
@@ -3192,7 +2821,7 @@ export default function DagCanvas({
               ))}
             </div>
           )}
-          {nodeContextMenu ? (
+          {nodeContextMenu && !readOnly ? (
             <NodeContextMenu
               x={nodeContextMenu.x}
               y={nodeContextMenu.y}
@@ -3225,59 +2854,164 @@ export default function DagCanvas({
             />
           ) : null}
           {!invalidWorkflow ? (
-            <GraphMinimap
-              nodes={[
-                ...visibleWorkflowNodes,
-                ...canvasGroups.filter((group) => group.collapsed).map(groupRectForViewport),
-              ]}
-              selectedNodeIds={selectedNodeIds}
-              viewport={viewport}
-              viewportSize={canvasViewportSize()}
-              onPointerDown={handleMinimapPointerDown}
-              onPointerLeave={handleMinimapPointerUp}
-              onPointerMove={handleMinimapPointerMove}
-              onPointerUp={handleMinimapPointerUp}
-              onWheel={handleMinimapWheel}
-            />
+            <div
+              className="absolute bottom-4 z-30 flex items-center gap-2 transition-[right] duration-200"
+              style={{ right: inspectorCollapsed ? 16 : inspectorWidth + 16 }}
+              onPointerDown={(event) => event.stopPropagation()}
+            >
+              <div className="relative">
+                {mapOpen ? (
+                  <div className="absolute bottom-10 right-0 w-72 overflow-hidden rounded-[14px] border border-line bg-white shadow-panel">
+                  <div className="flex border-b border-line p-1.5">
+                    {[
+                      ["outline", "Outline"],
+                      ["minimap", "Minimap"],
+                    ].map(([id, label]) => (
+                      <button
+                        key={id}
+                        className={`h-7 flex-1 rounded-lg text-[11px] font-semibold transition ${
+                          mapTab === id ? "bg-indigo-50 text-indigo-700" : "text-muted hover:bg-slate-50 hover:text-ink"
+                        }`}
+                        type="button"
+                        onClick={() => setMapTab(id)}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+                  {mapTab === "outline" ? (
+                    <GraphOutline
+                      embedded
+                      announcement={graphAnnouncement}
+                      connectionFrom={keyboardConnectionFrom}
+                      edgeDiagnostics={edgeDiagnostics}
+                      edges={workflowEdges}
+                      focusRequest={outlineFocusRequest}
+                      nodeDiagnostics={nodeDiagnostics}
+                      nodes={workflowNodes}
+                      nodeStatuses={nodeStatuses}
+                      selectedEdgeId={selectedEdgeId}
+                      selectedNodeId={selectedNodeId}
+                      onCancelConnection={() => setKeyboardConnectionFrom(null)}
+                      onConnect={(fromNodeId, toNodeId) => addEdge(fromNodeId, toNodeId, "always")}
+                      onDeleteEdge={deleteEdge}
+                      onDeleteNode={deleteNode}
+                      onDuplicateNode={duplicateNode}
+                      onOpenEdge={(edgeId) => {
+                        selectOutlineEdge(edgeId);
+                        focusInspector();
+                      }}
+                      onOpenNode={(nodeId) => {
+                        selectOutlineNode(nodeId);
+                        focusInspector();
+                      }}
+                      onSelectEdge={selectOutlineEdge}
+                      onSelectNode={selectOutlineNode}
+                      onStartConnection={(nodeId) => {
+                        selectOutlineNode(nodeId);
+                        setKeyboardConnectionFrom(nodeId);
+                      }}
+                    />
+                  ) : (
+                    <div className="h-[174px] w-full p-2">
+                      <GraphMinimap
+                        embedded
+                        nodes={workflowNodes}
+                        selectedNodeIds={selectedNodeIds}
+                        viewport={viewport}
+                        viewportSize={canvasViewportSize()}
+                        onPointerDown={handleMinimapPointerDown}
+                        onPointerLeave={handleMinimapPointerUp}
+                        onPointerMove={handleMinimapPointerMove}
+                        onPointerUp={handleMinimapPointerUp}
+                        onWheel={handleMinimapWheel}
+                      />
+                    </div>
+                  )}
+                  </div>
+                ) : null}
+                <button
+                  aria-expanded={mapOpen}
+                  className={`flex h-8 items-center gap-1.5 rounded-[10px] border px-2.5 text-xs font-semibold shadow-panel transition ${
+                    mapOpen
+                      ? "border-indigo-200 bg-indigo-50 text-indigo-700"
+                      : "border-line bg-white text-muted hover:border-slate-300 hover:text-ink"
+                  }`}
+                  title="Map"
+                  type="button"
+                  onClick={() => setMapOpen((current) => !current)}
+                >
+                  <Layers aria-hidden="true" size={14} />
+                  Map
+                </button>
+              </div>
+              <button
+                aria-label={graphFullscreen ? "Exit graph full screen" : "Open graph full screen"}
+                aria-pressed={graphFullscreen}
+                className="grid h-8 w-8 place-items-center rounded-[10px] border border-line bg-white text-muted shadow-panel transition hover:border-slate-300 hover:text-ink"
+                title={graphFullscreen ? "Exit full screen" : "Enter full screen"}
+                type="button"
+                onClick={() => setGraphFullscreen((current) => !current)}
+              >
+                {graphFullscreen ? (
+                  <Minimize2 aria-hidden="true" size={14} />
+                ) : (
+                  <Maximize2 aria-hidden="true" size={14} />
+                )}
+              </button>
+            </div>
           ) : null}
         </div>
       </div>
 
-        {!invalidWorkflow ? (
+        {!invalidWorkflow && radishMode ? (
+          <RadishInspector
+            collapsed={inspectorCollapsed}
+            document={radishDocument}
+            edge={selectedEdge}
+            node={selectedNode}
+            nodeOutput={selectedNodeOutput}
+            nodeRun={selectedRunNode}
+            runEvents={runEvents}
+            width={inspectorWidth}
+            onMutate={onRadishMutation}
+            onRenameNode={renameRadishNode}
+            onResizeStart={startInspectorResize}
+            onResizeKeyDown={handleInspectorResizeKeyDown}
+            onShowWorkflowSettings={showWorkflowSettings}
+            onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
+          />
+        ) : !invalidWorkflow && !readOnly ? (
           <Inspector
             agents={workflow.agents ?? {}}
             approval={selectedApproval}
-            dashboards={dashboards}
             edges={workflowEdges}
             collapsed={inspectorCollapsed}
             edge={selectedEdge}
-            group={selectedGroup}
             node={selectedNode}
             nodeRun={selectedRunNode}
             nodeOutput={selectedNodeOutput}
             nodes={workflowNodes}
             providerProfiles={providerProfiles}
-            workflows={workflows}
+            providerCapabilities={providerCapabilities}
             workflow={workflow}
             dataDir={dataDir}
             width={inspectorWidth}
             onAddEdge={addEdge}
             onDeleteEdge={deleteEdge}
-            onDeleteGroup={deleteGroup}
-            onDuplicateGroup={duplicateGroup}
             onAgentChange={updateAgentConfig}
             onDecideApproval={onDecideApproval}
             onEdgeChange={updateEdge}
-            onGroupChange={updateGroup}
             onResizeStart={startInspectorResize}
+            onResizeKeyDown={handleInspectorResizeKeyDown}
             onNodeChange={(patch) => updateNode(selectedNode.id, patch)}
             onOperationChange={(patch) => updateNodeOperation(selectedNode.id, patch)}
             onProviderProfilesChange={setProviderProfiles}
+            onProviderCapabilitiesRefresh={refreshProviderCapabilities}
             onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
+            onShowWorkflowSettings={showWorkflowSettings}
             onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
             onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
-            onNavigateWorkflow={onNavigateWorkflow}
-            onRenameWorkflow={onRenameWorkflow}
             onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
             onApplyFix={applyValidationFix}
           />
@@ -3297,6 +3031,7 @@ export default function DagCanvas({
         title={logTitle}
         usageSummary={usageSummary}
         onResizeStart={startLogResize}
+        onResizeKeyDown={handleLogResizeKeyDown}
         onSelectRun={onSelectRunLog}
         onShowLatest={onLoadLatestLog}
         onResumeRun={onResumeRunLog}
@@ -3305,7 +3040,6 @@ export default function DagCanvas({
         onRetentionSettingsChange={onRetentionSettingsChange}
         onStopRun={onStopRunLog}
         onToggle={() => setLogCollapsed((current) => !current)}
-        selectedNodeId={selectedNodeId}
       />
       {filePreviewPath ? (
         <TextFileDialog
@@ -3326,7 +3060,7 @@ function InvalidWorkflowCanvas({ workflow }) {
     workflow.description ||
     "The workflow TOML could not be parsed or validated.";
   const markdown = [
-    "# Gofer Flow workflow TOML validation error",
+    "# Taskurotta workflow TOML validation error",
     "",
     `Workflow file: \`${sourcePath}\``,
     "",
@@ -3421,193 +3155,24 @@ function WorkflowTriggerStrip({ dataDir, runContinuously, schedule, webhooks, wa
           </span>
         </div>
       ) : null}
-      {enabledWebhooks.map(([triggerId, config]) => {
-        const riskReasons = webhookRiskReasons(config);
-        const highRisk = webhookIsHighRisk(config);
-        return (
-          <div
-            key={triggerId}
-            className={`inline-flex items-center gap-2 rounded-lg border px-3 py-2 text-xs font-medium shadow-sm backdrop-blur ${
-              highRisk
-                ? "border-red-200 bg-red-50/95 text-red-900 dark:border-red-500/40 dark:bg-red-950/80 dark:text-red-100"
-                : "border-line bg-white/90 text-ink dark:bg-[#252526]/95"
-            }`}
-            title={riskReasons.length ? webhookRiskSummary(riskReasons) : undefined}
-          >
-            {highRisk ? (
-              <AlertCircle size={14} className="text-red-600" />
-            ) : (
-              <Webhook size={14} className="text-teal-600" />
-            )}
-            <span className="truncate">
-              API trigger: {triggerId}
-              {config.source ? ` (${config.source})` : ""}
-              {highRisk ? " - high risk" : ""}
-            </span>
-          </div>
-        );
-      })}
+      {enabledWebhooks.map(([triggerId, config]) => (
+        <div
+          key={triggerId}
+          className="inline-flex items-center gap-2 rounded-lg border border-line bg-white/90 px-3 py-2 text-xs font-medium text-ink shadow-sm backdrop-blur dark:bg-[#252526]/95"
+        >
+          <Webhook size={14} className="text-teal-600" />
+          <span className="truncate">
+            API trigger: {triggerId}
+            {config.source ? ` (${config.source})` : ""}
+          </span>
+        </div>
+      ))}
     </div>
   );
 }
 
-function webhookRiskReasons(config = {}) {
-  const rawReasons = Array.isArray(config.riskReasons)
-    ? config.riskReasons
-    : String(config.riskReasons ?? "")
-        .split(",")
-        .map((item) => item.trim())
-        .filter(Boolean);
-  const reasons = new Set(rawReasons);
-  const tokenConfigured = Boolean(config.tokenConfigured || config.token_env);
-  if (config.enabled && !tokenConfigured && !config.allow_unauthenticated) {
-    reasons.add("missing_authentication");
-  }
-  if (config.enabled && !tokenConfigured && config.allow_unauthenticated) {
-    reasons.add("unauthenticated_allowed");
-  }
-  return [...reasons];
-}
-
-function webhookIsHighRisk(config = {}) {
-  return config.risk === "high" || webhookRiskReasons(config).length > 0;
-}
-
-function webhookRiskSummary(reasons = []) {
-  const labels = {
-    missing_authentication: "Missing authentication",
-    unauthenticated_allowed: "Unauthenticated requests allowed",
-    raw_payload_retention: "Raw replay payload retention",
-  };
-  return reasons.map((reason) => labels[reason] ?? reason).join(", ");
-}
-
-function webhookAuthSummary(config = {}) {
-  if (config.tokenConfigured || config.token_env) return "Token required";
-  if (config.allow_unauthenticated) return "Unauthenticated requests allowed";
-  return "No token configured";
-}
-
-function WorkflowGroup({
-  group,
-  onChange,
-  onSelect,
-  onPointerDown,
-  onPointerMove,
-  onPointerUp,
-  selected,
-}) {
-  const height = group.collapsed ? collapsedGroupHeight : group.height;
-  const generatedLabel = /^Group \d+$/.test(group.label);
-  const [editingGeneratedLabel, setEditingGeneratedLabel] = useState(false);
-  const displayedLabel = editingGeneratedLabel ? "" : group.label;
-  const backgroundOpacity = clamp(
-    group.collapsed ? Math.max(group.opacity, 0.12) : group.opacity,
-    0,
-    1,
-  );
-
-  return (
-    <section
-      className={`absolute rounded-lg border-2 shadow-sm ${
-        selected ? "ring-2 ring-teal-500 ring-offset-2 dark:ring-offset-[#1e1e1e]" : ""
-      }`}
-      data-testid={`canvas-group-${group.id}`}
-      style={{
-        left: group.x,
-        top: group.y,
-        width: group.width,
-        height,
-        borderColor: group.color,
-        backgroundColor: hexToRgba(group.color, backgroundOpacity),
-        zIndex: group.collapsed ? 28 : 1,
-      }}
-      onPointerDown={(event) => {
-        event.stopPropagation();
-        if (event.button === 0) {
-          onPointerDown(event, group.id, "move");
-        }
-      }}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
-    >
-      <div
-        className="flex h-11 cursor-grab items-center gap-1.5 border-b bg-white/90 px-2.5 shadow-sm active:cursor-grabbing dark:bg-[#111113]"
-        style={{ borderColor: `${group.color}55` }}
-        title="Move canvas group"
-        onPointerDown={(event) => onPointerDown(event, group.id, "move")}
-      >
-        <input
-          aria-label={`Rename ${group.label}`}
-          className={`min-w-0 flex-1 rounded border border-transparent bg-transparent px-1 text-sm font-semibold outline-none transition placeholder:text-muted focus:border-line focus:bg-white dark:placeholder:text-[#a1a1aa] dark:focus:bg-[#1e1e1e] ${
-            generatedLabel
-              ? "text-slate-600 dark:text-[#f8fafc]"
-              : "text-ink dark:text-[#f4f4f5]"
-          }`}
-          placeholder={generatedLabel ? group.label : "Group name"}
-          value={displayedLabel}
-          onBlur={() => setEditingGeneratedLabel(false)}
-          onChange={(event) => {
-            setEditingGeneratedLabel(false);
-            onChange(group.id, { label: event.target.value });
-          }}
-          onFocus={() => {
-            onSelect(group.id);
-            if (generatedLabel) {
-              setEditingGeneratedLabel(true);
-            }
-          }}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              event.currentTarget.blur();
-            }
-          }}
-          onPointerDown={(event) => event.stopPropagation()}
-        />
-      </div>
-      {!group.collapsed ? (
-        <div
-          className="absolute bottom-0 right-0 h-4 w-4 cursor-nwse-resize rounded-tl-md border-l border-t border-white/70 bg-white/80"
-          title="Resize canvas group"
-          onPointerDown={(event) => {
-            event.stopPropagation();
-            onPointerDown(event, group.id, "resize");
-          }}
-        />
-      ) : null}
-    </section>
-  );
-}
-
-function groupRectForViewport(group) {
-  return {
-    id: group.id,
-    x: group.x,
-    y: group.y,
-    width: group.width,
-    height: group.collapsed ? collapsedGroupHeight : group.height,
-  };
-}
-
-function groupStatusLabel(status) {
-  if (status === "approval") return "approval";
-  if (status === "running" || status === "queued") return status;
-  if (status === "error") return "failed";
-  if (status === "success") return "done";
-  return "idle";
-}
-
-function groupStatusClass(status) {
-  if (status === "approval") return "border-amber-200 bg-amber-50 text-amber-700";
-  if (status === "running" || status === "queued") return "border-blue-200 bg-blue-50 text-blue-700";
-  if (status === "error") return "border-red-200 bg-red-50 text-red-700";
-  if (status === "success") return "border-emerald-200 bg-emerald-50 text-emerald-700";
-  return "border-slate-200 bg-slate-50 text-slate-600";
-}
-
 function GraphMinimap({
+  embedded = false,
   nodes,
   onPointerDown,
   onPointerLeave,
@@ -3618,11 +3183,40 @@ function GraphMinimap({
   viewport,
   viewportSize,
 }) {
+  const fallbackSize = embedded
+    ? { width: 252, height: 156 }
+    : { width: minimapWidth, height: minimapHeight };
+  const surfaceRef = useRef(null);
+  const [surfaceSize, setSurfaceSize] = useState(fallbackSize);
+
+  useEffect(() => {
+    const surface = surfaceRef.current;
+    if (!surface) return undefined;
+
+    const measure = () => {
+      const rect = surface.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      setSurfaceSize((current) =>
+        current.width === rect.width && current.height === rect.height
+          ? current
+          : { width: rect.width, height: rect.height },
+      );
+    };
+
+    measure();
+    if (typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(surface);
+    return () => observer.disconnect();
+  }, [embedded]);
+
   if (!nodes.length) return null;
   const bounds = graphBounds(nodes, 160);
+  const mapWidth = surfaceSize.width;
+  const mapHeight = surfaceSize.height;
   const scale = Math.min(
-    minimapWidth / Math.max(1, bounds.width),
-    minimapHeight / Math.max(1, bounds.height),
+    mapWidth / Math.max(1, bounds.width),
+    mapHeight / Math.max(1, bounds.height),
   );
   const viewportWorld = {
     left: -viewport.x / viewport.scale,
@@ -3641,14 +3235,14 @@ function GraphMinimap({
 
   return (
     <div
-      className="absolute left-4 top-4 z-20 rounded-lg border border-line bg-white/70 p-2 opacity-80 shadow-panel backdrop-blur transition-opacity hover:opacity-100 dark:border-[#3a3a3d] dark:bg-[#252526]/70"
-      data-testid="graph-minimap"
+      className={embedded ? "h-full w-full rounded-lg bg-slate-50" : "absolute left-4 top-4 z-20 rounded-lg border border-line bg-white/70 p-2 opacity-80 shadow-panel backdrop-blur transition-opacity hover:opacity-100 dark:border-[#3a3a3d] dark:bg-[#252526]/70"}
       title="Minimap"
       onWheel={onWheel}
     >
       <div
+        ref={surfaceRef}
         className="relative cursor-crosshair overflow-hidden rounded-md bg-[#edf3f8]/80 dark:bg-[#1b1f22]/80"
-        style={{ width: minimapWidth, height: minimapHeight }}
+        style={{ width: embedded ? "100%" : minimapWidth, height: embedded ? "100%" : minimapHeight }}
         onPointerDown={onPointerDown}
         onPointerLeave={onPointerLeave}
         onPointerMove={onPointerMove}
@@ -3660,14 +3254,14 @@ function GraphMinimap({
           const rect = toMinimapRect({
             left: node.x ?? 0,
             top: node.y ?? 0,
-            width: node.width ?? nodeWidth,
-            height: node.height ?? nodeHeight,
+            width: nodeWidth,
+            height: nodeHeight,
           });
           return (
             <div
               key={node.id}
               className={`absolute rounded-sm ${
-                selectedSet.has(node.id) ? "bg-teal-600 dark:bg-teal-400" : "bg-slate-500 dark:bg-slate-500"
+                selectedSet.has(node.id) ? "bg-indigo-600 dark:bg-indigo-400" : "bg-slate-500 dark:bg-slate-500"
               }`}
               style={{
                 left: rect.left,
@@ -3679,7 +3273,7 @@ function GraphMinimap({
           );
         })}
         <div
-          className="absolute rounded-sm border-2 border-teal-700 bg-teal-500/10 dark:border-teal-300 dark:bg-teal-300/15"
+          className="absolute rounded-sm border-2 border-indigo-700 bg-indigo-500/10 dark:border-indigo-300 dark:bg-indigo-300/15"
           style={{
             left: viewportRect.left,
             top: viewportRect.top,
@@ -3974,11 +3568,11 @@ function LogOverlay({
   onPruneRuns,
   onRetentionSettingsChange,
   onResizeStart,
+  onResizeKeyDown,
   onSelectRun,
   onShowLatest,
   onStopRun,
   onToggle,
-  selectedNodeId,
   retentionSettings = DEFAULT_RETENTION_SETTINGS,
   text,
   title,
@@ -4071,9 +3665,17 @@ function LogOverlay({
     >
       {!collapsed ? (
         <div
+          aria-label="Resize workflow log"
+          aria-orientation="horizontal"
+          aria-valuemax={420}
+          aria-valuemin={140}
+          aria-valuenow={height}
+          aria-valuetext={`${height} pixels high`}
           className="absolute left-0 top-[-3px] z-20 h-1.5 w-full cursor-row-resize transition hover:bg-brand/40"
           role="separator"
+          tabIndex={0}
           title="Resize workflow log"
+          onKeyDown={onResizeKeyDown}
           onPointerDown={onResizeStart}
         />
       ) : null}
@@ -4487,10 +4089,6 @@ export function UsageSummaryStrip({ summary }) {
 
   const mostExpensive = firstUsageNode(summary.most_expensive_nodes);
   const slowest = firstUsageNode(summary.slowest_nodes);
-  const budgetFailures = Array.isArray(summary.budget_failures)
-    ? summary.budget_failures
-    : [];
-
   return (
     <div className="border-b border-line bg-slate-50 px-3 py-2 text-xs text-slate-700 dark:bg-[#252526] dark:text-[#cccccc]">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
@@ -4507,11 +4105,6 @@ export function UsageSummaryStrip({ summary }) {
         {slowest ? (
           <span>
             Slowest: {slowest.node_id} ({formatUsageSeconds(slowest.duration_seconds)})
-          </span>
-        ) : null}
-        {budgetFailures.length ? (
-          <span className="font-semibold text-red-700">
-            Budget failures: {budgetFailures.map((node) => node.node_id).join(", ")}
           </span>
         ) : null}
       </div>
@@ -4937,7 +4530,7 @@ function formatRunLabel(run) {
 function SelectionRectangle({ box }) {
   return (
     <div
-      className="pointer-events-none absolute z-20 border border-teal-500 bg-teal-500/10"
+      className="pointer-events-none absolute z-20 border border-indigo-500 bg-indigo-500/10"
       style={{
         left: box.left,
         top: box.top,
@@ -4953,6 +4546,7 @@ function WorkflowNode({
   folderEntries,
   diagnostics = [],
   node,
+  readOnly = false,
   onConnectorPointerDown,
   onConnectorPointerUp,
   onContextMenu,
@@ -4981,14 +4575,12 @@ function WorkflowNode({
     : hasWarning
       ? "border-amber-400 ring-4 ring-amber-100"
       : selected
-        ? "border-teal-500 ring-4 ring-teal-100"
+        ? "border-indigo-500 ring-4 ring-indigo-100"
         : style.border;
 
   return (
     <article
-      className={`absolute w-[220px] cursor-grab rounded-lg border bg-white p-3 shadow-node transition active:cursor-grabbing ${borderClass}`}
-      data-node-id={node.id}
-      data-testid="workflow-node"
+      className={`absolute w-[220px] rounded-lg border bg-white p-3 shadow-node transition ${readOnly ? "cursor-default" : "cursor-grab active:cursor-grabbing"} ${borderClass}`}
       style={{ left: node.x, top: node.y, zIndex }}
       title={title}
       onDoubleClick={(event) => {
@@ -5003,20 +4595,25 @@ function WorkflowNode({
           }
           return;
         }
-        onPointerDown(event, node.id);
+        if (!readOnly) onPointerDown(event, node.id);
       }}
-      onPointerMove={(event) => onPointerMove(event, node.id)}
-      onPointerUp={(event) => onPointerUp(event, node.id)}
-      onContextMenu={(event) => onContextMenu?.(event, node.id)}
+      onPointerMove={(event) => {
+        if (!readOnly) onPointerMove(event, node.id);
+      }}
+      onPointerUp={(event) => {
+        if (!readOnly) onPointerUp(event, node.id);
+      }}
+      onContextMenu={(event) => {
+        if (!readOnly) onContextMenu?.(event, node.id);
+      }}
     >
-      <button
-        className="absolute -right-2 top-1/2 z-10 h-4 w-4 -translate-y-1/2 rounded-full border border-teal-300 bg-white shadow-sm transition hover:scale-110 hover:border-teal-500 hover:bg-teal-50"
-        data-testid="node-connector"
+      {!readOnly ? <button
+        className="absolute -right-2 top-1/2 z-10 h-4 w-4 -translate-y-1/2 rounded-full border border-indigo-300 bg-white shadow-sm transition hover:scale-110 hover:border-indigo-500 hover:bg-indigo-50"
         title="Drag to connect"
         type="button"
         onPointerDown={(event) => onConnectorPointerDown?.(event, node.id)}
         onPointerUp={(event) => onConnectorPointerUp?.(event, node.id)}
-      />
+      /> : null}
       <div className="min-w-0">
         <h3 className="truncate text-sm font-semibold leading-5">{node.label}</h3>
         <p className="mt-1 truncate text-xs leading-5 text-muted">{node.meta}</p>
@@ -5054,7 +4651,6 @@ function NodeContextMenu({ onDelete, onDuplicate, onRename, x, y }) {
   return (
     <div
       className="fixed z-[90] w-48 rounded-lg border border-line bg-white p-1 text-sm shadow-panel"
-      data-testid="node-context-menu"
       style={{ left: x, top: y }}
       onClick={(event) => event.stopPropagation()}
       onPointerDown={(event) => event.stopPropagation()}
@@ -5089,80 +4685,23 @@ function NodeContextMenu({ onDelete, onDuplicate, onRename, x, y }) {
   );
 }
 
-function ToolbarActionButton({ action, measure = false }) {
-  const Icon = action.icon;
-  return (
-    <button
-      className="grid h-8 w-8 shrink-0 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
-      data-toolbar-measure-action={measure ? "" : undefined}
-      disabled={Boolean(action.disabled)}
-      tabIndex={measure ? -1 : undefined}
-      title={measure ? undefined : action.label}
-      type="button"
-      onClick={measure ? undefined : action.onClick}
-    >
-      <Icon size={17} />
-    </button>
-  );
-}
-
-function ToolbarOverflowMenu({ actions, onClose }) {
-  return (
-    <div
-      className="absolute right-0 top-10 z-50 w-56 rounded-lg border border-line bg-white p-1 text-sm shadow-panel"
-      data-testid="toolbar-overflow-menu"
-      onClick={(event) => event.stopPropagation()}
-      onPointerDown={(event) => event.stopPropagation()}
-      onContextMenu={(event) => event.preventDefault()}
-    >
-      {actions.map((action) => {
-        const Icon = action.icon;
-        return (
-          <button
-            key={action.label}
-            className={`flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-slate-700 transition hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-45 ${action.hiddenClassName ?? ""}`}
-            disabled={Boolean(action.disabled)}
-            type="button"
-            onClick={() => {
-              action.onClick?.();
-              onClose?.();
-            }}
-          >
-            <Icon size={15} />
-            <span>{action.label}</span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
+export function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
   const [label, setLabel] = useState(initialLabel || "");
-
-  function submitRename() {
-    const trimmedLabel = label.trim();
-    if (!trimmedLabel) return;
-    onRename(trimmedLabel);
-  }
 
   function handleSubmit(event) {
     event.preventDefault();
-    submitRename();
+    onRename(label);
   }
 
   return (
-    <div
-      className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4"
-      onClick={onCancel}
-      onPointerDown={(event) => event.stopPropagation()}
+    <Dialog
+      description="Update the label shown on the graph."
+      onClose={onCancel}
+      overlayClassName="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4"
+      panelClassName="w-full max-w-sm rounded-lg border border-line bg-white shadow-panel"
+      title="Rename node"
     >
-      <form
-        className="w-full max-w-sm rounded-lg border border-line bg-white shadow-panel"
-        onSubmit={handleSubmit}
-        onClick={(event) => event.stopPropagation()}
-        onPointerDown={(event) => event.stopPropagation()}
-      >
+      <form onSubmit={handleSubmit}>
         <div className="flex items-center justify-between border-b border-line px-4 py-3">
           <div>
             <h2 className="text-sm font-semibold text-ink">Rename node</h2>
@@ -5199,36 +4738,28 @@ function NodeRenameDialog({ initialLabel, onCancel, onRename }) {
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
             disabled={!label.trim()}
-            onClick={submitRename}
             title="Confirm node rename"
-            type="button"
+            type="submit"
           >
             <PencilLine size={15} />
             Rename
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 
-function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
+export function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
   const [trustParent, setTrustParent] = useState(true);
   return (
-    <div
-      className="absolute inset-0 z-50 grid place-items-center bg-slate-950/20 px-4 backdrop-blur-sm"
-      role="presentation"
-      onClick={onCancel}
-      onPointerDown={(event) => event.stopPropagation()}
-      onPointerMove={(event) => event.stopPropagation()}
-      onPointerUp={(event) => event.stopPropagation()}
+    <Dialog
+      description={parentPath}
+      onClose={onCancel}
+      overlayClassName="absolute inset-0 z-50 grid place-items-center bg-slate-950/20 px-4 backdrop-blur-sm"
+      panelClassName="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel"
+      title="Trust files"
     >
-      <section
-        className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel"
-        role="dialog"
-        aria-modal="true"
-        onClick={(event) => event.stopPropagation()}
-      >
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <h2 className="text-base font-semibold text-ink">Trust the files in</h2>
@@ -5269,68 +4800,7 @@ function FilesystemTrustPrompt({ parentPath, onCancel, onConfirm }) {
             Add access
           </button>
         </div>
-      </section>
-    </div>
-  );
-}
-
-function PathSelectionTrustPrompt({ parentPath, path, onCancel, onConfirm }) {
-  const [trustParent, setTrustParent] = useState(false);
-  return (
-    <div className="fixed inset-0 z-[90] grid place-items-center bg-slate-950/30 px-4 backdrop-blur-sm">
-      <section className="w-full max-w-lg rounded-lg border border-line bg-white p-5 shadow-panel">
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 className="text-base font-semibold text-ink">Trust selected path?</h2>
-            <p className="mt-1 text-sm leading-6 text-muted">
-              This path is outside the project folder and current trusted directories.
-            </p>
-            <p className="mt-2 break-all rounded-md border border-line bg-slate-50 px-3 py-2 text-xs text-slate-700">
-              {path}
-            </p>
-          </div>
-          <button
-            className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line text-muted transition hover:bg-slate-50 hover:text-ink"
-            title="Cancel"
-            type="button"
-            onClick={onCancel}
-          >
-            <X size={15} />
-          </button>
-        </div>
-        <label className="mt-4 flex items-start gap-3 rounded-md border border-line bg-slate-50 px-3 py-2 text-sm text-ink">
-          <input
-            checked={trustParent}
-            className="mt-0.5 h-4 w-4 rounded border-slate-300"
-            type="checkbox"
-            onChange={(event) => setTrustParent(event.target.checked)}
-          />
-          <span>
-            Trust parent folder instead
-            {parentPath ? (
-              <span className="mt-1 block break-all text-xs text-muted">{parentPath}</span>
-            ) : null}
-          </span>
-        </label>
-        <div className="mt-5 flex justify-end gap-2">
-          <button
-            className="inline-flex h-9 items-center justify-center rounded-md border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-slate-50"
-            type="button"
-            onClick={onCancel}
-          >
-            Cancel
-          </button>
-          <button
-            className="inline-flex h-9 items-center justify-center gap-2 rounded-md bg-brand px-3 text-sm font-semibold text-white shadow-sm transition hover:bg-brand-dark"
-            type="button"
-            onClick={() => onConfirm(trustParent)}
-          >
-            <Check size={15} />
-            Trust and use path
-          </button>
-        </div>
-      </section>
-    </div>
+    </Dialog>
   );
 }
 
@@ -5413,7 +4883,21 @@ const edgeConditionOptions = [
   ["on_success", "On success"],
   ["on_failure", "On failure"],
   ["output_matches", "Output matches"],
+  ["output_field", "Structured field"],
   ["after_loop", "After loop finishes"],
+];
+
+const edgeOutputFieldOperatorOptions = [
+  ["equals", "Equals"],
+  ["not_equals", "Not equal"],
+  ["in", "In list"],
+  ["not_in", "Not in list"],
+  ["greater_than", "Greater than"],
+  ["greater_than_or_equal", "At least"],
+  ["less_than", "Less than"],
+  ["less_than_or_equal", "At most"],
+  ["exists", "Exists"],
+  ["matches", "Regex matches"],
 ];
 
 const compactEdgeConditionOptions = [
@@ -5421,55 +4905,645 @@ const compactEdgeConditionOptions = [
   ["on_success", "Success"],
   ["on_failure", "Failure"],
   ["output_matches", "Matches"],
+  ["output_field", "Structured field"],
   ["after_loop", "After loop"],
 ];
+
+function handleInspectorTabKeyDown(event, onChange) {
+  const tabs = [...event.currentTarget.parentNode.childNodes].filter(
+    (candidate) => candidate.getAttribute?.("role") === "tab",
+  );
+  const currentIndex = tabs.indexOf(event.currentTarget);
+  let nextIndex = currentIndex;
+
+  if (["ArrowRight", "ArrowDown"].includes(event.key)) {
+    nextIndex = (currentIndex + 1) % tabs.length;
+  } else if (["ArrowLeft", "ArrowUp"].includes(event.key)) {
+    nextIndex = (currentIndex - 1 + tabs.length) % tabs.length;
+  } else if (event.key === "Home") {
+    nextIndex = 0;
+  } else if (event.key === "End") {
+    nextIndex = tabs.length - 1;
+  } else {
+    return;
+  }
+
+  event.preventDefault();
+  const nextTab = tabs[nextIndex];
+  onChange(nextTab.getAttribute("data-inspector-tab"));
+  nextTab.focus();
+}
+
+function RadishInspector({
+  collapsed,
+  document,
+  edge,
+  node,
+  nodeOutput,
+  nodeRun,
+  onMutate,
+  onRenameNode,
+  onResizeKeyDown,
+  onResizeStart,
+  onShowWorkflowSettings,
+  onToggleCollapsed,
+  runEvents = [],
+  width,
+}) {
+  const [nodeTab, setNodeTab] = useState("general");
+  const graphNode = document?.graph?.nodes?.find((candidate) => candidate.id === node?.id);
+  const graphEdge = document?.graph?.edges?.find((candidate) => candidate.id === edge?.id);
+  const contract = document?.nodeContracts?.find(
+    (candidate) => candidate.nodeType === graphNode?.type,
+  );
+  const schemaProperties = contract?.configurationSchema?.properties ?? {};
+  const workflowFields = document?.workflow?.fields ?? {};
+  const diagnostics = graphNode?.diagnostics ?? [];
+
+  useEffect(() => setNodeTab("general"), [node?.id]);
+
+  const setNodeField = (field, value, { source = false } = {}) =>
+    onMutate?.([
+      {
+        kind: "set_field",
+        target: { node: node.id },
+        field,
+        ...(source ? { valueSource: value } : { value }),
+      },
+    ]);
+  const removeNodeField = (field) =>
+    onMutate?.([{ kind: "remove_field", target: { node: node.id }, field }]);
+  const setWorkflowField = (field, value, { source = false } = {}) =>
+    onMutate?.([
+      {
+        kind: "set_field",
+        target: "workflow",
+        field,
+        ...(source ? { valueSource: value } : { value }),
+      },
+    ]);
+
+  return (
+    <aside
+      id="workflow-inspector"
+      aria-label="Radish workflow settings and node inspector"
+      className="absolute bottom-0 right-0 top-0 z-40 shrink-0 overflow-visible border-l border-line bg-white shadow-panel transition-[width] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
+      style={{ width: collapsed ? 0 : width }}
+      tabIndex={-1}
+    >
+      {!collapsed ? (
+        <div
+          aria-label="Resize Radish inspector"
+          aria-orientation="vertical"
+          aria-valuemax={520}
+          aria-valuemin={280}
+          aria-valuenow={width}
+          className="absolute left-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
+          role="separator"
+          tabIndex={0}
+          onKeyDown={onResizeKeyDown}
+          onPointerDown={onResizeStart}
+        />
+      ) : null}
+      {collapsed ? (
+        <button
+          className="absolute left-[-140px] top-3 z-40 flex h-8 w-[132px] items-center justify-center gap-1.5 rounded-[10px] border border-line bg-white px-2 text-xs font-semibold text-muted shadow-panel transition hover:border-slate-300 hover:text-ink"
+          title="Show workflow settings"
+          type="button"
+          onClick={onShowWorkflowSettings}
+        >
+          <Settings2 size={14} /> Workflow settings
+        </button>
+      ) : null}
+      <div
+        className={`flex h-full min-h-0 flex-col overflow-hidden transition-opacity duration-200 ${
+          collapsed ? "pointer-events-none opacity-0" : "opacity-100 delay-100"
+        }`}
+      >
+        <header className="flex h-[52px] shrink-0 items-center justify-between border-b border-line px-3.5">
+          <div className="flex min-w-0 items-center gap-2.5">
+            <span className="grid h-6 w-6 shrink-0 place-items-center rounded-lg bg-slate-100 text-muted">
+              {node ? <Braces size={14} /> : edge ? <Route size={14} /> : <Settings2 size={14} />}
+            </span>
+            <div className="min-w-0">
+              <h2 className="truncate text-[13px] font-semibold text-ink">
+                {node ? "Node inspector" : edge ? "Route inspector" : "Workflow settings"}
+              </h2>
+              <p className="truncate font-mono text-[10px] text-muted">
+                {node?.id ?? (edge ? `${edge.from} -> ${edge.to}` : document?.workflowId)}
+              </p>
+            </div>
+          </div>
+          <button
+            className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+            title="Hide inspector"
+            type="button"
+            onClick={onToggleCollapsed}
+          >
+            <X size={15} />
+          </button>
+        </header>
+
+        {node ? (
+          <>
+            <nav className="grid shrink-0 grid-cols-5 gap-0.5 border-b border-line px-2 pt-2" role="tablist" aria-label="Node inspector sections">
+              {[
+                ["general", "General"],
+                ["action", "Action"],
+                ["inputs", "Inputs"],
+                ["run", "Run"],
+                ["routes", "Routes"],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  aria-selected={nodeTab === id}
+                  className={`h-8 border-b-2 px-1 text-[11px] font-semibold transition ${
+                    nodeTab === id
+                      ? "border-indigo-600 text-ink"
+                      : "border-transparent text-muted hover:text-ink"
+                  }`}
+                  data-inspector-tab={id}
+                  role="tab"
+                  tabIndex={nodeTab === id ? 0 : -1}
+                  type="button"
+                  onClick={() => setNodeTab(id)}
+                  onKeyDown={(event) => handleInspectorTabKeyDown(event, setNodeTab)}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            <div className="workflow-scrollbar min-h-0 flex-1 overflow-y-auto p-4">
+              {nodeTab === "general" ? (
+                <InspectorSection title="Node">
+                  <TextField
+                    commitOnBlur
+                    label="ID"
+                    value={node.id}
+                    parseDraft={parseRadishIdentifierDraft}
+                    onChange={(value) => onRenameNode?.(node.id, value)}
+                  />
+                  <SelectField
+                    label="Type"
+                    value={graphNode?.type ?? ""}
+                    options={(document?.nodeContracts ?? []).map((item) => [
+                      item.nodeType,
+                      humanizeRadishField(item.nodeType),
+                    ])}
+                    onChange={(value) =>
+                      onMutate?.([
+                        { kind: "change_node_type", node: node.id, node_type: value },
+                      ])
+                    }
+                  />
+                  <HealthDiagnosticList diagnostics={diagnostics} />
+                </InspectorSection>
+              ) : null}
+
+              {nodeTab === "action" ? (
+                <InspectorSection title={humanizeRadishField(graphNode?.type || "Action")}>
+                  {Object.entries(schemaProperties).map(([field, fieldSchema]) => (
+                    <RadishContractField
+                      key={field}
+                      authored={Boolean(graphNode?.authoredFields?.[field.replaceAll("_", "-")])}
+                      field={field}
+                      schema={fieldSchema}
+                      value={graphNode?.configuration?.[field]}
+                      onChange={(value, options) =>
+                        setNodeField(field.replaceAll("_", "-"), value, options)
+                      }
+                      onReset={() => removeNodeField(field.replaceAll("_", "-"))}
+                    />
+                  ))}
+                  {!Object.keys(schemaProperties).length ? (
+                    <p className="text-xs leading-5 text-muted">
+                      This node contract has no action fields.
+                    </p>
+                  ) : null}
+                </InspectorSection>
+              ) : null}
+
+              {nodeTab === "inputs" ? (
+                <>
+                  <InspectorSection title="Readiness">
+                    <ListField
+                      label="Needs"
+                      value={graphNode?.needs ?? []}
+                      placeholder="node-id"
+                      onChange={(nodes) =>
+                        onMutate?.([{ kind: "set_needs", node: node.id, nodes }])
+                      }
+                    />
+                    <p className="text-xs leading-5 text-muted">
+                      Every listed node must complete at least once before an incoming activation can run this node.
+                    </p>
+                  </InspectorSection>
+                  <InspectorSection title="Bindings">
+                    <RadishBindingSummary bindings={graphNode?.bindings ?? []} />
+                    <p className="text-xs leading-5 text-muted">
+                      Rich binding editing is available in Code for now. Graph changes preserve the existing with block.
+                    </p>
+                  </InspectorSection>
+                </>
+              ) : null}
+
+              {nodeTab === "run" ? (
+                <>
+                <InspectorSection title="Execution">
+                  <ToggleField
+                    checked={Boolean(graphNode?.execution?.allow_fail)}
+                    label="Allow failure"
+                    onChange={(value) => setNodeField("allow-fail", value)}
+                  />
+                  <ToggleField
+                    checked={Boolean(graphNode?.execution?.start_declared)}
+                    label="Start marker"
+                    onChange={(value) => setNodeField("start", value)}
+                  />
+                  <SelectField
+                    label="Finish"
+                    value={graphNode?.execution?.finish ?? "none"}
+                    options={[["none", "None"], ["pass", "Pass"], ["fail", "Fail"]]}
+                    onChange={(value) => setNodeField("finish", value, { source: true })}
+                  />
+                  <TextField
+                    commitOnBlur
+                    label="Timeout"
+                    placeholder="none or 30m"
+                    value={radishDurationFromMilliseconds(graphNode?.execution?.timeout_ms)}
+                    onChange={(value) => setNodeField("timeout", value || "none", { source: true })}
+                  />
+                  <NumberField
+                    label="Max runs"
+                    min="1"
+                    placeholder="None"
+                    value={graphNode?.execution?.max_runs ?? ""}
+                    onChange={(value) =>
+                      setNodeField("max-runs", value ? String(value) : "none", { source: true })
+                    }
+                  />
+                  <NumberField
+                    label="Max concurrency"
+                    min="1"
+                    value={graphNode?.execution?.max_concurrency ?? 1}
+                    onChange={(value) => setNodeField("max-concurrency", String(value || 1), { source: true })}
+                  />
+                  <NumberField
+                    label="Retry count"
+                    min="0"
+                    value={graphNode?.execution?.retry_count ?? 0}
+                    onChange={(value) => setNodeField("retry-count", String(value || 0), { source: true })}
+                  />
+                  <TextField
+                    commitOnBlur
+                    label="Retry delay"
+                    value={radishDurationFromMilliseconds(graphNode?.execution?.retry_delay_ms) || "1s"}
+                    onChange={(value) => setNodeField("retry-delay", value || "1s", { source: true })}
+                  />
+                </InspectorSection>
+                {nodeRun || nodeOutput ? (
+                  <InspectorSection title="Latest activation">
+                    <div className="grid grid-cols-2 gap-2 rounded-lg border border-line bg-slate-50 p-3 text-xs">
+                      <span className="text-muted">Status</span>
+                      <span className="text-right font-semibold text-ink">{nodeRun?.status ?? (nodeOutput?.success ? "success" : "error")}</span>
+                      <span className="text-muted">Duration</span>
+                      <span className="text-right font-mono text-ink">{nodeRun?.durationMs == null ? "-" : `${nodeRun.durationMs} ms`}</span>
+                    </div>
+                    {nodeOutput?.data !== undefined ? (
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-slate-950 p-3 font-mono text-[11px] leading-5 text-slate-100">
+                        {JSON.stringify(nodeOutput.data, null, 2)}
+                      </pre>
+                    ) : null}
+                  </InspectorSection>
+                ) : null}
+                {runEvents.filter((event) => event.nodeId === node.id).length ? (
+                  <InspectorSection title="Activation history">
+                    {runEvents
+                      .filter((event) => event.nodeId === node.id)
+                      .slice()
+                      .reverse()
+                      .map((event) => (
+                        <div key={`${event.sequence}-${event.attempt}`} className="rounded-lg border border-line bg-slate-50 p-3 text-xs">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-semibold text-ink">Activation {event.attempt ?? "-"}</span>
+                            <span className="text-muted">{event.status ?? event.outcome}</span>
+                          </div>
+                          <div className="mt-1 truncate font-mono text-[10px] text-muted" title={event.activationLineageId ?? ""}>
+                            {event.activationLineageId ?? "No lineage recorded"}
+                          </div>
+                        </div>
+                      ))}
+                  </InspectorSection>
+                ) : null}
+                </>
+              ) : null}
+
+              {nodeTab === "routes" ? (
+                <InspectorSection title="Outgoing routes">
+                  {(document?.graph?.edges ?? [])
+                    .filter((candidate) => candidate.from === node.id)
+                    .map((route) => (
+                      <div key={route.id} className="rounded-lg border border-line bg-slate-50 p-3 text-xs">
+                        <div className="font-mono font-semibold text-ink">{route.to}</div>
+                        <div className="mt-1 text-muted">
+                          {route.mode === "when" ? `when ${route.predicateSource}` : route.mode}
+                        </div>
+                      </div>
+                    ))}
+                  {!document?.graph?.edges?.some((candidate) => candidate.from === node.id) ? (
+                    <p className="text-xs text-muted">This branch ends after the node completes.</p>
+                  ) : null}
+                  <p className="text-xs leading-5 text-muted">
+                    Drag from a node connector to add an unconditional route. Select a route to edit its target or condition.
+                  </p>
+                </InspectorSection>
+              ) : null}
+            </div>
+          </>
+        ) : edge ? (
+          <div className="workflow-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+            <InspectorSection title="Route">
+              <TextField label="Source" value={edge.from} readOnly />
+              <TextField label="Target" value={edge.to} readOnly />
+              <SelectField
+                label="Mode"
+                value={graphEdge?.mode ?? "unconditional"}
+                options={[["unconditional", "Always"], ["when", "When"], ["otherwise", "Otherwise"]]}
+                onChange={(mode) =>
+                  updateRadishRoute(document, graphEdge, { mode }, onMutate)
+                }
+              />
+              {graphEdge?.mode === "when" ? (
+                <TextField
+                  commitOnBlur
+                  label="Condition"
+                  value={graphEdge.predicateSource ?? ""}
+                  onChange={(predicateSource) =>
+                    updateRadishRoute(document, graphEdge, { predicateSource }, onMutate)
+                  }
+                />
+              ) : null}
+              <p className="text-xs leading-5 text-muted">
+                Route edits replace only the selected node&apos;s to block in workflow.rad.
+              </p>
+            </InspectorSection>
+          </div>
+        ) : (
+          <div className="workflow-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+            <InspectorSection title="General">
+              <TextField
+                commitOnBlur
+                label="Name"
+                value={document?.workflow?.name ?? ""}
+                onChange={(value) => setWorkflowField("name", value)}
+              />
+              <TextField label="Workflow ID" value={document?.workflowId ?? ""} readOnly />
+              <TextField label="Source path" value={document?.sourcePath ?? ""} readOnly pathLink />
+              <NumberField
+                label="Interface version"
+                min="1"
+                placeholder="None"
+                value={workflowFields["interface-version"]?.value ?? ""}
+                onChange={(value) =>
+                  value
+                    ? setWorkflowField("interface-version", String(value), { source: true })
+                    : onMutate?.([{ kind: "remove_field", target: "workflow", field: "interface-version" }])
+                }
+              />
+              <TextField
+                commitOnBlur
+                label="Timeout"
+                placeholder="none or 18h"
+                value={workflowFields.timeout?.source ?? "none"}
+                onChange={(value) => setWorkflowField("timeout", value || "none", { source: true })}
+              />
+              <NumberField
+                label="Max total node runs"
+                min="1"
+                placeholder="None"
+                value={workflowFields["max-runs"]?.value ?? ""}
+                onChange={(value) =>
+                  setWorkflowField("max-runs", value ? String(value) : "none", { source: true })
+                }
+              />
+            </InspectorSection>
+            <InspectorSection title="Public interface">
+              <TextareaField
+                commitOnBlur
+                label="Inputs"
+                rows={6}
+                value={sourceTextForSpan(document?.source, workflowFields.inputs?.span)}
+                onChange={(value) => setWorkflowField("inputs", value || "{}", { source: true })}
+              />
+              <TextareaField
+                commitOnBlur
+                label="Outputs"
+                rows={6}
+                value={sourceTextForSpan(document?.source, workflowFields.outputs?.span)}
+                onChange={(value) => setWorkflowField("outputs", value || "{}", { source: true })}
+              />
+              <p className="text-xs leading-5 text-muted">
+                Output references and schemas are checked again by the Radish compiler after every change.
+              </p>
+            </InspectorSection>
+          </div>
+        )}
+      </div>
+    </aside>
+  );
+}
+
+function RadishContractField({ authored, field, onChange, onReset, schema, value }) {
+  const label = humanizeRadishField(field);
+  const reset = authored ? (
+    <button
+      className="text-[11px] font-medium text-indigo-700 hover:underline"
+      type="button"
+      onClick={onReset}
+    >
+      Use default
+    </button>
+  ) : null;
+  if (schema.enum) {
+    return (
+      <div className="space-y-1.5">
+        <SelectField
+          label={label}
+          value={value ?? schema.enum[0]}
+          options={schema.enum.map((item) => [String(item), humanizeRadishField(String(item))])}
+          onChange={(next) => onChange(next, { source: true })}
+        />
+        {reset}
+      </div>
+    );
+  }
+  const types = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (types.includes("boolean")) {
+    return (
+      <div className="space-y-1.5">
+        <ToggleField checked={Boolean(value)} label={label} onChange={onChange} />
+        {reset}
+      </div>
+    );
+  }
+  if (types.includes("integer") || types.includes("number")) {
+    return (
+      <div className="space-y-1.5">
+        <NumberField
+          label={label}
+          min={schema.minimum}
+          value={value ?? ""}
+          onChange={onChange}
+        />
+        {reset}
+      </div>
+    );
+  }
+  if (types.includes("object") || types.includes("array")) {
+    return (
+      <div className="space-y-1.5">
+        <JsonBodyField label={label} value={value ?? (types.includes("array") ? [] : {})} onChange={onChange} />
+        {reset}
+      </div>
+    );
+  }
+  const longText = ["body", "command", "content", "instructions", "prompt", "template"].some(
+    (part) => field.includes(part),
+  );
+  return (
+    <div className="space-y-1.5">
+      {longText ? (
+        <TextareaField
+          commitOnBlur
+          label={label}
+          rows={field === "prompt" ? 6 : 4}
+          value={value ?? ""}
+          onChange={onChange}
+        />
+      ) : (
+        <TextField commitOnBlur label={label} value={value ?? ""} onChange={onChange} />
+      )}
+      {reset}
+    </div>
+  );
+}
+
+function RadishBindingSummary({ bindings }) {
+  if (!bindings.length) return <p className="text-xs text-muted">No with bindings.</p>;
+  return (
+    <div className="space-y-2">
+      {bindings.map((binding, index) => (
+        <div key={`${binding.name ?? "binding"}-${index}`} className="rounded-lg border border-line bg-slate-50 p-2.5 text-xs">
+          <div className="font-mono font-semibold text-ink">{binding.name ?? `binding-${index + 1}`}</div>
+          <div className="mt-1 truncate font-mono text-[11px] text-muted">
+            {binding.reference?.source ?? binding.value ?? "Bound value"}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function humanizeRadishField(value) {
+  return String(value || "")
+    .replaceAll("_", "-")
+    .split("-")
+    .filter(Boolean)
+    .map((part) => part[0]?.toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+function radishDurationFromMilliseconds(value) {
+  if (value === null || value === undefined || value === "") return "none";
+  if (value % 3_600_000 === 0) return `${value / 3_600_000}h`;
+  if (value % 60_000 === 0) return `${value / 60_000}m`;
+  if (value % 1_000 === 0) return `${value / 1_000}s`;
+  return `${value}ms`;
+}
+
+function parseRadishIdentifierDraft(text) {
+  const value = String(text).trim();
+  if (!value) return { ok: false, error: "Enter a node ID." };
+  if (!/^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$/.test(value)) {
+    return {
+      ok: false,
+      error: "Use letters, numbers, and single hyphens, starting with a letter.",
+    };
+  }
+  return { ok: true, value };
+}
+
+function radishRouteValue(edge, source = "") {
+  const mode = edge.mode ?? edge.displayLabel ?? "unconditional";
+  if (mode === "unconditional" || mode === "always") return edge.to;
+  if (mode === "otherwise") return { target: edge.to, mode: "otherwise" };
+  const predicateSource = edge.predicateSource ?? sourceTextForSpan(source, edge.predicate?.span);
+  return {
+    target: edge.to,
+    mode: "when",
+    predicateSource: predicateSource || "succeeded",
+  };
+}
+
+function sourceTextForSpan(source, span) {
+  if (!source || !span) return "";
+  const bytes = new TextEncoder().encode(source);
+  return new TextDecoder().decode(bytes.slice(span.start.offset, span.end.offset));
+}
+
+function updateRadishRoute(document, edge, patch, onMutate) {
+  if (!edge) return;
+  const routes = (document?.graph?.edges ?? [])
+    .filter((candidate) => candidate.from === edge.from)
+    .map((candidate) =>
+      radishRouteValue(
+        candidate.id === edge.id ? { ...candidate, ...patch } : candidate,
+        document?.source,
+      ),
+    );
+  onMutate?.([{ kind: "set_routes", node: edge.from, routes }]);
+}
 
 function Inspector({
   agents,
   approval,
-  dashboards = [],
   collapsed,
   dataDir,
   edge,
   edges,
-  group,
   node,
   nodeRun,
   nodeOutput,
   nodes,
+  providerCapabilities = [],
   providerProfiles = [],
-  workflows = [],
   workflow,
   onAddEdge,
   onAgentChange,
   onDecideApproval,
   onDeleteEdge,
-  onDeleteGroup,
-  onDuplicateGroup,
   onEdgeChange,
-  onGroupChange,
   onNodeChange,
   onOperationChange,
   onApplyFix,
   onProviderProfilesChange,
+  onProviderCapabilitiesRefresh,
   onResizeStart,
+  onResizeKeyDown,
   onSettingsChange,
+  onShowWorkflowSettings,
   onToggleCollapsed,
   onTypeChange,
-  onNavigateWorkflow,
-  onRenameWorkflow,
   onWorkflowChange,
   width,
 }) {
-  const [workflowSettingsOpen, setWorkflowSettingsOpen] = useState(!node && !edge && !group);
+  const [workflowTab, setWorkflowTab] = useState("general");
+  const [nodeTab, setNodeTab] = useState("general");
   const [edgeInspectorOpen, setEdgeInspectorOpen] = useState(Boolean(edge));
-  const [groupInspectorOpen, setGroupInspectorOpen] = useState(Boolean(group));
-  const [nodeInspectorOpen, setNodeInspectorOpen] = useState(Boolean(node));
   const [cronPickerOpen, setCronPickerOpen] = useState(false);
   const [draftEdge, setDraftEdge] = useState(null);
   const [addingFilesystemPath, setAddingFilesystemPath] = useState(false);
   const [filesystemPathDraft, setFilesystemPathDraft] = useState("");
-  const latestWorkflowRef = useRef(workflow);
   const operation = node?.operation ?? defaultOperation(node?.type ?? "agent");
   const settings = { ...defaultSettings, ...(node?.settings ?? {}) };
   const existingSpecialTypes = new Set(
@@ -5483,7 +5557,6 @@ function Inspector({
     ["fail", "FAIL"],
     ["break", "BREAK"],
     ["loop", "Loop"],
-    ["workflow", "Workflow"],
     ["agent", "Agent"],
     ["bash_command", commandNodeLabel],
     ["python_script", "Python script"],
@@ -5503,17 +5576,9 @@ function Inspector({
     ["http_request", "HTTP request"],
     ["approval_gate", "Approval gate"],
     ["notification", "Notification"],
-    ["dashboard_item", "Dashboard item"],
+    ["workflow", "Workflow call"],
+    ["subflow", "Subflow call"],
   ].filter(([type]) => type === node?.type || !existingSpecialTypes.has(type));
-  const workflowTargetOptions = [
-    ["", "Choose workflow"],
-    ...workflows
-      .filter(
-        (candidate) =>
-          candidate.id !== workflow.id || candidate.id === operation.workflow_id,
-      )
-      .map((candidate) => [candidate.id, candidate.name || candidate.id]),
-  ];
   const agentConfig =
     operation.type === "agent" || operation.type === "common_llm_task"
       ? agents[operation.agent_id] ?? defaultAgentConfig(operation.agent_id || "agent")
@@ -5521,18 +5586,27 @@ function Inspector({
   const schedule = workflow.schedule ?? null;
   const watch = workflow.watch ?? null;
   const webhooks = workflow.webhooks ?? {};
-  const filesystemAccess = workflow.filesystemAccess ?? [];
+  const filesystemAccess = useMemo(
+    () => workflow.filesystemAccess ?? [],
+    [workflow.filesystemAccess],
+  );
   const manualFilesystemAccess = filesystemAccess
     .map((entry, index) => ({ entry, index }))
     .filter(({ entry }) => !dataDir || !pathsMatch(entry.path, dataDir));
   const connectedEdges = node
     ? edges.filter((edge) => edge.from === node.id || edge.to === node.id)
     : [];
-  const inputSourceGroups = node ? buildInputSourceGroups(node, nodes, edges, dashboards) : [];
-  const inputSourceOptions = flattenInputSourceGroups(inputSourceGroups);
+  const inputSourceOptions = node ? buildInputSourceOptions(node, nodes, edges) : [];
   const workflowDiagnostics = workflowDiagnosticsForDisplay(workflow);
   const nodeDiagnostics = node
     ? diagnosticsForNode(workflowDiagnostics, node, agentConfig)
+    : [];
+  const nodeBindings = node
+    ? (workflow.validationBindings ?? []).filter(
+        (binding) =>
+          binding.destinationNode === node.id &&
+          !["invalid", "type-incompatible"].includes(binding.status),
+      )
     : [];
   const agentDiagnostics = agentConfig
     ? diagnosticsForAgent(workflowDiagnostics, operation.agent_id, agentConfig)
@@ -5543,17 +5617,28 @@ function Inspector({
   const nodeFieldDiagnostics = (...fields) => diagnosticsForField(nodeDiagnostics, ...fields);
   const edgeFieldDiagnostics = (...fields) => diagnosticsForField(edgeDiagnostics, ...fields);
 
-  useEffect(() => {
-    latestWorkflowRef.current = workflow;
-  }, [workflow]);
+  const edgeId = edge?.id;
+  const nodeId = node?.id;
 
   useEffect(() => {
-    setWorkflowSettingsOpen(!node && !edge && !group);
-    setEdgeInspectorOpen(Boolean(edge));
-    setGroupInspectorOpen(Boolean(group));
-    setNodeInspectorOpen(Boolean(node));
+    setEdgeInspectorOpen(Boolean(edgeId));
     setDraftEdge(null);
-  }, [edge?.id, group?.id, node?.id]);
+  }, [edgeId, nodeId]);
+
+  useEffect(() => {
+    setNodeTab("general");
+  }, [nodeId]);
+
+  useEffect(() => {
+    if (!window.goferDesktop?.workspace?.grantPath) return;
+    for (const entry of filesystemAccess) {
+      if (entry?.path) {
+        window.goferDesktop.workspace.grantPath(entry.path).catch((error) => {
+          console.error("Failed to trust workflow path", error);
+        });
+      }
+    }
+  }, [filesystemAccess]);
 
   function updateWorkflowSchedule(patch) {
     const currentSchedule = schedule ?? { cron_expression: "0 9 * * *", timezone: "UTC" };
@@ -5615,25 +5700,17 @@ function Inspector({
     });
   }
 
-  function addTrustedPath(pathValue) {
-    const path = String(pathValue ?? "").trim();
-    if (!path) return;
-    const currentWorkflow = latestWorkflowRef.current ?? workflow;
-    onWorkflowChange({
-      ...currentWorkflow,
-      filesystemAccess: uniqueAccessEntries([
-        ...(currentWorkflow.filesystemAccess ?? []),
-        { path },
-      ]),
-    });
-  }
-
   function addFilesystemAccess(pathValue = filesystemPathDraft) {
     const path = String(pathValue ?? "").trim();
     if (!path) return;
-    addTrustedPath(path);
+    onWorkflowChange({
+      filesystemAccess: uniqueAccessEntries([...filesystemAccess, { path }]),
+    });
     setFilesystemPathDraft("");
     setAddingFilesystemPath(false);
+    window.goferDesktop?.workspace?.grantPath?.(path).catch((error) => {
+      console.error("Failed to trust workflow path", error);
+    });
   }
 
   function removeFilesystemAccess(index) {
@@ -5646,52 +5723,105 @@ function Inspector({
 
   return (
     <aside
-      className="relative shrink-0 overflow-visible border-l border-line bg-white transition-[width] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
+      id="workflow-inspector"
+      aria-label="Workflow settings and node inspector"
+      className="absolute bottom-0 right-0 top-0 z-40 shrink-0 overflow-visible border-l border-line bg-white shadow-panel transition-[width] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)]"
       style={{ width: collapsed ? 0 : width }}
+      tabIndex={-1}
     >
       {!collapsed ? (
         <div
+          aria-label="Resize workflow settings and node inspector"
+          aria-orientation="vertical"
+          aria-valuemax={520}
+          aria-valuemin={280}
+          aria-valuenow={width}
+          aria-valuetext={`${width} pixels wide`}
           className="absolute left-[-3px] top-0 z-20 h-full w-1.5 cursor-col-resize transition hover:bg-brand/40"
           role="separator"
+          tabIndex={0}
           title="Resize workflow settings and node inspector"
+          onKeyDown={onResizeKeyDown}
           onPointerDown={onResizeStart}
         />
       ) : null}
+      {collapsed || edge ? (
       <button
-        className="absolute left-[-15px] top-1/2 z-40 grid h-12 w-7 -translate-y-1/2 place-items-center rounded-full border border-line bg-white text-muted shadow-panel transition hover:-translate-y-1/2 hover:scale-105 hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+        className={`absolute z-40 flex items-center justify-center border border-line bg-white text-muted shadow-panel transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink ${
+          collapsed
+            ? "left-[-140px] top-3 h-8 w-[132px] gap-1.5 rounded-[10px] px-2 text-xs font-semibold"
+            : "left-[-40px] top-3 h-8 w-8 rounded-[10px]"
+        }`}
         title={
           collapsed
             ? "Show workflow settings and node inspector"
             : "Hide workflow settings and node inspector"
         }
         type="button"
-        onClick={onToggleCollapsed}
+        onClick={collapsed ? onShowWorkflowSettings : onToggleCollapsed}
       >
-        {collapsed ? <ChevronLeft size={18} /> : <ChevronRight size={18} />}
+        {collapsed ? (
+          <><Settings2 size={14} /><span>Workflow settings</span></>
+        ) : (
+          <X size={15} />
+        )}
       </button>
+      ) : null}
 
       <div
-        className={`workflow-scrollbar h-full overflow-y-auto transition-opacity duration-200 ${
+        className={`${node ? "h-full overflow-hidden" : "workflow-scrollbar h-full overflow-y-auto"} transition-opacity duration-200 ${
           collapsed ? "pointer-events-none opacity-0" : "opacity-100 delay-100"
         }`}
       >
-        <PathTrustContext.Provider
-          value={{
-            isTrustedPath: (targetPath) => workflowAccessCoversPath(workflow, targetPath, dataDir),
-            trustPath: addTrustedPath,
-          }}
-        >
-        <InspectorPanel
-          open={workflowSettingsOpen}
-          subtitle={workflow.id}
-          title="Workflow settings"
-          onToggle={() => setWorkflowSettingsOpen((current) => !current)}
-        >
-          <div className="space-y-4 p-4">
-            <InspectorSection title="Workflow">
-              <TextField label="ID" value={workflow.id} readOnly />
+        {!node && !edge ? (
+          <div className="flex h-full min-h-0 flex-col overflow-hidden">
+            <header className="flex h-[52px] shrink-0 items-center justify-between border-b border-line px-3.5">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="grid h-6 w-6 shrink-0 place-items-center rounded-lg bg-slate-100 text-muted">
+                  <Settings2 size={14} />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="truncate text-[13px] font-semibold text-ink">Workflow settings</h2>
+                  <p className="truncate font-mono text-[10px] text-muted">{workflow.id}</p>
+                </div>
+              </div>
+              <button
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+                title="Hide workflow settings and node inspector"
+                type="button"
+                onClick={onToggleCollapsed}
+              >
+                <X size={15} />
+              </button>
+            </header>
+            <nav aria-label="Workflow settings sections" className="grid shrink-0 grid-cols-4 gap-0.5 border-b border-line px-2 pt-2">
+              {[
+                ["general", "General"],
+                ["triggers", "Triggers"],
+                ["variables", "Variables"],
+                ["access", "Access"],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  aria-selected={workflowTab === id}
+                  className={`h-8 border-b-2 px-1 text-[11px] font-semibold transition ${
+                    workflowTab === id
+                      ? "border-indigo-600 text-ink"
+                      : "border-transparent text-muted hover:text-ink"
+                  }`}
+                  role="tab"
+                  type="button"
+                  onClick={() => setWorkflowTab(id)}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            <div className="workflow-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
+            {workflowTab === "general" ? (
+              <WorkflowSettingsSection title="General">
               <TextField
-                label="Label"
+                label="Name"
                 value={workflow.name}
                 onChange={(value) => onWorkflowChange({ name: value })}
               />
@@ -5717,9 +5847,34 @@ function Inspector({
                   Stop all runs to turn it off.
                 </p>
               ) : null}
-            </InspectorSection>
+            </WorkflowSettingsSection>
+            ) : null}
 
-            <InspectorSection title="Filesystem access">
+            {workflowTab === "variables" ? (
+              <WorkflowSettingsSection title="Variables">
+                <JsonBodyField
+                  label="Input schema (JSON object)"
+                  value={workflow.inputs ?? workflow.parameters ?? {}}
+                  onChange={(value) => onWorkflowChange({ inputs: value ?? {}, parameters: {} })}
+                />
+                <JsonBodyField
+                  label="Initial variables (JSON object)"
+                  value={workflow.variables ?? {}}
+                  onChange={(value) => onWorkflowChange({ variables: value ?? {} })}
+                />
+                <JsonBodyField
+                  label="Named output schemas (JSON object)"
+                  value={workflow.outputSchemas ?? {}}
+                  onChange={(value) => onWorkflowChange({ outputSchemas: value ?? {} })}
+                />
+                <p className="text-xs leading-5 text-muted">
+                  Inputs are immutable for one run. Variable changes stay isolated to that run.
+                </p>
+              </WorkflowSettingsSection>
+            ) : null}
+
+            {workflowTab === "access" ? (
+            <WorkflowSettingsSection title="Filesystem access">
               <div className="grid gap-3">
                 {dataDir ? (
                   <div className="rounded-lg border border-line bg-slate-50 p-3">
@@ -5744,7 +5899,6 @@ function Inspector({
                           pathBasePath={dataDir}
                           pathLink
                           placeholder="/absolute/path"
-                          promptForTrust={false}
                         />
                       </div>
                       <button
@@ -5755,6 +5909,30 @@ function Inspector({
                       >
                         <Trash2 size={14} />
                       </button>
+                    </div>
+                    <div className="mt-3 grid gap-2">
+                      <ToggleField
+                        checked={entry.read ?? true}
+                        label="Read files"
+                        onChange={(checked) => updateFilesystemAccess(index, { read: checked })}
+                      />
+                      <ToggleField
+                        checked={entry.write ?? true}
+                        label="Write files"
+                        onChange={(checked) => updateFilesystemAccess(index, { write: checked })}
+                      />
+                      <p className="text-xs leading-5 text-muted">
+                        Write access allows this workflow to create, change, move, and delete files
+                        in this directory.
+                      </p>
+                      <ToggleField
+                        checked={entry.execute ?? false}
+                        label="Execute files"
+                        onChange={(checked) => updateFilesystemAccess(index, { execute: checked })}
+                      />
+                      <p className="text-xs leading-5 text-muted">
+                        Execute access allows this workflow to run programs from this directory.
+                      </p>
                     </div>
                   </div>
                 ))}
@@ -5767,7 +5945,6 @@ function Inspector({
                       pathPicker
                       pathBasePath={dataDir}
                       placeholder="/absolute/path"
-                      promptForTrust={false}
                     />
                     <div className="mt-3 flex justify-end gap-2">
                       <button
@@ -5801,12 +5978,15 @@ function Inspector({
                   </button>
                 )}
                 <p className="text-xs leading-5 text-muted">
-                  Trusted directories are saved with the workflow. Gofer can read and write files
-                  in them, and Codex or Claude agent nodes receive them as sandbox paths.
+                  Trusted directories and their selected permissions are saved with the workflow.
+                  Codex or Claude agent nodes receive eligible directories as sandbox paths.
                 </p>
               </div>
-            </InspectorSection>
+            </WorkflowSettingsSection>
+            ) : null}
 
+            {workflowTab === "triggers" ? (
+            <>
             <InspectorSection
               title="Schedule"
               className={workflow.runContinuously ? "opacity-50" : ""}
@@ -5841,6 +6021,16 @@ function Inspector({
                     onChange={(value) => updateWorkflowSchedule({ timezone: value })}
                     placeholder="UTC"
                   />
+                  <JsonBodyField
+                    label="Invocation inputs (JSON object)"
+                    value={schedule.inputs ?? {}}
+                    onChange={(value) =>
+                      updateWorkflowSchedule({ inputs: value ?? {}, params: {} })
+                    }
+                  />
+                  <p className="text-xs leading-5 text-muted">
+                    Values are validated against the workflow input schema when the schedule runs.
+                  </p>
                 </>
               ) : (
                 <p className="text-sm leading-6 text-muted">
@@ -5918,6 +6108,17 @@ function Inspector({
                     value={watch.debounce_seconds ?? 1}
                     onChange={(value) => updateWorkflowWatch({ debounce_seconds: value || 0 })}
                   />
+                  <JsonBodyField
+                    label="Invocation inputs (JSON object)"
+                    value={watch.inputs ?? {}}
+                    onChange={(value) =>
+                      updateWorkflowWatch({ inputs: value ?? {}, params: {} })
+                    }
+                  />
+                  <p className="text-xs leading-5 text-muted">
+                    File-event data stays under trigger; these values populate immutable workflow
+                    inputs.
+                  </p>
                 </>
               ) : (
                 <p className="text-sm leading-6 text-muted">
@@ -5928,95 +6129,75 @@ function Inspector({
 
             <InspectorSection title="Webhook/API triggers">
               <div className="grid gap-3">
-                {Object.entries(webhooks).map(([triggerId, config]) => {
-                  const riskReasons = webhookRiskReasons(config);
-                  const highRisk = webhookIsHighRisk(config);
-                  return (
-                    <div
-                      key={triggerId}
-                      className={`rounded-lg border p-3 ${
-                        highRisk
-                          ? "border-red-200 bg-red-50"
-                          : "border-line bg-slate-50"
-                      }`}
-                    >
-                      <div className="mb-3 flex items-center justify-between gap-2">
-                        <div className="min-w-0">
-                          <div className="flex min-w-0 flex-wrap items-center gap-2">
-                            <div className="truncate text-sm font-semibold text-ink">{triggerId}</div>
-                            {highRisk ? (
-                              <span className="inline-flex items-center gap-1 rounded-md border border-red-200 bg-white px-2 py-0.5 text-xs font-semibold text-red-700">
-                                <AlertCircle size={12} />
-                                High risk
-                              </span>
-                            ) : null}
-                          </div>
-                          <div className="truncate text-xs text-muted">
-                            {webhookAuthSummary(config)}
-                          </div>
+                {Object.entries(webhooks).map(([triggerId, config]) => (
+                  <div key={triggerId} className="rounded-lg border border-line bg-slate-50 p-3">
+                    <div className="mb-3 flex items-center justify-between gap-2">
+                      <div className="min-w-0">
+                        <div className="truncate text-sm font-semibold text-ink">{triggerId}</div>
+                        <div className="truncate text-xs text-muted">
+                          {config.tokenConfigured || config.token_env ? "Token required" : "No token required"}
                         </div>
-                        <button
-                          className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
-                          title="Remove webhook trigger"
-                          type="button"
-                          onClick={() => removeWorkflowWebhook(triggerId)}
-                        >
-                          <Trash2 size={14} />
-                        </button>
                       </div>
-                      {riskReasons.length ? (
-                        <div className="mb-3 rounded-lg border border-red-200 bg-white px-3 py-2 text-xs font-medium text-red-800">
-                          {webhookRiskSummary(riskReasons)}
-                        </div>
-                      ) : null}
-                      <ToggleField
-                        checked={Boolean(config.enabled)}
-                        label="Enabled"
-                        onChange={(checked) => updateWorkflowWebhook(triggerId, { enabled: checked })}
-                      />
-                      <ToggleField
-                        checked={Boolean(config.allow_unauthenticated)}
-                        label="Allow unauthenticated local testing"
-                        onChange={(checked) =>
-                          updateWorkflowWebhook(triggerId, { allow_unauthenticated: checked })
-                        }
-                      />
-                      <TextField
-                        label="Source"
-                        value={config.source ?? "webhook"}
-                        onChange={(value) => updateWorkflowWebhook(triggerId, { source: value })}
-                        placeholder="github"
-                      />
-                      <TextField
-                        label="Fan-out path"
-                        value={config.fanout_path ?? ""}
-                        onChange={(value) =>
-                          updateWorkflowWebhook(triggerId, { fanout_path: value || null })
-                        }
-                        placeholder="payload.items"
-                      />
-                      <TextField
-                        label="Token environment variable"
-                        value={config.token_env ?? ""}
-                        onChange={(value) =>
-                          updateWorkflowWebhook(triggerId, { token_env: value || null })
-                        }
-                        placeholder="GOFER_GITHUB_WEBHOOK_TOKEN"
-                      />
-                      <SelectField
-                        label="Concurrency"
-                        value={config.concurrency_policy ?? "allow"}
-                        options={[
-                          ["allow", "Allow concurrent runs"],
-                          ["reject_if_running", "Reject while running"],
-                        ]}
-                        onChange={(value) =>
-                          updateWorkflowWebhook(triggerId, { concurrency_policy: value })
-                        }
-                      />
+                      <button
+                        className="grid h-8 w-8 shrink-0 place-items-center rounded-md border border-line bg-white text-muted transition hover:border-red-200 hover:bg-red-50 hover:text-red-700"
+                        title="Remove webhook trigger"
+                        type="button"
+                        onClick={() => removeWorkflowWebhook(triggerId)}
+                      >
+                        <Trash2 size={14} />
+                      </button>
                     </div>
-                  );
-                })}
+                    <ToggleField
+                      checked={Boolean(config.enabled)}
+                      label="Enabled"
+                      onChange={(checked) => updateWorkflowWebhook(triggerId, { enabled: checked })}
+                    />
+                    <TextField
+                      label="Source"
+                      value={config.source ?? "webhook"}
+                      onChange={(value) => updateWorkflowWebhook(triggerId, { source: value })}
+                      placeholder="github"
+                    />
+                    <TextField
+                      label="Fan-out path"
+                      value={config.fanout_path ?? ""}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { fanout_path: value || null })
+                      }
+                      placeholder="payload.items"
+                    />
+                    <TextField
+                      label="Token environment variable"
+                      value={config.token_env ?? ""}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { token_env: value || null })
+                      }
+                      placeholder="GOFER_GITHUB_WEBHOOK_TOKEN"
+                    />
+                    <SelectField
+                      label="Concurrency"
+                      value={config.concurrency_policy ?? "allow"}
+                      options={[
+                        ["allow", "Allow concurrent runs"],
+                        ["reject_if_running", "Reject while running"],
+                      ]}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { concurrency_policy: value })
+                      }
+                    />
+                    <JsonBodyField
+                      label="Input bindings (JSON object)"
+                      value={config.input_bindings ?? {}}
+                      onChange={(value) =>
+                        updateWorkflowWebhook(triggerId, { input_bindings: value ?? {} })
+                      }
+                    />
+                    <p className="mt-2 text-xs leading-5 text-muted">
+                      Bind payload data with references such as
+                      {" "}<code>{"{{trigger.payload.project_dir}}"}</code>.
+                    </p>
+                  </div>
+                ))}
                 <button
                   className="inline-flex h-8 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
                   type="button"
@@ -6027,118 +6208,17 @@ function Inspector({
                 </button>
               </div>
             </InspectorSection>
+            </>
+            ) : null}
           </div>
-        </InspectorPanel>
-
-        {group ? (
-          <InspectorPanel
-            open={groupInspectorOpen}
-            subtitle={`${group.nodeIds.length} node${group.nodeIds.length === 1 ? "" : "s"}`}
-            title="Group settings"
-            onToggle={() => setGroupInspectorOpen((current) => !current)}
-          >
-            <div className="space-y-4 p-4">
-              <InspectorSection title="Group">
-                <TextField
-                  label="Label"
-                  value={group.label}
-                  onChange={(value) => onGroupChange(group.id, { label: value })}
-                  placeholder="Group name"
-                />
-                <label className="block">
-                  <span className="text-xs font-medium text-muted">Color</span>
-                  <input
-                    aria-label={`Color ${group.label}`}
-                    className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-2 py-1"
-                    type="color"
-                    value={group.color}
-                    onChange={(event) => onGroupChange(group.id, { color: event.target.value })}
-                  />
-                </label>
-                <GroupOpacityField
-                  value={Math.round(group.opacity * 100)}
-                  onCommit={(value) => onGroupChange(group.id, { opacity: value / 100 })}
-                />
-                <ToggleField
-                  checked={Boolean(group.collapsed)}
-                  label="Collapsed"
-                  onChange={(checked) => onGroupChange(group.id, { collapsed: checked })}
-                />
-              </InspectorSection>
-
-              <InspectorSection title="Layout">
-                <div className="grid grid-cols-2 gap-3">
-                  <NumberField
-                    label="X"
-                    value={Math.round(group.x)}
-                    onChange={(value) => onGroupChange(group.id, { x: value || 0 })}
-                  />
-                  <NumberField
-                    label="Y"
-                    value={Math.round(group.y)}
-                    onChange={(value) => onGroupChange(group.id, { y: value || 0 })}
-                  />
-                  <NumberField
-                    label="Width"
-                    min={groupMinWidth}
-                    value={Math.round(group.width)}
-                    onChange={(value) => onGroupChange(group.id, { width: value || groupMinWidth })}
-                  />
-                  <NumberField
-                    label="Height"
-                    min={groupMinHeight}
-                    value={Math.round(group.height)}
-                    onChange={(value) =>
-                      onGroupChange(group.id, { height: value || groupMinHeight })
-                    }
-                  />
-                </div>
-              </InspectorSection>
-
-              <InspectorSection title="Members">
-                <div className="space-y-2">
-                  {group.nodeIds.map((nodeId) => {
-                    const member = nodes.find((candidate) => candidate.id === nodeId);
-                    return (
-                      <div
-                        key={nodeId}
-                        className="rounded-md border border-line bg-slate-50 px-3 py-2 text-sm"
-                      >
-                        <div className="font-medium text-ink">{member?.label || nodeId}</div>
-                        <div className="text-xs text-muted">{nodeId}</div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </InspectorSection>
-
-              <div className="grid grid-cols-2 gap-2">
-                <button
-                  className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
-                  type="button"
-                  onClick={() => onDuplicateGroup(group.id)}
-                >
-                  <Copy size={14} />
-                  Duplicate
-                </button>
-                <button
-                  className="inline-flex h-9 items-center justify-center gap-2 rounded-md border border-line bg-white px-3 text-xs font-medium text-ink transition hover:bg-slate-50"
-                  type="button"
-                  onClick={() => onDeleteGroup(group.id)}
-                >
-                  <Trash2 size={14} />
-                  Ungroup
-                </button>
-              </div>
-            </div>
-          </InspectorPanel>
+          </div>
         ) : null}
 
         {edge ? (
           <InspectorPanel
             open={edgeInspectorOpen}
             subtitle={`${edge.from} -> ${edge.to}`}
-            title="Edge settings"
+            title="Edge inspector"
             onToggle={() => setEdgeInspectorOpen((current) => !current)}
           >
             <div className="space-y-4 p-4">
@@ -6154,6 +6234,10 @@ function Inspector({
                       condition: value,
                       outputPattern:
                         value === "output_matches" ? edge.outputPattern ?? "" : null,
+                      field: value === "output_field" ? edge.field ?? "" : null,
+                      operator:
+                        value === "output_field" ? edge.operator ?? "equals" : null,
+                      value: value === "output_field" ? edge.value ?? null : null,
                     })
                   }
                 />
@@ -6165,6 +6249,31 @@ function Inspector({
                     onChange={(value) => onEdgeChange(edge.id, { outputPattern: value })}
                     placeholder="Regex pattern"
                   />
+                ) : null}
+                {edge.condition === "output_field" ? (
+                  <>
+                    <TextField
+                      diagnostics={edgeFieldDiagnostics("field")}
+                      label="Field"
+                      value={edge.field ?? ""}
+                      onChange={(value) => onEdgeChange(edge.id, { field: value })}
+                      placeholder="priority or result.priority"
+                    />
+                    <SelectField
+                      diagnostics={edgeFieldDiagnostics("operator")}
+                      label="Operator"
+                      value={edge.operator ?? "equals"}
+                      options={edgeOutputFieldOperatorOptions}
+                      onChange={(value) => onEdgeChange(edge.id, { operator: value })}
+                    />
+                    {(edge.operator ?? "equals") !== "exists" ? (
+                      <JsonBodyField
+                        label="Comparison value (JSON)"
+                        value={edge.value}
+                        onChange={(value) => onEdgeChange(edge.id, { value })}
+                      />
+                    ) : null}
+                  </>
                 ) : null}
               </InspectorSection>
 
@@ -6195,35 +6304,75 @@ function Inspector({
         ) : null}
 
         {node ? (
-          <InspectorPanel
-            open={nodeInspectorOpen}
-            subtitle={node.id}
-            title="Node settings"
-            onToggle={() => setNodeInspectorOpen((current) => !current)}
-          >
-            <div className="space-y-4 p-4">
+          <div className="flex h-full min-h-0 flex-col overflow-hidden">
+            <header className="flex h-[52px] shrink-0 items-center justify-between border-b border-line px-3.5">
+              <div className="flex min-w-0 items-center gap-2.5">
+                <span className="grid h-6 w-6 shrink-0 place-items-center rounded-lg bg-slate-100 text-muted">
+                  <Braces size={14} />
+                </span>
+                <div className="min-w-0">
+                  <h2 className="truncate text-[13px] font-semibold text-ink">Node inspector</h2>
+                  <p className="truncate font-mono text-[10px] text-muted">{node.id}</p>
+                </div>
+              </div>
+              <button
+                className="grid h-8 w-8 shrink-0 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
+                title="Hide node inspector"
+                type="button"
+                onClick={onToggleCollapsed}
+              >
+                <X size={15} />
+              </button>
+            </header>
+            <nav
+              aria-label="Node inspector sections"
+              className="grid shrink-0 grid-cols-5 gap-0.5 border-b border-line px-2 pt-2"
+              role="tablist"
+            >
+              {[
+                ["general", "General"],
+                ["action", "Action"],
+                ["inputs", "Inputs"],
+                ["run", "Run"],
+                ["edges", "Edges"],
+              ].map(([id, label]) => (
+                <button
+                  key={id}
+                  id={`node-tab-${id}`}
+                  data-inspector-tab={id}
+                  aria-controls={`node-tabpanel-${id}`}
+                  aria-selected={nodeTab === id}
+                  className={`h-8 border-b-2 px-1 text-[11px] font-semibold transition ${
+                    nodeTab === id
+                      ? "border-indigo-600 text-ink"
+                      : "border-transparent text-muted hover:text-ink"
+                  }`}
+                  role="tab"
+                  tabIndex={nodeTab === id ? 0 : -1}
+                  type="button"
+                  onClick={() => setNodeTab(id)}
+                  onKeyDown={(event) => handleInspectorTabKeyDown(event, setNodeTab)}
+                >
+                  {label}
+                </button>
+              ))}
+            </nav>
+            <div className="workflow-scrollbar min-h-0 flex-1 overflow-y-auto">
+              <div
+                id="node-tabpanel-general"
+                aria-labelledby="node-tab-general"
+                className="node-inspector-panel space-y-4 p-4"
+                hidden={nodeTab !== "general"}
+                role="tabpanel"
+                tabIndex={0}
+              >
           <InspectorSection title="Node">
-            <TextField label="ID" value={node.id} readOnly />
-            {node.type === "workflow" ? (
-              <WorkflowNodeLabelField
-                node={node}
-                workflows={workflows}
-                onChange={(value) => onNodeChange({ label: value })}
-                onRenameWorkflow={onRenameWorkflow}
-                onTargetWorkflowRenamed={(renamedWorkflow) => {
-                  if (renamedWorkflow?.id) {
-                    onOperationChange({ workflow_id: renamedWorkflow.id });
-                  }
-                }}
-              />
-            ) : (
-              <TextField
-                label="Label"
-                value={specialNodeLabel(node.type) ?? node.label}
-                onChange={(value) => onNodeChange({ label: value })}
-                readOnly={isSpecialNodeType(node.type)}
-              />
-            )}
+            <TextField
+              label="Label"
+              value={specialNodeLabel(node.type) ?? node.label}
+              onChange={(value) => onNodeChange({ label: value })}
+              readOnly={isSpecialNodeType(node.type)}
+            />
             <SelectField
               label="Type"
               value={node.type}
@@ -6231,8 +6380,18 @@ function Inspector({
               onChange={onTypeChange}
             />
             <HealthDiagnosticList diagnostics={nodeDiagnostics} onApplyFix={onApplyFix} />
+            <NodeBindingList bindings={nodeBindings} />
           </InspectorSection>
+              </div>
 
+              <div
+                id="node-tabpanel-run"
+                aria-labelledby="node-tab-run"
+                className="node-inspector-panel space-y-4 p-4"
+                hidden={nodeTab !== "run"}
+                role="tabpanel"
+                tabIndex={0}
+              >
           <InspectorSection title="Execution">
             <ToggleField
               checked={Boolean(settings.pipeOutput)}
@@ -6259,6 +6418,34 @@ function Inspector({
                 Failed output can still trigger on-failure edges, but it will not fail the whole workflow.
               </p>
             ) : null}
+            <TextField
+              diagnostics={nodeFieldDiagnostics("for_each")}
+              label="For each"
+              placeholder="{{inputs.items}}"
+              value={settings.forEach ?? ""}
+              onChange={(value) => onSettingsChange({ forEach: value })}
+            />
+            {settings.forEach ? (
+              <>
+                <NumberField
+                  allowRuntimeReference
+                  diagnostics={nodeFieldDiagnostics("max_concurrency")}
+                  label="Fan-out max concurrency"
+                  min="1"
+                  value={settings.maxConcurrency ?? 1}
+                  onChange={(value) =>
+                    onSettingsChange({ maxConcurrency: value || 1 })
+                  }
+                />
+                <ToggleField
+                  allowRuntimeReference
+                  checked={settings.failFast ?? false}
+                  diagnostics={nodeFieldDiagnostics("fail_fast")}
+                  label="Fan-out fail fast"
+                  onChange={(checked) => onSettingsChange({ failFast: checked })}
+                />
+              </>
+            ) : null}
             <NumberField
               label="Retry count"
               min="0"
@@ -6281,15 +6468,35 @@ function Inspector({
             />
           </InspectorSection>
 
+          {nodeRun ? <RunNodeInspector nodeRun={nodeRun} /> : null}
+              </div>
+
+              <div
+                id="node-tabpanel-inputs"
+                aria-labelledby="node-tab-inputs"
+                className="node-inspector-panel space-y-4 p-4"
+                hidden={nodeTab !== "inputs"}
+                role="tabpanel"
+                tabIndex={0}
+              >
           <InspectorSection title="Inputs">
             <InputMappingField
-              sourceGroups={inputSourceGroups}
+              nodeType={node.type}
               sourceOptions={inputSourceOptions}
               value={node.inputs ?? {}}
               onChange={(value) => onNodeChange({ inputs: value })}
             />
           </InspectorSection>
+              </div>
 
+              <div
+                id="node-tabpanel-action"
+                aria-labelledby="node-tab-action"
+                className="node-inspector-panel space-y-4 p-4"
+                hidden={nodeTab !== "action"}
+                role="tabpanel"
+                tabIndex={0}
+              >
           {operation.type === "start" ? (
             <InspectorSection title="START">
               <p className="text-sm leading-6 text-muted">
@@ -6331,30 +6538,6 @@ function Inspector({
             </InspectorSection>
           ) : null}
 
-          {operation.type === "workflow" ? (
-            <InspectorSection title="Workflow">
-              <SelectField
-                label="Target workflow"
-                value={operation.workflow_id ?? ""}
-                options={workflowTargetOptions}
-                onChange={(value) => onOperationChange({ workflow_id: value })}
-              />
-              <button
-                type="button"
-                className="inline-flex items-center gap-2 rounded-lg border border-subtle px-3 py-2 text-sm font-medium text-primary transition hover:bg-subtle disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={!operation.workflow_id}
-                onClick={() => operation.workflow_id && onNavigateWorkflow?.(operation.workflow_id)}
-              >
-                <ExternalLink className="h-4 w-4" />
-                Open workflow
-              </button>
-              <p className="text-sm leading-6 text-muted">
-                Runs the selected workflow when this node fires. The target workflow name is used as
-                this node label.
-              </p>
-            </InspectorSection>
-          ) : null}
-
           {operation.type === "loop" ? (
             <InspectorSection title="Loop">
               <SelectField
@@ -6365,13 +6548,13 @@ function Inspector({
                   ["tabular", "JSONL or CSV rows"],
                   ["directory", "Directory files"],
                   ["trigger_events", "Trigger events"],
-                  ["dashboard_items", "Dashboard items"],
                   ["infinite", "Until BREAK"],
                 ]}
                 onChange={(value) => onOperationChange({ source: defaultFanSource(value) })}
               />
               {operation.source?.type === "count" ? (
                 <NumberField
+                  allowRuntimeReference
                   label="Count"
                   min="1"
                   value={String(operation.source.count ?? 1)}
@@ -6412,7 +6595,8 @@ function Inspector({
                     }
                   />
                   <ToggleField
-                    checked={Boolean(operation.source.include_content)}
+                    allowRuntimeReference
+                    checked={operation.source.include_content ?? false}
                     label="Include content"
                     onChange={(checked) =>
                       onOperationChange({
@@ -6424,7 +6608,8 @@ function Inspector({
               ) : null}
               {operation.source?.type === "trigger_events" ? (
                 <ToggleField
-                  checked={Boolean(operation.source.include_content)}
+                  allowRuntimeReference
+                  checked={operation.source.include_content ?? false}
                   label="Include file content"
                   onChange={(checked) =>
                     onOperationChange({
@@ -6433,48 +6618,8 @@ function Inspector({
                   }
                 />
               ) : null}
-              {operation.source?.type === "dashboard_items" ? (
-                <>
-                  <SelectField
-                    diagnostics={nodeFieldDiagnostics("operation.source.dashboard")}
-                    label="Dashboard"
-                    value={operation.source.dashboard ?? ""}
-                    options={dashboardSelectOptions(dashboards)}
-                    onChange={(value) => {
-                      const component = firstDashboardComponent(dashboards, value);
-                      onOperationChange({
-                        source: {
-                          ...operation.source,
-                          dashboard: value,
-                          component: component?.id ?? "",
-                        },
-                      });
-                    }}
-                  />
-                  <SelectField
-                    diagnostics={nodeFieldDiagnostics("operation.source.component")}
-                    label="Component"
-                    value={operation.source.component ?? ""}
-                    options={dashboardComponentSelectOptions(dashboards, operation.source.dashboard)}
-                    onChange={(value) =>
-                      onOperationChange({ source: { ...operation.source, component: value } })
-                    }
-                  />
-                  <TextField
-                    label="Filter"
-                    value={operation.source.filter ?? ""}
-                    onChange={(value) =>
-                      onOperationChange({ source: { ...operation.source, filter: value } })
-                    }
-                    placeholder="status=todo"
-                  />
-                  <p className="text-xs leading-5 text-muted">
-                    Each matching dashboard item becomes one loop iteration. Child nodes can use
-                    loop.current.item_id, loop.current.item_json, or item fields like loop.current.item.title and loop.current.item.status.
-                  </p>
-                </>
-              ) : null}
               <NumberField
+                allowRuntimeReference
                 diagnostics={nodeFieldDiagnostics("operation.source.max_concurrency")}
                 label="Max concurrency"
                 min="1"
@@ -6489,7 +6634,8 @@ function Inspector({
                 Use 1 for sequential loop iterations. Increase this only when child nodes are safe to run in parallel.
               </p>
               <ToggleField
-                checked={Boolean(operation.source?.fail_fast)}
+                allowRuntimeReference
+                checked={operation.source?.fail_fast ?? false}
                 label="Fail fast"
                 onChange={(checked) =>
                   onOperationChange({
@@ -6605,17 +6751,20 @@ function Inspector({
                 onChange={(value) => onOperationChange({ encoding: value })}
               />
               <ToggleField
-                checked={operation.create_dirs !== false}
+                allowRuntimeReference
+                checked={operation.create_dirs ?? true}
                 label="Create parent folders"
                 onChange={(checked) => onOperationChange({ create_dirs: checked })}
               />
               <ToggleField
-                checked={operation.overwrite !== false}
+                allowRuntimeReference
+                checked={operation.overwrite ?? true}
                 label="Overwrite existing file"
                 onChange={(checked) => onOperationChange({ overwrite: checked })}
               />
               <ToggleField
-                checked={Boolean(operation.append)}
+                allowRuntimeReference
+                checked={operation.append ?? false}
                 label="Append instead of replace"
                 onChange={(checked) => onOperationChange({ append: checked })}
               />
@@ -6641,12 +6790,14 @@ function Inspector({
                 pathBasePath={dataDir}
               />
               <ToggleField
-                checked={operation.create_dirs !== false}
+                allowRuntimeReference
+                checked={operation.create_dirs ?? true}
                 label="Create parent folders"
                 onChange={(checked) => onOperationChange({ create_dirs: checked })}
               />
               <ToggleField
-                checked={Boolean(operation.overwrite)}
+                allowRuntimeReference
+                checked={operation.overwrite ?? false}
                 label="Overwrite existing destination"
                 onChange={(checked) => onOperationChange({ overwrite: checked })}
               />
@@ -6664,17 +6815,20 @@ function Inspector({
                 pathBasePath={dataDir}
               />
               <ToggleField
-                checked={operation.use_trash !== false}
-                label="Move to Gofer trash"
+                allowRuntimeReference
+                checked={operation.use_trash ?? true}
+                label="Move to Taskurotta trash"
                 onChange={(checked) => onOperationChange({ use_trash: checked })}
               />
               <ToggleField
-                checked={Boolean(operation.recursive)}
+                allowRuntimeReference
+                checked={operation.recursive ?? false}
                 label="Allow recursive folder delete"
                 onChange={(checked) => onOperationChange({ recursive: checked })}
               />
               <ToggleField
-                checked={Boolean(operation.missing_ok)}
+                allowRuntimeReference
+                checked={operation.missing_ok ?? false}
                 label="Succeed if missing"
                 onChange={(checked) => onOperationChange({ missing_ok: checked })}
               />
@@ -6721,6 +6875,7 @@ function Inspector({
                 placeholder="File, folder, URL, or app path"
               />
               <SelectField
+                allowRuntimeReference
                 label="Type"
                 value={operation.resource_type ?? "auto"}
                 options={[
@@ -6778,15 +6933,74 @@ function Inspector({
                 onChange={(value) => onOperationChange({ encoding: value })}
               />
               <ToggleField
-                checked={operation.create_dirs !== false}
+                allowRuntimeReference
+                checked={operation.create_dirs ?? true}
                 label="Create parent folders"
                 onChange={(checked) => onOperationChange({ create_dirs: checked })}
               />
               <ToggleField
-                checked={operation.overwrite !== false}
+                allowRuntimeReference
+                checked={operation.overwrite ?? true}
                 label="Overwrite existing file"
                 onChange={(checked) => onOperationChange({ overwrite: checked })}
               />
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "workflow" ? (
+            <InspectorSection title="Workflow call">
+              <TextField
+                diagnostics={nodeFieldDiagnostics("operation.workflow_id")}
+                label="Workflow ID"
+                value={operation.workflow_id ?? ""}
+                onChange={(value) => onOperationChange({ workflow_id: value })}
+                placeholder="development-checks"
+              />
+              <JsonBodyField
+                label="Input bindings (JSON object or quoted exact reference)"
+                value={operation.input_bindings ?? {}}
+                onChange={(value) => onOperationChange({ input_bindings: value ?? {} })}
+              />
+              <p className="text-xs leading-5 text-muted">
+                Bind values from this run into the called workflow’s immutable inputs.
+              </p>
+            </InspectorSection>
+          ) : null}
+
+          {operation.type === "subflow" ? (
+            <InspectorSection title="Subflow call">
+              <TextField
+                diagnostics={nodeFieldDiagnostics("operation.component_id")}
+                label="Component ID"
+                value={operation.component_id ?? ""}
+                onChange={(value) => onOperationChange({ component_id: value })}
+                placeholder="counter"
+              />
+              <TextField
+                diagnostics={nodeFieldDiagnostics("operation.source_path")}
+                label="Source workflow"
+                value={operation.source_path ?? ""}
+                onChange={(value) => onOperationChange({ source_path: value })}
+                pathPicker
+                pathBasePath={dataDir}
+                placeholder="workflows/child.toml"
+              />
+              <JsonBodyField
+                label="Input bindings (JSON object or quoted exact reference)"
+                value={operation.input_bindings ?? operation.parameter_bindings ?? {}}
+                onChange={(value) =>
+                  onOperationChange({ input_bindings: value ?? {}, parameter_bindings: {} })
+                }
+              />
+              <JsonBodyField
+                label="Declared outputs (JSON object)"
+                value={operation.output_contract ?? {}}
+                onChange={(value) => onOperationChange({ output_contract: value ?? {} })}
+              />
+              <p className="text-xs leading-5 text-muted">
+                The child receives a fresh scope. Only bound inputs and declared outputs cross the
+                boundary.
+              </p>
             </InspectorSection>
           ) : null}
 
@@ -6800,6 +7014,7 @@ function Inspector({
                   onChange={(value) => onOperationChange({ agent_id: value })}
                 />
                 <SelectField
+                  allowRuntimeReference
                   label="Task"
                   value={operation.task ?? "summarize"}
                   options={[
@@ -6811,6 +7026,17 @@ function Inspector({
                     ["classify", "Classify"],
                   ]}
                   onChange={(value) => onOperationChange({ task: value })}
+                />
+                <SelectField
+                  allowRuntimeReference
+                  label="Memory"
+                  value={operation.memory ?? "none"}
+                  options={[
+                    ["none", "None"],
+                    ["run", "This run only"],
+                    ["all", "All runs"],
+                  ]}
+                  onChange={(value) => onOperationChange({ memory: value })}
                 />
                 <TextareaField
                   label="Target"
@@ -6839,13 +7065,18 @@ function Inspector({
                   options={profileSelectOptions(providerProfiles, agentConfig?.subscription)}
                   onChange={(value) => onOperationChange({ profile: value })}
                 />
-                <TextField
-                  label="Model override"
-                  value={operation.model ?? ""}
-                  onChange={(value) => onOperationChange({ model: value })}
-                  placeholder="Optional"
+                <ProviderModelEffortFields
+                  allowInheritedModel
+                  capabilities={providerCapabilities}
+                  effort={operation.effort ?? ""}
+                  model={operation.model ?? ""}
+                  provider={agentConfig?.subscription}
+                  showProvider={false}
+                  onChange={(patch) => onOperationChange(patch)}
+                  onRefresh={onProviderCapabilitiesRefresh}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Timeout override"
                   min="0"
                   step="1"
@@ -6853,12 +7084,24 @@ function Inspector({
                   onChange={(value) => onOperationChange({ timeout: value || "" })}
                   placeholder="Seconds"
                 />
-                <InputMappingField
+                <KeyValueField
                   label="Input mapping"
-                  sourceGroups={inputSourceGroups}
-                  sourceOptions={inputSourceOptions}
                   value={operation.input_mapping ?? {}}
                   onChange={(value) => onOperationChange({ input_mapping: value })}
+                />
+                <JsonBodyField
+                  label="Output schema (JSON Schema or quoted schema name)"
+                  value={operation.output_schema ?? null}
+                  onChange={(value) => onOperationChange({ output_schema: value })}
+                />
+                <NumberField
+                  allowRuntimeReference
+                  label="Structured output repair attempts"
+                  min="0"
+                  max="3"
+                  step="1"
+                  value={operation.repair_attempts ?? 0}
+                  onChange={(value) => onOperationChange({ repair_attempts: value || 0 })}
                 />
               </InspectorSection>
               <AgentConfigSection
@@ -6867,7 +7110,9 @@ function Inspector({
                 agentId={operation.agent_id}
                 pathBasePath={dataDir}
                 providerProfiles={providerProfiles}
+                providerCapabilities={providerCapabilities}
                 onProviderProfilesChange={onProviderProfilesChange}
+                onProviderCapabilitiesRefresh={onProviderCapabilitiesRefresh}
                 onAgentChange={onAgentChange}
               />
             </>
@@ -6898,6 +7143,7 @@ function Inspector({
                   onChange={(value) => onOperationChange({ glob: value })}
                 />
                 <SelectField
+                  allowRuntimeReference
                   label="Mode"
                   value={operation.mode ?? "incremental"}
                   options={[
@@ -6909,17 +7155,20 @@ function Inspector({
                   onChange={(value) => onOperationChange({ mode: value })}
                 />
                 <ToggleField
-                  checked={operation.recursive !== false}
+                  allowRuntimeReference
+                  checked={operation.recursive ?? true}
                   label="Recursive"
                   onChange={(checked) => onOperationChange({ recursive: checked })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Chunk size"
                   min="100"
                   value={operation.chunk_size ?? 1200}
                   onChange={(value) => onOperationChange({ chunk_size: value || 1200 })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Chunk overlap"
                   min="0"
                   value={operation.chunk_overlap ?? 120}
@@ -6948,12 +7197,14 @@ function Inspector({
                   onChange={(value) => onOperationChange({ query: value })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Top K"
                   min="1"
                   value={operation.top_k ?? 5}
                   onChange={(value) => onOperationChange({ top_k: value || 5 })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Score threshold"
                   min="0"
                   step="0.01"
@@ -6961,12 +7212,14 @@ function Inspector({
                   onChange={(value) => onOperationChange({ score_threshold: value || 0 })}
                 />
                 <ToggleField
-                  checked={operation.include_snippets !== false}
+                  allowRuntimeReference
+                  checked={operation.include_snippets ?? true}
                   label="Include snippets"
                   onChange={(checked) => onOperationChange({ include_snippets: checked })}
                 />
                 <ToggleField
-                  checked={operation.include_file_metadata !== false}
+                  allowRuntimeReference
+                  checked={operation.include_file_metadata ?? true}
                   label="Include file metadata"
                   onChange={(checked) => onOperationChange({ include_file_metadata: checked })}
                 />
@@ -7020,13 +7273,14 @@ function Inspector({
                 />
                 <ListField
                   label="Expected statuses"
-                  value={(operation.expected_statuses ?? [200]).map((status) => String(status))}
+                  value={runtimeListEditorValue(operation.expected_statuses ?? [200])}
                   onChange={(value) =>
-                    onOperationChange({ expected_statuses: value.map((status) => Number(status)) })
+                    onOperationChange({ expected_statuses: runtimeIntegerListValue(value) })
                   }
                   placeholder="200, 201"
                 />
                 <SelectField
+                  allowRuntimeReference
                   label="Response mode"
                   value={operation.response_mode ?? "auto"}
                   options={[
@@ -7038,6 +7292,7 @@ function Inspector({
                   onChange={(value) => onOperationChange({ response_mode: value })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Timeout seconds"
                   min="0.1"
                   step="0.1"
@@ -7045,6 +7300,7 @@ function Inspector({
                   onChange={(value) => onOperationChange({ timeout_seconds: value || 30 })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Retry attempts"
                   min="1"
                   value={operation.retry?.attempts ?? 1}
@@ -7055,6 +7311,7 @@ function Inspector({
                   }
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Retry backoff seconds"
                   min="0"
                   step="0.1"
@@ -7067,12 +7324,12 @@ function Inspector({
                 />
                 <ListField
                   label="Retry statuses"
-                  value={(operation.retry?.retry_on_statuses ?? []).map((status) => String(status))}
+                  value={runtimeListEditorValue(operation.retry?.retry_on_statuses ?? [])}
                   onChange={(value) =>
                     onOperationChange({
                       retry: {
                         ...(operation.retry ?? {}),
-                        retry_on_statuses: value.map((status) => Number(status)),
+                        retry_on_statuses: runtimeIntegerListValue(value),
                       },
                     })
                   }
@@ -7104,6 +7361,7 @@ function Inspector({
                   onChange={(value) => onOperationChange({ message: value })}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Timeout seconds"
                   min="0"
                   step="1"
@@ -7114,6 +7372,7 @@ function Inspector({
                   placeholder="None"
                 />
                 <SelectField
+                  allowRuntimeReference
                   label="Timeout decision"
                   value={operation.timeout_decision ?? "timeout"}
                   options={[
@@ -7129,13 +7388,14 @@ function Inspector({
                   placeholder="alice, ops-team"
                 />
                 <ToggleField
-                  checked={Boolean(operation.notify)}
+                  allowRuntimeReference
+                  checked={operation.notify ?? false}
                   label="Desktop notification"
                   onChange={(checked) => onOperationChange({ notify: checked })}
                 />
                 <TextField
                   label="Notification title"
-                  value={operation.notification_title ?? "Gofer Flow approval needed"}
+                  value={operation.notification_title ?? "Taskurotta approval needed"}
                   onChange={(value) => onOperationChange({ notification_title: value })}
                 />
               </InspectorSection>
@@ -7157,84 +7417,75 @@ function Inspector({
                 onChange={(value) => onOperationChange({ body: value })}
               />
               <SelectField
+                allowRuntimeReference
                 label="Channel"
                 value={operation.channel ?? "desktop"}
                 options={[
                   ["desktop", "Desktop"],
-                  ["slack", "Slack webhook"],
-                  ["teams", "Teams webhook"],
+                  ["slack", "Slack"],
+                  ["teams", "Microsoft Teams"],
                   ["webhook", "Webhook"],
                   ["email", "Email"],
                 ]}
                 onChange={(value) => onOperationChange({ channel: value })}
               />
+              <SelectField
+                allowRuntimeReference
+                label="Urgency"
+                value={operation.urgency ?? "normal"}
+                options={[
+                  ["low", "Low"],
+                  ["normal", "Normal"],
+                  ["critical", "Critical"],
+                ]}
+                onChange={(value) => onOperationChange({ urgency: value })}
+              />
               {["slack", "teams", "webhook"].includes(operation.channel) ? (
                 <>
                   <TextField
-                    diagnostics={nodeFieldDiagnostics("operation.webhook_url")}
                     label="Webhook URL"
                     value={operation.webhook_url ?? ""}
                     onChange={(value) => onOperationChange({ webhook_url: value })}
+                    placeholder="https://hooks.example.com/services/..."
                   />
-                  <JsonBodyField
+                  <KeyValueField
                     label="Headers"
                     value={operation.headers ?? {}}
                     onChange={(value) => onOperationChange({ headers: value })}
                   />
                   <JsonBodyField
-                    label="Payload"
-                    value={operation.payload ?? null}
+                    label="Payload (JSON)"
+                    value={operation.payload}
                     onChange={(value) => onOperationChange({ payload: value })}
-                  />
-                  <NumberField
-                    label="Timeout seconds"
-                    min="0"
-                    step="0.5"
-                    value={operation.timeout_seconds ?? 30}
-                    onChange={(value) => onOperationChange({ timeout_seconds: value })}
-                  />
-                  <ListField
-                    label="Expected statuses"
-                    value={operation.expected_statuses ?? [200, 201, 202, 204]}
-                    onChange={(value) =>
-                      onOperationChange({ expected_statuses: value.map((item) => Number(item)) })
-                    }
-                    placeholder="200, 202"
-                  />
-                  <ListField
-                    label="Network allowlist"
-                    value={operation.network_allowlist ?? []}
-                    onChange={(value) => onOperationChange({ network_allowlist: value })}
-                    placeholder="hooks.slack.com, 203.0.113.0/24"
                   />
                 </>
               ) : null}
               {operation.channel === "email" ? (
                 <>
                   <TextField
-                    diagnostics={nodeFieldDiagnostics("operation.email_from")}
-                    label="From"
+                    label="From address"
                     value={operation.email_from ?? ""}
                     onChange={(value) => onOperationChange({ email_from: value })}
+                    placeholder="gofer@example.com"
                   />
                   <ListField
-                    diagnostics={nodeFieldDiagnostics("operation.email_to")}
-                    label="To"
+                    label="Recipients"
                     value={operation.email_to ?? []}
                     onChange={(value) => onOperationChange({ email_to: value })}
-                    placeholder="ops@example.com, oncall@example.com"
+                    placeholder="ops@example.com, owner@example.com"
                   />
                   <TextField
-                    diagnostics={nodeFieldDiagnostics("operation.smtp_host")}
                     label="SMTP host"
                     value={operation.smtp_host ?? ""}
                     onChange={(value) => onOperationChange({ smtp_host: value })}
+                    placeholder="smtp.example.com"
                   />
                   <NumberField
+                    allowRuntimeReference
                     label="SMTP port"
                     min="1"
                     value={operation.smtp_port ?? 587}
-                    onChange={(value) => onOperationChange({ smtp_port: value })}
+                    onChange={(value) => onOperationChange({ smtp_port: value || 587 })}
                   />
                   <TextField
                     label="SMTP username"
@@ -7242,27 +7493,30 @@ function Inspector({
                     onChange={(value) => onOperationChange({ smtp_username: value })}
                   />
                   <TextField
-                    label="SMTP password"
+                    label="SMTP password or secret reference"
                     value={operation.smtp_password ?? ""}
                     onChange={(value) => onOperationChange({ smtp_password: value })}
+                    placeholder="{{secret.SMTP_PASSWORD}}"
                   />
                   <ToggleField
-                    checked={operation.smtp_starttls !== false}
-                    label="STARTTLS"
+                    allowRuntimeReference
+                    checked={operation.smtp_starttls ?? true}
+                    label="Use STARTTLS"
                     onChange={(checked) => onOperationChange({ smtp_starttls: checked })}
-                  />
-                  <NumberField
-                    label="Timeout seconds"
-                    min="0"
-                    step="0.5"
-                    value={operation.timeout_seconds ?? 30}
-                    onChange={(value) => onOperationChange({ timeout_seconds: value })}
                   />
                 </>
               ) : null}
-              {["slack", "teams", "webhook", "email"].includes(operation.channel) ? (
+              {operation.channel !== "desktop" ? (
                 <>
                   <NumberField
+                    allowRuntimeReference
+                    label="Timeout seconds"
+                    min="0.1"
+                    value={operation.timeout_seconds ?? 30}
+                    onChange={(value) => onOperationChange({ timeout_seconds: value || 30 })}
+                  />
+                  <NumberField
+                    allowRuntimeReference
                     label="Retry attempts"
                     min="1"
                     value={operation.retry?.attempts ?? 1}
@@ -7273,9 +7527,9 @@ function Inspector({
                     }
                   />
                   <NumberField
+                    allowRuntimeReference
                     label="Retry backoff seconds"
                     min="0"
-                    step="0.1"
                     value={operation.retry?.backoff_seconds ?? 0}
                     onChange={(value) =>
                       onOperationChange({
@@ -7285,124 +7539,37 @@ function Inspector({
                   />
                   <ListField
                     label="Retry statuses"
-                    value={(operation.retry?.retry_on_statuses ?? []).map((status) =>
-                      String(status),
-                    )}
+                    value={runtimeListEditorValue(operation.retry?.retry_on_statuses ?? [])}
                     onChange={(value) =>
                       onOperationChange({
                         retry: {
                           ...(operation.retry ?? {}),
-                          retry_on_statuses: value.map((status) => Number(status)),
+                          retry_on_statuses: runtimeIntegerListValue(value),
                         },
                       })
                     }
                     placeholder="429, 503"
                   />
-                </>
-              ) : null}
-              <SelectField
-                label="Urgency"
-                value={operation.urgency ?? "normal"}
-                options={[
-                  ["low", "Low"],
-                  ["normal", "Normal"],
-                  ["critical", "Critical"],
-                ]}
-                onChange={(value) => onOperationChange({ urgency: value })}
-              />
-            </InspectorSection>
-          ) : null}
-
-          {operation.type === "dashboard_item" ? (
-            <InspectorSection title="Dashboard item">
-              <SelectField
-                label="Action"
-                value={operation.action ?? "read"}
-                options={[
-                  ["read", "Read matching items"],
-                  ["add", "Add item"],
-                  ["update", "Update item"],
-                  ["move", "Move item"],
-                  ["delete", "Delete item"],
-                ]}
-                onChange={(value) => onOperationChange({ action: value })}
-              />
-              <SelectField
-                diagnostics={nodeFieldDiagnostics("operation.dashboard")}
-                label="Dashboard"
-                value={operation.dashboard ?? ""}
-                options={dashboardSelectOptions(dashboards)}
-                onChange={(value) => {
-                  const component = firstDashboardComponent(dashboards, value);
-                  onOperationChange({
-                    dashboard: value,
-                    component: component?.id ?? "",
-                  });
-                }}
-              />
-              <SelectField
-                diagnostics={nodeFieldDiagnostics("operation.component")}
-                label="Component"
-                value={operation.component ?? ""}
-                options={dashboardComponentSelectOptions(dashboards, operation.dashboard)}
-                onChange={(value) => onOperationChange({ component: value })}
-              />
-              {operation.action === "read" ? (
-                <TextField
-                  label="Filter"
-                  value={operation.filter ?? ""}
-                  onChange={(value) => onOperationChange({ filter: value })}
-                  placeholder="status=todo"
-                />
-              ) : null}
-              {["update", "move", "delete"].includes(operation.action ?? "read") ? (
-                <TextField
-                  label="Item ID"
-                  value={operation.item_id ?? ""}
-                  onChange={(value) => onOperationChange({ item_id: value })}
-                  placeholder="{{loop.current.item_id}}"
-                />
-              ) : null}
-              {operation.action === "add" ? (
-                <KeyValueField
-                  label="Item fields"
-                  value={operation.item ?? {}}
-                  onChange={(value) => onOperationChange({ item: value })}
-                />
-              ) : null}
-              {operation.action === "update" ? (
-                <KeyValueField
-                  label="Patch fields"
-                  value={operation.patch ?? {}}
-                  onChange={(value) => onOperationChange({ patch: value })}
-                />
-              ) : null}
-              {operation.action === "move" ? (
-                <>
-                  <SelectField
-                    label="Field"
-                    value={operation.field ?? "status"}
-                    options={dashboardFieldSelectOptions(
-                      dashboards,
-                      operation.dashboard,
-                      operation.component,
+                  <ListField
+                    label="Expected statuses"
+                    value={runtimeListEditorValue(
+                      operation.expected_statuses ?? [200, 201, 202, 204],
                     )}
-                    onChange={(value) => onOperationChange({ field: value })}
+                    onChange={(value) =>
+                      onOperationChange({
+                        expected_statuses: runtimeIntegerListValue(value),
+                      })
+                    }
+                    placeholder="200, 201, 202, 204"
                   />
-                  <DashboardValueField
-                    dashboards={dashboards}
-                    dashboardIdOrName={operation.dashboard}
-                    componentId={operation.component}
-                    field={operation.field ?? "status"}
-                    value={operation.value ?? ""}
-                    onChange={(value) => onOperationChange({ value })}
+                  <ListField
+                    label="Network allowlist"
+                    value={operation.network_allowlist ?? []}
+                    onChange={(value) => onOperationChange({ network_allowlist: value })}
+                    placeholder="hooks.slack.com, outlook.office.com"
                   />
                 </>
               ) : null}
-              <p className="text-xs leading-5 text-muted">
-                Use this after a dashboard item loop to deterministically update the current item.
-                Item ID can use templates such as {"{{loop.current.item_id}}"}.
-              </p>
             </InspectorSection>
           ) : null}
 
@@ -7444,13 +7611,18 @@ function Inspector({
                   options={profileSelectOptions(providerProfiles, agentConfig?.subscription)}
                   onChange={(value) => onOperationChange({ profile: value })}
                 />
-                <TextField
-                  label="Model override"
-                  value={operation.model ?? ""}
-                  onChange={(value) => onOperationChange({ model: value })}
-                  placeholder="Optional"
+                <ProviderModelEffortFields
+                  allowInheritedModel
+                  capabilities={providerCapabilities}
+                  effort={operation.effort ?? ""}
+                  model={operation.model ?? ""}
+                  provider={agentConfig?.subscription}
+                  showProvider={false}
+                  onChange={(patch) => onOperationChange(patch)}
+                  onRefresh={onProviderCapabilitiesRefresh}
                 />
                 <NumberField
+                  allowRuntimeReference
                   label="Timeout override"
                   min="0"
                   step="1"
@@ -7459,6 +7631,7 @@ function Inspector({
                   placeholder="Seconds"
                 />
                 <SelectField
+                  allowRuntimeReference
                   label="Memory"
                   value={operation.memory ?? "none"}
                   options={[
@@ -7468,12 +7641,24 @@ function Inspector({
                   ]}
                   onChange={(value) => onOperationChange({ memory: value })}
                 />
-                <InputMappingField
+                <KeyValueField
                   label="Input mapping"
-                  sourceGroups={inputSourceGroups}
-                  sourceOptions={inputSourceOptions}
                   value={operation.input_mapping ?? {}}
                   onChange={(value) => onOperationChange({ input_mapping: value })}
+                />
+                <JsonBodyField
+                  label="Output schema (JSON Schema or quoted schema name)"
+                  value={operation.output_schema ?? null}
+                  onChange={(value) => onOperationChange({ output_schema: value })}
+                />
+                <NumberField
+                  allowRuntimeReference
+                  label="Structured output repair attempts"
+                  min="0"
+                  max="3"
+                  step="1"
+                  value={operation.repair_attempts ?? 0}
+                  onChange={(value) => onOperationChange({ repair_attempts: value || 0 })}
                 />
               </InspectorSection>
 
@@ -7484,13 +7669,24 @@ function Inspector({
                   agentId={operation.agent_id}
                   pathBasePath={dataDir}
                   providerProfiles={providerProfiles}
+                  providerCapabilities={providerCapabilities}
                   onProviderProfilesChange={onProviderProfilesChange}
+                  onProviderCapabilitiesRefresh={onProviderCapabilitiesRefresh}
                   onAgentChange={onAgentChange}
                 />
               </InspectorSection>
             </>
           ) : null}
+              </div>
 
+              <div
+                id="node-tabpanel-edges"
+                aria-labelledby="node-tab-edges"
+                className="node-inspector-panel space-y-4 p-4"
+                hidden={nodeTab !== "edges"}
+                role="tabpanel"
+                tabIndex={0}
+              >
           <InspectorSection title="Edges">
             <div className="space-y-3">
               <div className="grid grid-cols-[1.1fr_1fr_1fr] gap-2 px-1 text-xs font-semibold uppercase tracking-[0.08em] text-muted">
@@ -7525,6 +7721,9 @@ function Inspector({
                           nextEdge.to,
                           nextEdge.condition,
                           nextEdge.outputPattern,
+                          nextEdge.field,
+                          nextEdge.operator,
+                          nextEdge.value,
                         );
                         setDraftEdge(null);
                       }}
@@ -7557,14 +7756,10 @@ function Inspector({
               ) : null}
             </div>
           </InspectorSection>
-
-          {nodeRun ? (
-            <RunNodeInspector nodeRun={nodeRun} />
-          ) : null}
+              </div>
             </div>
-          </InspectorPanel>
+          </div>
         ) : null}
-        </PathTrustContext.Provider>
       </div>
     </aside>
   );
@@ -7587,118 +7782,11 @@ export function defaultFanSource(type) {
       };
     case "trigger_events":
       return { type, include_content: false, max_concurrency: 1, fail_fast: false };
-    case "dashboard_items":
-      return {
-        type,
-        dashboard: "",
-        component: "",
-        filter: "",
-        max_concurrency: 1,
-        fail_fast: false,
-      };
     case "infinite":
       return { type, max_concurrency: 1, fail_fast: false };
     default:
       return null;
   }
-}
-
-function dashboardSelectOptions(dashboards = []) {
-  return [
-    ["", "Select dashboard"],
-    ...dashboards.map((dashboard) => [
-      dashboard.id,
-      dashboard.name ? `${dashboard.name} (${dashboard.id})` : dashboard.id,
-    ]),
-  ];
-}
-
-function dashboardComponentSelectOptions(dashboards = [], dashboardIdOrName = "") {
-  const dashboard = dashboards.find(
-    (candidate) => candidate.id === dashboardIdOrName || candidate.name === dashboardIdOrName,
-  );
-  const components = (dashboard?.sections ?? []).flatMap((section) =>
-    (section.components ?? []).map((component) => ({
-      ...component,
-      sectionTitle: section.title,
-    })),
-  );
-  return [
-    ["", "Select component"],
-    ...components.map((component) => [
-      component.id,
-      component.sectionTitle
-        ? `${component.title} (${component.id}) · ${component.sectionTitle}`
-        : `${component.title} (${component.id})`,
-    ]),
-  ];
-}
-
-function firstDashboardComponent(dashboards = [], dashboardIdOrName = "") {
-  const dashboard = dashboards.find(
-    (candidate) => candidate.id === dashboardIdOrName || candidate.name === dashboardIdOrName,
-  );
-  return (dashboard?.sections ?? []).flatMap((section) => section.components ?? [])[0] ?? null;
-}
-
-function dashboardComponentById(dashboard, componentId = "") {
-  return (
-    (dashboard?.sections ?? [])
-      .flatMap((section) => section.components ?? [])
-      .find((component) => component.id === componentId) ?? null
-  );
-}
-
-function dashboardFieldSelectOptions(dashboards = [], dashboardIdOrName = "", componentId = "") {
-  const dashboard = dashboards.find(
-    (candidate) => candidate.id === dashboardIdOrName || candidate.name === dashboardIdOrName,
-  );
-  const component = dashboardComponentById(dashboard, componentId);
-  const fields = new Set([
-    ...Object.keys(component?.schema ?? {}),
-    ...(component?.items ?? []).flatMap((item) => Object.keys(item ?? {})),
-  ]);
-  if (!fields.size) {
-    fields.add("status");
-  }
-  return [...fields].sort().map((field) => [field, field]);
-}
-
-function dashboardFieldSchema(dashboards = [], dashboardIdOrName = "", componentId = "", field = "") {
-  const dashboard = dashboards.find(
-    (candidate) => candidate.id === dashboardIdOrName || candidate.name === dashboardIdOrName,
-  );
-  const component = dashboardComponentById(dashboard, componentId);
-  return component?.schema?.[field] ?? null;
-}
-
-function DashboardValueField({
-  dashboards,
-  dashboardIdOrName,
-  componentId,
-  field,
-  onChange,
-  value,
-}) {
-  const schema = dashboardFieldSchema(dashboards, dashboardIdOrName, componentId, field);
-  if (schema?.type === "enum" && Array.isArray(schema.values) && schema.values.length) {
-    return (
-      <SelectField
-        label="Value"
-        value={value ?? ""}
-        options={[["", "Select value"], ...schema.values.map((item) => [String(item), String(item)])]}
-        onChange={onChange}
-      />
-    );
-  }
-  return (
-    <TextField
-      label="Value"
-      value={value ?? ""}
-      onChange={onChange}
-      placeholder="completed"
-    />
-  );
 }
 
 function ConnectedEdgeEditor({
@@ -7724,6 +7812,9 @@ function ConnectedEdgeEditor({
     const patch = {
       condition: value,
       outputPattern: value === "output_matches" ? edge.outputPattern || "" : null,
+      field: value === "output_field" ? edge.field || "" : null,
+      operator: value === "output_field" ? edge.operator || "equals" : null,
+      value: value === "output_field" ? edge.value ?? null : null,
     };
     if (draft) {
       updateDraft(patch);
@@ -7781,7 +7872,7 @@ function ConnectedEdgeEditor({
       className="space-y-2"
       onBlur={handleBlur}
     >
-      <div className="grid grid-cols-[1.1fr_1fr_1fr_auto] gap-2">
+      <div className="grid min-w-0 grid-cols-[minmax(0,1.1fr)_minmax(0,1fr)_minmax(0,1fr)_32px] gap-2">
         <EdgeSelect
           diagnostics={edgeFieldDiagnostics("condition")}
           value={typeValue}
@@ -7829,6 +7920,37 @@ function ConnectedEdgeEditor({
           placeholder="regex pattern"
         />
       ) : null}
+      {typeValue === "output_field" ? (
+        <div className="grid grid-cols-2 gap-2">
+          <InlineTextField
+            diagnostics={edgeFieldDiagnostics("field")}
+            value={edge.field ?? ""}
+            onChange={(value) =>
+              draft ? updateDraft({ field: value }) : onUpdate({ field: value })
+            }
+            placeholder="field.path"
+          />
+          <EdgeSelect
+            diagnostics={edgeFieldDiagnostics("operator")}
+            value={edge.operator ?? "equals"}
+            options={edgeOutputFieldOperatorOptions}
+            onChange={(value) =>
+              draft ? updateDraft({ operator: value }) : onUpdate({ operator: value })
+            }
+          />
+          {(edge.operator ?? "equals") !== "exists" ? (
+            <div className="col-span-2">
+              <JsonBodyField
+                label="Comparison value (JSON)"
+                value={edge.value}
+                onChange={(value) =>
+                  draft ? updateDraft({ value }) : onUpdate({ value })
+                }
+              />
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -7850,8 +7972,10 @@ function AgentConfigSection({
   diagnostics = [],
   agentId,
   onAgentChange,
+  onProviderCapabilitiesRefresh,
   onProviderProfilesChange,
   pathBasePath,
+  providerCapabilities = [],
   providerProfiles = [],
 }) {
   if (!agentConfig) return null;
@@ -7862,8 +7986,10 @@ function AgentConfigSection({
         diagnostics={diagnostics}
         agentId={agentId}
         onAgentChange={onAgentChange}
+        onProviderCapabilitiesRefresh={onProviderCapabilitiesRefresh}
         onProviderProfilesChange={onProviderProfilesChange}
         pathBasePath={pathBasePath}
+        providerCapabilities={providerCapabilities}
         providerProfiles={providerProfiles}
       />
     </InspectorSection>
@@ -7875,23 +8001,30 @@ function AgentConfigFields({
   diagnostics = [],
   agentId,
   onAgentChange,
+  onProviderCapabilitiesRefresh,
   onProviderProfilesChange,
   pathBasePath,
+  providerCapabilities = [],
   providerProfiles = [],
 }) {
   const agentFieldDiagnostics = (...fields) => diagnosticsForField(diagnostics, ...fields);
   return (
     <>
-      <SelectField
-        label="Subscription"
-        value={agentConfig.subscription}
-        options={[
-          ["codex", "Codex"],
-          ["claude_code", "Claude Code"],
-          ["openai_api", "OpenAI API"],
-          ["anthropic_api", "Anthropic API"],
-        ]}
-        onChange={(value) => onAgentChange(agentId, { subscription: value })}
+      <ProviderModelEffortFields
+        capabilities={providerCapabilities}
+        effort={agentConfig.effort ?? ""}
+        model={agentConfig.model ?? ""}
+        provider={agentConfig.subscription}
+        onChange={(patch) => {
+          const nextPatch = { ...patch };
+          if (patch.provider !== undefined) {
+            nextPatch.subscription = patch.provider;
+            nextPatch.profile = "";
+            delete nextPatch.provider;
+          }
+          onAgentChange(agentId, nextPatch);
+        }}
+        onRefresh={onProviderCapabilitiesRefresh}
       />
       <SelectField
         label="Provider profile"
@@ -7901,16 +8034,12 @@ function AgentConfigFields({
       />
       <ProviderProfileEditor
         agentSubscription={agentConfig.subscription}
+        providerCapabilities={providerCapabilities}
         providerProfiles={providerProfiles}
         selectedProfileName={agentConfig.profile ?? ""}
         onAgentChange={(patch) => onAgentChange(agentId, patch)}
+        onProviderCapabilitiesRefresh={onProviderCapabilitiesRefresh}
         onProviderProfilesChange={onProviderProfilesChange}
-      />
-      <TextField
-        label="Model override"
-        value={agentConfig.model ?? ""}
-        onChange={(value) => onAgentChange(agentId, { model: value })}
-        placeholder="Optional"
       />
       <HealthDiagnosticList diagnostics={diagnostics} />
       <TextField
@@ -7952,9 +8081,11 @@ function AgentConfigFields({
 
 function ProviderProfileEditor({
   agentSubscription,
+  providerCapabilities = [],
   providerProfiles = [],
   selectedProfileName = "",
   onAgentChange,
+  onProviderCapabilitiesRefresh,
   onProviderProfilesChange,
 }) {
   const selectedProfile =
@@ -8048,22 +8179,20 @@ function ProviderProfileEditor({
             onChange={(value) => setDraft({ ...draft, name: value })}
             placeholder="fast-review"
           />
-          <SelectField
-            label="Subscription"
-            value={draft.subscription}
-            options={[
-              ["codex", "Codex"],
-              ["claude_code", "Claude Code"],
-              ["openai_api", "OpenAI API"],
-              ["anthropic_api", "Anthropic API"],
-            ]}
-            onChange={(value) => setDraft({ ...draft, subscription: value })}
-          />
-          <TextField
-            label="Model"
-            value={draft.model}
-            onChange={(value) => setDraft({ ...draft, model: value })}
-            placeholder="Optional"
+          <ProviderModelEffortFields
+            capabilities={providerCapabilities}
+            effort={draft.effort}
+            model={draft.model}
+            provider={draft.subscription}
+            onChange={(patch) => {
+              const { provider, ...profilePatch } = patch;
+              setDraft({
+                ...draft,
+                ...profilePatch,
+                ...(provider !== undefined ? { subscription: provider } : {}),
+              });
+            }}
+            onRefresh={onProviderCapabilitiesRefresh}
           />
           <NumberField
             label="Timeout"
@@ -8072,12 +8201,6 @@ function ProviderProfileEditor({
             value={draft.timeout}
             onChange={(value) => setDraft({ ...draft, timeout: value })}
             placeholder="Seconds"
-          />
-          <TextField
-            label="Reasoning"
-            value={draft.reasoning}
-            onChange={(value) => setDraft({ ...draft, reasoning: value })}
-            placeholder="Codex only"
           />
           <SelectField
             label="Approval mode"
@@ -8124,53 +8247,13 @@ function ProviderProfileEditor({
           <KeyValueField
             label="Environment"
             value={draft.env}
-            onChange={(value) => {
-              const split = splitProviderProfileEnv(value, draft.secret_refs);
-              setDraft({ ...draft, env: split.env, secret_refs: split.secret_refs });
-            }}
+            onChange={(value) => setDraft({ ...draft, env: value })}
           />
           <KeyValueField
             label="Secret refs"
             value={draft.secret_refs}
             onChange={(value) => setDraft({ ...draft, secret_refs: value })}
           />
-          {["openai_api", "anthropic_api"].includes(draft.subscription) ? (
-            <>
-              <TextField
-                label="API base URL"
-                value={draft.api_base_url}
-                onChange={(value) => setDraft({ ...draft, api_base_url: value })}
-                placeholder="Provider default"
-              />
-              <TextField
-                label="API key env"
-                value={draft.api_key_env}
-                onChange={(value) => setDraft({ ...draft, api_key_env: value })}
-                placeholder={
-                  draft.subscription === "anthropic_api"
-                    ? "ANTHROPIC_API_KEY"
-                    : "OPENAI_API_KEY"
-                }
-              />
-              <TextField
-                label="API key secret"
-                value={draft.api_key_secret}
-                onChange={(value) => setDraft({ ...draft, api_key_secret: value })}
-                placeholder="GOFER secret name"
-              />
-              <TextField
-                label="Organization"
-                value={draft.organization}
-                onChange={(value) => setDraft({ ...draft, organization: value })}
-                placeholder="Optional"
-              />
-              <KeyValueField
-                label="Provider options"
-                value={draft.provider_options}
-                onChange={(value) => setDraft({ ...draft, provider_options: value })}
-              />
-            </>
-          ) : null}
           {error ? <p className="text-xs text-red-600">{error}</p> : null}
           <div className="flex gap-2">
             <button
@@ -8204,7 +8287,7 @@ function profileEditorDraft(profile, subscription) {
     subscription: profile?.subscription ?? subscription ?? "codex",
     model: profile?.model ?? "",
     timeout: profile?.timeout ?? "",
-    reasoning: profile?.reasoning ?? "",
+    effort: profile?.effort ?? "",
     approval_mode: profile?.approval_mode ?? "",
     sandbox_mode: profile?.sandbox_mode ?? "",
     extra_args: profile?.extra_args ?? [],
@@ -8212,11 +8295,6 @@ function profileEditorDraft(profile, subscription) {
     mcp_servers: profile?.mcp_servers ?? [],
     env: profile?.env ?? {},
     secret_refs: profile?.secret_refs ?? {},
-    api_base_url: profile?.api_base_url ?? "",
-    api_key_env: profile?.api_key_env ?? "",
-    api_key_secret: profile?.api_key_secret ?? "",
-    organization: profile?.organization ?? "",
-    provider_options: profile?.provider_options ?? {},
   };
 }
 
@@ -8225,47 +8303,17 @@ function profilePayloadFromDraft(draft) {
     name: draft.name.trim(),
     subscription: draft.subscription,
   };
-  for (const key of [
-    "model",
-    "reasoning",
-    "approval_mode",
-    "sandbox_mode",
-    "api_base_url",
-    "api_key_env",
-    "api_key_secret",
-    "organization",
-  ]) {
+  for (const key of ["model", "effort", "approval_mode", "sandbox_mode"]) {
     if (draft[key]) payload[key] = draft[key];
   }
   if (draft.timeout) payload.timeout = Number(draft.timeout);
   for (const key of ["extra_args", "tools", "mcp_servers"]) {
     if (draft[key]?.length) payload[key] = draft[key];
   }
-  for (const key of ["env", "secret_refs", "provider_options"]) {
+  for (const key of ["env", "secret_refs"]) {
     if (Object.keys(draft[key] ?? {}).length) payload[key] = draft[key];
   }
   return payload;
-}
-
-const MASKED_PROVIDER_SECRET_VALUE = "********";
-const SENSITIVE_PROVIDER_ENV_NAME_PATTERN =
-  /(^|_)(API_?KEY|AUTHORIZATION|AUTH|BEARER|CREDENTIALS?|KEY|PASSWORD|PASS|SECRET|TOKEN)(_|$)/i;
-
-function isSensitiveProviderEnvName(name) {
-  return SENSITIVE_PROVIDER_ENV_NAME_PATTERN.test(String(name ?? "").trim().replaceAll("-", "_"));
-}
-
-function splitProviderProfileEnv(env, existingSecretRefs = {}) {
-  const nextEnv = {};
-  const nextSecretRefs = { ...(existingSecretRefs ?? {}) };
-  for (const [key, value] of Object.entries(env ?? {})) {
-    if (!isSensitiveProviderEnvName(key) || value === MASKED_PROVIDER_SECRET_VALUE) {
-      nextEnv[key] = value;
-      continue;
-    }
-    nextSecretRefs[key] = nextSecretRefs[key] || key;
-  }
-  return { env: nextEnv, secret_refs: nextSecretRefs };
 }
 
 function profileSelectOptions(providerProfiles = [], subscription) {
@@ -8454,6 +8502,34 @@ function HealthDiagnosticList({ diagnostics = [], onApplyFix }) {
   );
 }
 
+function NodeBindingList({ bindings = [] }) {
+  if (!bindings.length) return null;
+  return (
+    <div className="space-y-2" aria-label="Runtime bindings">
+      {bindings.map((binding) => (
+        <div
+          key={binding.id}
+          className="rounded-md border border-cyan-200 bg-cyan-50 px-3 py-2 text-xs leading-5 text-cyan-950"
+        >
+          <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-1">
+            <span className="font-semibold">{binding.destinationField}</span>
+            <span className="text-cyan-800">{binding.status}</span>
+          </div>
+          <p className="mt-1 break-words">
+            <code>{binding.expression}</code>
+            {` from ${binding.producer} · ${binding.sourceType} → ${binding.destinationType}`}
+          </p>
+          <p className="text-cyan-800">
+            {binding.resolutionPhase}
+            {binding.coercion === "string" ? " · string coercion" : ""}
+            {binding.readiness ? ` · secret ${binding.readiness}` : ""}
+          </p>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 export function createDefaultWorkflowNode(
   workflow,
   { type = "agent", usedAgentIds = [], x = 214, y = 204 } = {},
@@ -8577,177 +8653,6 @@ export function moveWorkflowNode(workflow, nodeId, delta) {
   };
 }
 
-export function normalizeCanvasGroups(workflow) {
-  const nodeIds = new Set((workflow.nodes ?? []).map((node) => node.id));
-  const groups = workflow.metadata?.canvas?.groups;
-  if (!Array.isArray(groups)) return [];
-  return groups
-    .filter((group) => group && typeof group === "object")
-    .map((group, index) => {
-      const color = /^#[0-9A-Fa-f]{6}$/.test(String(group.color ?? ""))
-        ? group.color
-        : canvasGroupColors[index % canvasGroupColors.length];
-      return {
-        id: String(group.id || `group-${index + 1}`),
-        label: group.label == null ? `Group ${index + 1}` : String(group.label),
-        color,
-        nodeIds: [...new Set(group.nodeIds ?? group.node_ids ?? [])]
-          .map(String)
-          .filter((nodeId) => nodeIds.has(nodeId)),
-        x: finiteNumber(group.x, 80),
-        y: finiteNumber(group.y, 80),
-        width: Math.max(groupMinWidth, finiteNumber(group.width, 360)),
-        height: Math.max(groupMinHeight, finiteNumber(group.height, 240)),
-        opacity: clamp(finiteNumber(group.opacity, defaultCanvasGroupOpacity), 0, 1),
-        collapsed: Boolean(group.collapsed),
-      };
-    });
-}
-
-function setWorkflowGroups(workflow, groups) {
-  return {
-    ...workflow,
-    metadata: {
-      ...(workflow.metadata ?? {}),
-      canvas: {
-        ...(workflow.metadata?.canvas ?? {}),
-        groups: groups.map((group) => ({
-          id: group.id,
-          label: group.label,
-          color: group.color,
-          nodeIds: group.nodeIds,
-          x: Math.round(group.x),
-          y: Math.round(group.y),
-          width: Math.round(group.width),
-          height: Math.round(group.height),
-          opacity: clamp(finiteNumber(group.opacity, defaultCanvasGroupOpacity), 0, 1),
-          collapsed: Boolean(group.collapsed),
-        })),
-      },
-    },
-  };
-}
-
-export function createCanvasGroup(workflow, nodeIds = []) {
-  const nodes = workflow.nodes ?? [];
-  const selected = nodes.filter((node) => nodeIds.includes(node.id));
-  const members = selected;
-  if (!members.length) return workflow;
-  const existing = normalizeCanvasGroups(workflow);
-  const nextNumber = nextAvailableGroupNumber(existing);
-  const bounds = graphBounds(members, 48);
-  const fallbackX = 120 + nextNumber * 28;
-  const fallbackY = 120 + nextNumber * 24;
-  const group = {
-    id: `group-${nextNumber}`,
-    label: `Group ${nextNumber}`,
-    color: canvasGroupColors[(nextNumber - 1) % canvasGroupColors.length],
-    nodeIds: members.map((node) => node.id),
-    x: members.length ? bounds.left : fallbackX,
-    y: members.length ? bounds.top : fallbackY,
-    width: Math.max(groupMinWidth, members.length ? bounds.width : 360),
-    height: Math.max(groupMinHeight, members.length ? bounds.height : 240),
-    opacity: defaultCanvasGroupOpacity,
-    collapsed: false,
-  };
-  return setWorkflowGroups(workflow, [...existing, group]);
-}
-
-export function updateCanvasGroup(workflow, groupId, patch) {
-  return setWorkflowGroups(
-    workflow,
-    normalizeCanvasGroups(workflow).map((group) =>
-      group.id === groupId
-        ? {
-            ...group,
-            ...patch,
-            width: Math.max(groupMinWidth, finiteNumber(patch.width, group.width)),
-            height: Math.max(groupMinHeight, finiteNumber(patch.height, group.height)),
-          }
-        : group,
-    ),
-  );
-}
-
-export function moveCanvasGroup(workflow, groupId, delta) {
-  const dx = delta.x ?? 0;
-  const dy = delta.y ?? 0;
-  const group = normalizeCanvasGroups(workflow).find((candidate) => candidate.id === groupId);
-  if (!group) return workflow;
-  const memberIds = new Set(group.nodeIds);
-  return updateCanvasGroup(
-    {
-      ...workflow,
-      nodes: (workflow.nodes ?? []).map((node) =>
-        memberIds.has(node.id)
-          ? { ...node, x: (node.x ?? 0) + dx, y: (node.y ?? 0) + dy }
-          : node,
-      ),
-    },
-    groupId,
-    { x: group.x + dx, y: group.y + dy },
-  );
-}
-
-export function duplicateCanvasGroup(workflow, groupId) {
-  const groups = normalizeCanvasGroups(workflow);
-  const group = groups.find((candidate) => candidate.id === groupId);
-  if (!group) return workflow;
-  const nextNumber = nextAvailableGroupNumber(groups);
-  return setWorkflowGroups(workflow, [
-    ...groups,
-    {
-      ...group,
-      id: `group-${nextNumber}`,
-      label: `${group.label} copy`,
-      x: group.x + 32,
-      y: group.y + 32,
-    },
-  ]);
-}
-
-export function deleteCanvasGroup(workflow, groupId) {
-  return setWorkflowGroups(
-    workflow,
-    normalizeCanvasGroups(workflow).filter((group) => group.id !== groupId),
-  );
-}
-
-export function collapsedGroupNodeIds(groups) {
-  const nodeIds = new Set();
-  for (const group of groups) {
-    if (!group.collapsed) continue;
-    for (const nodeId of group.nodeIds) nodeIds.add(nodeId);
-  }
-  return nodeIds;
-}
-
-export function visibleNodesForGroups(nodes, groups) {
-  const hidden = collapsedGroupNodeIds(groups);
-  return nodes.filter((node) => !hidden.has(node.id));
-}
-
-export function visibleEdgesForGroups(edges, visibleNodes) {
-  const visible = new Set(visibleNodes.map((node) => node.id));
-  return edges.filter((edge) => visible.has(edge.from) && visible.has(edge.to));
-}
-
-export function canvasGroupStatus(group, nodeStatuses = {}, pendingApprovals = []) {
-  const statuses = group.nodeIds.map((nodeId) => nodeStatuses[nodeId]).filter(Boolean);
-  const approvalIds = new Set(
-    pendingApprovals
-      .filter((approval) => approval.status === "pending")
-      .map((approval) => approval.nodeId),
-  );
-  if (group.nodeIds.some((nodeId) => approvalIds.has(nodeId))) return "approval";
-  if (statuses.some((status) => status === "running" || status === "started")) return "running";
-  if (statuses.some((status) => status === "error" || status === "failed")) return "error";
-  if (statuses.length && statuses.every((status) => status === "success" || status === "reused")) {
-    return "success";
-  }
-  return statuses.some((status) => status === "queued") ? "queued" : "idle";
-}
-
 export function autoLayoutWorkflow(workflow, options = {}) {
   const nodes = [...(workflow.nodes ?? [])];
   const edges = workflow.edges ?? [];
@@ -8807,55 +8712,21 @@ export function autoLayoutWorkflow(workflow, options = {}) {
     grouped.get(layer).push(node);
   }
 
-  const groupByNodeId = new Map();
-  const canvasGroups = normalizeCanvasGroups(workflow);
-  canvasGroups.forEach((group) => {
-    group.nodeIds.forEach((nodeId) => groupByNodeId.set(nodeId, group.id));
-  });
-  const groupLayerSlots = new Map();
   const positioned = new Map();
   for (const layer of [...grouped.keys()].sort((left, right) => left - right)) {
     const layerNodes = grouped.get(layer).sort(compareNodesForLayout);
-    const rowSlots = new Map();
-    let rowCursor = 0;
     layerNodes.forEach((node, row) => {
-      const groupId = groupByNodeId.get(node.id);
-      const slotKey = groupId || node.id;
-      if (!rowSlots.has(slotKey)) {
-        rowSlots.set(slotKey, rowCursor);
-        rowCursor += groupId ? Math.max(1, canvasGroups.find((group) => group.id === groupId)?.nodeIds.length ?? 1) : 1;
-      }
-      const groupOffset = groupId
-        ? (groupLayerSlots.get(`${layer}:${groupId}`) ?? 0)
-        : 0;
-      groupLayerSlots.set(`${layer}:${groupId}`, groupOffset + 1);
       positioned.set(node.id, {
         ...node,
         x: startX + layer * columnGap,
-        y: startY + rowSlots.get(slotKey) * rowGap + groupOffset * rowGap,
+        y: startY + row * rowGap,
       });
     });
   }
 
-  const positionedNodes = nodes.map((node) => positioned.get(node.id) ?? node);
-  const positionedById = Object.fromEntries(positionedNodes.map((node) => [node.id, node]));
-  const nextGroups = canvasGroups.map((group) => {
-    const members = group.nodeIds.map((nodeId) => positionedById[nodeId]).filter(Boolean);
-    if (!members.length) return group;
-    const bounds = graphBounds(members, 48);
-    return {
-      ...group,
-      x: bounds.left,
-      y: bounds.top,
-      width: Math.max(groupMinWidth, bounds.width),
-      height: Math.max(groupMinHeight, bounds.height),
-    };
-  });
-
   return {
     ...workflow,
-    nodes: positionedNodes,
-    metadata: setWorkflowGroups(workflow, nextGroups).metadata,
+    nodes: nodes.map((node) => positioned.get(node.id) ?? node),
   };
 }
 
@@ -8872,9 +8743,20 @@ export function graphBounds(nodes, padding = 0) {
   }
   const left = Math.min(...nodes.map((node) => node.x ?? 0)) - padding;
   const top = Math.min(...nodes.map((node) => node.y ?? 0)) - padding;
-  const right = Math.max(...nodes.map((node) => (node.x ?? 0) + (node.width ?? nodeWidth))) + padding;
-  const bottom = Math.max(...nodes.map((node) => (node.y ?? 0) + (node.height ?? nodeHeight))) + padding;
+  const right = Math.max(...nodes.map((node) => (node.x ?? 0) + nodeWidth)) + padding;
+  const bottom = Math.max(...nodes.map((node) => (node.y ?? 0) + nodeHeight)) + padding;
   return { left, top, right, bottom, width: right - left, height: bottom - top };
+}
+
+export function minimapPointToWorld(pointer, rect, bounds) {
+  const scale = Math.min(
+    Math.max(1, rect.width) / Math.max(1, bounds.width),
+    Math.max(1, rect.height) / Math.max(1, bounds.height),
+  );
+  return {
+    x: bounds.left + (pointer.clientX - rect.left) / scale,
+    y: bounds.top + (pointer.clientY - rect.top) / scale,
+  };
 }
 
 export function fitViewportToNodes(nodes, viewportSize, options = {}) {
@@ -8933,17 +8815,19 @@ export function removeWorkflowNode(workflow, nodeId) {
     ...workflow,
     nodes: (workflow.nodes ?? []).filter((node) => node.id !== nodeId),
     edges: (workflow.edges ?? []).filter((edge) => edge.from !== nodeId && edge.to !== nodeId),
-    metadata: setWorkflowGroups(
-      workflow,
-      normalizeCanvasGroups(workflow).map((group) => ({
-        ...group,
-        nodeIds: group.nodeIds.filter((candidate) => candidate !== nodeId),
-      })),
-    ).metadata,
   };
 }
 
-export function addWorkflowEdge(workflow, fromNodeId, toNodeId, condition = "always", outputPattern = null) {
+export function addWorkflowEdge(
+  workflow,
+  fromNodeId,
+  toNodeId,
+  condition = "always",
+  outputPattern = null,
+  field = null,
+  operator = null,
+  value = null,
+) {
   const nextCondition = condition || "always";
   const nextOutputPattern = nextCondition === "output_matches" ? outputPattern || "" : null;
   return {
@@ -8954,9 +8838,12 @@ export function addWorkflowEdge(workflow, fromNodeId, toNodeId, condition = "alw
         id: uniqueEdgeId(workflow.edges ?? [], fromNodeId, toNodeId),
         from: fromNodeId,
         to: toNodeId,
-        label: edgeLabel(nextCondition, nextOutputPattern),
+        label: edgeLabel(nextCondition, nextOutputPattern, field, operator, value),
         condition: nextCondition,
         outputPattern: nextOutputPattern,
+        field: nextCondition === "output_field" ? field || "" : null,
+        operator: nextCondition === "output_field" ? operator || "equals" : null,
+        value: nextCondition === "output_field" ? value : null,
       },
     ],
   };
@@ -8975,9 +8862,22 @@ export function uniqueEdgeId(edges, fromNodeId, toNodeId) {
   return `${baseId}-${index}`;
 }
 
-export function edgeLabel(condition = "always", outputPattern = "") {
+export function edgeLabel(
+  condition = "always",
+  outputPattern = "",
+  field = "",
+  operator = "",
+  value = null,
+) {
   if (condition === "always") return "always";
   if (condition === "output_matches" && outputPattern) return `matches ${outputPattern}`;
+  if (condition === "output_field") {
+    const fieldLabel = field || "field";
+    const operatorLabel = (operator || "equals").replaceAll("_", " ");
+    if (operator === "exists") return `${fieldLabel} exists`;
+    const serializedValue = JSON.stringify(value);
+    return `${fieldLabel} ${operatorLabel} ${serializedValue ?? String(value)}`;
+  }
   if (condition === "after_loop") return "after loop";
   return condition.replaceAll("_", " ");
 }
@@ -9060,9 +8960,12 @@ function draftEdgePath(draftEdge) {
 }
 
 function InspectorPanel({ children, open, subtitle, title, onToggle }) {
+  const contentId = useId();
   return (
     <section className="border-b border-line">
       <button
+        aria-controls={contentId}
+        aria-expanded={open}
         className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition hover:bg-slate-50"
         type="button"
         onClick={onToggle}
@@ -9077,7 +8980,7 @@ function InspectorPanel({ children, open, subtitle, title, onToggle }) {
           <ChevronDown className="shrink-0 text-muted" size={16} />
         )}
       </button>
-      {open ? children : null}
+      {open ? <div id={contentId}>{children}</div> : null}
     </section>
   );
 }
@@ -9091,24 +8994,40 @@ function InspectorSection({ children, className = "", title }) {
   );
 }
 
-function ApprovalDecisionOverlay({ approval, node, onDecideApproval }) {
+function WorkflowSettingsSection({ children, title }) {
+  return (
+    <section aria-label={title} className="space-y-3">
+      <h3 className="sr-only">{title}</h3>
+      {children}
+    </section>
+  );
+}
+
+export function ApprovalDecisionOverlay({ approval, node, onDecideApproval }) {
   const [notes, setNotes] = useState("");
   const [approver, setApprover] = useState(approval?.approvers?.[0] || "ui");
+  const [dismissed, setDismissed] = useState(false);
   useEffect(() => {
     setNotes("");
     setApprover(approval?.approvers?.[0] || "ui");
+    setDismissed(false);
   }, [approval?.runId, approval?.nodeId, approval?.approvers]);
-  if (!approval) return null;
+  if (!approval || dismissed) return null;
   const nodeLabel = node?.label || node?.id || approval.nodeId;
   return (
-    <div className="pointer-events-none absolute inset-0 z-[90] flex items-center justify-center px-4">
-      <section
-        className="pointer-events-auto w-full max-w-[560px] rounded-lg border border-amber-300 bg-white shadow-2xl"
-        onPointerDown={(event) => event.stopPropagation()}
-        onPointerMove={(event) => event.stopPropagation()}
-        onPointerUp={(event) => event.stopPropagation()}
-        onWheel={(event) => event.stopPropagation()}
-      >
+    <Dialog
+      description={`${nodeLabel}: ${approval.message}`}
+      onClose={() => setDismissed(true)}
+      overlayClassName="pointer-events-none absolute inset-0 z-[90] flex items-center justify-center px-4"
+      panelClassName="pointer-events-auto w-full max-w-[560px] rounded-lg border border-amber-300 bg-white shadow-2xl"
+      panelProps={{
+        onPointerDown: (event) => event.stopPropagation(),
+        onPointerMove: (event) => event.stopPropagation(),
+        onPointerUp: (event) => event.stopPropagation(),
+        onWheel: (event) => event.stopPropagation(),
+      }}
+      title="Approval required"
+    >
         <div className="border-b border-amber-200 bg-amber-50 px-5 py-4">
           <div className="flex items-center gap-3">
             <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-amber-600 text-white">
@@ -9121,7 +9040,7 @@ function ApprovalDecisionOverlay({ approval, node, onDecideApproval }) {
           </div>
         </div>
         <div className="space-y-4 px-5 py-5">
-          <div className="max-h-[180px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-slate-50 px-3 py-3 text-sm leading-6 text-slate-800">
+          <div className="max-h-[180px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-slate-50 px-3 py-3 text-sm leading-6 text-ink">
             {approval.message}
           </div>
           <div className="grid gap-3 sm:grid-cols-[minmax(0,180px)_1fr]">
@@ -9165,8 +9084,7 @@ function ApprovalDecisionOverlay({ approval, node, onDecideApproval }) {
             </button>
           </div>
         </div>
-      </section>
-    </div>
+    </Dialog>
   );
 }
 
@@ -9397,69 +9315,111 @@ function HttpResponsePreview({ output }) {
   );
 }
 
-function WorkflowNodeLabelField({
-  node,
-  workflows = [],
-  onChange,
-  onRenameWorkflow,
-  onTargetWorkflowRenamed,
-}) {
-  const targetWorkflow = workflows.find(
-    (candidate) => candidate.id === node.operation?.workflow_id,
-  );
-  const currentLabel = targetWorkflow?.name || node.label || "";
-  const [draft, setDraft] = useState(currentLabel);
+function useCommittedDraft({ enterCommits = true, format, onCommit, parse, value }) {
+  const committedText = format(value);
+  const committedRef = useRef(committedText);
+  const draftRef = useRef(committedText);
+  const focusedRef = useRef(false);
+  const [draft, setDraft] = useState(committedText);
+  const [error, setError] = useState("");
+  const [conflict, setConflict] = useState(false);
 
   useEffect(() => {
-    setDraft(currentLabel);
-  }, [currentLabel, node.operation?.workflow_id]);
+    draftRef.current = draft;
+  }, [draft]);
 
-  function commit() {
-    const nextLabel = draft.trim();
-    if (!nextLabel) {
-      setDraft(currentLabel);
+  useEffect(() => {
+    const previousCommitted = committedRef.current;
+    if (committedText === previousCommitted) return;
+
+    committedRef.current = committedText;
+    if (focusedRef.current && draftRef.current !== previousCommitted) {
+      setConflict(true);
       return;
     }
-    if (targetWorkflow && nextLabel !== targetWorkflow.name) {
-      Promise.resolve(onRenameWorkflow?.(targetWorkflow.id, nextLabel))
-        .then((renamedWorkflow) => {
-          if (renamedWorkflow?.id) {
-            onTargetWorkflowRenamed?.(renamedWorkflow);
-          }
-        })
-        .catch(() => {
-          setDraft(currentLabel);
-        });
-    } else if (!targetWorkflow) {
-      onChange?.(nextLabel);
-    }
+
+    draftRef.current = committedText;
+    setDraft(committedText);
+    setError("");
+    setConflict(false);
+  }, [committedText]);
+
+  function validate(text) {
+    const parsed = parse(text);
+    setError(parsed.ok ? "" : parsed.error);
+    return parsed;
   }
 
+  function commitText(text = draftRef.current) {
+    const parsed = validate(text);
+    if (!parsed.ok) return false;
+
+    const normalized = format(parsed.value);
+    const changed = normalized !== committedRef.current;
+    committedRef.current = normalized;
+    draftRef.current = normalized;
+    setDraft(normalized);
+    setConflict(false);
+    if (changed) onCommit(parsed.value);
+    return true;
+  }
+
+  function restore() {
+    draftRef.current = committedRef.current;
+    setDraft(committedRef.current);
+    setError("");
+    setConflict(false);
+  }
+
+  return {
+    conflict,
+    draft,
+    error,
+    commitText,
+    onBlur() {
+      focusedRef.current = false;
+      commitText();
+    },
+    onChange(nextDraft) {
+      draftRef.current = nextDraft;
+      setDraft(nextDraft);
+      validate(nextDraft);
+    },
+    onFocus() {
+      focusedRef.current = true;
+    },
+    onKeyDown(event) {
+      if (enterCommits && event.key === "Enter" && !event.shiftKey) {
+        event.preventDefault();
+        commitText();
+      } else if (event.key === "Escape") {
+        event.preventDefault();
+        restore();
+      }
+    },
+  };
+}
+
+function DraftFieldMessage({ id, state }) {
+  if (!state.error && !state.conflict) return null;
   return (
-    <label className="block">
-      <span className="text-xs font-medium text-muted">Label</span>
-      <input
-        className="mt-1 h-10 w-full rounded-lg border border-subtle bg-white px-3 text-sm outline-none transition focus:border-brand focus:ring-2 focus:ring-brand/20"
-        value={draft}
-        onBlur={commit}
-        onChange={(event) => setDraft(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.preventDefault();
-            event.currentTarget.blur();
-          }
-          if (event.key === "Escape") {
-            setDraft(currentLabel);
-            event.currentTarget.blur();
-          }
-        }}
-      />
-      <p className="mt-1 text-xs leading-5 text-muted">Renames the target workflow.</p>
-    </label>
+    <div id={id}>
+      {state.error ? (
+        <p className="mt-1 text-xs text-red-600" role="alert">
+          {state.error}
+        </p>
+      ) : null}
+      {state.conflict ? (
+        <p className="mt-1 text-xs text-amber-700" role="status">
+          This value changed elsewhere. Your draft is preserved; press Escape to use the latest value.
+        </p>
+      ) : null}
+    </div>
   );
 }
 
-function TextField({
+export function TextField({
+  commitOnBlur = false,
   diagnostics = [],
   label,
   onChange,
@@ -9467,22 +9427,38 @@ function TextField({
   pathLink = false,
   pathPicker = false,
   placeholder,
-  promptForTrust = true,
+  parseDraft = (text) => ({ ok: true, value: text }),
   readOnly = false,
   value,
 }) {
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [pendingTrustSelection, setPendingTrustSelection] = useState(null);
   const [pathInfo, setPathInfo] = useState(null);
   const [textFileDialog, setTextFileDialog] = useState(null);
-  const pathTrust = useContext(PathTrustContext);
   const isPathField = pathPicker || pathLink;
   const canPickPath = pathPicker && !readOnly && typeof onChange === "function";
-  const displayValue = isPathField ? resolveDisplayPath(value ?? "", pathBasePath) : value ?? "";
+  const canDraftPath = isPathField && !readOnly && typeof onChange === "function";
+  const canDraftText = commitOnBlur && !readOnly && typeof onChange === "function";
+  const canDraft = canDraftPath || canDraftText;
+  const draftState = useCommittedDraft({
+    format: (nextValue) => String(nextValue ?? ""),
+    onCommit: (nextValue) => onChange?.(nextValue),
+    parse: parseDraft,
+    value,
+  });
+  const storedPath = canDraft ? draftState.draft : String(value ?? "");
+  const displayValue = isPathField ? resolveDisplayPath(storedPath, pathBasePath) : value ?? "";
+  const inputValue = canDraft ? draftState.draft : displayValue;
   const canOpenPath = isPathField && displayValue && !isUrlPath(displayValue);
   const canEditTextPath = canOpenPath && pathInfo?.isFile;
   const diagnosticId = useId();
+  const draftDiagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const describedBy = [
+    hasFieldDiagnostics ? diagnosticId : null,
+    canDraft && (draftState.error || draftState.conflict) ? draftDiagnosticId : null,
+  ]
+    .filter(Boolean)
+    .join(" ") || undefined;
 
   useEffect(() => {
     let cancelled = false;
@@ -9510,37 +9486,21 @@ function TextField({
     };
   }, [canOpenPath, displayValue]);
 
-  function applySelectedPath(selectedPath) {
-    if (!selectedPath) return;
-    if (
-      promptForTrust &&
-      pathTrust?.isTrustedPath &&
-      pathTrust?.trustPath &&
-      !pathTrust.isTrustedPath(selectedPath)
-    ) {
-      setPendingTrustSelection({
-        parentPath: pathParent(selectedPath) || selectedPath,
-        path: selectedPath,
-      });
-      return;
-    }
-    onChange(selectedPath);
-  }
-
   async function handlePathPick(event) {
     event.preventDefault();
     event.stopPropagation();
 
+    if (window.goferDesktop?.workspace?.listDirectory) {
+      setPickerOpen(true);
+      return;
+    }
+
     try {
-      if (window.goferDesktop?.workspace?.selectPath) {
-        const selectedPath = await window.goferDesktop.workspace.selectPath({
-          currentPath: displayValue,
-        });
-        applySelectedPath(selectedPath);
-        return;
-      }
-      if (window.goferDesktop?.workspace?.listDirectory) {
-        setPickerOpen(true);
+      const selectedPath = await window.goferDesktop?.workspace?.selectPath?.({
+        currentPath: displayValue,
+      });
+      if (selectedPath) {
+        draftState.commitText(selectedPath);
       }
     } catch (error) {
       console.error("Failed to select path", error);
@@ -9570,16 +9530,25 @@ function TextField({
         <span className="text-xs font-medium text-muted">{label}</span>
         <span className="relative mt-1 block">
           <input
-            aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
-            aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+            aria-describedby={describedBy}
+            aria-invalid={
+              draftState.error || fieldDiagnosticState(diagnostics).severity === "error" || undefined
+            }
             className={`h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition read-only:bg-slate-50 ${fieldBorderClass(diagnostics)} ${
               canPickPath && canOpenPath ? "pr-[4.5rem]" : canPickPath || canOpenPath ? "pr-10" : ""
             }`}
             placeholder={placeholder}
             readOnly={readOnly}
             title={displayValue}
-            value={displayValue}
-            onChange={(event) => onChange?.(event.target.value)}
+            value={inputValue}
+            onBlur={canDraft ? draftState.onBlur : undefined}
+            onChange={
+              canDraft
+                ? (event) => draftState.onChange(event.target.value)
+                : (event) => onChange?.(event.target.value)
+            }
+            onFocus={canDraft ? draftState.onFocus : undefined}
+            onKeyDown={canDraft ? draftState.onKeyDown : undefined}
           />
           {canOpenPath ? (
             <button
@@ -9607,6 +9576,7 @@ function TextField({
           ) : null}
         </span>
         <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+        {canDraft ? <DraftFieldMessage id={draftDiagnosticId} state={draftState} /> : null}
       </label>
       {canEditTextPath ? (
         <div className="mt-1 flex justify-end gap-2">
@@ -9634,23 +9604,8 @@ function TextField({
           label={label}
           onClose={() => setPickerOpen(false)}
           onSelect={(selectedPath) => {
-            applySelectedPath(selectedPath);
+            draftState.commitText(selectedPath);
             setPickerOpen(false);
-          }}
-        />
-      ) : null}
-      {pendingTrustSelection ? (
-        <PathSelectionTrustPrompt
-          parentPath={pendingTrustSelection.parentPath}
-          path={pendingTrustSelection.path}
-          onCancel={() => setPendingTrustSelection(null)}
-          onConfirm={(trustParent) => {
-            const trustedPath = trustParent
-              ? pendingTrustSelection.parentPath
-              : pendingTrustSelection.path;
-            onChange(pendingTrustSelection.path);
-            setPendingTrustSelection(null);
-            window.setTimeout(() => pathTrust?.trustPath?.(trustedPath), 0);
           }}
         />
       ) : null}
@@ -9665,7 +9620,7 @@ function TextField({
   );
 }
 
-function TextFileDialog({ mode, path, onClose }) {
+export function TextFileDialog({ mode, path, onClose }) {
   const [content, setContent] = useState("");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -9714,8 +9669,14 @@ function TextFileDialog({ mode, path, onClose }) {
   }
 
   return (
-    <div className="fixed inset-0 z-[80] grid place-items-center bg-slate-950/35 px-4">
-      <div className="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-line bg-white shadow-panel">
+    <Dialog
+      description={path}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-[80] grid place-items-center bg-slate-950/35 px-4"
+      panelClassName="flex max-h-[82vh] w-full max-w-3xl flex-col overflow-hidden rounded-lg border border-line bg-white shadow-panel"
+      panelProps={{ "aria-busy": loading || saving || undefined }}
+      title={readOnly ? "Preview file" : "Edit file"}
+    >
         <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-strong">
@@ -9742,7 +9703,7 @@ function TextFileDialog({ mode, path, onClose }) {
               Loading file
             </div>
           ) : error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
               {error}
             </div>
           ) : (
@@ -9776,8 +9737,7 @@ function TextFileDialog({ mode, path, onClose }) {
             </button>
           ) : null}
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 
@@ -9945,8 +9905,14 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
   }
 
   return (
-    <div className="fixed inset-0 z-[70] grid place-items-center bg-slate-950/35 px-4">
-      <div className="flex max-h-[78vh] w-full max-w-[680px] flex-col rounded-lg border border-line bg-white shadow-panel">
+    <Dialog
+      description="Browse the local workspace and select a path"
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-[70] grid place-items-center bg-slate-950/35 px-4"
+      panelClassName="flex max-h-[78vh] w-full max-w-[680px] flex-col rounded-lg border border-line bg-white shadow-panel"
+      panelProps={{ "aria-busy": loading || undefined }}
+      title={`Choose ${titleLabel.toLowerCase()}`}
+    >
         <div className="flex items-start justify-between gap-3 border-b border-line px-4 py-3">
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-strong">
@@ -10040,7 +10006,7 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
             </div>
           ) : null}
           {error ? (
-            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
               {error}
             </div>
           ) : null}
@@ -10124,12 +10090,11 @@ export function PathPickerDialog({ currentPath, label, onClose, onSelect }) {
             </button>
           </div>
         </div>
-      </div>
-    </div>
+    </Dialog>
   );
 }
 
-function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSubmit }) {
+export function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSubmit }) {
   const [name, setName] = useState(initialName);
   const [submitting, setSubmitting] = useState(false);
   const title =
@@ -10153,11 +10118,14 @@ function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSu
   }
 
   return (
-    <div className="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4">
-      <form
-        className="w-full max-w-sm rounded-lg border border-line bg-white p-4 shadow-panel"
-        onSubmit={submit}
-      >
+    <Dialog
+      description={directory}
+      onClose={onClose}
+      overlayClassName="fixed inset-0 z-[95] grid place-items-center bg-slate-950/25 px-4"
+      panelClassName="w-full max-w-sm rounded-lg border border-line bg-white p-4 shadow-panel"
+      title={title}
+    >
+      <form onSubmit={submit}>
         <div className="mb-3">
           <h3 className="text-sm font-semibold text-strong">{title}</h3>
           <p className="mt-1 truncate text-xs text-muted" title={directory}>
@@ -10190,7 +10158,7 @@ function PathNameDialog({ directory, initialName = "", kind, mode, onClose, onSu
           </button>
         </div>
       </form>
-    </div>
+    </Dialog>
   );
 }
 
@@ -10295,7 +10263,7 @@ function InlineTextField({ diagnostics = [], onChange, placeholder, value }) {
   const diagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
   return (
-    <div>
+    <div className="min-w-0">
       <input
         aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
         aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
@@ -10444,122 +10412,160 @@ function cronFromPicker({ date, recurrence, time }) {
   }
 }
 
-function NumberField({ diagnostics = [], label, min, onChange, placeholder, step = "1", value }) {
+export function NumberField({
+  allowRuntimeReference = false,
+  diagnostics = [],
+  label,
+  min,
+  onChange,
+  placeholder,
+  value,
+}) {
   const diagnosticId = useId();
+  const draftDiagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const draftState = useCommittedDraft({
+    format: (nextValue) => String(nextValue ?? ""),
+    onCommit: onChange,
+    parse: (text) => parseNumberDraft(text, min, allowRuntimeReference),
+    value,
+  });
+  const describedBy = [
+    hasFieldDiagnostics ? diagnosticId : null,
+    draftState.error || draftState.conflict ? draftDiagnosticId : null,
+  ]
+    .filter(Boolean)
+    .join(" ") || undefined;
   return (
     <label className="block">
       <span className="text-xs font-medium text-muted">{label}</span>
       <input
-        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
-        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
-        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
-        min={min}
+        aria-describedby={describedBy}
+        aria-invalid={
+          draftState.error || fieldDiagnosticState(diagnostics).severity === "error" || undefined
+        }
+        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)} ${
+          draftState.error ? "border-red-400 focus:border-red-500" : ""
+        }`}
+        inputMode={allowRuntimeReference ? "text" : "decimal"}
         placeholder={placeholder}
-        step={step}
-        type="number"
-        value={value ?? ""}
-        onChange={(event) => onChange(event.target.value === "" ? "" : Number(event.target.value))}
+        type="text"
+        value={draftState.draft}
+        onBlur={draftState.onBlur}
+        onChange={(event) => draftState.onChange(event.target.value)}
+        onFocus={draftState.onFocus}
+        onKeyDown={draftState.onKeyDown}
       />
       <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+      <DraftFieldMessage id={draftDiagnosticId} state={draftState} />
     </label>
   );
 }
 
-function GroupOpacityField({ onCommit, value }) {
-  const [editing, setEditing] = useState(false);
-  const [draftValue, setDraftValue] = useState(String(value ?? ""));
-  const skipCommitOnBlurRef = useRef(false);
-
-  useEffect(() => {
-    if (!editing) {
-      setDraftValue(String(value ?? ""));
-    }
-  }, [editing, value]);
-
-  function restoreValue() {
-    setDraftValue(String(value ?? ""));
+export function parseNumberDraft(text, min, allowRuntimeReference = false) {
+  const trimmed = String(text).trim();
+  if (!trimmed) return { ok: true, value: "" };
+  if (allowRuntimeReference && isExactRuntimeReference(trimmed)) {
+    return { ok: true, value: trimmed };
+  }
+  if (!/^[+-]?(?:(?:\d+\.?\d*)|(?:\.\d+))(?:[eE][+-]?\d+)?$/.test(trimmed)) {
+    return {
+      ok: false,
+      error: allowRuntimeReference
+        ? "Enter a complete number or an exact {{...}} reference."
+        : "Enter a complete number.",
+    };
   }
 
-  function commitValue(rawValue = draftValue, { restoreEmpty = true } = {}) {
-    const trimmed = rawValue.trim();
-    if (trimmed === "") {
-      if (restoreEmpty) {
-        restoreValue();
-      }
-      return;
-    }
-    const parsedValue = Number(trimmed);
-    if (!Number.isFinite(parsedValue)) {
-      restoreValue();
-      return;
-    }
-    const nextValue = clamp(Math.round(parsedValue), 0, 100);
-    setDraftValue(String(nextValue));
-    onCommit(nextValue);
+  const number = Number(trimmed);
+  if (!Number.isFinite(number)) {
+    return { ok: false, error: "Enter a finite number." };
   }
+  if (min !== undefined && number < Number(min)) {
+    return { ok: false, error: `Enter ${min} or greater.` };
+  }
+  return { ok: true, value: number };
+}
 
+function RuntimeReferenceField({ label, onChange, value }) {
+  const state = useCommittedDraft({
+    format: (nextValue) => String(nextValue ?? ""),
+    onCommit: onChange,
+    parse: (text) => {
+      const trimmed = text.trim();
+      return isExactRuntimeReference(trimmed)
+        ? { ok: true, value: trimmed }
+        : { ok: false, error: "Enter an exact reference such as {{inputs.value}}." };
+    },
+    value,
+  });
+  const messageId = useId();
   return (
-    <label className="block">
-      <span className="text-xs font-medium text-muted">Background opacity (%)</span>
+    <label className="mt-2 block">
+      <span className="text-xs text-muted">{label} reference</span>
       <input
-        className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition"
-        max="100"
-        min="0"
-        step="1"
-        type="number"
-        value={draftValue}
-        onBlur={() => {
-          if (skipCommitOnBlurRef.current) {
-            skipCommitOnBlurRef.current = false;
-            restoreValue();
-            setEditing(false);
-            return;
-          }
-          commitValue();
-          setEditing(false);
-        }}
-        onChange={(event) => {
-          const nextValue = event.target.value;
-          setDraftValue(nextValue);
-          commitValue(nextValue, { restoreEmpty: false });
-        }}
-        onFocus={() => setEditing(true)}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            event.currentTarget.blur();
-          }
-          if (event.key === "Escape") {
-            skipCommitOnBlurRef.current = true;
-            event.currentTarget.blur();
-          }
-        }}
+        aria-describedby={state.error || state.conflict ? messageId : undefined}
+        aria-invalid={state.error || undefined}
+        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 font-mono text-sm outline-none transition ${
+          state.error ? "border-red-400 focus:border-red-500" : "border-line focus:border-teal-600"
+        }`}
+        placeholder="{{inputs.value}}"
+        type="text"
+        value={state.draft}
+        onBlur={state.onBlur}
+        onChange={(event) => state.onChange(event.target.value)}
+        onFocus={state.onFocus}
+        onKeyDown={state.onKeyDown}
       />
+      <DraftFieldMessage id={messageId} state={state} />
     </label>
   );
 }
 
-function SelectField({ diagnostics = [], label, onChange, options, value }) {
+function SelectField({
+  allowRuntimeReference = false,
+  diagnostics = [],
+  label,
+  onChange,
+  options,
+  value,
+}) {
   const diagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const usesRuntimeReference = allowRuntimeReference && isExactRuntimeReference(value);
+  const selectedValue = usesRuntimeReference ? "__runtime_reference__" : (value ?? "");
   return (
-    <label className="block">
-      <span className="text-xs font-medium text-muted">{label}</span>
-      <select
-        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
-        aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
-        className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
-        value={value ?? ""}
-        onChange={(event) => onChange(event.target.value)}
-      >
-        {options.map(([optionValue, labelText]) => (
-          <option key={optionValue} value={optionValue}>
-            {labelText}
-          </option>
-        ))}
-      </select>
+    <div className="block">
+      <label>
+        <span className="text-xs font-medium text-muted">{label}</span>
+        <select
+          aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+          aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
+          className={`mt-1 h-10 w-full rounded-lg border bg-white px-3 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
+          value={selectedValue}
+          onChange={(event) =>
+            onChange(
+              event.target.value === "__runtime_reference__"
+                ? (usesRuntimeReference ? value : "{{inputs.value}}")
+                : event.target.value,
+            )
+          }
+        >
+          {options.map(([optionValue, labelText]) => (
+            <option key={optionValue} value={optionValue}>
+              {labelText}
+            </option>
+          ))}
+          {allowRuntimeReference ? (
+            <option value="__runtime_reference__">Exact runtime reference…</option>
+          ) : null}
+        </select>
+      </label>
+      {usesRuntimeReference ? (
+        <RuntimeReferenceField label={label} value={value} onChange={onChange} />
+      ) : null}
       <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
-    </label>
+    </div>
   );
 }
 
@@ -10573,7 +10579,7 @@ function EdgeSelect({ diagnostics = [], onChange, options, value }) {
       <select
         aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
         aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
-        className={`h-9 min-w-0 rounded-lg border bg-white px-1.5 text-xs outline-none transition ${fieldBorderClass(diagnostics)}`}
+        className={`h-9 w-full min-w-0 max-w-full rounded-lg border bg-white px-1.5 text-xs outline-none transition ${fieldBorderClass(diagnostics)}`}
         title={selectedLabel}
         value={value ?? ""}
         onChange={(event) => onChange(event.target.value)}
@@ -10589,29 +10595,77 @@ function EdgeSelect({ diagnostics = [], onChange, options, value }) {
   );
 }
 
-function TextareaField({ diagnostics = [], label, onChange, placeholder, rows = 3, value }) {
+function TextareaField({
+  commitOnBlur = false,
+  diagnostics = [],
+  label,
+  onChange,
+  placeholder,
+  rows = 3,
+  value,
+}) {
   const diagnosticId = useId();
+  const draftDiagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const draftState = useCommittedDraft({
+    enterCommits: false,
+    format: (nextValue) => String(nextValue ?? ""),
+    onCommit: onChange,
+    parse: (text) => ({ ok: true, value: text }),
+    value,
+  });
+  const describedBy =
+    [
+      hasFieldDiagnostics ? diagnosticId : null,
+      commitOnBlur && (draftState.error || draftState.conflict) ? draftDiagnosticId : null,
+    ]
+      .filter(Boolean)
+      .join(" ") || undefined;
   return (
     <label className="block">
       <span className="text-xs font-medium text-muted">{label}</span>
       <textarea
-        aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
+        aria-describedby={describedBy}
         aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
         className={`mt-1 w-full resize-none rounded-lg border px-3 py-2 text-sm outline-none transition ${fieldBorderClass(diagnostics)}`}
         placeholder={placeholder}
         rows={rows}
-        value={value ?? ""}
-        onChange={(event) => onChange(event.target.value)}
+        value={commitOnBlur ? draftState.draft : value ?? ""}
+        onBlur={commitOnBlur ? draftState.onBlur : undefined}
+        onChange={(event) =>
+          commitOnBlur ? draftState.onChange(event.target.value) : onChange(event.target.value)
+        }
+        onFocus={commitOnBlur ? draftState.onFocus : undefined}
+        onKeyDown={
+          commitOnBlur
+            ? (event) => {
+                if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+                  event.preventDefault();
+                  draftState.commitText();
+                  return;
+                }
+                draftState.onKeyDown(event);
+              }
+            : undefined
+        }
       />
       <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+      {commitOnBlur ? <DraftFieldMessage id={draftDiagnosticId} state={draftState} /> : null}
     </label>
   );
 }
 
-function ToggleField({ checked, diagnostics = [], disabled = false, label, onChange }) {
+function ToggleField({
+  allowRuntimeReference = false,
+  checked,
+  diagnostics = [],
+  disabled = false,
+  label,
+  onChange,
+}) {
   const diagnosticId = useId();
   const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const usesRuntimeReference = allowRuntimeReference && isExactRuntimeReference(checked);
   return (
     <div>
       <label
@@ -10623,48 +10677,126 @@ function ToggleField({ checked, diagnostics = [], disabled = false, label, onCha
         <input
           aria-describedby={hasFieldDiagnostics ? diagnosticId : undefined}
           aria-invalid={fieldDiagnosticState(diagnostics).severity === "error" || undefined}
-          checked={checked}
+          checked={usesRuntimeReference ? false : Boolean(checked)}
           className="h-4 w-4 accent-teal-700"
           disabled={disabled}
           type="checkbox"
           onChange={(event) => onChange(event.target.checked)}
         />
       </label>
+      {allowRuntimeReference && !disabled ? (
+        <button
+          className="mt-1 text-xs font-medium text-teal-700 hover:text-teal-900"
+          type="button"
+          onClick={() => onChange(usesRuntimeReference ? false : "{{inputs.value}}")}
+        >
+          {usesRuntimeReference ? "Use a literal toggle" : "Use an exact runtime reference"}
+        </button>
+      ) : null}
+      {usesRuntimeReference ? (
+        <RuntimeReferenceField label={label} value={checked} onChange={onChange} />
+      ) : null}
       <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
     </div>
   );
 }
 
-function ListField({ diagnostics = [], label, onChange, placeholder, value }) {
+export function ListField({ diagnostics = [], label, onChange, placeholder, value }) {
+  const state = useCommittedDraft({
+    format: (nextValue) =>
+      Array.isArray(nextValue) ? nextValue.join(", ") : String(nextValue ?? ""),
+    onCommit: onChange,
+    parse: (text) => {
+      const trimmed = text.trim();
+      if (isExactRuntimeReference(trimmed)) return { ok: true, value: trimmed };
+      return {
+        ok: true,
+        value: text
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean),
+      };
+    },
+    value,
+  });
   return (
-    <TextareaField
+    <DraftTextareaField
       diagnostics={diagnostics}
       label={label}
       placeholder={placeholder}
       rows={2}
-      value={(value ?? []).join(", ")}
-      onChange={(text) =>
-        onChange(
-          text
-            .split(",")
-            .map((item) => item.trim())
-            .filter(Boolean),
-        )
-      }
+      state={state}
     />
   );
 }
 
-function KeyValueField({ diagnostics = [], label, onChange, value }) {
+export function KeyValueField({ diagnostics = [], label, onChange, value }) {
+  const state = useCommittedDraft({
+    format: objectToKeyValueText,
+    onCommit: onChange,
+    parse: parseKeyValueDraft,
+    value,
+  });
   return (
-    <TextareaField
-      diagnostics={diagnostics}
-      label={label}
-      rows={3}
-      value={objectToKeyValueText(value)}
-      onChange={(text) => onChange(keyValueTextToObject(text))}
-    />
+    <DraftTextareaField diagnostics={diagnostics} label={label} rows={3} state={state} />
   );
+}
+
+function DraftTextareaField({ diagnostics, label, placeholder, rows, state }) {
+  const diagnosticId = useId();
+  const draftDiagnosticId = useId();
+  const hasFieldDiagnostics = fieldDiagnosticState(diagnostics).diagnostics.length > 0;
+  const describedBy = [
+    hasFieldDiagnostics ? diagnosticId : null,
+    state.error || state.conflict ? draftDiagnosticId : null,
+  ]
+    .filter(Boolean)
+    .join(" ") || undefined;
+  return (
+    <label className="block">
+      <span className="text-xs font-medium text-muted">{label}</span>
+      <textarea
+        aria-describedby={describedBy}
+        aria-invalid={
+          state.error || fieldDiagnosticState(diagnostics).severity === "error" || undefined
+        }
+        className={`mt-1 w-full resize-none rounded-lg border px-3 py-2 text-sm outline-none transition ${fieldBorderClass(diagnostics)} ${
+          state.error ? "border-red-400 focus:border-red-500" : ""
+        }`}
+        placeholder={placeholder}
+        rows={rows}
+        value={state.draft}
+        onBlur={state.onBlur}
+        onChange={(event) => state.onChange(event.target.value)}
+        onFocus={state.onFocus}
+        onKeyDown={state.onKeyDown}
+      />
+      <FieldDiagnosticMessage diagnostics={diagnostics} id={diagnosticId} />
+      <DraftFieldMessage id={draftDiagnosticId} state={state} />
+    </label>
+  );
+}
+
+function parseKeyValueDraft(text) {
+  if (isExactRuntimeReference(String(text).trim())) {
+    return { ok: true, value: String(text).trim() };
+  }
+  const entries = [];
+  const lines = String(text).split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index].trim();
+    if (!line) continue;
+    const separatorIndex = line.indexOf("=");
+    if (separatorIndex === -1) {
+      return { ok: false, error: `Line ${index + 1} needs an “=” between the key and value.` };
+    }
+    const key = line.slice(0, separatorIndex).trim();
+    if (!key) {
+      return { ok: false, error: `Line ${index + 1} needs a key before “=”.` };
+    }
+    entries.push([key, line.slice(separatorIndex + 1).trim()]);
+  }
+  return { ok: true, value: Object.fromEntries(entries) };
 }
 
 export function formatJsonBodyEditorValue(value) {
@@ -10685,50 +10817,62 @@ export function parseJsonBodyEditorValue(text) {
 }
 
 function JsonBodyField({ label, onChange, value }) {
-  const [text, setText] = useState(() => formatJsonBodyEditorValue(value));
-  const [error, setError] = useState("");
-
-  useEffect(() => {
-    setText(formatJsonBodyEditorValue(value));
-    setError("");
-  }, [value]);
-
-  function update(nextText) {
-    setText(nextText);
-    const parsed = parseJsonBodyEditorValue(nextText);
-    if (!parsed.ok) {
-      setError(parsed.error);
-      return;
-    }
-    setError("");
-    onChange(parsed.value);
-  }
+  const draftState = useCommittedDraft({
+    format: formatJsonBodyEditorValue,
+    onCommit: onChange,
+    parse: parseJsonBodyEditorValue,
+    value,
+  });
+  const draftDiagnosticId = useId();
 
   return (
     <label className="flex flex-col gap-1 text-xs font-medium text-slate-600">
       {label}
       <textarea
+        aria-describedby={
+          draftState.error || draftState.conflict ? draftDiagnosticId : undefined
+        }
+        aria-invalid={draftState.error || undefined}
         className={`min-h-[8rem] rounded-lg border bg-white px-2 py-1.5 font-mono text-xs text-slate-900 outline-none transition focus:ring-2 focus:ring-brand/20 ${
-          error ? "border-red-300 focus:border-red-400" : "border-line focus:border-brand"
+          draftState.error
+            ? "border-red-300 focus:border-red-400"
+            : "border-line focus:border-brand"
         }`}
         rows={6}
-        value={text}
-        onChange={(event) => update(event.target.value)}
+        value={draftState.draft}
+        onBlur={draftState.onBlur}
+        onChange={(event) => draftState.onChange(event.target.value)}
+        onFocus={draftState.onFocus}
+        onKeyDown={draftState.onKeyDown}
       />
-      {error ? <span className="text-[11px] font-medium text-red-600">{error}</span> : null}
+      <DraftFieldMessage id={draftDiagnosticId} state={draftState} />
     </label>
   );
 }
 
 const inputTargetOptions = [
-  ["stdin", "stdin"],
+  ["stdin", "Standard input"],
+  ["env.FILE_PATH", "Env: FILE_PATH"],
+  ["env.FILE_NAME", "Env: FILE_NAME"],
+  ["env.FILE_STEM", "Env: FILE_STEM"],
+  ["env.FILE_EXTENSION", "Env: FILE_EXTENSION"],
+  ["env.FOLDER_PATH", "Env: FOLDER_PATH"],
+  ["env.CONTENT", "Env: CONTENT"],
+  ["env.INDEX", "Env: INDEX"],
+  ["file_path", "Prompt variable: file_path"],
+  ["file_name", "Prompt variable: file_name"],
+  ["file_stem", "Prompt variable: file_stem"],
+  ["file_extension", "Prompt variable: file_extension"],
+  ["folder_path", "Prompt variable: folder_path"],
+  ["content", "Prompt variable: content"],
+  ["index", "Prompt variable: index"],
+  ["row", "Prompt variable: row"],
+  ["query", "Prompt variable: query"],
 ];
 
-function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }) {
-  const targetListId = useId();
+function InputMappingField({ nodeType, onChange, sourceOptions, value }) {
   const entries = Object.entries(value ?? {});
-  const [openSourcePicker, setOpenSourcePicker] = useState(null);
-  const [expandedGroups, setExpandedGroups] = useState(() => new Set());
+  const hasLoopFileSources = sourceOptions.some(([source]) => source === "loop.current.file_path");
   const targetOptions = useMemo(() => {
     const usedTargets = new Set(inputTargetOptions.map(([optionValue]) => optionValue));
     const customTargets = Object.keys(value ?? {})
@@ -10743,46 +10887,14 @@ function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }
       .map((source) => [source, source]);
     return [...sourceOptions, ...customSources];
   }, [sourceOptions, value]);
-  const sourceGroupsWithCustom = useMemo(() => {
-    const usedSources = new Set(sourceGroups.flatMap((group) => group.options.map(([optionValue]) => optionValue)));
-    const customSources = Object.values(value ?? {})
-      .filter((source) => source && !usedSources.has(source))
-      .map((source) => [source, source]);
-    return customSources.length
-      ? [...sourceGroups, { id: "custom", label: "Custom paths", options: customSources }]
-      : sourceGroups;
-  }, [sourceGroups, value]);
-  const sourceGroupIds = useMemo(
-    () => sourceGroupsWithCustom.map((group) => group.id).join("\n"),
-    [sourceGroupsWithCustom],
-  );
-
-  useEffect(() => {
-    setExpandedGroups(new Set(sourceGroupIds ? sourceGroupIds.split("\n") : []));
-  }, [sourceGroupIds]);
-
-  function toggleSourceGroup(groupId) {
-    setExpandedGroups((current) => {
-      const next = new Set(current);
-      if (next.has(groupId)) {
-        next.delete(groupId);
-      } else {
-        next.add(groupId);
-      }
-      return next;
-    });
-  }
-
-  function selectSource(index, key, nextSource) {
-    updateEntry(index, key, nextSource);
-    setOpenSourcePicker(null);
-  }
 
   function updateEntry(index, nextKey, nextValue) {
     const next = {};
     entries.forEach(([key, item], entryIndex) => {
       if (entryIndex === index) {
-        next[nextKey.trim() || defaultBlankInputKey(value ?? {}, key)] = nextValue;
+        if (nextKey.trim()) {
+          next[nextKey.trim()] = nextValue;
+        }
       } else {
         next[key] = item;
       }
@@ -10792,12 +10904,29 @@ function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }
 
   function removeEntry(index) {
     onChange(Object.fromEntries(entries.filter((_, entryIndex) => entryIndex !== index)));
-    setOpenSourcePicker(null);
   }
 
   function addEntry() {
     const key = nextInputKey(value ?? {});
     onChange({ ...(value ?? {}), [key]: "previous.text" });
+  }
+
+  function addLoopFileInputs() {
+    const mappings =
+      nodeType === "agent" || nodeType === "common_llm_task" || nodeType === "prompt_file"
+        ? {
+            file_path: "loop.current.file_path",
+            file_name: "loop.current.file_name",
+            file_stem: "loop.current.file_stem",
+            file_extension: "loop.current.file_extension",
+          }
+        : {
+            "env.FILE_PATH": "loop.current.file_path",
+            "env.FILE_NAME": "loop.current.file_name",
+            "env.FILE_STEM": "loop.current.file_stem",
+            "env.FILE_EXTENSION": "loop.current.file_extension",
+          };
+    onChange({ ...(value ?? {}), ...mappings });
   }
 
   return (
@@ -10810,31 +10939,31 @@ function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }
       {entries.length ? (
         entries.map(([key, source], index) => (
           <div
-            key={`input-mapping-${index}`}
+            key={`${key}-${index}`}
             className="grid grid-cols-[minmax(0,0.9fr)_minmax(0,1.2fr)_32px] gap-2"
           >
-            <input
+            <select
               className="h-9 min-w-0 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
-              list={targetListId}
-              placeholder="stdin"
-              value={isStdinInputKey(key) ? "" : key}
+              value={key}
               onChange={(event) => updateEntry(index, event.target.value, source)}
-            />
-            <datalist id={targetListId}>
+            >
               {targetOptions.map(([optionValue, label]) => (
-                <option key={optionValue} label={label} value={optionValue} />
+                <option key={optionValue} value={optionValue}>
+                  {label}
+                </option>
               ))}
-            </datalist>
-            <InputSourcePicker
-              expandedGroups={expandedGroups}
-              groups={sourceGroupsWithCustom}
-              open={openSourcePicker === index}
-              source={source}
-              sourceOptions={sourceOptionsWithCustom}
-              onOpenChange={(open) => setOpenSourcePicker(open ? index : null)}
-              onSelect={(nextSource) => selectSource(index, key, nextSource)}
-              onToggleGroup={toggleSourceGroup}
-            />
+            </select>
+            <select
+              className="h-9 min-w-0 rounded-lg border border-line bg-white px-2 text-xs outline-none transition focus:border-teal-500"
+              value={source}
+              onChange={(event) => updateEntry(index, key, event.target.value)}
+            >
+              {sourceOptionsWithCustom.map(([optionValue, label]) => (
+                <option key={optionValue} value={optionValue}>
+                  {label}
+                </option>
+              ))}
+            </select>
             <button
               className="grid h-9 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-red-600 dark:hover:bg-[#2a2a2a]"
               title="Remove input"
@@ -10847,16 +10976,9 @@ function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }
         ))
       ) : (
         <p className="rounded-lg border border-dashed border-line px-3 py-2 text-xs leading-5 text-muted">
-          Map parent outputs into stdin or named variables.
+          Map parent outputs into stdin, environment variables, or prompt variables.
         </p>
       )}
-      <p className="text-xs leading-5 text-muted">
-        Leave inputs blank to pass values as positional args like <code>$1</code> and{" "}
-        <code>$2</code>. Type a name like <code>ticket_description</code> to expose it as{" "}
-        <code>{"{{ticket_description}}"}</code> in prompts/templates,{" "}
-        <code>$ticket_description</code> in shell commands, and{" "}
-        <code>os.environ["ticket_description"]</code> in Python scripts.
-      </p>
       <div className="flex flex-wrap gap-2">
         <button
           className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
@@ -10866,117 +10988,51 @@ function InputMappingField({ onChange, sourceGroups = [], sourceOptions, value }
           <Plus size={13} />
           Add input
         </button>
+        {hasLoopFileSources ? (
+          <button
+            className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-line bg-white px-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
+            title={
+              nodeType === "agent" || nodeType === "common_llm_task" || nodeType === "prompt_file"
+                ? "Map loop file fields as prompt variables"
+                : "Map loop file fields as environment variables"
+            }
+            type="button"
+            onClick={addLoopFileInputs}
+          >
+            <Files size={13} />
+            Loop file inputs
+          </button>
+        ) : null}
       </div>
-    </div>
-  );
-}
-
-function InputSourcePicker({
-  expandedGroups,
-  groups,
-  onOpenChange,
-  onSelect,
-  onToggleGroup,
-  open,
-  source,
-  sourceOptions,
-}) {
-  const sourceLabel = sourceOptions.find(([optionValue]) => optionValue === source)?.[1] ?? source;
-  return (
-    <div className="relative min-w-0">
-      <button
-        className="flex h-9 w-full min-w-0 items-center justify-between gap-2 rounded-lg border border-line bg-white px-2 text-left text-xs text-slate-700 outline-none transition hover:bg-slate-50 focus:border-teal-500 dark:bg-[#1f1f1f] dark:text-slate-100 dark:hover:bg-[#272727]"
-        title={sourceLabel || "Choose source output"}
-        type="button"
-        onClick={() => onOpenChange(!open)}
-      >
-        <span className="min-w-0 truncate">{sourceLabel || "Choose source output"}</span>
-        <ChevronDown size={14} className="shrink-0 text-muted" />
-      </button>
-      {open ? (
-        <div className="absolute left-0 right-0 top-10 z-50 max-h-72 overflow-auto rounded-xl border border-line bg-white p-1.5 shadow-xl dark:bg-[#181818]">
-          {groups.length ? (
-            groups.map((group) => {
-              const expanded = expandedGroups.has(group.id);
-              return (
-                <div key={group.id} className="rounded-lg">
-                  <button
-                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-xs font-semibold text-slate-700 transition hover:bg-slate-100 dark:text-slate-200 dark:hover:bg-[#262626]"
-                    title={group.label}
-                    type="button"
-                    onClick={() => onToggleGroup(group.id)}
-                  >
-                    {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-                    <span className="min-w-0 truncate">{group.label}</span>
-                  </button>
-                  {expanded ? (
-                    <div className="ml-3 border-l border-line py-1 pl-2">
-                      {group.options.map(([optionValue, label]) => (
-                        <button
-                          key={`${group.id}-${optionValue}`}
-                          className={`flex w-full items-center justify-between gap-2 rounded-md px-2 py-1.5 text-left text-xs transition ${
-                            optionValue === source
-                              ? "bg-teal-50 text-teal-800 dark:bg-teal-500/15 dark:text-teal-200"
-                              : "text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-[#262626]"
-                          }`}
-                          title={`${group.id === "previous" ? label : `${group.label} ${label}`} (${optionValue})`}
-                          type="button"
-                          onClick={() => onSelect(optionValue)}
-                        >
-                          <span className="min-w-0 truncate">{label}</span>
-                          {optionValue === source ? <Check size={13} className="shrink-0" /> : null}
-                        </button>
-                      ))}
-                    </div>
-                  ) : null}
-                </div>
-              );
-            })
-          ) : (
-            <p className="px-2 py-2 text-xs text-muted">No ancestor outputs available.</p>
-          )}
-        </div>
-      ) : null}
     </div>
   );
 }
 
 function nextInputKey(value = {}) {
   if (!Object.hasOwn(value, "stdin")) return "stdin";
-  let index = 2;
-  while (Object.hasOwn(value, `stdin${index}`)) {
+  let index = 1;
+  while (Object.hasOwn(value, `input_${index}`)) {
     index += 1;
   }
-  return `stdin${index}`;
-}
-
-function defaultBlankInputKey(value = {}, currentKey = "") {
-  if (isStdinInputKey(currentKey)) return currentKey;
-  return nextInputKey(value);
-}
-
-function isStdinInputKey(key = "") {
-  return key === "stdin" || /^stdin\d+$/.test(key);
+  return `input_${index}`;
 }
 
 function objectToKeyValueText(value = {}) {
+  if (typeof value === "string") return value;
   return Object.entries(value)
     .map(([key, item]) => `${key}=${item}`)
     .join("\n");
 }
 
-function keyValueTextToObject(text) {
-  return Object.fromEntries(
-    text
-      .split("\n")
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .map((line) => {
-        const index = line.indexOf("=");
-        if (index === -1) {
-          return [line, ""];
-        }
-        return [line.slice(0, index).trim(), line.slice(index + 1).trim()];
-      }),
-  );
+function isExactRuntimeReference(value) {
+  return /^\s*\{\{\s*[^{}]+?\s*\}\}\s*$/.test(String(value));
+}
+
+function runtimeListEditorValue(value) {
+  return Array.isArray(value) ? value.map((item) => String(item)) : value;
+}
+
+function runtimeIntegerListValue(value) {
+  if (typeof value === "string") return value;
+  return value.map((item) => Number(item));
 }

@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 from typing import Any
 
+from gofer.core.provider_capabilities import resolve_provider_executable
 from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions import base as subscription_base
 from gofer.subscriptions.base import Subscription
@@ -25,7 +25,7 @@ class CodexSubscription(Subscription):
             if sandbox_mode is not None:
                 sandbox = sandbox_mode
         cmd = [
-            shutil.which("codex") or "codex",
+            resolve_provider_executable("codex") or "codex",
             "exec",
             "--color",
             "never",
@@ -37,6 +37,8 @@ class CodexSubscription(Subscription):
         if provider_settings:
             if provider_settings.model:
                 cmd += ["--model", provider_settings.model]
+            if provider_settings.effort:
+                cmd += ["-c", f'model_reasoning_effort="{provider_settings.effort}"']
             cmd += provider_settings.extra_args
         for path in extra_paths or []:
             cmd += ["--add-dir", str(path)]
@@ -44,7 +46,7 @@ class CodexSubscription(Subscription):
         return cmd
 
     def is_available(self) -> bool:
-        return shutil.which("codex") is not None
+        return resolve_provider_executable("codex") is not None
 
     def _parse_provider_output(self, stdout: str, stderr: str) -> tuple[str, dict[str, object]]:
         payloads = subscription_base._json_payloads(stdout) + subscription_base._json_payloads(
@@ -173,7 +175,5 @@ def _validate_codex_settings(settings: ResolvedProviderSettings | None) -> None:
         raise ValueError("Codex profiles do not support default tools")
     if settings.mcp_servers:
         raise ValueError("Codex profiles do not support MCP server flags")
-    if settings.reasoning:
-        raise ValueError("Codex profiles do not support reasoning/effort")
     if settings.approval_mode not in (None, "default"):
         raise ValueError("Codex profiles do not support approval_mode")

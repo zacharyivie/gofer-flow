@@ -21,7 +21,6 @@ from gofer.core.provider_profiles import (
     validate_provider_settings,
 )
 from gofer.core.workflow import AgenticWorkflow, WorkflowConfig
-from gofer.subscriptions import claude_code, codex
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
 from gofer.subscriptions.direct_api import AnthropicApiSubscription, OpenAiApiSubscription
@@ -36,16 +35,18 @@ from gofer.ui.api import (
 def test_provider_profile_serialization_round_trips(tmp_path: Path) -> None:
     save_provider_profiles(
         {
-            "fast": ProviderProfile(
-                name="fast",
-                subscription="codex",
-                model="gpt-5-mini",
-                timeout=45,
-                reasoning="low",
-                approval_mode="never",
-                sandbox_mode="read-only",
-                extra_args=["--flag"],
-                env={"A": "B"},
+            "fast": ProviderProfile.model_validate(
+                {
+                    "name": "fast",
+                    "subscription": "codex",
+                    "model": "gpt-5-mini",
+                    "timeout": 45,
+                    "reasoning": "low",
+                    "approval_mode": "never",
+                    "sandbox_mode": "read-only",
+                    "extra_args": ["--flag"],
+                    "env": {"A": "B"},
+                }
             )
         },
         tmp_path,
@@ -54,6 +55,7 @@ def test_provider_profile_serialization_round_trips(tmp_path: Path) -> None:
     loaded = load_provider_profiles(tmp_path)
 
     assert loaded["fast"].model == "gpt-5-mini"
+    assert loaded["fast"].effort == "low"
     assert loaded["fast"].timeout == 45
     assert loaded["fast"].extra_args == ["--flag"]
 
@@ -307,7 +309,6 @@ def test_direct_provider_missing_api_secret_is_reported_in_plan(
 
 
 def test_codex_profile_command_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(codex.shutil, "which", lambda _binary: None)
     settings = ResolvedProviderSettings(
         profile_name="quality",
         subscription="codex",
@@ -325,18 +326,13 @@ def test_codex_profile_command_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
     assert ["--model", "gpt-5"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
-    assert ["--sandbox", "read-only"] == cmd[
-        cmd.index("--sandbox") : cmd.index("--sandbox") + 2
-    ]
+    assert ["--sandbox", "read-only"] == cmd[cmd.index("--sandbox") : cmd.index("--sandbox") + 2]
     assert "--config" in cmd
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
-    [
-        ("reasoning", "high", "do not support reasoning/effort"),
-        ("approval_mode", "on-request", "do not support approval_mode"),
-    ],
+    [("approval_mode", "on-request", "do not support approval_mode")],
 )
 def test_codex_profile_rejects_unsupported_settings_before_launch(
     field: str,
@@ -355,8 +351,23 @@ def test_codex_profile_rejects_unsupported_settings_before_launch(
         CodexSubscription()._build_command("prompt", [], [], [], settings)
 
 
+def test_codex_profile_passes_effort_to_codex(monkeypatch: pytest.MonkeyPatch) -> None:
+    settings = ResolvedProviderSettings(
+        profile_name="quality",
+        subscription="codex",
+        model="gpt-5",
+        effort="high",
+    )
+
+    validate_provider_settings(settings)
+    command = CodexSubscription()._build_command("prompt", [], [], [], settings)
+
+    assert ["-c", 'model_reasoning_effort="high"'] == command[
+        command.index("-c") : command.index("-c") + 2
+    ]
+
+
 def test_claude_profile_command_flags(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     settings = ResolvedProviderSettings(
         profile_name="review",
         subscription="claude_code",

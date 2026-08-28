@@ -71,9 +71,9 @@ function createWindow(apiBaseUrl, apiToken = "") {
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 960,
-    minWidth: 1180,
-    minHeight: 720,
-    title: "Gofer Flow",
+    minWidth: 980,
+    minHeight: 640,
+    title: "Taskurotta",
     backgroundColor: "#1f1f1f",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
@@ -169,7 +169,7 @@ function startBackend() {
     let stdoutBuffer = "";
     let stderrBuffer = "";
     const timeoutId = setTimeout(() => {
-      fail(new Error("Timed out waiting for Gofer backend to start."));
+      fail(new Error("Timed out waiting for the Taskurotta backend to start."));
     }, BACKEND_START_TIMEOUT_MS);
 
     function succeed(apiBaseUrl, apiToken = "") {
@@ -368,10 +368,10 @@ function showBackendCrash(error) {
     return;
   }
 
-  createBackendErrorWindow(error, { title: "Gofer backend stopped" });
+  createBackendErrorWindow(error, { title: "Taskurotta backend stopped" });
 }
 
-function createBackendErrorWindow(error, { title = "Gofer backend did not start" } = {}) {
+function createBackendErrorWindow(error, { title = "Taskurotta backend did not start" } = {}) {
   const message = error instanceof Error ? error.message : String(error);
   if (backendErrorWindow && !backendErrorWindow.isDestroyed()) {
     backendErrorWindow.focus();
@@ -381,7 +381,7 @@ function createBackendErrorWindow(error, { title = "Gofer backend did not start"
   const errorWindow = new BrowserWindow({
     width: 720,
     height: 420,
-    title: "Gofer Flow Backend Error",
+    title: "Taskurotta Backend Error",
     backgroundColor: "#1f1f1f",
     webPreferences: {
       preload: path.join(__dirname, "error-preload.cjs"),
@@ -457,15 +457,15 @@ app.on("window-all-closed", () => {
 function setupApplicationMenu() {
   const template = [
     {
-      label: "Gofer Flow",
+      label: "Taskurotta",
       submenu: [
         {
-          label: "About Gofer Flow",
+          label: "About Taskurotta",
           click: () => {
             dialog.showMessageBox({
               type: "info",
-              title: "About Gofer Flow",
-              message: "Gofer Flow",
+              title: "About Taskurotta",
+              message: "Taskurotta",
               detail: "Local workflow automation studio.",
             });
           },
@@ -734,7 +734,7 @@ async function checkLatestReleaseFallback() {
   const response = await fetch(LATEST_RELEASE_URL, {
     headers: {
       Accept: "application/vnd.github+json",
-      "User-Agent": `Gofer-Flow/${app.getVersion()}`,
+      "User-Agent": `Taskurotta/${app.getVersion()}`,
     },
   });
   if (response.status === 404) {
@@ -962,10 +962,14 @@ async function readTextFile(_event, options = {}) {
     throw new Error(`Path is not a file: ${targetPath}`);
   }
   if (stat.size > 2 * 1024 * 1024) {
-    throw new Error("File is too large to edit in Gofer Flow.");
+    throw new Error("File is too large to edit in Taskurotta.");
+  }
+  const content = await fs.promises.readFile(targetPath);
+  if (content.includes(0)) {
+    throw new Error("Binary files cannot be opened in the code editor.");
   }
   return {
-    content: await fs.promises.readFile(targetPath, "utf-8"),
+    content: content.toString("utf-8"),
     ...pathHandle(targetPath),
   };
 }
@@ -1060,7 +1064,9 @@ async function selectPath(_event, options = {}) {
   fs.mkdirSync(defaultPath, { recursive: true });
   const properties = options.directoryOnly === true
     ? ["openDirectory", "showHiddenFiles", "createDirectory"]
-    : ["openFile", "openDirectory", "showHiddenFiles", "createDirectory"];
+    : options.fileOnly === true
+      ? ["openFile", "showHiddenFiles"]
+      : ["openFile", "openDirectory", "showHiddenFiles", "createDirectory"];
   const result = await dialog.showOpenDialog(parentWindow, {
     defaultPath,
     properties,

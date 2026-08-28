@@ -293,7 +293,9 @@ class WorkflowWatcher:
                         ),
                     )
                     .with_trigger_context(trigger_context)
-                    .with_parameters(workflow.config.watch.params if workflow.config.watch else {})
+                    .with_parameters(
+                        workflow.config.watch.invocation_inputs if workflow.config.watch else {}
+                    )
                     .run()
                 )
                 log.info(

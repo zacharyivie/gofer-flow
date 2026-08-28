@@ -14,10 +14,12 @@ from gofer.core.operations import (
     CommonLlmTaskOperation,
     HttpRequestOperation,
     NotificationOperation,
+    PromptFileOperation,
     PythonScriptOperation,
     ShellScriptOperation,
 )
 from gofer.core.provider_profiles import resolve_provider_settings
+from gofer.core.references import parse_exact_reference
 from gofer.core.workflow import AgenticWorkflow
 
 SECRET_TOKEN_PATTERN = re.compile(
@@ -104,6 +106,17 @@ def workflow_secret_requirements(
         for name in secret_reference_names(value):
             add(name, source)
 
+    def add_exact_refs(value: object, source: str) -> None:
+        if isinstance(value, str):
+            expression = parse_exact_reference(value)
+            if expression is not None and expression.startswith("secret."):
+                parts = expression.split(".")
+                if len(parts) == 2:
+                    add(parts[1], source)
+        elif isinstance(value, dict):
+            for item in value.values():
+                add_exact_refs(item, source)
+
     for trigger_id, trigger in workflow.config.webhooks.items():
         if trigger.token_env:
             add(trigger.token_env, f"trigger:{trigger_id}.token_env")
@@ -111,9 +124,13 @@ def workflow_secret_requirements(
     for node in workflow.graph.nodes_in_order():
         op = node.operation
         node_source = f"node:{node.node_id}"
+        add_refs(node.inputs, f"{node_source}.inputs")
+        add_exact_refs(node.inputs, f"{node_source}.inputs")
         if isinstance(op, (BashCommandOperation, PythonScriptOperation, ShellScriptOperation)):
             add_refs(op.env, f"{node_source}.env")
         elif isinstance(op, (AgentOperation, CommonLlmTaskOperation)):
+            add_refs(op.input_mapping, f"{node_source}.input_mapping")
+            add_exact_refs(op.input_mapping, f"{node_source}.input_mapping")
             agent = workflow.agents.get(op.agent_id)
             if agent is not None:
                 add_refs(agent.env, f"agent:{agent.agent_id}.env")
@@ -121,8 +138,10 @@ def workflow_secret_requirements(
                     agent_subscription=agent.subscription,
                     profile_name=agent.profile,
                     agent_model=agent.model,
+                    agent_effort=agent.effort,
                     operation_profile=op.profile,
                     operation_model=op.model,
+                    operation_effort=op.effort,
                     operation_timeout=op.timeout,
                     data_dir=profile_data_dir,
                 )
@@ -132,6 +151,9 @@ def workflow_secret_requirements(
                     add(settings.api_key_secret, f"{node_source}.provider.api_key")
                 elif settings.api_key_env:
                     add(settings.api_key_env, f"{node_source}.provider.api_key")
+        elif isinstance(op, PromptFileOperation):
+            add_refs(op.model_dump(by_alias=True), node_source)
+            add_exact_refs(op.variables, f"{node_source}.variables")
         elif isinstance(op, HttpRequestOperation):
             add_refs(op.model_dump(by_alias=True), node_source)
         elif isinstance(op, NotificationOperation):

@@ -4,7 +4,7 @@ This file provides guidance for AI coding agents, including Codex, Claude Code, 
 
 ## Project Summary
 
-`gofer-flow` is a Python CLI tool (`gof`) for defining and executing DAG-based agentic workflows. Workflows are defined in TOML and can run bash commands, scripts, or LLM agent calls as nodes in a directed acyclic graph.
+`gofer-flow` is a Python CLI and desktop workflow studio. Workflows use the Radish language in `workflow.rad`; the compiler validates them and emits versioned JSON IR. Execution supports explicit routes, joins, branches, and cycles.
 
 ## Commands
 
@@ -43,43 +43,37 @@ Layer structure:
 
 Execution flow:
 
-1. `AgenticWorkflow.from_file()` deserializes TOML into a NetworkX DAG and agent configs.
-2. `WorkflowExecutor.run()` groups nodes by topological generation.
-3. Each generation runs concurrently with `anyio` task groups.
-4. Node outputs are captured as `NodeOutput` and stored in `ExecutionContext` for downstream interpolation.
-5. `EdgeConfig.evaluate()` handles conditional edges: `ON_SUCCESS`, `ON_FAILURE`, and `OUTPUT_MATCHES`.
+1. The Radish lexer and parser build a source-faithful AST.
+2. Semantic analysis applies machine-readable node and provider contracts.
+3. The compiler emits schema-valid, versioned JSON IR with explicit defaults.
+4. Preflight checks whether the compiled workflow has the resources needed to run.
+5. The activation runtime executes routes, joins, branches, and cycles while preserving activation lineage.
 
 Key patterns:
 
-- Operations use a Pydantic v2 discriminated union on the `type` field; TOML deserialization should remain automatic.
-- `dynamic_count` on `AgentOperation` nodes enables runtime fan-out resolved against prior outputs.
+- Built-in node behavior must agree with the Radish machine contract, compiler, preflight, runtime handler, and conformance fixtures.
+- Loop nodes provide runtime fan-out with explicit concurrency and failure behavior.
 - `WorkflowScheduler` wraps APScheduler with a SQLite job store persisted at `~/.local/share/gofer/schedules.db`.
 - Tests use `FakeSubscription` from `tests/conftest.py` to avoid requiring real `claude` or `codex` CLIs.
 
-## TOML Workflow Format
+## Radish workflow format
 
-```toml
-[workflow]
-id = "my-workflow"
-name = "My Workflow"
+```yaml
+Radish: 1
 
-[agents.analyzer]
-subscription = "claude_code"
+Workflow:
+  name: My Workflow
 
-[[nodes]]
-id = "step1"
-type = "bash_command"
-command = "echo hello"
+Node step-1:
+  type: bash-command
+  command: echo hello
+  to: step-2
 
-[[nodes]]
-id = "step2"
-type = "agent"
-agent_id = "analyzer"
-prompt = "Analyze: {{step1.output}}"
-
-[[edges]]
-from = "step1"
-to = "step2"
+Node step-2:
+  type: agent
+  provider: codex
+  prompt: Analyze the command output.
+  needs: step-1
 ```
 
 ## Development Rules

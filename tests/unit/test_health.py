@@ -10,6 +10,7 @@ from gofer.core.health import (
     HealthDiagnostic,
     HealthReport,
     run_health_checks,
+    workflow_health_diagnostics,
     workflow_health_payload,
 )
 from gofer.core.provider_profiles import ProviderProfile, save_provider_profiles
@@ -60,7 +61,7 @@ def test_doctor_human_reports_ready_checks_when_all_diagnostics_ok(
     result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert "Gofer Flow doctor" in result.output
+    assert "Taskurotta doctor" in result.output
     assert "Ready checks" in result.output
     assert "- Python version is supported." in result.output
     assert "- Data directory is writable." in result.output
@@ -157,7 +158,7 @@ def test_doctor_human_with_no_diagnostics_prints_only_header(
     result = runner.invoke(app, ["doctor", "--data-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
-    assert result.output == "Gofer Flow doctor\n"
+    assert result.output == "Taskurotta doctor\n"
 
 
 def test_doctor_human_workflow_option_prints_workflow_diagnostics(
@@ -262,9 +263,7 @@ working_dir = "."
 
     payload = run_health_checks(data_dir=tmp_path).to_dict()
 
-    provider_diagnostics = [
-        item for item in payload["diagnostics"] if item["id"] == "provider.cli"
-    ]
+    provider_diagnostics = [item for item in payload["diagnostics"] if item["id"] == "provider.cli"]
     assert provider_diagnostics == [
         {
             "id": "provider.cli",
@@ -297,9 +296,7 @@ def test_doctor_reports_legacy_plaintext_provider_profile_secrets(
     payload = run_health_checks(data_dir=tmp_path).to_dict()
 
     diagnostics = [
-        item
-        for item in payload["warnings"]
-        if item["id"] == "provider_profile.plaintext_secret"
+        item for item in payload["warnings"] if item["id"] == "provider_profile.plaintext_secret"
     ]
     assert diagnostics == [
         {
@@ -374,9 +371,7 @@ script_path = "run.sh"
 
     assert result.exit_code == 1
     payload = json.loads(result.output)
-    shell_errors = [
-        item for item in payload["errors"] if item["id"] == "workflow.shell_available"
-    ]
+    shell_errors = [item for item in payload["errors"] if item["id"] == "workflow.shell_available"]
     assert {item["subject"] for item in shell_errors} == {"node:command", "node:script"}
     assert all(item["detail"]["binary"] == "bash" for item in shell_errors)
 
@@ -426,6 +421,43 @@ dynamic_count = 1
     assert "workflow.provider_cli" in error_ids
     assert "workflow.working_dir" in error_ids
     assert "workflow.prompt_path" in error_ids
+
+
+def test_workflow_health_ignores_stale_agent_prompt_when_node_overrides_it(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "node-prompt.md").write_text("Use this prompt.", encoding="utf-8")
+    workflow = tmp_path / "node-prompt-override.toml"
+    workflow.write_text(
+        """
+[workflow]
+id = "node-prompt-override"
+name = "Node Prompt Override"
+
+[agents.reviewer]
+subscription = "codex"
+working_dir = "."
+prompt_path = "prompts"
+
+[[nodes]]
+id = "review"
+type = "agent"
+agent_id = "reviewer"
+working_dir = "."
+prompt_path = "node-prompt.md"
+dynamic_count = 1
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("gofer.core.health.shutil.which", lambda _binary: "/usr/bin/codex")
+
+    diagnostics = workflow_health_diagnostics(workflow)
+
+    assert not any(
+        item.id == "workflow.prompt_path" and item.severity == "error" for item in diagnostics
+    )
 
 
 def test_workflow_health_catches_script_and_fanout_paths(monkeypatch, tmp_path: Path) -> None:
@@ -599,7 +631,7 @@ def test_global_health_rejects_workflow_assistant_cli_source_inside_data_dir(
     assert any(
         item["id"] == "packaging.gofer_cli"
         and item["severity"] == "warning"
-        and "mutable Gofer data directory" in item["message"]
+        and "mutable Taskurotta data directory" in item["message"]
         for item in payload["warnings"]
     )
 

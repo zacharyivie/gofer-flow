@@ -1,5 +1,5 @@
 pkgbase = gofer-flow-cli
-	pkgdesc = Command line workflow automation tool for Gofer Flow
+	pkgdesc = Command line workflow automation tool for Taskurotta
 	pkgver = 0.1.2
 	pkgrel = 1
 	url = https://github.com/doonk/gofer-flow

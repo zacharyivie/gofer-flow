@@ -64,14 +64,18 @@ def test_self_loop_is_allowed() -> None:
 
 def test_special_nodes_must_be_unique() -> None:
     g = WorkflowGraph()
-    g.add_node(GraphNode(
-        node_id="start-a",
-        operation=StartOperation(type=OperationType.START),
-    ))
-    g.add_node(GraphNode(
-        node_id="start-b",
-        operation=StartOperation(type=OperationType.START),
-    ))
+    g.add_node(
+        GraphNode(
+            node_id="start-a",
+            operation=StartOperation(type=OperationType.START),
+        )
+    )
+    g.add_node(
+        GraphNode(
+            node_id="start-b",
+            operation=StartOperation(type=OperationType.START),
+        )
+    )
 
     with pytest.raises(ValueError, match="one START node"):
         g.validate()

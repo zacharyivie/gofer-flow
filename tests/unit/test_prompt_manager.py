@@ -49,5 +49,6 @@ def test_search_dir_resolution(tmp_path: Path) -> None:
     (tmp_path / "greet.md").write_text("Hi {{user}}!")
     mgr = PromptManager(search_dirs=[tmp_path])
     from pathlib import Path
+
     result = mgr.load(Path("greet.md"), {"user": "Alice"})
     assert result == "Hi Alice!"

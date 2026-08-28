@@ -42,7 +42,7 @@ def _run_workflow(workflow_id: str, workflow_path: str, subscriptions: dict[str,
             log_base_dir=path.parent / "logs",
             workflow_path=path,
             stop_file=workflow_stop_path(workflow_id, path.parent),
-        ).with_parameters(wf.config.schedule.params if wf.config.schedule else {})
+        ).with_parameters(wf.config.schedule.invocation_inputs if wf.config.schedule else {})
         result = await executor.run()
         write_run_node_outputs_payload(result, wf.config.resource_limits)
         log.info("Workflow %s finished: success=%s", workflow_id, result.success)

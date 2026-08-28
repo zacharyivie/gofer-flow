@@ -5,8 +5,8 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 binary_path="${1:-${repo_root}/dist/gof}"
 output_dir="${2:-${repo_root}/frontend/release}"
 package_name="gofer-flow-cli"
-maintainer="Gofer Flow <maintainers@goferflow.local>"
-description="Command line workflow automation tool for Gofer Flow"
+maintainer="Taskurotta <maintainers@goferflow.local>"
+description="Command line workflow automation tool for Taskurotta"
 
 if [[ ! -x "${binary_path}" ]]; then
   echo "CLI binary is missing or not executable: ${binary_path}" >&2
@@ -50,7 +50,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: ${maintainer}
 Description: ${description}
- Gofer Flow is a local DAG workflow runner for deterministic automation,
+ Taskurotta is a local DAG workflow runner for deterministic automation,
  shell/script steps, and LLM-backed agent steps.
 EOF
 
@@ -72,7 +72,7 @@ URL:            https://github.com/doonk/gofer-flow
 BuildArch:      x86_64
 
 %description
-Gofer Flow is a local DAG workflow runner for deterministic automation,
+Taskurotta is a local DAG workflow runner for deterministic automation,
 shell/script steps, and LLM-backed agent steps.
 
 %prep

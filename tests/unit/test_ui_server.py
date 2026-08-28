@@ -7,13 +7,14 @@ from email.message import Message
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
 from gofer.core.resources import DEFAULT_RESOURCE_LIMITS, ResourceLimits
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.core.watcher import WorkflowWatcher
+from gofer.radish.workspaces import create_registered_workflow
 from gofer.ui import server as server_module
 from gofer.ui.chat import workflow_chat_prompt_path
 from gofer.ui.server import (
@@ -429,6 +430,42 @@ def test_ui_server_rejects_disallowed_origin(tmp_path) -> None:
     assert response.json() == {"error": "Origin is not allowed"}
 
 
+@pytest.mark.parametrize(
+    "disconnect",
+    [BrokenPipeError, ConnectionAbortedError, ConnectionResetError],
+)
+def test_ui_server_treats_client_disconnect_as_normal(
+    monkeypatch: pytest.MonkeyPatch,
+    disconnect: type[OSError],
+) -> None:
+    handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
+
+    def disconnect_during_response(_handler: object) -> None:
+        raise disconnect("client closed the connection")
+
+    monkeypatch.setattr(
+        server_module.BaseHTTPRequestHandler,
+        "handle",
+        disconnect_during_response,
+    )
+
+    handler.handle()
+
+
+def test_ui_server_does_not_hide_unexpected_handler_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = GoferUiRequestHandler.__new__(GoferUiRequestHandler)
+
+    def fail_request(_handler: object) -> None:
+        raise RuntimeError("response bug")
+
+    monkeypatch.setattr(server_module.BaseHTTPRequestHandler, "handle", fail_request)
+
+    with pytest.raises(RuntimeError, match="response bug"):
+        handler.handle()
+
+
 def test_ui_server_state_change_requires_ui_api_token(tmp_path) -> None:
     response = _request(
         tmp_path,
@@ -440,6 +477,130 @@ def test_ui_server_state_change_requires_ui_api_token(tmp_path) -> None:
 
     assert response.status == 401
     assert response.json() == {"error": "UI API authentication required"}
+
+
+def test_ui_server_exposes_revisioned_radish_document_routes(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    create_registered_workflow(project, "Route Editor", registry_dir=tmp_path)
+
+    opened_response = _request(tmp_path, "GET", "/api/workflows/route-editor/document")
+    assert opened_response.status == 200
+    opened = cast(dict[str, Any], opened_response.json())["document"]
+    source = (
+        opened["source"]
+        + """Node prepare:
+  type: bash-command
+  command: echo ready
+"""
+    )
+
+    analyzed_response = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/route-editor/document/analyze",
+        body={"source": source},
+    )
+    assert analyzed_response.status == 200
+    assert cast(dict[str, Any], analyzed_response.json())["document"]["dirty"] is True
+
+    saved_response = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/route-editor/document/save",
+        body={"source": source, "expectedRevision": opened["sourceRevision"]},
+    )
+    assert saved_response.status == 200
+    saved = cast(dict[str, Any], saved_response.json())["document"]
+    assert saved["dirty"] is False
+
+    conflict = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/route-editor/document/save",
+        body={"source": source, "expectedRevision": opened["sourceRevision"]},
+    )
+    assert conflict.status == 409
+    assert cast(dict[str, Any], conflict.json())["code"] == ("RADISH_EDITOR_REVISION_CONFLICT")
+
+    metadata = saved["metadata"]
+    metadata["canvas"]["nodes"]["prepare"] = {"x": 10, "y": 20}
+    metadata_response = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/route-editor/metadata",
+        body={
+            "metadata": metadata,
+            "expectedRevision": saved["metadataRevision"],
+        },
+    )
+    assert metadata_response.status == 200
+    assert cast(dict[str, Any], metadata_response.json())["metadata"]["canvas"]["nodes"][
+        "prepare"
+    ] == {"x": 10, "y": 20}
+
+    mutation_response = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/route-editor/document/mutate",
+        body={
+            "mutations": [
+                {
+                    "kind": "set_field",
+                    "target": {"node": "prepare"},
+                    "field": "command",
+                    "value": "echo changed",
+                }
+            ],
+            "expectedRevision": saved["sourceRevision"],
+        },
+    )
+    assert mutation_response.status == 200
+    mutated = cast(dict[str, Any], mutation_response.json())["document"]
+    assert 'command: "echo changed"' in mutated["source"]
+
+
+def test_ui_server_plans_and_runs_registered_radish_workflows(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    registered = create_registered_workflow(project, "Runnable Radish", registry_dir=tmp_path)
+    registered.entrypoint.write_text(
+        """Radish: 1
+
+Workflow:
+  name: Runnable Radish
+
+Node prepare:
+  type: bash-command
+  command: "printf ready"
+""",
+        encoding="utf-8",
+    )
+
+    planned = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/runnable-radish/plan",
+        body={"triggerContext": {}},
+    )
+    assert planned.status == 200
+    plan = cast(dict[str, Any], planned.json())["plan"]
+    assert plan["kind"] == "radish"
+    assert plan["runnable"] is True
+    assert plan["generations"][0]["nodes"][0]["id"] == "prepare"
+
+    executed = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows/runnable-radish/run",
+        body={"inputs": {}},
+    )
+    assert executed.status == 200
+    run = cast(dict[str, Any], executed.json())["run"]
+    assert run["success"] is True
+    assert run["workflowId"] == "runnable-radish"
+    assert run["nodeOutputs"]["prepare"]["data"]["stdout"] == "ready"
+    assert Path(run["logPath"]).is_file()
 
 
 def test_ui_server_renders_llm_usage_summary() -> None:
@@ -469,21 +630,13 @@ def test_ui_server_renders_llm_usage_summary() -> None:
                     "duration_seconds": 2.5,
                 }
             ],
-            "budget_failures": [
-                {
-                    "node_id": "blocked",
-                    "budget_violations": ["node budget max_estimated_tokens exceeded"],
-                }
-            ],
         }
     )
 
     assert "LLM run usage" in html
     assert "Most expensive nodes" in html
     assert "Slowest nodes" in html
-    assert "Budget failures" in html
     assert "expensive" in html
-    assert "blocked" in html
 
 
 def test_ui_server_workflow_usage_page_reads_recent_sidecars(tmp_path: Path) -> None:
@@ -908,9 +1061,15 @@ def test_ui_server_get_routes_forward_to_api_payloads(monkeypatch, tmp_path) -> 
         "provider_payload",
         lambda: {"providers": [{"id": "codex"}]},
     )
+    monkeypatch.setattr(
+        server_module,
+        "provider_capabilities_payload",
+        lambda *, refresh=False: {"providers": [{"id": "codex", "refresh": refresh}]},
+    )
 
     workflows = _request(tmp_path, "GET", "/api/workflows")
     providers = _request(tmp_path, "GET", "/api/chat/providers")
+    capabilities = _request(tmp_path, "GET", "/api/provider/capabilities?refresh=true")
     latest = _request(tmp_path, "GET", "/api/workflows/wf/logs/latest")
     logs = _request(
         tmp_path,
@@ -922,6 +1081,7 @@ def test_ui_server_get_routes_forward_to_api_payloads(monkeypatch, tmp_path) -> 
     assert workflows.status == 200
     assert workflows.json() == {"workflows": []}
     assert providers.json() == {"providers": [{"id": "codex"}]}
+    assert capabilities.json() == {"providers": [{"id": "codex", "refresh": True}]}
     assert latest.json() == {"log": {"id": "latest.log"}}
     assert logs.json() == {"runs": [], "total": 0}
     assert events.json() == {"events": [{"type": "start"}]}
@@ -946,8 +1106,8 @@ def test_ui_server_get_routes_forward_to_api_payloads(monkeypatch, tmp_path) -> 
 def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None:
     calls: dict[str, object] = {}
 
-    def fake_create(name, data_dir):
-        calls["create"] = (name, data_dir)
+    def fake_create(name, project_root, *, registry_dir):
+        calls["create"] = (name, project_root, registry_dir)
         return {"id": "created"}
 
     def fake_import(content, data_dir):
@@ -962,12 +1122,19 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
         calls["duplicate"] = (workflow_id, name, data_dir)
         return {"id": "copy"}
 
-    monkeypatch.setattr(server_module, "create_workflow_payload", fake_create)
+    monkeypatch.setattr(server_module, "create_registered_workflow_payload", fake_create)
     monkeypatch.setattr(server_module, "import_workflow_payload", fake_import)
     monkeypatch.setattr(server_module, "rename_workflow_payload", fake_rename)
     monkeypatch.setattr(server_module, "duplicate_workflow_payload", fake_duplicate)
 
-    create = _request(tmp_path, "POST", "/api/workflows", body={"name": "Created"})
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    create = _request(
+        tmp_path,
+        "POST",
+        "/api/workflows",
+        body={"name": "Created", "projectRoot": str(project_root)},
+    )
     imported = _request(tmp_path, "POST", "/api/workflows/import", body={"content": "toml"})
     renamed = _request(tmp_path, "POST", "/api/workflows/wf/rename", body={"name": "Renamed"})
     duplicate = _request(tmp_path, "POST", "/api/workflows/wf/duplicate", body={"name": "Copy"})
@@ -981,7 +1148,7 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
     assert renamed.server.continuous_sync_calls == 1
     assert duplicate.status == 201
     assert calls == {
-        "create": ("Created", tmp_path),
+        "create": ("Created", project_root, tmp_path),
         "import": ("toml", tmp_path),
         "rename": ("wf", "Renamed", tmp_path),
         "duplicate": ("wf", "Copy", tmp_path),
@@ -1290,8 +1457,8 @@ def test_ui_server_chat_stream_provider_error_is_ndjson(monkeypatch, tmp_path) -
         (
             "POST",
             "/api/workflows",
-            {"name": "Taken"},
-            "create_workflow_payload",
+            {"name": "Taken", "projectRoot": "."},
+            "create_registered_workflow_payload",
             server_module.WorkflowAlreadyExistsError("taken"),
             409,
         ),
@@ -1357,6 +1524,8 @@ def test_ui_server_error_status_mappings(
         async_raise if patch_name in {"run_workflow_payload", "run_workflow_chat"} else sync_raise
     )
     monkeypatch.setattr(server_module, patch_name, replacement)
+    if patch_name == "create_registered_workflow_payload":
+        body = {**body, "projectRoot": str(tmp_path)}
 
     response = _request(tmp_path, method, path, body=body)
 

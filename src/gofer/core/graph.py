@@ -9,6 +9,12 @@ import networkx as nx
 from pydantic import BaseModel, model_validator
 
 from gofer.core.operations import Operation, OperationType
+from gofer.core.runtime_values import RuntimeBool, RuntimeInt
+from gofer.core.structured_output import (
+    OutputFieldOperator,
+    evaluate_output_field,
+    predicate_explanation,
+)
 
 if TYPE_CHECKING:
     from gofer.core.executor import NodeOutput
@@ -19,6 +25,8 @@ class EdgeConditionType(StrEnum):
     ON_SUCCESS = "on_success"
     ON_FAILURE = "on_failure"
     OUTPUT_MATCHES = "output_matches"
+    OUTPUT_NO_MATCH = "output_no_match"
+    OUTPUT_FIELD = "output_field"
     AFTER_LOOP = "after_loop"
 
 
@@ -27,6 +35,18 @@ class EdgeConfig(BaseModel):
     to_node: str
     condition: EdgeConditionType = EdgeConditionType.ALWAYS
     output_pattern: str | None = None
+    field: str | None = None
+    operator: OutputFieldOperator | None = None
+    value: Any = None
+
+    @model_validator(mode="after")
+    def validate_condition_fields(self) -> EdgeConfig:
+        if self.condition == EdgeConditionType.OUTPUT_FIELD:
+            if not self.field:
+                raise ValueError("output_field edges require field")
+            if self.operator is None:
+                raise ValueError("output_field edges require operator")
+        return self
 
     def evaluate(self, output: NodeOutput) -> bool:
         match self.condition:
@@ -38,9 +58,24 @@ class EdgeConfig(BaseModel):
                 return not output.success
             case EdgeConditionType.OUTPUT_MATCHES:
                 return bool(re.search(self.output_pattern or "", _matchable_output(output)))
+            case EdgeConditionType.OUTPUT_NO_MATCH:
+                return False
+            case EdgeConditionType.OUTPUT_FIELD:
+                if self.operator is None:
+                    return False
+                return evaluate_output_field(
+                    output.value, self.field or "", self.operator, self.value
+                )
             case EdgeConditionType.AFTER_LOOP:
                 return False
         return True
+
+    def explanation(self) -> str:
+        if self.condition == EdgeConditionType.OUTPUT_FIELD and self.operator is not None:
+            return predicate_explanation(self.field or "", self.operator, self.value)
+        if self.condition == EdgeConditionType.OUTPUT_MATCHES and self.output_pattern:
+            return f"output matches {self.output_pattern!r}"
+        return self.condition.value.replace("_", " ")
 
 
 def _matchable_output(output: NodeOutput) -> str:
@@ -64,6 +99,9 @@ class GraphNode(BaseModel):
     operation: Operation
     label: str | None = None
     inputs: dict[str, str] = {}
+    for_each: str | None = None
+    max_concurrency: RuntimeInt = 1
+    fail_fast: RuntimeBool = False
     retry_count: int = 0
     retry_delay_seconds: float = 1.0
     timeout_seconds: float | None = None
@@ -112,8 +150,7 @@ class WorkflowGraph:
     def topological_generations(self) -> list[list[GraphNode]]:
         try:
             return [
-                [self._nodes[nid] for nid in gen]
-                for gen in nx.topological_generations(self._graph)
+                [self._nodes[nid] for nid in gen] for gen in nx.topological_generations(self._graph)
             ]
         except nx.NetworkXUnfeasible:
             return [[node] for node in self._nodes.values()]
@@ -136,9 +173,7 @@ class WorkflowGraph:
         for node_type, node_ids in special_nodes.items():
             if len(node_ids) > 1:
                 label = node_type.value.upper()
-                raise ValueError(
-                    f"Workflow can only contain one {label} node; found {node_ids}"
-                )
+                raise ValueError(f"Workflow can only contain one {label} node; found {node_ids}")
 
     def __len__(self) -> int:
         return len(self._nodes)

@@ -6,13 +6,19 @@ from pathlib import Path
 
 import pytest
 
+from gofer.core.provider_profiles import ResolvedProviderSettings
 from gofer.subscriptions import base, claude_code, codex
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
 from gofer.subscriptions.codex import CodexSubscription
 
 
+@pytest.fixture(autouse=True)
+def use_unresolved_provider_binaries(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(claude_code, "resolve_provider_executable", lambda _provider: None)
+    monkeypatch.setattr(codex, "resolve_provider_executable", lambda _provider: None)
+
+
 def test_claude_code_command_basic(monkeypatch) -> None:
-    monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     sub = ClaudeCodeSubscription()
     cmd = sub._build_command("hello", [], [])
     assert cmd[:5] == ["claude", "--print", "--output-format", "stream-json", "-p"]
@@ -20,7 +26,6 @@ def test_claude_code_command_basic(monkeypatch) -> None:
 
 
 def test_claude_code_command_with_tools(monkeypatch) -> None:
-    monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     sub = ClaudeCodeSubscription()
     cmd = sub._build_command("hi", ["Bash", "Read"], [])
     assert "--allowedTools" in cmd
@@ -29,15 +34,26 @@ def test_claude_code_command_with_tools(monkeypatch) -> None:
 
 
 def test_claude_code_command_with_mcp(monkeypatch) -> None:
-    monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     sub = ClaudeCodeSubscription()
     cmd = sub._build_command("hi", [], ["my-server"])
     assert "--mcp-server" in cmd
     assert "my-server" in cmd
 
 
+def test_claude_code_command_with_model_and_effort(monkeypatch) -> None:
+    settings = ResolvedProviderSettings(
+        subscription="claude_code",
+        model="claude-sonnet-4-5",
+        effort="high",
+    )
+
+    cmd = ClaudeCodeSubscription()._build_command("hi", [], [], provider_settings=settings)
+
+    assert ["--model", "claude-sonnet-4-5"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
+    assert ["--effort", "high"] == cmd[cmd.index("--effort") : cmd.index("--effort") + 2]
+
+
 def test_codex_command_basic(monkeypatch) -> None:
-    monkeypatch.setattr(codex.shutil, "which", lambda _binary: None)
     sub = CodexSubscription()
     cmd = sub._build_command("hello", [], [])
     assert cmd == [
@@ -54,15 +70,26 @@ def test_codex_command_basic(monkeypatch) -> None:
 
 
 def test_codex_command_ignores_unsupported_tool_flags(monkeypatch) -> None:
-    monkeypatch.setattr(codex.shutil, "which", lambda _binary: None)
     sub = CodexSubscription()
     cmd = sub._build_command("hi", ["Bash"], [])
     assert "--tool" not in cmd
     assert cmd[-1] == "hi"
 
 
+def test_codex_command_with_model_and_effort(monkeypatch) -> None:
+    settings = ResolvedProviderSettings(
+        subscription="codex",
+        model="gpt-5.6-sol",
+        effort="ultra",
+    )
+
+    cmd = CodexSubscription()._build_command("hi", [], [], provider_settings=settings)
+
+    assert ["--model", "gpt-5.6-sol"] == cmd[cmd.index("--model") : cmd.index("--model") + 2]
+    assert ["-c", 'model_reasoning_effort="ultra"'] == cmd[cmd.index("-c") : cmd.index("-c") + 2]
+
+
 def test_codex_command_adds_extra_sandbox_dirs(monkeypatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(codex.shutil, "which", lambda _binary: None)
     extra_dir = tmp_path / "tickets"
     sub = CodexSubscription()
 
@@ -76,7 +103,6 @@ def test_claude_code_command_adds_extra_sandbox_dirs(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    monkeypatch.setattr(claude_code.shutil, "which", lambda _binary: None)
     extra_dir = tmp_path / "tickets"
     sub = ClaudeCodeSubscription()
 
@@ -89,12 +115,14 @@ def test_claude_code_command_adds_extra_sandbox_dirs(
 
 def test_subscription_commands_use_resolved_binary_paths(monkeypatch) -> None:
     monkeypatch.setattr(
-        codex.shutil,
-        "which",
-        lambda binary: {
-            "codex": r"C:\Users\me\AppData\Roaming\npm\codex.cmd",
-            "claude": r"C:\Users\me\AppData\Roaming\npm\claude.cmd",
-        }.get(binary),
+        codex,
+        "resolve_provider_executable",
+        lambda _provider: r"C:\Users\me\AppData\Roaming\npm\codex.cmd",
+    )
+    monkeypatch.setattr(
+        claude_code,
+        "resolve_provider_executable",
+        lambda _provider: r"C:\Users\me\AppData\Roaming\npm\claude.cmd",
     )
 
     assert CodexSubscription()._build_command("hello", [], [])[0] == (
@@ -125,7 +153,7 @@ async def test_subscription_execute_splits_thoughts_from_final_message(
     )
 
     assert result.success
-    assert result.thoughts == ["thinking\n", "final answer\n"]
+    assert result.thoughts == ["thinking", "final answer"]
     assert result.message == "final answer\n"
     assert result.output == "final answer\n"
 
@@ -322,8 +350,7 @@ async def test_subscription_execute_streams_structured_agent_events(
             "type": "chunk",
             "stream": "stdout",
             "text": (
-                '{"type":"item.completed",'
-                '"item":{"type":"agent_message","text":"hello live"}}\n'
+                '{"type":"item.completed","item":{"type":"agent_message","text":"hello live"}}\n'
             ),
             "returncode": None,
         }
@@ -466,7 +493,7 @@ async def test_codex_subscription_execute_uses_prompt_file_instead_of_full_promp
 
     assert result.success
     assert captured["prompt_file_text"] == long_prompt
-    assert "Read the complete Gofer Flow agent prompt" in str(captured["prompt_arg"])
+    assert "Read the complete Taskurotta agent prompt" in str(captured["prompt_arg"])
     assert long_prompt not in list(captured["cmd"])  # type: ignore[arg-type]
     assert not Path(captured["prompt_path"]).exists()
 
@@ -500,6 +527,6 @@ async def test_claude_subscription_execute_uses_prompt_file_instead_of_full_prom
 
     assert result.success
     assert captured["prompt_file_text"] == long_prompt
-    assert "Read the complete Gofer Flow agent prompt" in str(captured["prompt_arg"])
+    assert "Read the complete Taskurotta agent prompt" in str(captured["prompt_arg"])
     assert long_prompt not in list(captured["cmd"])  # type: ignore[arg-type]
     assert not Path(captured["prompt_path"]).exists()

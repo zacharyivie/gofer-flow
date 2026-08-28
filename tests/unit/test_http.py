@@ -34,9 +34,7 @@ def _install_recording_connection(
             body: bytes | None,
             headers: dict[str, str],
         ) -> None:
-            calls.update(
-                {"method": method, "path": path, "body": body, "headers": headers}
-            )
+            calls.update({"method": method, "path": path, "body": body, "headers": headers})
 
         def getresponse(self) -> SimpleNamespace:
             return SimpleNamespace(

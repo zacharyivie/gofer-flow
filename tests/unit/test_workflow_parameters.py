@@ -24,6 +24,32 @@ from gofer.ui.api import WorkflowRunError, run_workflow_payload, workflow_plan_p
 runner = CliRunner()
 
 
+def test_legacy_dashboard_nodes_are_removed_with_attached_edges() -> None:
+    workflow = AgenticWorkflow.from_dict(
+        {
+            "workflow": {"id": "legacy", "name": "Legacy"},
+            "nodes": [
+                {"id": "start", "type": "pass", "message": "start"},
+                {
+                    "id": "retired",
+                    "type": "dashboard_item",
+                    "dashboard": "old",
+                    "component": "items",
+                },
+                {"id": "finish", "type": "pass", "message": "finish"},
+            ],
+            "edges": [
+                {"from": "start", "to": "retired"},
+                {"from": "retired", "to": "finish"},
+                {"from": "start", "to": "finish"},
+            ],
+        }
+    )
+
+    assert [node.node_id for node in workflow.graph.nodes_in_order()] == ["start", "finish"]
+    assert list(workflow.graph._graph.edges()) == [("start", "finish")]
+
+
 def test_workflow_parameters_parse_validate_and_serialize(tmp_path: Path) -> None:
     path = tmp_path / "params.toml"
     path.write_text(
@@ -96,18 +122,35 @@ def test_workflow_parameter_validation_rejects_missing_unknown_and_invalid() -> 
         },
     )
 
-    for provided, message in [
-        ({}, "Missing required workflow parameter: count"),
-        ({"count": 2, "extra": "x"}, "Unknown workflow parameter"),
-        ({"count": 4, "kind": "daily"}, "must be <= 3"),
-        ({"count": 2, "kind": "monthly"}, "must be one of"),
+    for provided, field_path, expected_type, detail in [
+        ({}, "inputs.count", "number", "missing required workflow input 'count'"),
+        (
+            {"count": 2, "extra": "x"},
+            "inputs.extra",
+            "declared workflow input name",
+            "unknown workflow input(s): extra",
+        ),
+        (
+            {"count": "bogus", "kind": "daily"},
+            "inputs.count",
+            "number",
+            "must be a valid number",
+        ),
+        ({"count": 4, "kind": "daily"}, "inputs.count", "number", "must be <= 3"),
+        ({"count": 2, "kind": "monthly"}, "inputs.kind", "enum", "must be one of"),
     ]:
         try:
             resolve_workflow_parameters(config, provided)
         except ValueError as exc:
-            assert message in str(exc)
+            diagnostic = str(exc)
+            assert "Workflow 'params' invocation 'preflight'" in diagnostic
+            assert "node '<invocation>'" in diagnostic
+            assert f"field '{field_path}'" in diagnostic
+            assert f"expected type '{expected_type}'" in diagnostic
+            assert detail in diagnostic
+            assert "workflow parameter" not in diagnostic.lower()
         else:
-            raise AssertionError("parameter validation unexpectedly passed")
+            raise AssertionError("input validation unexpectedly passed")
 
 
 def test_executor_interpolates_params_in_command_input_and_dynamic_count(
@@ -170,7 +213,10 @@ command = "printf '%s' '{{params.message}}'"
 
     missing = runner.invoke(app, ["workflow", "run", str(workflow_path)])
     assert missing.exit_code == 1
-    assert "Missing required workflow parameter: message" in missing.output
+    diagnostic = " ".join(missing.output.split())
+    assert "missing required workflow input 'message'" in diagnostic
+    assert "field 'inputs.message'" in diagnostic
+    assert "expected type 'string'" in diagnostic
 
     result = runner.invoke(
         app,
@@ -206,7 +252,9 @@ message = "{{params.report_date}}"
     try:
         anyio.run(run_workflow_payload, "api-params", tmp_path)
     except WorkflowRunError as exc:
-        assert "Missing required workflow parameter: report_date" in str(exc)
+        assert "missing required workflow input 'report_date'" in str(exc)
+        assert "field 'inputs.report_date'" in str(exc)
+        assert "expected type 'date'" in str(exc)
     else:
         raise AssertionError("run without required parameters unexpectedly passed")
 

@@ -453,7 +453,10 @@ def _workflow_assistant_cli_diagnostic(data_dir: Path) -> HealthDiagnostic:
                 id="packaging.gofer_cli",
                 severity="warning",
                 subject=str(source),
-                message="Workflow assistant CLI source is inside the mutable Gofer data directory.",
+                message=(
+                    "Workflow assistant CLI source is inside the mutable "
+                    "Taskurotta data directory."
+                ),
                 detail=detail,
             )
     except OSError as exc:
@@ -470,7 +473,7 @@ def _workflow_assistant_cli_diagnostic(data_dir: Path) -> HealthDiagnostic:
         subject=str(source),
         message=(
             "Workflow assistant CLI helper has an authoritative source outside the "
-            "Gofer data directory."
+            "Taskurotta data directory."
         ),
         detail=detail,
     )
@@ -610,7 +613,14 @@ def _workflow_agent_diagnostics(
 ) -> list[HealthDiagnostic]:
     diagnostics: list[HealthDiagnostic] = []
     for agent in workflow.agents.values():
-        diagnostics.extend(_agent_config_diagnostics(agent, path_base, f"agent:{agent.agent_id}"))
+        diagnostics.extend(
+            _agent_config_diagnostics(
+                agent,
+                path_base,
+                f"agent:{agent.agent_id}",
+                include_prompt_path=False,
+            )
+        )
         if agent.subscription in DIRECT_API_SUBSCRIPTIONS:
             diagnostics.extend(_direct_provider_profile_diagnostics(agent, path_base))
     return diagnostics
@@ -625,6 +635,7 @@ def _direct_provider_profile_diagnostics(
             agent_subscription=agent.subscription,
             profile_name=agent.profile,
             agent_model=agent.model,
+            agent_effort=agent.effort,
             data_dir=data_dir,
         )
         validate_provider_settings(settings)
@@ -676,6 +687,8 @@ def _agent_config_diagnostics(
     agent: AgentConfig,
     path_base: Path,
     subject: str,
+    *,
+    include_prompt_path: bool = True,
 ) -> list[HealthDiagnostic]:
     diagnostics = [
         _directory_dependency(
@@ -686,7 +699,7 @@ def _agent_config_diagnostics(
             label="Agent working directory",
         )
     ]
-    if agent.prompt_path is not None:
+    if include_prompt_path and agent.prompt_path is not None:
         diagnostics.append(
             _file_dependency(
                 agent.prompt_path,
@@ -780,9 +793,7 @@ def _operation_diagnostics(
                 }
             )
             diagnostics.extend(_agent_config_diagnostics(effective_agent, path_base, subject))
-            diagnostics.extend(
-                _fan_source_diagnostics(op.fan_source, path_base, subject)
-            )
+            diagnostics.extend(_fan_source_diagnostics(op.fan_source, path_base, subject))
     elif isinstance(op, CommonLlmTaskOperation):
         agent = workflow.agents.get(op.agent_id)
         if agent is None:

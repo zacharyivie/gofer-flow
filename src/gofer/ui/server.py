@@ -22,13 +22,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from gofer.core.provider_capabilities import provider_capabilities_payload
 from gofer.core.resources import ResourceLimits, bundle_resource_limits_from_env
 from gofer.core.scheduler import WorkflowScheduler
 from gofer.core.usage import summarize_node_outputs
 from gofer.core.watcher import WorkflowWatcher
 from gofer.core.workflow import AgenticWorkflow
+from gofer.radish.editor import RadishEditorError, RadishRevisionConflict
 from gofer.ui.api import (
-    DashboardUiError,
     ProviderProfileError,
     RunnerQueueError,
     WorkflowAlreadyExistsError,
@@ -41,18 +42,12 @@ from gofer.ui.api import (
     WorkflowRunError,
     WorkflowTriggerError,
     WorkflowUpdateError,
-    add_dashboard_component_payload,
-    add_dashboard_section_payload,
+    analyze_radish_document_payload,
     apply_workflow_validation_fix_payload,
     cancel_queued_run_payload,
-    create_dashboard_payload,
+    create_registered_workflow_payload,
     create_workflow_payload,
-    dashboard_items_payload,
-    dashboard_payload,
     decide_workflow_approval_payload,
-    delete_dashboard_component_payload,
-    delete_dashboard_payload,
-    delete_dashboard_section_payload,
     delete_provider_profile_payload,
     delete_workflow_chat_payload,
     delete_workflow_payload,
@@ -67,7 +62,8 @@ from gofer.ui.api import (
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     list_workflow_templates_payload,
-    mutate_dashboard_item_payload,
+    mutate_radish_document_payload,
+    open_radish_document_payload,
     preview_workflow_bundle_payload,
     provider_profiles_payload,
     prune_workflow_run_logs_payload,
@@ -79,11 +75,10 @@ from gofer.ui.api import (
     retention_settings_payload,
     run_workflow_payload,
     runner_queue_payload,
+    save_radish_document_payload,
+    save_radish_metadata_payload,
     stop_workflow_run_payload,
     trigger_workflow_payload,
-    update_dashboard_component_payload,
-    update_dashboard_payload,
-    update_dashboard_section_payload,
     update_retention_settings_payload,
     update_workflow_payload,
     upsert_provider_profile_payload,
@@ -138,6 +133,13 @@ def _optional_body_int(body: dict[str, Any], name: str) -> int | None:
     if value in {None, ""}:
         return None
     return int(str(value))
+
+
+def _optional_body_str(body: dict[str, Any], name: str) -> str | None:
+    value = body.get(name)
+    if value in {None, ""}:
+        return None
+    return str(value)
 
 
 def sync_workflow_schedules(data_dir: Path, scheduler: WorkflowScheduler) -> None:
@@ -346,6 +348,14 @@ class GoferUiServer(ThreadingHTTPServer):
 class GoferUiRequestHandler(BaseHTTPRequestHandler):
     server_version = "GoferUi/0.1"
 
+    def handle(self) -> None:
+        try:
+            super().handle()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # Browsers cancel stale requests during navigation. The response may
+            # finish after the client has already closed its socket.
+            return
+
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if not self._allow_origin(parsed.path):
@@ -416,32 +426,18 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
-        if parsed.path == "/api/dashboards":
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/document"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/document")
             query = parse_qs(parsed.query)
             try:
-                self._send_json(dashboard_payload(self._request_data_dir(query)))
-            except DashboardUiError as exc:
-                self._send_json({"error": str(exc)}, status=400)
-            return
-
-        if parsed.path.startswith("/api/dashboards/") and parsed.path.endswith("/items"):
-            query = parse_qs(parsed.query)
-            remainder = parsed.path.removeprefix("/api/dashboards/").removesuffix("/items")
-            parts = [part for part in remainder.split("/") if part]
-            if len(parts) != 3 or parts[1] != "components":
-                self._send_json({"error": "Not found"}, status=404)
-                return
-            try:
-                self._send_json(
-                    dashboard_items_payload(
-                        parts[0],
-                        parts[2],
-                        self._request_data_dir(query),
-                        _optional_query(query, "filter"),
-                    )
+                payload = open_radish_document_payload(
+                    workflow_id,
+                    self._request_data_dir(query),
                 )
-            except DashboardUiError as exc:
+            except RadishEditorError as exc:
                 self._send_json({"error": str(exc)}, status=404)
+                return
+            self._send_json({"document": payload})
             return
 
         if parsed.path == "/api/workflow-templates":
@@ -458,6 +454,12 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/api/chat/providers":
             self._send_json(provider_payload())
+            return
+
+        if parsed.path == "/api/provider/capabilities":
+            query = parse_qs(parsed.query)
+            refresh = query.get("refresh", ["0"])[0] in {"1", "true"}
+            self._send_json(provider_capabilities_payload(refresh=refresh))
             return
 
         if parsed.path == "/api/provider/profiles":
@@ -664,6 +666,109 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/document/analyze"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix(
+                "/document/analyze"
+            )
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                source = body.get("source")
+                if not isinstance(source, str):
+                    raise ValueError("Radish document analysis requires string source.")
+                payload = analyze_radish_document_payload(
+                    workflow_id,
+                    source,
+                    self._request_data_dir(query),
+                )
+            except (RadishEditorError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"document": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/document/save"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/document/save")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                source = body.get("source")
+                expected_revision = body.get("expectedRevision")
+                if not isinstance(source, str) or not isinstance(expected_revision, str):
+                    raise ValueError(
+                        "Radish document save requires source and expectedRevision strings."
+                    )
+                payload = save_radish_document_payload(
+                    workflow_id,
+                    source,
+                    expected_revision,
+                    self._request_data_dir(query),
+                )
+            except RadishRevisionConflict as exc:
+                self._send_json(exc.to_payload(), status=409)
+                return
+            except (RadishEditorError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"document": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/document/mutate"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix(
+                "/document/mutate"
+            )
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                mutations = body.get("mutations")
+                expected_revision = body.get("expectedRevision")
+                if (
+                    not isinstance(mutations, list)
+                    or not all(isinstance(item, dict) for item in mutations)
+                    or not isinstance(expected_revision, str)
+                ):
+                    raise ValueError(
+                        "Radish document mutation requires mutations and expectedRevision."
+                    )
+                payload = mutate_radish_document_payload(
+                    workflow_id,
+                    mutations,
+                    expected_revision,
+                    self._request_data_dir(query),
+                )
+            except RadishRevisionConflict as exc:
+                self._send_json(exc.to_payload(), status=409)
+                return
+            except (RadishEditorError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"document": payload})
+            return
+
+        if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/metadata"):
+            workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/metadata")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                metadata = body.get("metadata")
+                expected_revision = body.get("expectedRevision")
+                if not isinstance(metadata, dict) or not isinstance(expected_revision, str):
+                    raise ValueError("Radish metadata save requires metadata and expectedRevision.")
+                payload = save_radish_metadata_payload(
+                    workflow_id,
+                    metadata,
+                    expected_revision,
+                    self._request_data_dir(query),
+                )
+            except RadishRevisionConflict as exc:
+                self._send_json(exc.to_payload(), status=409)
+                return
+            except (RadishEditorError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/retention"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/retention")
             query = parse_qs(parsed.query)
@@ -754,86 +859,6 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"import": payload})
             return
 
-        if parsed.path == "/api/dashboards":
-            query = parse_qs(parsed.query)
-            try:
-                body = self._read_json()
-                payload = create_dashboard_payload(
-                    str(body.get("name") or ""),
-                    self._request_data_dir(query),
-                    dashboard_id=body.get("id"),
-                )
-            except (DashboardUiError, json.JSONDecodeError, ValueError) as exc:
-                self._send_json({"error": str(exc)}, status=400)
-                return
-            self._send_json(payload, status=201)
-            return
-
-        if parsed.path.startswith("/api/dashboards/"):
-            query = parse_qs(parsed.query)
-            remainder = parsed.path.removeprefix("/api/dashboards/")
-            parts = [part for part in remainder.split("/") if part]
-            try:
-                body = self._read_json()
-                if len(parts) == 1:
-                    payload = update_dashboard_payload(
-                        parts[0],
-                        self._request_data_dir(query),
-                        name=body.get("name"),
-                        duplicate=bool(body.get("duplicate", False)),
-                    )
-                elif len(parts) == 2 and parts[1] == "sections":
-                    payload = add_dashboard_section_payload(
-                        parts[0],
-                        str(body.get("title") or ""),
-                        self._request_data_dir(query),
-                        section_id=body.get("id"),
-                    )
-                elif len(parts) == 3 and parts[1] == "sections" and body.get("type"):
-                    payload = add_dashboard_component_payload(
-                        parts[0],
-                        parts[2],
-                        str(body.get("title") or ""),
-                        str(body.get("type") or "table"),  # type: ignore[arg-type]
-                        self._request_data_dir(query),
-                        component_id=body.get("id"),
-                    )
-                elif len(parts) == 3 and parts[1] == "sections":
-                    payload = update_dashboard_section_payload(
-                        parts[0],
-                        parts[2],
-                        self._request_data_dir(query),
-                        title=body.get("title"),
-                        layout=body.get("layout"),
-                    )
-                elif len(parts) == 3 and parts[1] == "components":
-                    payload = update_dashboard_component_payload(
-                        parts[0],
-                        parts[2],
-                        self._request_data_dir(query),
-                        content=body.get("content"),
-                        display=body.get("display"),
-                        schema=body.get("schema"),
-                        title=body.get("title"),
-                        views=body.get("views"),
-                    )
-                elif len(parts) == 4 and parts[1] == "components" and parts[3] == "items":
-                    payload = mutate_dashboard_item_payload(
-                        parts[0],
-                        parts[2],
-                        str(body.get("action") or "add"),
-                        body,
-                        self._request_data_dir(query),
-                    )
-                else:
-                    self._send_json({"error": "Not found"}, status=404)
-                    return
-            except (DashboardUiError, json.JSONDecodeError, ValueError) as exc:
-                self._send_json({"error": str(exc)}, status=400)
-                return
-            self._send_json(payload)
-            return
-
         if parsed.path == "/api/workflows":
             query = parse_qs(parsed.query)
             try:
@@ -845,9 +870,21 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                         template=body.get("template"),
                     )
                 else:
-                    workflow = create_workflow_payload(
+                    project_root = Path(str(body.get("projectRoot", ""))).expanduser()
+                    if not str(body.get("projectRoot", "")).strip():
+                        raise WorkflowCreateError("Project folder is required")
+                    try:
+                        self._assert_bundle_path_allowed(
+                            project_root,
+                            body.get("projectGrantId"),
+                            must_exist=True,
+                        )
+                    except WorkflowBundleError as exc:
+                        raise WorkflowCreateError(str(exc)) from exc
+                    workflow = create_registered_workflow_payload(
                         str(body.get("name", "")),
-                        self._request_data_dir(query),
+                        project_root,
+                        registry_dir=self._request_data_dir(query),
                     )
             except WorkflowAlreadyExistsError as exc:
                 self._send_json({"error": str(exc)}, status=409)
@@ -885,6 +922,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                     run_workflow_chat(
                         provider=str(body.get("provider", "codex")),
                         model=str(body.get("model", "cli-default")),
+                        effort=_optional_body_str(body, "effort"),
                         messages=body.get("messages") or [],
                         workflow=body.get("workflow"),
                         data_dir=self._request_data_dir(query),
@@ -1138,13 +1176,17 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 if trigger_context is not None and not isinstance(trigger_context, dict):
                     raise WorkflowPlanError("triggerContext must be an object")
                 parameters = body.get("parameters")
+                inputs = body.get("inputs")
                 if parameters is not None and not isinstance(parameters, dict):
                     raise WorkflowPlanError("parameters must be an object")
+                if inputs is not None and not isinstance(inputs, dict):
+                    raise WorkflowPlanError("inputs must be an object")
                 plan = workflow_plan_payload(
                     workflow_id,
                     self._request_data_dir(query),
                     trigger_context=trigger_context,
                     parameters=parameters,
+                    inputs=inputs,
                 )
             except (WorkflowPlanError, json.JSONDecodeError) as exc:
                 self._send_json({"error": str(exc)}, status=400)
@@ -1201,9 +1243,12 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 if trigger_context is not None and not isinstance(trigger_context, dict):
                     raise WorkflowRunError("triggerContext must be an object")
                 parameters = body.get("parameters")
+                inputs = body.get("inputs")
                 if parameters is not None and not isinstance(parameters, dict):
                     raise WorkflowRunError("parameters must be an object")
-                if parameters is None:
+                if inputs is not None and not isinstance(inputs, dict):
+                    raise WorkflowRunError("inputs must be an object")
+                if parameters is None and inputs is None:
                     result = asyncio.run(
                         run_workflow_payload(
                             workflow_id,
@@ -1220,6 +1265,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                             dry_run=dry_run,
                             trigger_context=trigger_context,
                             parameters=parameters,
+                            inputs=inputs,
                         )
                     )
             except (WorkflowRunError, json.JSONDecodeError) as exc:
@@ -1391,44 +1437,6 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             self._send_json(payload)
             return
 
-        if parsed.path.startswith("/api/dashboards/"):
-            query = parse_qs(parsed.query)
-            remainder = parsed.path.removeprefix("/api/dashboards/")
-            parts = [part for part in remainder.split("/") if part]
-            if len(parts) == 3 and parts[1] == "sections":
-                try:
-                    payload = delete_dashboard_section_payload(
-                        parts[0],
-                        parts[2],
-                        self._request_data_dir(query),
-                    )
-                except DashboardUiError as exc:
-                    self._send_json({"error": str(exc)}, status=404)
-                    return
-                self._send_json(payload)
-                return
-            if len(parts) == 3 and parts[1] == "components":
-                try:
-                    payload = delete_dashboard_component_payload(
-                        parts[0],
-                        parts[2],
-                        self._request_data_dir(query),
-                    )
-                except DashboardUiError as exc:
-                    self._send_json({"error": str(exc)}, status=404)
-                    return
-                self._send_json(payload)
-                return
-
-            dashboard_id = remainder
-            try:
-                payload = delete_dashboard_payload(dashboard_id, self._request_data_dir(query))
-            except DashboardUiError as exc:
-                self._send_json({"error": str(exc)}, status=404)
-                return
-            self._send_json(payload)
-            return
-
         if parsed.path.startswith("/api/workflows/") and parsed.path.endswith("/chat"):
             workflow_id = parsed.path.removeprefix("/api/workflows/").removesuffix("/chat")
             query = parse_qs(parsed.query)
@@ -1499,6 +1507,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             async for event in stream_workflow_chat(
                 provider=str(body.get("provider", "codex")),
                 model=str(body.get("model", "cli-default")),
+                effort=_optional_body_str(body, "effort"),
                 messages=body.get("messages") or [],
                 workflow=body.get("workflow"),
                 cancel_event=cancel_event,
@@ -1546,9 +1555,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
     ) -> None:
         server = self.server
         grants = (
-            server.path_grants
-            if isinstance(server, GoferUiServer)
-            else DesktopPathGrantStore()
+            server.path_grants if isinstance(server, GoferUiServer) else DesktopPathGrantStore()
         )
         data_dir = self._default_data_dir()
         try:
@@ -1563,7 +1570,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
         grant_value = str(grant_id or "").strip()
         if grants.covers(target_path, grant_value):
             return
-        raise WorkflowBundleError("Bundle path is outside the approved Gofer desktop roots")
+        raise WorkflowBundleError("Bundle path is outside the approved Taskurotta desktop roots")
 
     def _register_desktop_path_grant(self, body: dict[str, Any]) -> dict[str, str]:
         server = self.server
@@ -1825,7 +1832,6 @@ def render_usage_summary_html(summary: dict[str, Any]) -> str:
         f"{_usage_totals_html(totals)}"
         f"{_usage_nodes_html('Most expensive nodes', summary.get('most_expensive_nodes'))}"
         f"{_usage_nodes_html('Slowest nodes', summary.get('slowest_nodes'))}"
-        f"{_budget_failures_html(summary.get('budget_failures'))}"
         "</body></html>"
     )
 
@@ -1862,19 +1868,6 @@ def _usage_nodes_html(title: str, nodes: Any) -> str:
         "<th>Duration</th></tr></thead>"
         f"<tbody>{body}</tbody></table></section>"
     )
-
-
-def _budget_failures_html(nodes: Any) -> str:
-    items = []
-    for node in nodes or []:
-        if not isinstance(node, dict):
-            continue
-        violations = ", ".join(str(value) for value in node.get("budget_violations") or [])
-        items.append(
-            f"<li>{html.escape(str(node.get('node_id') or ''))}: {html.escape(violations)}</li>"
-        )
-    body = "".join(items) or "<li>None</li>"
-    return f"<section><h2>Budget failures</h2><ul>{body}</ul></section>"
 
 
 def create_server(
@@ -1974,7 +1967,7 @@ def _bundle_path_from_body(body: dict[str, Any]) -> Iterator[Path | None]:
 
 def _install_shutdown_handlers(server: GoferUiServer) -> None:
     def request_shutdown(signum: int, _frame: object) -> None:
-        log.info("Received signal %s; shutting down Gofer UI server", signum)
+        log.info("Received signal %s; shutting down Taskurotta UI server", signum)
         threading.Thread(target=server.shutdown, daemon=True).start()
 
     for signum in (signal.SIGINT, signal.SIGTERM):

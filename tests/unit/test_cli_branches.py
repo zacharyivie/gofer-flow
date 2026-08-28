@@ -221,9 +221,7 @@ def test_agent_list_filters_by_workflow_and_reports_missing(tmp_path: Path) -> N
     assert "not found" in missing.output
 
 
-def test_agent_list_empty_and_table_fields(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_agent_list_empty_and_table_fields(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     from gofer.cli.commands import agent as agent_cmd
 
     monkeypatch.setattr(agent_cmd, "console", Console(width=240))
@@ -398,14 +396,13 @@ def test_agent_edit_interactive_cancel_and_save(
             return False
 
     monkeypatch.setattr(tui_editor, "FieldEditorApp", CancelEditor)
-    cancelled = runner.invoke(
-        app, ["agent", "edit", agent_id, "--data-dir", str(tmp_path)]
-    )
+    cancelled = runner.invoke(app, ["agent", "edit", agent_id, "--data-dir", str(tmp_path)])
     assert cancelled.exit_code == 0, cancelled.output
     assert "Edit cancelled" in cancelled.output
-    assert AgenticWorkflow.from_file(tmp_path / f"{agent_id}.toml").agents[
-        agent_id
-    ].subscription == "codex"
+    assert (
+        AgenticWorkflow.from_file(tmp_path / f"{agent_id}.toml").agents[agent_id].subscription
+        == "codex"
+    )
 
     class SaveEditor:
         def __init__(self, sections: list[tui_editor.Section], title: str) -> None:
@@ -417,9 +414,7 @@ def test_agent_edit_interactive_cancel_and_save(
             return True
 
     monkeypatch.setattr(tui_editor, "FieldEditorApp", SaveEditor)
-    saved = runner.invoke(
-        app, ["agent", "edit", agent_id, "--data-dir", str(tmp_path)]
-    )
+    saved = runner.invoke(app, ["agent", "edit", agent_id, "--data-dir", str(tmp_path)])
 
     assert saved.exit_code == 0, saved.output
     assert "Updated agent" in saved.output
@@ -441,9 +436,7 @@ def test_agent_rm_confirmation_and_managed_prompt_cleanup(tmp_path: Path) -> Non
     remove_id = _create_agent(tmp_path, "Remove Agent")
     prompt_path = tmp_path / "prompts" / f"{remove_id}.md"
     assert prompt_path.exists()
-    removed = runner.invoke(
-        app, ["agent", "rm", remove_id, "--yes", "--data-dir", str(tmp_path)]
-    )
+    removed = runner.invoke(app, ["agent", "rm", remove_id, "--yes", "--data-dir", str(tmp_path)])
 
     assert removed.exit_code == 0, removed.output
     assert not (tmp_path / f"{remove_id}.toml").exists()
@@ -487,12 +480,8 @@ def test_agent_rm_updates_workflow_without_deleting_unmanaged_prompt(
     )
     wf.to_file(tmp_path / "mixed-flow.toml")
 
-    removed = runner.invoke(
-        app, ["agent", "rm", "primary", "--yes", "--data-dir", str(tmp_path)]
-    )
-    missing = runner.invoke(
-        app, ["agent", "rm", "missing", "--yes", "--data-dir", str(tmp_path)]
-    )
+    removed = runner.invoke(app, ["agent", "rm", "primary", "--yes", "--data-dir", str(tmp_path)])
+    missing = runner.invoke(app, ["agent", "rm", "missing", "--yes", "--data-dir", str(tmp_path)])
 
     assert removed.exit_code == 0, removed.output
     assert (tmp_path / "mixed-flow.toml").exists()
@@ -515,18 +504,12 @@ def test_agent_run_success_failure_and_missing(
     from gofer.cli.commands import agent as agent_cmd
 
     monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {"codex": success_sub})
-    success = runner.invoke(
-        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
-    )
+    success = runner.invoke(app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)])
 
     failure_sub = _CliSubscription(success=False, output="bad result")
     monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {"codex": failure_sub})
-    failure = runner.invoke(
-        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
-    )
-    missing = runner.invoke(
-        app, ["agent", "run", "missing", "--data-dir", str(tmp_path)]
-    )
+    failure = runner.invoke(app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)])
+    missing = runner.invoke(app, ["agent", "run", "missing", "--data-dir", str(tmp_path)])
 
     assert success.exit_code == 0, success.output
     assert "done" in success.output
@@ -546,9 +529,7 @@ def test_agent_run_unknown_subscription_and_invalid_extra_paths(
     from gofer.cli.commands import agent as agent_cmd
 
     monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {})
-    unknown = runner.invoke(
-        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
-    )
+    unknown = runner.invoke(app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)])
     assert unknown.exit_code == 1
     assert "Unknown subscription 'codex'" in unknown.output
 
@@ -558,9 +539,7 @@ def test_agent_run_unknown_subscription_and_invalid_extra_paths(
     )
     wf.to_file(tmp_path / f"{agent_id}.toml")
     monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {"codex": _CliSubscription()})
-    invalid_extra = runner.invoke(
-        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
-    )
+    invalid_extra = runner.invoke(app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)])
 
     assert invalid_extra.exit_code == 1
     assert "extra_paths entry does not exist" in invalid_extra.output
@@ -573,18 +552,14 @@ def test_agent_run_displays_external_extra_paths(
     extra_dir = tmp_path.parent / "agent-shared-access"
     extra_dir.mkdir(exist_ok=True)
     wf = AgenticWorkflow.from_file(tmp_path / f"{agent_id}.toml")
-    wf.agents[agent_id] = wf.agents[agent_id].model_copy(
-        update={"extra_paths": [extra_dir]}
-    )
+    wf.agents[agent_id] = wf.agents[agent_id].model_copy(update={"extra_paths": [extra_dir]})
     wf.to_file(tmp_path / f"{agent_id}.toml")
     sub = _CliSubscription(success=True, output="done")
 
     from gofer.cli.commands import agent as agent_cmd
 
     monkeypatch.setattr(agent_cmd, "_SUBSCRIPTIONS", {"codex": sub})
-    result = runner.invoke(
-        app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)]
-    )
+    result = runner.invoke(app, ["agent", "run", agent_id, "--data-dir", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     assert "Agent filesystem access outside working_dir" in result.output
@@ -604,9 +579,7 @@ class _FakeScheduler:
 
     def add_workflow(self, workflow: AgenticWorkflow, workflow_path: Path) -> None:
         if workflow.config.schedule is None:
-            raise ValueError(
-                f"Workflow '{workflow.config.id}' has no schedule configured"
-            )
+            raise ValueError(f"Workflow '{workflow.config.id}' has no schedule configured")
         self.jobs.append(
             {
                 "id": workflow.config.id,
@@ -641,9 +614,7 @@ def fake_scheduler(monkeypatch: pytest.MonkeyPatch) -> type[_FakeScheduler]:
 def test_schedule_remove_and_empty_list(
     fake_scheduler: type[_FakeScheduler], tmp_path: Path
 ) -> None:
-    list_result = runner.invoke(
-        app, ["schedule", "list", "--db", str(tmp_path / "s.db")]
-    )
+    list_result = runner.invoke(app, ["schedule", "list", "--db", str(tmp_path / "s.db")])
     remove_result = runner.invoke(
         app, ["schedule", "remove", "old-flow", "--db", str(tmp_path / "s.db")]
     )
@@ -760,9 +731,7 @@ def test_schedule_add_invalid_workflow_schedule(
 ) -> None:
     workflow = _create_workflow(tmp_path)
 
-    result = runner.invoke(
-        app, ["schedule", "add", str(workflow), "--db", str(tmp_path / "s.db")]
-    )
+    result = runner.invoke(app, ["schedule", "add", str(workflow), "--db", str(tmp_path / "s.db")])
 
     assert result.exit_code == 1
     assert "Schedule failed" in result.output
@@ -835,9 +804,7 @@ def test_watch_empty_list_and_invalid_toml_skip(tmp_path: Path) -> None:
     assert "No watched workflows" in result.output
 
 
-def test_watch_start_no_watched_workflows(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_watch_start_no_watched_workflows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _FakeWatcher.instances = []
     _create_workflow(tmp_path)
     monkeypatch.setattr(watch_cmd, "WorkflowWatcher", _FakeWatcher)
@@ -853,8 +820,7 @@ def test_watch_start_shutdowns_on_interrupt(
 ) -> None:
     _FakeWatcher.instances = []
     (tmp_path / "watched.toml").write_text(
-        _SIMPLE_TOML
-        + '\n[workflow.watch]\npath = "inputs"\nglob = "*.txt"\nmode = "batch"\n',
+        _SIMPLE_TOML + '\n[workflow.watch]\npath = "inputs"\nglob = "*.txt"\nmode = "batch"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr(watch_cmd, "WorkflowWatcher", _FakeWatcher)
@@ -876,8 +842,7 @@ def test_watch_start_shutdowns_on_interrupt(
 def test_sync_watchers_skips_invalid_workflows_and_watchers(tmp_path: Path) -> None:
     (tmp_path / "bad.toml").write_text("not = [valid", encoding="utf-8")
     (tmp_path / "ok.toml").write_text(
-        _SIMPLE_TOML
-        + '\n[workflow.watch]\npath = "inputs"\nglob = "*.txt"\nmode = "batch"\n',
+        _SIMPLE_TOML + '\n[workflow.watch]\npath = "inputs"\nglob = "*.txt"\nmode = "batch"\n',
         encoding="utf-8",
     )
     (tmp_path / "bad-watch.toml").write_text(
@@ -938,9 +903,7 @@ extra_paths = ["{extra_dir}"]
 def test_workflow_unresolved_id_and_option_parse_errors(tmp_path: Path) -> None:
     _create_workflow(tmp_path)
 
-    missing = runner.invoke(
-        app, ["workflow", "show", "missing", "--data-dir", str(tmp_path)]
-    )
+    missing = runner.invoke(app, ["workflow", "show", "missing", "--data-dir", str(tmp_path)])
     bad_kv = runner.invoke(
         app,
         [
@@ -1139,9 +1102,7 @@ def test_workflow_edit_cancel_save_and_validation_failure(
             return False
 
     monkeypatch.setattr(tui_editor, "FieldEditorApp", CancelEditor)
-    cancelled = runner.invoke(
-        app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)]
-    )
+    cancelled = runner.invoke(app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)])
     assert cancelled.exit_code == 0, cancelled.output
     assert "Edit cancelled" in cancelled.output
 
@@ -1153,9 +1114,7 @@ def test_workflow_edit_cancel_save_and_validation_failure(
             return True
 
     monkeypatch.setattr(tui_editor, "FieldEditorApp", SaveEditor)
-    saved = runner.invoke(
-        app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)]
-    )
+    saved = runner.invoke(app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)])
     assert saved.exit_code == 0, saved.output
     assert "Saved" in saved.output
 
@@ -1165,9 +1124,7 @@ def test_workflow_edit_cancel_save_and_validation_failure(
         raise ValueError("invalid edit")
 
     monkeypatch.setattr(AgenticWorkflow, "validate", fail_validate)
-    failed = runner.invoke(
-        app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)]
-    )
+    failed = runner.invoke(app, ["workflow", "edit", "simple", "--data-dir", str(tmp_path)])
     assert failed.exit_code == 1
     assert "Validation failed: invalid edit" in failed.output
     assert (tmp_path / "simple.toml").read_text(encoding="utf-8") == original_toml

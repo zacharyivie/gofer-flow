@@ -1,4 +1,4 @@
 interface:
-  display_name: "Gofer Flow Workflow Builder"
-  short_description: "Create Gofer Flow workflows end to end with the CLI."
-  default_prompt: "Create a Gofer Flow workflow from this request:"
+  display_name: "Taskurotta Workflow Builder"
+  short_description: "Create Taskurotta workflows end to end with the CLI."
+  default_prompt: "Create a Taskurotta workflow from this request:"

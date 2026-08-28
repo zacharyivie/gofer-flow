@@ -13,6 +13,7 @@ from gofer.core.revisions import (
     list_workflow_revisions,
     restore_workflow_revision,
 )
+from gofer.core.workflow import AgenticWorkflow
 
 runner = CliRunner()
 
@@ -76,8 +77,8 @@ def test_revision_diff_restore_and_restore_as_copy(tmp_path: Path) -> None:
 
     diff = diff_workflow_revision("history", original.revision_id, tmp_path)
     assert "node added: bye" in diff["summary"]
-    assert "-name = \"History\"" in diff["tomlDiff"]
-    assert "+name = \"Changed\"" in diff["tomlDiff"]
+    assert '-name = "History"' in diff["tomlDiff"]
+    assert '+name = "Changed"' in diff["tomlDiff"]
 
     restored = restore_workflow_revision("history", original.revision_id, tmp_path)
     assert restored["workflowId"] == "history"
@@ -131,8 +132,61 @@ PUBLIC = "visible"
     assert len(revisions) == 1
     stored = revisions[0].toml
     assert "cleartext-password" not in stored
-    assert "PASSWORD = \"***\"" in stored
-    assert "PUBLIC = \"visible\"" in stored
+    assert 'PASSWORD = "***"' in stored
+    assert 'PUBLIC = "visible"' in stored
+
+
+def test_revision_restore_round_trips_scopes_and_bindings(tmp_path: Path) -> None:
+    path = tmp_path / "revision-scopes.toml"
+    path.write_text(
+        """
+[workflow]
+id = "revision-scopes"
+name = "Revision Scopes"
+
+[workflow.inputs.project_dir]
+type = "path"
+required = true
+
+[workflow.variables.attempt]
+type = "number"
+initial = 1
+
+[workflow.schedule]
+cron_expression = "0 9 * * *"
+inputs = { project_dir = "/scheduled" }
+
+[workflow.webhooks.default]
+enabled = true
+allow_unauthenticated = true
+input_bindings = { project_dir = "{{trigger.payload.project_dir}}" }
+
+[[nodes]]
+id = "child"
+type = "workflow"
+workflow_id = "{{inputs.project_dir}}"
+input_bindings = { project_dir = "{{inputs.project_dir}}" }
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    revision = capture_workflow_revision(path, tmp_path, source="manual")
+    assert revision is not None
+    path.write_text('[workflow]\nid = "revision-scopes"\nname = "Changed"\n')
+
+    restore_workflow_revision("revision-scopes", revision.revision_id, tmp_path)
+
+    restored = AgenticWorkflow.from_file(path)
+    assert restored.config.inputs["project_dir"].required
+    assert restored.config.variables["attempt"].initial == 1
+    assert restored.config.schedule is not None
+    assert restored.config.schedule.inputs == {"project_dir": "/scheduled"}
+    assert restored.config.webhooks["default"].input_bindings == {
+        "project_dir": "{{trigger.payload.project_dir}}"
+    }
+    assert restored.graph._nodes["child"].operation.input_bindings == {
+        "project_dir": "{{inputs.project_dir}}"
+    }
 
 
 def test_cli_history_diff_and_restore(tmp_path: Path) -> None:

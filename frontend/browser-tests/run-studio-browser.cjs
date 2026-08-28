@@ -1,5 +1,3 @@
-/* global __dirname, console, process */
-
 const { spawn } = require("node:child_process");
 const path = require("node:path");
 const electronPath = require("electron");
