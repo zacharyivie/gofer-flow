@@ -12,6 +12,7 @@ import { createServer } from "vite";
 const frontendRoot = path.resolve(import.meta.dirname, "../..");
 const repoRoot = path.resolve(frontendRoot, "..");
 const require = createRequire(import.meta.url);
+const frontendPackage = JSON.parse(fs.readFileSync(path.join(frontendRoot, "package.json"), "utf8"));
 
 let viteServer;
 let apiUrl;
@@ -553,12 +554,12 @@ test("app crash fallback exposes recovery actions and complete diagnostics", () 
   const report = crashBoundaryModule.formatCrashReport(crash);
   assert.match(report, /React component stack:/);
   assert.match(report, /URL: http:\/\/127\.0\.0\.1:5173\/#\//);
-  assert.match(report, /Taskurotta v0\.1\.3/);
+  assert.ok(report.includes(`Taskurotta v${frontendPackage.version}`));
 
   const issueUrl = new URL(crashBoundaryModule.issueUrlForCrash(crash));
   assert.equal(issueUrl.origin + issueUrl.pathname, "https://github.com/zacharyivie/gofer-flow/issues/new");
   assert.match(issueUrl.searchParams.get("title"), /^Crash: ReferenceError:/);
-  assert.match(issueUrl.searchParams.get("body"), /Taskurotta v0\.1\.3/);
+  assert.ok(issueUrl.searchParams.get("body").includes(`Taskurotta v${frontendPackage.version}`));
 });
 
 test("apiUrl normalizes relative paths, HTTP origins, trailing slashes, and prefixed bases", () => {
