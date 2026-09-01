@@ -69,6 +69,27 @@ def _read_json(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(path.read_text(encoding="utf8")))
 
 
+def test_release_metadata_uses_agpl_3_only() -> None:
+    license_id = "AGPL-3.0-only"
+    pyproject = (REPO_ROOT / "pyproject.toml").read_text(encoding="utf8")
+    assert f'license = "{license_id}"' in pyproject
+    assert _read_json(REPO_ROOT / "frontend" / "package.json")["license"] == license_id
+    package_lock = _read_json(REPO_ROOT / "frontend" / "package-lock.json")
+    assert package_lock["packages"][""]["license"] == license_id
+    assert f'license=("{license_id}")' in (
+        REPO_ROOT / "packaging" / "arch" / "PKGBUILD"
+    ).read_text(encoding="utf8")
+    assert f'license=("{license_id}")' in (
+        REPO_ROOT / "packaging" / "arch-cli" / "PKGBUILD"
+    ).read_text(encoding="utf8")
+    assert f"License:        {license_id}" in (
+        REPO_ROOT / "scripts" / "package-cli-linux.sh"
+    ).read_text(encoding="utf8")
+    assert "GNU AFFERO GENERAL PUBLIC LICENSE" in (
+        REPO_ROOT / "LICENSE"
+    ).read_text(encoding="utf8")
+
+
 def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path) -> None:
     repo = _copy_release_fixture(tmp_path)
     appimage_sha = "A" * 64

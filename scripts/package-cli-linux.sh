@@ -67,7 +67,7 @@ Name:           ${package_name}
 Version:        ${version}
 Release:        1%{?dist}
 Summary:        ${description}
-License:        Apache-2.0
+License:        AGPL-3.0-only
 URL:            https://github.com/doonk/gofer-flow
 BuildArch:      x86_64
 

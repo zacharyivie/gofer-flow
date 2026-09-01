@@ -1,5 +1,5 @@
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
-import { AlertCircle, AlertTriangle, Check, ChevronDown, Loader2, RefreshCw, Save } from "lucide-react";
+import { AlertTriangle, Check, FileCode2, Loader2, RefreshCw, Save } from "lucide-react";
 import { apiUrl } from "../lib/api.js";
 import { diagnosticToMarker, diagnosticsToMarkers } from "../lib/radishRanges.js";
 
@@ -8,6 +8,7 @@ const editorSessions = new Map();
 
 const RadishEditor = forwardRef(function RadishEditor({
   active,
+  initialDocument = null,
   saveRequest = 0,
   showFileChrome = true,
   theme,
@@ -16,6 +17,7 @@ const RadishEditor = forwardRef(function RadishEditor({
 }, ref) {
   const containerRef = useRef(null);
   const editorRef = useRef(null);
+  const initialDocumentRef = useRef(initialDocument);
   const monacoRef = useRef(null);
   const modelRef = useRef(null);
   const themeRef = useRef(theme);
@@ -26,14 +28,13 @@ const RadishEditor = forwardRef(function RadishEditor({
   const suppressChangeRef = useRef(false);
   const savedSourceRef = useRef("");
   const handledSaveRequestRef = useRef(saveRequest);
+  const discardOnUnmountRef = useRef(false);
   const [state, setState] = useState({
     document: null,
     error: "",
     loading: true,
     saving: false,
   });
-  const [problemsOpen, setProblemsOpen] = useState(false);
-  const revealedProblemsRef = useRef(false);
 
   const publishState = useCallback(
     (nextState) => {
@@ -60,10 +61,6 @@ const RadishEditor = forwardRef(function RadishEditor({
         if (!response.ok) throw new Error(payload.error || `Analysis returned ${response.status}`);
         if (requestId !== requestRef.current) return;
         documentRef.current = payload.document;
-        if (documentProblemCount(payload.document) && !revealedProblemsRef.current) {
-          revealedProblemsRef.current = true;
-          setProblemsOpen(true);
-        }
         const nextState = { document: payload.document, error: "", loading: false, saving: false };
         publishState(nextState);
         updateMarkers(monacoRef.current, modelRef.current, payload.document);
@@ -109,10 +106,6 @@ const RadishEditor = forwardRef(function RadishEditor({
       if (requestId !== requestRef.current) return;
       documentRef.current = payload.document;
       savedSourceRef.current = source;
-      if (documentProblemCount(payload.document) && !revealedProblemsRef.current) {
-        revealedProblemsRef.current = true;
-        setProblemsOpen(true);
-      }
       const nextState = { document: payload.document, error: "", loading: false, saving: false };
       publishState(nextState);
       updateMarkers(monacoRef.current, modelRef.current, payload.document);
@@ -131,8 +124,43 @@ const RadishEditor = forwardRef(function RadishEditor({
 
   const loadDocument = useCallback(async () => {
     const requestId = ++requestRef.current;
-    publishState({ document: null, error: "", loading: true, saving: false });
+    publishState({
+      document: initialDocumentRef.current,
+      error: "",
+      loading: !initialDocumentRef.current,
+      saving: false,
+    });
     try {
+      const readTextFile = window.goferDesktop?.textFiles?.read;
+      if (readTextFile && workflow.sourcePath) {
+        try {
+          const payload = await readTextFile(workflow.sourcePath);
+          if (requestId !== requestRef.current) return;
+          const source = payload?.content ?? "";
+          savedSourceRef.current = source;
+          suppressChangeRef.current = true;
+          modelRef.current?.setValue(source);
+          suppressChangeRef.current = false;
+          const provisionalDocument = {
+            ...(initialDocumentRef.current ?? {}),
+            diagnostics: [],
+            dirty: false,
+            preflight: { diagnostics: [] },
+            source,
+          };
+          documentRef.current = provisionalDocument;
+          publishState({
+            document: provisionalDocument,
+            error: "",
+            loading: false,
+            saving: false,
+          });
+          void analyzeSource(source);
+          return;
+        } catch {
+          // The workflow API remains a fallback if the desktop file grant expired.
+        }
+      }
       const response = await fetch(
         apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/document`),
       );
@@ -172,7 +200,7 @@ const RadishEditor = forwardRef(function RadishEditor({
         saving: false,
       });
     }
-  }, [analyzeSource, publishState, workflow.id]);
+  }, [analyzeSource, publishState, workflow.id, workflow.sourcePath]);
 
   const acceptExternalDocument = useCallback(
     (nextDocument) => {
@@ -200,11 +228,6 @@ const RadishEditor = forwardRef(function RadishEditor({
     },
     [publishState],
   );
-
-  useEffect(() => {
-    revealedProblemsRef.current = false;
-    setProblemsOpen(false);
-  }, [workflow.id]);
 
   useEffect(() => {
     let disposed = false;
@@ -273,7 +296,9 @@ const RadishEditor = forwardRef(function RadishEditor({
     return () => {
       disposed = true;
       window.clearTimeout(analysisTimerRef.current);
-      if (documentRef.current && modelRef.current) {
+      if (discardOnUnmountRef.current) {
+        editorSessions.delete(workflow.id);
+      } else if (documentRef.current && modelRef.current) {
         editorSessions.set(workflow.id, {
           source: modelRef.current.getValue(),
           viewState: editorRef.current?.saveViewState() ?? null,
@@ -308,8 +333,22 @@ const RadishEditor = forwardRef(function RadishEditor({
 
   useImperativeHandle(
     ref,
-    () => ({ acceptDocument: acceptExternalDocument, save: saveSource }),
-    [acceptExternalDocument, saveSource],
+    () => ({
+      acceptDocument: acceptExternalDocument,
+      discard: () => {
+        discardOnUnmountRef.current = true;
+        editorSessions.delete(workflow.id);
+      },
+      revealDiagnostic: (diagnostic) => revealDiagnostic(
+        monacoRef.current,
+        editorRef.current,
+        modelRef.current,
+        documentRef.current,
+        diagnostic,
+      ),
+      save: saveSource,
+    }),
+    [acceptExternalDocument, saveSource, workflow.id],
   );
 
   const diagnostics = state.document?.diagnostics ?? [];
@@ -325,7 +364,7 @@ const RadishEditor = forwardRef(function RadishEditor({
     <section className="radish-editor-shell flex min-h-0 flex-1 flex-col bg-white" aria-label="Radish code editor">
       {showFileChrome ? <><div className="flex h-9 shrink-0 items-center border-b border-line bg-slate-50">
         <div className="relative flex h-full items-center gap-2 border-r border-line bg-white px-3 text-xs font-semibold">
-          <span aria-hidden="true" className="grid h-4 min-w-5 place-items-center rounded bg-brand px-1 text-[8px] font-bold text-white">RAD</span>
+          <FileCode2 aria-hidden="true" className="shrink-0 text-brand" size={14} />
           workflow.rad
           {dirty ? <span aria-label="Unsaved changes" className="h-1.5 w-1.5 rounded-full bg-brand" /> : null}
           <span className="absolute inset-x-0 top-0 h-0.5 bg-brand" />
@@ -355,47 +394,6 @@ const RadishEditor = forwardRef(function RadishEditor({
                 <RefreshCw size={14} />Retry
               </button>
             </div>
-          </div>
-        ) : null}
-      </div>
-      <div className="shrink-0 border-t border-line bg-white">
-        <button
-          aria-expanded={problemsOpen}
-          className="flex h-8 w-full items-center gap-2 px-3 text-left text-[11px] font-semibold text-muted hover:bg-slate-50 hover:text-ink"
-          type="button"
-          onClick={() => setProblemsOpen((current) => !current)}
-        >
-          <ChevronDown
-            aria-hidden="true"
-            className={`transition ${problemsOpen ? "" : "-rotate-90"}`}
-            size={13}
-          />
-          Problems
-          {errorCount ? <span className="text-red-700">{errorCount} {errorCount === 1 ? "error" : "errors"}</span> : null}
-          {warningCount ? <span className="text-amber-700">{warningCount} {warningCount === 1 ? "warning" : "warnings"}</span> : null}
-          {!problemDiagnostics.length ? <span className="font-normal text-muted">No problems</span> : null}
-        </button>
-        {problemsOpen && problemDiagnostics.length ? (
-          <div className="workflow-scrollbar max-h-36 overflow-y-auto border-t border-line py-1">
-            {problemDiagnostics.map((diagnostic, index) => (
-              <button
-                key={`${diagnostic.code}-${diagnostic.span?.start?.offset ?? 0}-${index}`}
-                className="flex w-full items-start gap-2 px-3 py-1.5 text-left text-[11px] leading-4 hover:bg-slate-50"
-                type="button"
-                onClick={() => revealDiagnostic(monacoRef.current, editorRef.current, modelRef.current, state.document, diagnostic)}
-              >
-                {diagnostic.severity === "warning" ? (
-                  <AlertTriangle aria-hidden="true" className="mt-0.5 shrink-0 text-amber-600" size={13} />
-                ) : (
-                  <AlertCircle aria-hidden="true" className="mt-0.5 shrink-0 text-red-600" size={13} />
-                )}
-                <span className="min-w-0 flex-1 text-ink">
-                  {diagnostic.message}
-                  <span className="ml-2 font-mono text-[10px] text-muted">{diagnostic.code}</span>
-                </span>
-                <span className="shrink-0 text-muted">Ln {diagnostic.span?.start?.line ?? 1}</span>
-              </button>
-            ))}
           </div>
         ) : null}
       </div>
@@ -437,10 +435,6 @@ function updateMarkers(monaco, model, document) {
     "radish",
     diagnosticsToMarkers(monaco, model, document.source, diagnostics),
   );
-}
-
-function documentProblemCount(document) {
-  return (document?.diagnostics?.length ?? 0) + (document?.preflight?.diagnostics?.length ?? 0);
 }
 
 function revealDiagnostic(monaco, editor, model, document, diagnostic) {

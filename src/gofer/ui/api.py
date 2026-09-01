@@ -106,10 +106,12 @@ from gofer.radish.editor import (
 )
 from gofer.radish.preflight import run_preflight
 from gofer.radish.run_service import RadishRunArtifactError, RadishRunResult, run_radish_file
+from gofer.radish.storage import migrate_legacy_directory, workflow_owned_directory
 from gofer.radish.workspaces import (
     RadishWorkspaceError,
     RegisteredWorkflow,
     create_registered_workflow,
+    discover_registered_workflows,
     list_registered_workflows,
 )
 from gofer.subscriptions.claude_code import ClaudeCodeSubscription
@@ -287,6 +289,23 @@ def create_registered_workflow_payload(
     except (RadishWorkspaceError, RadishArtifactError, RadishError) as exc:
         raise WorkflowCreateError(str(exc)) from exc
     return _registered_radish_payload(registered, base)
+
+
+def open_project_payload(
+    project_root: Path,
+    *,
+    registry_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Register existing Radish workflows discovered inside a project folder."""
+    base = _data_dir(registry_dir)
+    try:
+        registered = discover_registered_workflows(project_root, registry_dir=base)
+    except RadishWorkspaceError as exc:
+        raise WorkflowCreateError(str(exc)) from exc
+    return {
+        "projectRoot": str(project_root.expanduser().resolve()),
+        "workflows": [_registered_radish_payload(workflow, base) for workflow in registered],
+    }
 
 
 def open_radish_document_payload(workflow_id: str, data_dir: Path | None = None) -> dict[str, Any]:
@@ -2492,7 +2511,12 @@ def _node_output_data_payload(value: Any, limits: ResourceLimits, label: str) ->
 
 def _radish_run_directory(base: Path, workflow_id: str) -> Path:
     safe_id = _validate_storage_workflow_id(workflow_id, WorkflowLogError)
-    return base / "radish" / "runs" / safe_id
+    legacy_directory = base / "radish" / "runs" / safe_id
+    directory = workflow_owned_directory(safe_id, base, "logs")
+    if directory is None:
+        return legacy_directory
+    migrate_legacy_directory(legacy_directory, directory)
+    return directory
 
 
 def _radish_run_artifact_paths(base: Path, workflow_id: str) -> list[Path]:
@@ -3125,6 +3149,37 @@ def prune_workflow_run_logs_payload(
         keep_last = saved_settings.get("keepLast")
         keep_days = saved_settings.get("keepDays")
         keep_failed_days = saved_settings.get("keepFailedDays")
+    radish_paths = _radish_run_artifact_paths(base, workflow_id)
+    if radish_paths:
+        runs = [_radish_run_summary(_read_radish_run_artifact(path), path) for path in radish_paths]
+        retained_ids = {str(run["id"]) for run in runs[: max(0, keep_last or 0)]}
+        now = datetime.now(UTC)
+        radish_candidates: list[dict[str, Any]] = []
+        for run in runs:
+            if str(run["id"]) in retained_ids:
+                continue
+            started = _parse_run_datetime(run.get("startedAt"))
+            threshold = keep_failed_days if run["status"] == "error" else keep_days
+            if threshold is None:
+                continue
+            if started is not None and started >= now - timedelta(days=max(0, threshold)):
+                continue
+            radish_candidates.append(run)
+        radish_deleted: list[str] = []
+        if not dry_run:
+            paths_by_id = {path.stem: path for path in radish_paths}
+            for run in radish_candidates:
+                run_id = str(run["id"])
+                path = paths_by_id.get(run_id)
+                if path is not None:
+                    path.unlink(missing_ok=True)
+                    radish_deleted.append(run_id)
+        return {
+            "workflowId": workflow_id,
+            "dryRun": dry_run,
+            "runs": radish_candidates,
+            "deleted": radish_deleted,
+        }
     log_dir = _workflow_storage_dir(base, "logs", workflow_id, error_cls=WorkflowLogError)
     if not log_dir.exists():
         return {"workflowId": workflow_id, "dryRun": dry_run, "runs": [], "deleted": []}

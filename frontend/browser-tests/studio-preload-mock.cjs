@@ -86,3 +86,43 @@ window.goferDesktop = {
     },
   },
 };
+
+const terminalDataListeners = new Set();
+const terminalExitListeners = new Set();
+let nextTerminalId = 1;
+
+window.goferTerminal = {
+  create: async (options = {}) => {
+    const id = `browser-terminal-${nextTerminalId}`;
+    nextTerminalId += 1;
+    recordBridgeCall("terminal.create", options);
+    setTimeout(() => {
+      for (const listener of terminalDataListeners) {
+        listener({ data: "Taskurotta browser terminal\r\n$ ", id });
+      }
+    }, 0);
+    return { cwd: options.cwd || "/workspace", id, pid: nextTerminalId, shell: "bash" };
+  },
+  write: async (id, data) => {
+    recordBridgeCall("terminal.write", { data, id });
+    for (const listener of terminalDataListeners) listener({ data, id });
+    return { written: true };
+  },
+  resize: async (id, cols, rows) => {
+    recordBridgeCall("terminal.resize", { cols, id, rows });
+    return { resized: true };
+  },
+  close: async (id) => {
+    recordBridgeCall("terminal.close", { id });
+    for (const listener of terminalExitListeners) listener({ exitCode: 0, id, signal: 0 });
+    return { closed: true };
+  },
+  onData: (listener) => {
+    terminalDataListeners.add(listener);
+    return () => terminalDataListeners.delete(listener);
+  },
+  onExit: (listener) => {
+    terminalExitListeners.add(listener);
+    return () => terminalExitListeners.delete(listener);
+  },
+};

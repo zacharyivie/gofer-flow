@@ -3,11 +3,29 @@ import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const require = createRequire(import.meta.url);
-const { app, BrowserWindow, Menu, dialog, ipcMain, shell } = require("electron");
+const {
+  app,
+  BrowserWindow,
+  Menu,
+  WebContentsView,
+  dialog,
+  ipcMain,
+  shell,
+} = require("electron");
 const { autoUpdater } = require("electron-updater");
+const pty = require("node-pty");
+const {
+  addGitWorktree,
+  readGitFileBaseline,
+  readGitHistory,
+  readGitStatus,
+  readGitWorktrees,
+  removeGitWorktree,
+} = require("./git-status.cjs");
+const { browserShortcutAction, normalizeBrowserUrl } = require("./browser-utils.cjs");
 const { registerIpcHandlers } = require("./ipc-handlers.cjs");
 const { createIpcSecurity, isSafeExternalUrl } = require("./security.cjs");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,8 +37,13 @@ if (process.platform === "linux" && !process.env.GTK_USE_PORTAL) {
   process.env.GTK_USE_PORTAL = "0";
 }
 
-app.disableHardwareAcceleration();
-app.commandLine.appendSwitch("disable-gpu");
+if (
+  process.env.GOFER_ELECTRON_SMOKE_TEST === "1" ||
+  process.env.GOFER_DISABLE_HARDWARE_ACCELERATION === "1"
+) {
+  app.disableHardwareAcceleration();
+  app.commandLine.appendSwitch("disable-gpu");
+}
 if (process.env.GOFER_ELECTRON_SMOKE_TEST === "1") {
   app.commandLine.appendSwitch("no-sandbox");
 }
@@ -50,6 +73,8 @@ let mainWindow;
 let backendErrorWindow;
 let ipcSecurity;
 let backendErrorIpcSecurity;
+const terminalSessions = new Map();
+const browserSessions = new Map();
 let updateState = {
   available: false,
   checking: false,
@@ -86,6 +111,7 @@ function createWindow(apiBaseUrl, apiToken = "") {
       ],
     },
   });
+  const terminalOwnerId = mainWindow.webContents.id;
 
   mainWindow.webContents.once("did-finish-load", () => {
     if (!isSmokeTest) return;
@@ -128,6 +154,8 @@ function createWindow(apiBaseUrl, apiToken = "") {
   }
 
   mainWindow.on("closed", () => {
+    closeBrowsersForOwner(terminalOwnerId);
+    closeTerminalsForOwner(terminalOwnerId);
     mainWindow = undefined;
   });
 }
@@ -445,6 +473,8 @@ app.on("second-instance", () => {
 
 app.on("before-quit", () => {
   isQuitting = true;
+  closeAllBrowsers();
+  closeAllTerminals();
   stopBackend();
 });
 
@@ -455,6 +485,25 @@ app.on("window-all-closed", () => {
 });
 
 function setupApplicationMenu() {
+  const viewSubmenu = [
+    {
+      label: "Browser",
+      click: () => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send("gofer:browser-command", { action: "open-browser" });
+        }
+      },
+    },
+  ];
+  if (!isProduction) {
+    viewSubmenu.push(
+      { type: "separator" },
+      { role: "reload", label: "Reload" },
+      { role: "forceReload", label: "Force Reload" },
+      { type: "separator" },
+      { role: "toggleDevTools" },
+    );
+  }
   const template = [
     {
       label: "Taskurotta",
@@ -482,19 +531,11 @@ function setupApplicationMenu() {
         },
       ],
     },
-  ];
-
-  if (!isProduction) {
-    template.push({
+    {
       label: "View",
-      submenu: [
-        { role: "reload", label: "Reload" },
-        { role: "forceReload", label: "Force Reload" },
-        { type: "separator" },
-        { role: "toggleDevTools" },
-      ],
-    });
-  }
+      submenu: viewSubmenu,
+    },
+  ];
 
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
@@ -521,11 +562,20 @@ function setupIpcHandlers() {
   registerIpcHandlers(ipcMain, {
     checkForUpdates,
     copyPath,
+    browserAction,
+    createBrowser,
     createFile,
     createFolder,
+    createTerminal,
     deletePath,
     downloadAndInstallUpdate,
     getGoferDataDir,
+    gitStatus,
+    gitFileBaseline,
+    gitHistory,
+    gitWorktrees,
+    gitWorktreeAdd,
+    gitWorktreeRemove,
     grantPath,
     getUpdateState,
     installDownloadedUpdate,
@@ -534,12 +584,17 @@ function setupIpcHandlers() {
     openPath,
     openUpdateRelease,
     pathInfo,
+    readBinaryPreview,
     readTextFile,
+    resizeTerminal,
     renamePath,
+    resolveProjectFile,
     restartBackend,
     revealPath,
     selectPath,
     setDataDir,
+    closeTerminal,
+    writeTerminal,
     writeTextFile,
   }, {
     secureHandler: (handler, channel) => async (event, ...args) => {
@@ -553,6 +608,478 @@ function setupIpcHandlers() {
       return ipcSecurity.secureHandler(handler)(event, ...args);
     },
   });
+}
+
+function createBrowser(event, options = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    throw new Error("The browser window is unavailable.");
+  }
+  const requestedPath = typeof options.path === "string" ? options.path.trim() : "";
+  let url = "about:blank";
+  let grantId = "";
+  if (requestedPath) {
+    const targetPath = resolveExactPath(requestedPath, {
+      grantId: options.grantId,
+      mustExist: true,
+    });
+    if (!fs.statSync(targetPath).isFile()) {
+      throw new Error(`Browser preview path is not a file: ${targetPath}`);
+    }
+    url = pathToFileURL(targetPath).toString();
+    grantId = typeof options.grantId === "string" ? options.grantId : "";
+  } else if (options.url) {
+    url = normalizeBrowserUrl(options.url);
+  }
+
+  const id = crypto.randomUUID();
+  const view = new WebContentsView({
+    webPreferences: {
+      backgroundThrottling: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      partition: "persist:taskurotta-browser",
+    },
+  });
+  view.setBackgroundColor("#ffffff");
+  view.setVisible(false);
+  mainWindow.contentView.addChildView(view);
+  const session = {
+    clientId: typeof options.clientId === "string" ? options.clientId : "",
+    error: "",
+    grantId,
+    id,
+    owner: event.sender,
+    ownerId: event.sender.id,
+    openBrowserBinding: typeof options.openBrowserBinding === "string"
+      ? options.openBrowserBinding.slice(0, 120)
+      : "Mod+Alt+Slash",
+    view,
+  };
+  browserSessions.set(id, session);
+  configureBrowserSession(session);
+  void view.webContents.loadURL(url).catch((error) => {
+    session.error = error instanceof Error ? error.message : String(error);
+    emitBrowserState(session);
+  });
+  event.sender.once("destroyed", () => closeBrowserSession(session));
+  return browserSessionState(session, url);
+}
+
+function browserAction(event, options = {}) {
+  const session = ownedBrowserSession(event, options.id);
+  const contents = session.view.webContents;
+  switch (options.action) {
+    case "activate":
+      setBrowserSessionActive(session, options.active === true);
+      break;
+    case "back":
+      if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
+      break;
+    case "close":
+      closeBrowserSession(session);
+      return { closed: true };
+    case "focus":
+      contents.focus();
+      break;
+    case "forward":
+      if (contents.navigationHistory.canGoForward()) contents.navigationHistory.goForward();
+      break;
+    case "navigate":
+      session.error = "";
+      void contents.loadURL(normalizeBrowserUrl(options.url)).catch((error) => {
+        session.error = error instanceof Error ? error.message : String(error);
+        emitBrowserState(session);
+      });
+      break;
+    case "open-external": {
+      const url = contents.getURL();
+      if (isSafeExternalUrl(url)) void shell.openExternal(url);
+      break;
+    }
+    case "reload":
+      contents.reload();
+      break;
+    case "set-preferences":
+      session.openBrowserBinding = typeof options.openBrowserBinding === "string"
+        ? options.openBrowserBinding.slice(0, 120)
+        : session.openBrowserBinding;
+      break;
+    case "set-bounds":
+      setBrowserSessionBounds(session, options.bounds);
+      break;
+    case "stop":
+      contents.stop();
+      break;
+    default:
+      throw new Error(`Unknown browser action: ${options.action || "missing"}`);
+  }
+  return browserSessionState(session);
+}
+
+function configureBrowserSession(session) {
+  const contents = session.view.webContents;
+  const update = () => emitBrowserState(session);
+  contents.on("did-start-loading", () => {
+    session.error = "";
+    update();
+  });
+  contents.on("did-stop-loading", update);
+  contents.on("did-navigate", update);
+  contents.on("did-navigate-in-page", update);
+  contents.on("page-title-updated", update);
+  contents.on("did-fail-load", (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return;
+    session.error = `${errorDescription}: ${validatedUrl}`;
+    update();
+  });
+  contents.on("render-process-gone", (_event, details) => {
+    session.error = `Browser renderer stopped: ${details.reason}`;
+    update();
+  });
+  contents.on("will-navigate", (event, url) => {
+    if (!isAllowedBrowserNavigation(session, url)) event.preventDefault();
+  });
+  contents.on("before-input-event", (event, input) => {
+    const action = browserShortcutAction(input, process.platform, session.openBrowserBinding);
+    if (!action) return;
+    event.preventDefault();
+    if (action === "focus-location" || action === "close") {
+      emitBrowserCommand(session, action);
+      return;
+    }
+    if (action === "open-browser") {
+      emitBrowserCommand(session, action);
+      return;
+    }
+    if (action === "reload") contents.reload();
+    if (action === "back" && contents.navigationHistory.canGoBack()) {
+      contents.navigationHistory.goBack();
+    }
+    if (action === "forward" && contents.navigationHistory.canGoForward()) {
+      contents.navigationHistory.goForward();
+    }
+    if (action === "zoom-in") contents.setZoomFactor(Math.min(3, contents.getZoomFactor() + 0.1));
+    if (action === "zoom-out") contents.setZoomFactor(Math.max(0.5, contents.getZoomFactor() - 0.1));
+    if (action === "zoom-reset") contents.setZoomFactor(1);
+  });
+  if (session.grantId) {
+    contents.on("before-mouse-event", (event, mouse) => {
+      if (mouse.type !== "mouseDown" || mouse.button !== "left" || mouse.clickCount !== 2) return;
+      event.preventDefault();
+      emitBrowserCommand(session, "edit-local-html");
+    });
+  }
+  contents.setWindowOpenHandler(({ url }) => {
+    if (isAllowedBrowserNavigation(session, url) && !session.owner.isDestroyed()) {
+      session.owner.send("gofer:browser-open-tab", { url });
+    }
+    return { action: "deny" };
+  });
+  contents.on("context-menu", (_event, params) => showBrowserContextMenu(session, params));
+}
+
+function showBrowserContextMenu(session, params) {
+  const contents = session.view.webContents;
+  const template = [];
+  if (params.linkURL && isSafeExternalUrl(params.linkURL)) {
+    template.push({
+      label: "Open link in new browser tab",
+      click: () => session.owner.send("gofer:browser-open-tab", { url: params.linkURL }),
+    });
+    template.push({ type: "separator" });
+  }
+  if (params.isEditable) {
+    template.push({ role: "cut" }, { role: "copy" }, { role: "paste" }, { type: "separator" });
+  } else if (params.selectionText) {
+    template.push({ role: "copy" }, { type: "separator" });
+  }
+  template.push(
+    {
+      label: "Back",
+      enabled: contents.navigationHistory.canGoBack(),
+      click: () => contents.navigationHistory.goBack(),
+    },
+    {
+      label: "Forward",
+      enabled: contents.navigationHistory.canGoForward(),
+      click: () => contents.navigationHistory.goForward(),
+    },
+    { label: "Reload", click: () => contents.reload() },
+    { type: "separator" },
+    { label: "Inspect", click: () => contents.inspectElement(params.x, params.y) },
+  );
+  Menu.buildFromTemplate(template).popup({ window: mainWindow });
+}
+
+function setBrowserSessionActive(session, active) {
+  if (active) {
+    for (const candidate of browserSessions.values()) {
+      if (candidate.ownerId === session.ownerId && candidate.id !== session.id) {
+        candidate.view.setVisible(false);
+      }
+    }
+  }
+  session.view.setVisible(active);
+  if (active) session.view.webContents.focus();
+}
+
+function setBrowserSessionBounds(session, bounds = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  const windowBounds = mainWindow.getContentBounds();
+  const x = clampInteger(bounds.x, 0, windowBounds.width);
+  const y = clampInteger(bounds.y, 0, windowBounds.height);
+  const width = clampInteger(bounds.width, 0, windowBounds.width - x);
+  const height = clampInteger(bounds.height, 0, windowBounds.height - y);
+  session.view.setBounds({ x, y, width, height });
+}
+
+function browserSessionState(session, fallbackUrl = "about:blank") {
+  const contents = session.view.webContents;
+  return {
+    canGoBack: contents.navigationHistory.canGoBack(),
+    canGoForward: contents.navigationHistory.canGoForward(),
+    clientId: session.clientId,
+    error: session.error,
+    id: session.id,
+    loading: contents.isLoading(),
+    title: contents.getTitle(),
+    url: contents.getURL() || fallbackUrl,
+  };
+}
+
+function emitBrowserState(session) {
+  if (!session.owner.isDestroyed()) {
+    session.owner.send("gofer:browser-state", browserSessionState(session));
+  }
+}
+
+function emitBrowserCommand(session, action) {
+  if (!session.owner.isDestroyed()) {
+    session.owner.send("gofer:browser-command", {
+      action,
+      clientId: session.clientId,
+      id: session.id,
+    });
+  }
+}
+
+function ownedBrowserSession(event, id) {
+  const session = typeof id === "string" ? browserSessions.get(id) : null;
+  if (!session || session.ownerId !== event.sender.id) {
+    throw new Error("Browser session was not found.");
+  }
+  return session;
+}
+
+function closeBrowserSession(session) {
+  if (!session || !browserSessions.has(session.id)) return;
+  browserSessions.delete(session.id);
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.contentView.removeChildView(session.view);
+  }
+  if (!session.view.webContents.isDestroyed()) session.view.webContents.close();
+}
+
+function closeBrowsersForOwner(ownerId) {
+  for (const session of [...browserSessions.values()]) {
+    if (session.ownerId === ownerId) closeBrowserSession(session);
+  }
+}
+
+function closeAllBrowsers() {
+  for (const session of [...browserSessions.values()]) closeBrowserSession(session);
+}
+
+function isAllowedBrowserNavigation(session, value) {
+  try {
+    const url = new URL(value);
+    if (["http:", "https:", "about:", "blob:", "data:"].includes(url.protocol)) return true;
+    if (url.protocol !== "file:" || !session.grantId) return false;
+    resolveExactPath(fileURLToPath(url), { grantId: session.grantId, mustExist: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clampInteger(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, Math.round(Number(value) || 0)));
+}
+
+function createTerminal(event, options = {}) {
+  const requestedCwd = typeof options.cwd === "string" ? options.cwd.trim() : "";
+  const cwd = requestedCwd
+    ? resolveExactPath(requestedCwd, { grantId: options.grantId, mustExist: true })
+    : getGoferDataDir();
+  if (!fs.statSync(cwd).isDirectory()) {
+    throw new Error(`Terminal directory is not a folder: ${cwd}`);
+  }
+
+  const shell = terminalShell();
+  const id = crypto.randomUUID();
+  const terminal = pty.spawn(shell.command, shell.args, {
+    cols: terminalDimension(options.cols, 80, 2, 500),
+    cwd,
+    env: {
+      ...process.env,
+      ...(shell.env ?? {}),
+      COLORTERM: "truecolor",
+      TERM: "xterm-256color",
+    },
+    name: "xterm-256color",
+    rows: terminalDimension(options.rows, 24, 1, 200),
+  });
+  const session = {
+    id,
+    ownerId: event.sender.id,
+    terminal,
+  };
+  terminalSessions.set(id, session);
+  terminal.onData((data) => {
+    if (!event.sender.isDestroyed()) {
+      event.sender.send("gofer:terminal-data", { data, id });
+    }
+  });
+  terminal.onExit(({ exitCode, signal }) => {
+    terminalSessions.delete(id);
+    if (!event.sender.isDestroyed()) {
+      event.sender.send("gofer:terminal-exit", { exitCode, id, signal });
+    }
+  });
+
+  return {
+    cwd,
+    id,
+    pid: terminal.pid,
+    shell: shell.label,
+  };
+}
+
+function writeTerminal(event, options = {}) {
+  const session = ownedTerminalSession(event, options.id);
+  if (typeof options.data !== "string" || options.data.length > 64 * 1024) {
+    throw new Error("Terminal input must be a string smaller than 64 KB.");
+  }
+  session.terminal.write(options.data);
+  return { written: true };
+}
+
+function resizeTerminal(event, options = {}) {
+  const session = ownedTerminalSession(event, options.id);
+  session.terminal.resize(
+    terminalDimension(options.cols, 80, 2, 500),
+    terminalDimension(options.rows, 24, 1, 200),
+  );
+  return { resized: true };
+}
+
+function closeTerminal(event, options = {}) {
+  const session = ownedTerminalSession(event, options.id);
+  terminalSessions.delete(session.id);
+  session.terminal.kill();
+  return { closed: true };
+}
+
+function ownedTerminalSession(event, id) {
+  const session = typeof id === "string" ? terminalSessions.get(id) : null;
+  if (!session || session.ownerId !== event.sender.id) {
+    throw new Error("Terminal session was not found.");
+  }
+  return session;
+}
+
+function terminalShell() {
+  if (process.platform === "win32") {
+    return {
+      args: ["-NoLogo", "-NoExit", "-Command", powershellIntegrationCommand()],
+      command: path.join(
+        process.env.SystemRoot || "C:\\Windows",
+        "System32",
+        "WindowsPowerShell",
+        "v1.0",
+        "powershell.exe",
+      ),
+      label: "PowerShell",
+    };
+  }
+  const integrationPath = bashIntegrationPath();
+  if (integrationPath) {
+    return {
+      args: ["--rcfile", integrationPath],
+      command: "/bin/bash",
+      label: "bash",
+    };
+  }
+  return {
+    args: [],
+    command: "/bin/bash",
+    env: {
+      PROMPT_COMMAND: [
+        "printf '\\033]633;P;Cwd=%s\\007' \"$PWD\"",
+        process.env.PROMPT_COMMAND,
+      ].filter(Boolean).join(";"),
+    },
+    label: "bash",
+  };
+}
+
+function bashIntegrationPath() {
+  try {
+    const integrationDirectory = path.join(app.getPath("userData"), "shell-integration");
+    const integrationPath = path.join(integrationDirectory, "bash.sh");
+    const source = [
+      'if [ -f "$HOME/.bashrc" ]; then',
+      '  . "$HOME/.bashrc"',
+      "fi",
+      "__taskurotta_report_cwd() {",
+      "  printf '\\033]633;P;Cwd=%s\\007' \"$PWD\"",
+      "}",
+      'case "$(declare -p PROMPT_COMMAND 2>/dev/null)" in',
+      '  "declare -a"*) PROMPT_COMMAND[${#PROMPT_COMMAND[@]}]=__taskurotta_report_cwd ;;',
+      '  *) if [ -n "$PROMPT_COMMAND" ]; then',
+      '       PROMPT_COMMAND="__taskurotta_report_cwd;$PROMPT_COMMAND"',
+      "     else",
+      '       PROMPT_COMMAND="__taskurotta_report_cwd"',
+      "     fi ;;",
+      "esac",
+      "",
+    ].join("\n");
+    fs.mkdirSync(integrationDirectory, { recursive: true });
+    fs.writeFileSync(integrationPath, source, { encoding: "utf8", mode: 0o600 });
+    return integrationPath;
+  } catch {
+    return "";
+  }
+}
+
+function powershellIntegrationCommand() {
+  return [
+    "$global:__TaskurottaOriginalPrompt = $function:prompt",
+    'function global:prompt { $cwdPath = $executionContext.SessionState.Path.CurrentLocation.Path; [Console]::Write("$([char]27)]633;P;Cwd=$cwdPath$([char]7)"); if ($global:__TaskurottaOriginalPrompt) { & $global:__TaskurottaOriginalPrompt } else { "PS $cwdPath> " } }',
+  ].join("; ");
+}
+
+function terminalDimension(value, fallback, minimum, maximum) {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? Math.min(maximum, Math.max(minimum, parsed)) : fallback;
+}
+
+function closeTerminalsForOwner(ownerId) {
+  if (!ownerId) return;
+  for (const [id, session] of terminalSessions.entries()) {
+    if (session.ownerId !== ownerId) continue;
+    terminalSessions.delete(id);
+    session.terminal.kill();
+  }
+}
+
+function closeAllTerminals() {
+  for (const [id, session] of terminalSessions.entries()) {
+    terminalSessions.delete(id);
+    session.terminal.kill();
+  }
 }
 
 function setupAutoUpdater() {
@@ -855,6 +1382,39 @@ async function pathInfo(_event, options = {}) {
   return pathInfoFromStat(targetPath, stat);
 }
 
+async function resolveProjectFile(_event, options = {}) {
+  const selectedPath = resolveExactPath(options.selectedPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
+  const stat = await fs.promises.stat(selectedPath);
+  const selectedDirectory = stat.isDirectory() ? selectedPath : path.dirname(selectedPath);
+  const projectRoot = nearestProjectRoot(selectedDirectory);
+  const handle = pathHandle(projectRoot);
+  await registerBackendPathGrant(handle);
+  return {
+    directory: projectRoot,
+    grantId: handle.grantId,
+    selectedPath,
+  };
+}
+
+function nearestProjectRoot(startDirectory) {
+  let current = path.resolve(startDirectory);
+  const fallback = current;
+  while (true) {
+    if (
+      fs.existsSync(path.join(current, ".taskurotta"))
+      || fs.existsSync(path.join(current, ".git"))
+    ) {
+      return current;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return fallback;
+    current = parent;
+  }
+}
+
 async function grantPath(_event, options = {}) {
   if (!options.targetPath || typeof options.targetPath !== "string") {
     throw new Error("A path is required.");
@@ -974,6 +1534,37 @@ async function readTextFile(_event, options = {}) {
   };
 }
 
+async function readBinaryPreview(_event, options = {}) {
+  if (!options.targetPath || typeof options.targetPath !== "string") {
+    throw new Error("A path is required.");
+  }
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
+  const stat = await fs.promises.stat(targetPath);
+  if (!stat.isFile()) throw new Error(`Path is not a file: ${targetPath}`);
+  if (stat.size > 25 * 1024 * 1024) {
+    throw new Error("File is too large to preview in Taskurotta.");
+  }
+  const mimeType = imageMimeType(targetPath);
+  if (!mimeType) throw new Error("This file type does not have an image preview.");
+  const content = await fs.promises.readFile(targetPath);
+  return {
+    dataUrl: `data:${mimeType};base64,${content.toString("base64")}`,
+    ...pathHandle(targetPath),
+  };
+}
+
+function imageMimeType(targetPath) {
+  const types = {
+    ".avif": "image/avif", ".bmp": "image/bmp", ".gif": "image/gif",
+    ".ico": "image/x-icon", ".jpeg": "image/jpeg", ".jpg": "image/jpeg",
+    ".png": "image/png", ".webp": "image/webp",
+  };
+  return types[path.extname(targetPath).toLowerCase()] ?? "";
+}
+
 async function writeTextFile(_event, options = {}) {
   if (!options.targetPath || typeof options.targetPath !== "string") {
     throw new Error("A path is required.");
@@ -1053,6 +1644,67 @@ async function listDirectory(_event, options = {}) {
   };
 }
 
+async function gitStatus(_event, options = {}) {
+  const projectRoot = resolveExactPath(options.projectRoot, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
+  const stat = await fs.promises.stat(projectRoot);
+  if (!stat.isDirectory()) {
+    throw new Error(`Git status path is not a folder: ${projectRoot}`);
+  }
+  return readGitStatus(projectRoot);
+}
+
+async function gitFileBaseline(_event, options = {}) {
+  const targetPath = resolveExactPath(options.targetPath, {
+    grantId: options.grantId,
+    mustExist: true,
+  });
+  const stat = await fs.promises.stat(targetPath);
+  if (!stat.isFile()) {
+    throw new Error(`Git comparison path is not a file: ${targetPath}`);
+  }
+  return readGitFileBaseline(targetPath);
+}
+
+async function gitHistory(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  return readGitHistory(projectRoot);
+}
+
+async function gitWorktrees(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  return readGitWorktrees(projectRoot);
+}
+
+async function gitWorktreeAdd(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  if (typeof options.targetPath !== "string" || !options.targetPath.trim()) throw new Error("A worktree folder is required.");
+  if (typeof options.branch !== "string" || !options.branch.trim()) throw new Error("A branch is required.");
+  const targetPath = resolveExactPath(options.targetPath, { grantId: options.targetGrantId, mustExist: true });
+  const targetStat = await fs.promises.stat(targetPath);
+  if (!targetStat.isDirectory()) throw new Error("The worktree target must be a folder.");
+  const result = await addGitWorktree(projectRoot, targetPath, options.branch.trim(), { createBranch: options.createBranch === true });
+  const handle = pathHandle(targetPath);
+  await registerBackendPathGrant(handle);
+  return { ...result, createdPath: targetPath, grantId: handle.grantId };
+}
+
+async function gitWorktreeRemove(_event, options = {}) {
+  const projectRoot = await resolveGitProjectDirectory(options);
+  const targetPath = resolveExactPath(options.targetPath, { grantId: options.targetGrantId, mustExist: true });
+  if (path.resolve(targetPath) === path.resolve(projectRoot)) throw new Error("The current worktree cannot be removed.");
+  return removeGitWorktree(projectRoot, targetPath);
+}
+
+async function resolveGitProjectDirectory(options = {}) {
+  const projectRoot = resolveExactPath(options.projectRoot, { grantId: options.grantId, mustExist: true });
+  const stat = await fs.promises.stat(projectRoot);
+  if (!stat.isDirectory()) throw new Error(`Git project path is not a folder: ${projectRoot}`);
+  return projectRoot;
+}
+
 function resolveExactPath(currentPath, options = {}) {
   return getIpcSecurity().resolveAllowedPath(currentPath, options);
 }
@@ -1070,6 +1722,8 @@ async function selectPath(_event, options = {}) {
   const result = await dialog.showOpenDialog(parentWindow, {
     defaultPath,
     properties,
+    ...(options.directoryOnly === true ? { buttonLabel: "Open Folder", title: "Open Folder" } : {}),
+    ...(options.fileOnly === true ? { buttonLabel: "Open File", title: "Open File" } : {}),
   });
 
   if (result.canceled || result.filePaths.length === 0) {

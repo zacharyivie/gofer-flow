@@ -1,4 +1,4 @@
-/* global __dirname, clearTimeout, console, document, getComputedStyle, localStorage, MouseEvent, process, self, setTimeout */
+/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, localStorage, MouseEvent, process, self, setTimeout, window */
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -40,6 +40,13 @@ async function run() {
 
   await windowRef.loadURL(baseUrl);
   await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Search workflows']"))));
+  if (process.env.GOFER_TERMINAL_ONLY === "1") {
+    await exerciseBottomPanelTerminal();
+    clearTimeout(timeout);
+    console.log("Browser terminal regression test passed.");
+    await cleanup(0);
+    return;
+  }
   if (process.env.GOFER_MONACO_ONLY === "1") {
     await exerciseMonacoEditor();
     await exercisePackagedMonacoWorker(baseUrl);
@@ -57,6 +64,32 @@ async function run() {
   clearTimeout(timeout);
   console.log("Browser studio accessibility smoke test passed.");
   await cleanup(0);
+}
+
+async function exerciseBottomPanelTerminal() {
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Bottom panel']"))));
+  await evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", {
+    bubbles: true,
+    ctrlKey: true,
+    key: "`",
+  })));
+  await waitFor(() => evaluate(() => Boolean(document.querySelector(".terminal-host .xterm-screen"))));
+  assert.equal(
+    await evaluate(() => document.querySelector("[aria-label='Bottom panel'] button[role='tab'][aria-selected='true']")?.textContent.trim()),
+    "Terminal",
+  );
+  assert.equal(await evaluate(() => document.querySelector("[aria-label='Bottom panel']").getBoundingClientRect().height), 240);
+  await evaluate(() => document.querySelector("button[aria-label='New terminal']").click());
+  await waitFor(() => evaluate(() => document.querySelectorAll("button[title='Close terminal']").length === 2));
+  assert.equal(await evaluate(() => window.__goferBridgeCalls
+    .filter((call) => call.method === "terminal.create").length), 2);
+
+  await evaluate(() => window.dispatchEvent(new KeyboardEvent("keydown", {
+    bubbles: true,
+    ctrlKey: true,
+    key: "`",
+  })));
+  await waitFor(() => evaluate(() => document.querySelector("[aria-label='Bottom panel']").getBoundingClientRect().height === 36));
 }
 
 async function exerciseMonacoEditor() {

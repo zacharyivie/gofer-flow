@@ -46,7 +46,10 @@ def serve_ui(
     data_dir: Path | None = typer.Option(
         None,
         "--data-dir",
-        help="Taskurotta app data directory for workflows, logs, schedules, and chat state.",
+        help=(
+            "Taskurotta app data directory for global settings, schedules, registries, "
+            "and app state."
+        ),
     ),
 ) -> None:
     """Serve JSON endpoints used by the React workflow studio."""

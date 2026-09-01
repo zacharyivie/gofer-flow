@@ -30,6 +30,7 @@ from gofer.radish.runtime import (
     NodeHandlerRegistry,
     RuntimeErrorInfo,
 )
+from gofer.radish.storage import migrate_legacy_directory, registered_source_root
 from gofer.radish.workflow_runtime import (
     NodeRunRecord,
     WorkflowExecutionResult,
@@ -127,7 +128,12 @@ async def run_radish_file(
         finished_at=finished_at,
         duration_ms=round((time.monotonic() - started_clock) * 1000),
     )
-    path = _run_path(resolved_data_dir, compiled.ir["workflow"]["id"], run_id)
+    path = _run_path(
+        resolved_data_dir,
+        compiled.ir["workflow"]["id"],
+        run_id,
+        source_path=compiled.source_path,
+    )
     _write_json_atomic(path, document)
     return RadishRunResult(document, path, compiled, deployment)
 
@@ -243,7 +249,18 @@ def _new_run_id() -> str:
     return f"{timestamp}-{uuid.uuid4().hex[:12]}"
 
 
-def _run_path(data_dir: Path, workflow_id: str, run_id: str) -> Path:
+def _run_path(
+    data_dir: Path,
+    workflow_id: str,
+    run_id: str,
+    *,
+    source_path: Path,
+) -> Path:
+    workflow_root = registered_source_root(source_path, data_dir)
+    if workflow_root is not None:
+        directory = workflow_root / "logs"
+        migrate_legacy_directory(data_dir / "radish" / "runs" / workflow_id, directory)
+        return directory / f"{run_id}.json"
     return data_dir / "radish" / "runs" / workflow_id / f"{run_id}.json"
 
 

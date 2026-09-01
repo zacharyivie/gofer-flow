@@ -34,6 +34,7 @@ from gofer.core.references import (
     ReferenceNamespace,
 )
 from gofer.core.workflow import AgenticWorkflow
+from gofer.radish.artifacts import RadishArtifactError
 from gofer.ui.chat import _load_skill_text
 from tests.conftest import FakeSubscription
 
@@ -529,11 +530,14 @@ def test_installed_entrypoint_discovers_schema_without_repository_cwd(tmp_path: 
     assert json.loads(result.stdout)["operation"]["type"] == "pass"
 
 
-def test_human_help_and_missing_skill_recovery_point_to_schema(monkeypatch) -> None:
+def test_human_help_and_missing_skill_recovery_point_to_authoring_contract(monkeypatch) -> None:
     root_help = runner.invoke(app, ["--help"])
     node_help = runner.invoke(app, ["workflow", "add-node", "--help"])
-    monkeypatch.setattr("gofer.ui.chat.Path.exists", lambda _path: False)
+    monkeypatch.setattr(
+        "gofer.ui.chat.radish_assistant_skill_path",
+        lambda: (_ for _ in ()).throw(RadishArtifactError("missing")),
+    )
 
     assert "gof schema --format json" in root_help.output
     assert "gof schema --operation TYPE" in node_help.output
-    assert "gof schema --format json" in _load_skill_text()
+    assert "gof radish docs --format json" in _load_skill_text()

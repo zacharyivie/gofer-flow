@@ -37,6 +37,7 @@ from gofer.radish.runtime import (
     _workflow_interface_fingerprint,
     load_ir,
 )
+from gofer.radish.storage import registered_source_root
 from gofer.utils.paths import get_data_dir
 
 ARTIFACT_VERSION = 1
@@ -185,7 +186,7 @@ def _compile_radish_file(
         provider_contracts,
         referenced,
     )
-    cache_path = _cache_path(data_dir, source_path)
+    cache_path = _cache_path(data_dir, source_path, resolved_workflow_id)
     cached = _read_cached_artifact(
         cache_path,
         cache_inputs,
@@ -353,6 +354,29 @@ def radish_asset_root() -> Path:
     raise RadishArtifactError("Radish schemas and node contracts are not installed.")
 
 
+def radish_docs_root() -> Path:
+    """Return the installed Radish specification directory."""
+    asset_root = radish_asset_root()
+    packaged = asset_root / "docs"
+    if packaged.is_dir():
+        return packaged
+    repository = asset_root / "spec"
+    if repository.is_dir():
+        return repository
+    raise RadishArtifactError("Radish language documentation is not installed.")
+
+
+def radish_assistant_skill_path() -> Path:
+    """Return the workflow assistant skill bundled with this installation."""
+    packaged = radish_asset_root() / "assistant-skill" / "SKILL.md"
+    if packaged.is_file():
+        return packaged
+    repository = Path(__file__).parents[3] / "skills" / "gofer-flow-workflow-builder" / "SKILL.md"
+    if repository.is_file():
+        return repository
+    raise RadishArtifactError("Taskurotta workflow-builder skill is not installed.")
+
+
 def _cache_inputs(
     source_path: Path,
     source: str,
@@ -405,9 +429,33 @@ def _cache_inputs(
     )
 
 
-def _cache_path(data_dir: Path, source_path: Path) -> Path:
+def _cache_path(data_dir: Path, source_path: Path, workflow_id: str) -> Path:
     source_key = hashlib.sha256(str(source_path).encode("utf-8")).hexdigest()
-    return data_dir / "radish" / "artifacts" / f"{source_key}.json"
+    legacy_path = data_dir / "radish" / "artifacts" / f"{source_key}.json"
+    workflow_root = registered_source_root(source_path, data_dir)
+    if (
+        workflow_root is None
+        and source_path.name == "workflow.rad"
+        and source_path.parent.name == workflow_id
+        and source_path.parent.parent.name == ".taskurotta"
+    ):
+        workflow_root = source_path.parent
+    if workflow_root is None:
+        return legacy_path
+    path = workflow_root / "compiled" / f"{source_key}.json"
+    _move_legacy_file(legacy_path, path)
+    return path
+
+
+def _move_legacy_file(source: Path, destination: Path) -> None:
+    """Move one old app-data artifact into its registered workflow workspace."""
+    if destination.exists() or not source.is_file():
+        return
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(source, destination)
+    except OSError:
+        return
 
 
 def _read_cached_artifact(

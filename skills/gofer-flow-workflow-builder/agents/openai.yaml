@@ -1,4 +1,4 @@
 interface:
   display_name: "Taskurotta Workflow Builder"
-  short_description: "Create Taskurotta workflows end to end with the CLI."
-  default_prompt: "Create a Taskurotta workflow from this request:"
+  short_description: "Create and validate Taskurotta workflows in Radish."
+  default_prompt: "Create a Radish workflow from this request:"

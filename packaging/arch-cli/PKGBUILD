@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Command line workflow automation tool for Taskurotta"
 arch=("x86_64")
 url="https://github.com/doonk/gofer-flow"
-license=("Apache-2.0")
+license=("AGPL-3.0-only")
 options=(!strip)
 source_x86_64=(
   "gof-linux-x64-${pkgver}::${url}/releases/download/v${pkgver}/gof-linux-x64"

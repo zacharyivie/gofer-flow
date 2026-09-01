@@ -5,49 +5,86 @@ import {
   Bot,
   Check,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Code2,
   Copy,
   Download,
+  FileDiff,
   FolderOpen,
   GitBranch,
   History,
   Loader2,
   Moon,
   MoreVertical,
+  Paperclip,
   Plus,
   PencilLine,
   Play,
   RefreshCw,
+  Redo2,
   Save,
   Search,
-  Send,
-  Square,
+  Settings as SettingsIcon,
   Sun,
   Trash2,
+  Undo2,
   Waypoints,
   X,
 } from "lucide-react";
 import DagCanvas, { autoLayoutWorkflow } from "../components/DagCanvas.jsx";
 import { Dialog } from "../components/Dialog.jsx";
 import CodeFileExplorer from "../components/CodeFileExplorer.jsx";
-import CodeWorkspace, { applyCodeFilesystemChange } from "../components/CodeWorkspace.jsx";
+import CodeWorkspace, {
+  applyCodeFilesystemChange,
+  resolveMarkdownFileLinkTarget,
+} from "../components/CodeWorkspace.jsx";
+import MarkdownContent from "../components/MarkdownContent.jsx";
+import ChatComposer, { MessageAttachments } from "../components/ChatComposer.jsx";
+import SettingsPopover, { defaultSettingsSnapshot } from "../components/SettingsPopover.jsx";
+import UnifiedBottomPanel from "../components/UnifiedBottomPanel.jsx";
 import {
   ProviderModelEffortFields,
   useProviderCapabilities,
 } from "../components/ProviderModelEffortFields.jsx";
 import { apiUrl } from "../lib/api.js";
+import {
+  chatMessageForRequest,
+  clipboardAttachmentFiles,
+  readChatAttachments,
+  transferContainsFiles,
+  uploadChatAttachments,
+} from "../lib/chatAttachments.js";
+import {
+  DEFAULT_APP_SETTINGS,
+  formatKeybinding,
+  loadAppSettings,
+  matchesCommand,
+  matchesKeybinding,
+  reducedMotionEnabled,
+  resolvedTheme,
+  saveAppSettings,
+  settingBinding,
+  updateSetting,
+} from "../lib/settings.js";
 
 const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
 const PROJECT_LABELS_STORAGE_KEY = "gofer.projectLabels";
+const RECENT_PROJECTS_STORAGE_KEY = "gofer.recentProjects";
+export const STUDIO_SESSION_STORAGE_KEY = "taskurotta.studioSession.v1";
 const DEFAULT_RETENTION_SETTINGS = {
   keepDays: 14,
   keepFailedDays: 30,
   keepLast: 100,
 };
 const RUN_LOG_TAIL_BYTES = 64 * 1024;
+const RADISH_ANALYSIS_DELAY_MS = 300;
+let browserTabSequence = 0;
 
 export function prefersReducedMotion() {
+  if (typeof document !== "undefined" && document.documentElement.dataset.reducedMotion) {
+    return document.documentElement.dataset.reducedMotion === "true";
+  }
   return typeof window !== "undefined" &&
     (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false);
 }
@@ -163,15 +200,32 @@ function previewTriggerLines(items = []) {
 }
 
 export default function App() {
+  const [settings, setSettings] = useState(loadAppSettings);
+  const [initialStudioSession] = useState(loadStudioSession);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [systemDark, setSystemDark] = useState(
+    () => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false,
+  );
   const [workflows, setWorkflows] = useState([]);
   const [promptAgentIds, setPromptAgentIds] = useState([]);
-  const [activeWorkflowId, setActiveWorkflowId] = useState();
-  const [studioView, setStudioView] = useState("graph");
-  const [codeEditorOpened, setCodeEditorOpened] = useState(false);
+  const [activeWorkflowId, setActiveWorkflowId] = useState(initialStudioSession.workflowId || undefined);
+  const [activeProjectRoot, setActiveProjectRoot] = useState(initialStudioSession.projectRoot);
+  const [studioView, setStudioView] = useState(initialStudioSession.view || settings.general.defaultView);
+  const [codeEditorOpened, setCodeEditorOpened] = useState(
+    (initialStudioSession.view || settings.general.defaultView) === "code",
+  );
   const [codeOpenPaths, setCodeOpenPaths] = useState([]);
   const [activeCodePath, setActiveCodePath] = useState("");
+  const [previewCodePath, setPreviewCodePath] = useState("");
+  const [codeNavigationRequest, setCodeNavigationRequest] = useState(null);
+  const [browserTabs, setBrowserTabs] = useState({});
+  const [newCodeFileRequest, setNewCodeFileRequest] = useState(0);
+  const [recentProjectRoots, setRecentProjectRoots] = useState(loadRecentProjectRoots);
   const [radishEditorState, setRadishEditorState] = useState(null);
+  const [activeCodeDocumentState, setActiveCodeDocumentState] = useState(null);
   const [query, setQuery] = useState("");
+  const [projectPaneVisible, setProjectPaneVisible] = useState(true);
+  const [assistantPaneVisible, setAssistantPaneVisible] = useState(true);
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
   const [doctorState, setDoctorState] = useState({
@@ -200,7 +254,6 @@ export default function App() {
   const [saveStatesByWorkflowId, setSaveStatesByWorkflowId] = useState({});
   const [topBarNotice, setTopBarNotice] = useState({ type: "", message: "" });
   const [runPreview, setRunPreview] = useState(null);
-  const [executionMode, setExecutionMode] = useState("local");
   const [queueState, setQueueState] = useState({ runners: [], runs: [], error: "" });
   const [retentionSettings, setRetentionSettings] = useState(loadRetentionSettings);
   const [updateState, setUpdateState] = useState({
@@ -229,9 +282,7 @@ export default function App() {
     error: "",
     loading: false,
   });
-  const [theme, setTheme] = useState(getInitialTheme);
-  const [workflowPaneWidth, setWorkflowPaneWidth] = useState(272);
-  const [chatPaneWidth, setChatPaneWidth] = useState(380);
+  const [graphToolbarTarget, setGraphToolbarTarget] = useState(null);
   const workflowRevisionsRef = useRef(new Map());
   const dirtyWorkflowsRef = useRef(new Map());
   const saveTimersRef = useRef(new Map());
@@ -242,37 +293,237 @@ export default function App() {
   const radishEditorStateRef = useRef(null);
   const radishMetadataSaveTimerRef = useRef(null);
   const radishMetadataPendingRef = useRef(false);
-  const activeWorkflow = workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
+  const radishAnalysisTimerRef = useRef(null);
+  const radishAnalysisRequestRef = useRef(0);
+  const previewCodePathRef = useRef("");
+  const codeNavigationSequenceRef = useRef(0);
+  const pendingProjectFileRef = useRef(null);
+  const openProjectFolderRef = useRef(null);
+  const openFileRef = useRef(null);
+  const chordPendingRef = useRef(null);
+  const openIntegratedBrowserRef = useRef(null);
+  const changeStudioViewRef = useRef(null);
+  const runWorkflowNowRef = useRef(null);
+  const theme = resolvedTheme(settings, systemDark);
+  const workflowPaneWidth = settings.layout.workflowPaneWidth;
+  const chatPaneWidth = settings.layout.assistantPaneWidth;
+  const executionMode = settings.general.executionMode;
+  const activeWorkflow = activeWorkspaceForView(
+    workflows,
+    activeWorkflowId,
+    activeProjectRoot,
+    studioView,
+  );
   const graphWorkflow = useMemo(
     () => radishGraphWorkflow(activeWorkflow, radishEditorState?.document),
     [activeWorkflow, radishEditorState?.document],
   );
+
+  const changeSetting = useCallback((path, value) => {
+    setSettings((current) => updateSetting(current, path, value));
+  }, []);
+  changeStudioViewRef.current = changeStudioView;
+  runWorkflowNowRef.current = runWorkflowNow;
 
   useEffect(() => {
     radishEditorStateRef.current = radishEditorState;
   }, [radishEditorState]);
 
   useEffect(() => {
+    previewCodePathRef.current = previewCodePath;
+  }, [previewCodePath]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => saveAppSettings(settings), 120);
+    return () => window.clearTimeout(timer);
+  }, [settings]);
+
+  useEffect(() => {
+    const colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!colorScheme) return undefined;
+    const updateSystemTheme = (event) => setSystemDark(event.matches);
+    colorScheme.addEventListener?.("change", updateSystemTheme);
+    return () => colorScheme.removeEventListener?.("change", updateSystemTheme);
+  }, []);
+
+  useEffect(() => {
+    const reduceMotion = reducedMotionEnabled(
+      settings,
+      window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false,
+    );
+    document.documentElement.classList?.toggle?.("dark", theme === "dark");
+    if (document.documentElement.dataset) {
+      document.documentElement.dataset.reducedMotion = String(reduceMotion);
+    }
+    try {
+      window.localStorage?.setItem("gofer-ui-theme", theme);
+    } catch {
+      // The selected theme still applies for this session.
+    }
+  }, [settings, theme]);
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(
+        RECENT_PROJECTS_STORAGE_KEY,
+        JSON.stringify(recentProjectRoots),
+      );
+    } catch {
+      // Recent projects remain available for this session when storage is unavailable.
+    }
+  }, [recentProjectRoots]);
+
+  useEffect(() => {
+    saveStudioSession({
+      projectRoot: activeProjectRoot,
+      view: studioView,
+      workflowId: activeWorkflowId,
+    });
+  }, [activeProjectRoot, activeWorkflowId, studioView]);
+
+  useEffect(() => {
+    const projectRoot = activeWorkflow?.projectRoot;
+    if (!projectRoot) return;
+    setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+  }, [activeWorkflow?.projectRoot]);
+
+  useEffect(() => {
+    const getPathInfo = window.goferDesktop?.workspace?.getPathInfo;
+    if (!getPathInfo || !recentProjectRoots.length) return undefined;
+    let cancelled = false;
+    void Promise.all(recentProjectRoots.map(async (projectRoot) => {
+      try {
+        const info = await getPathInfo(projectRoot);
+        return info?.isDirectory ? projectRoot : "";
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return /does not exist|no such file|not a directory/i.test(message) ? "" : projectRoot;
+      }
+    })).then((existingRoots) => {
+      if (cancelled) return;
+      const nextRoots = existingRoots.filter(Boolean);
+      setRecentProjectRoots((current) => (
+        current.length === nextRoots.length
+          && current.every((root, index) => root === nextRoots[index])
+          ? current
+          : nextRoots
+      ));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [recentProjectRoots]);
+
+  useEffect(() => {
+    function runShortcutAction(action) {
+      if (action === "settings.open") setSettingsOpen(true);
+      if (action === "file.open") void openFileRef.current?.();
+      if (action === "project.open") void openProjectFolderRef.current?.();
+      if (action === "browser.open") openIntegratedBrowserRef.current?.();
+      if (action === "view.graph") changeStudioViewRef.current?.("graph");
+      if (action === "view.code") changeStudioViewRef.current?.("code");
+      if (action === "view.toggleProjectPane") setProjectPaneVisible((current) => !current);
+      if (action === "view.toggleAssistantPane") setAssistantPaneVisible((current) => !current);
+      if (action === "workflow.run" && activeWorkflow && !runState.running) {
+        void runWorkflowNowRef.current?.(activeWorkflow);
+      }
+    }
+    function clearChordPending() {
+      window.clearTimeout(chordPendingRef.current?.timeoutId);
+      chordPendingRef.current = null;
+    }
+    function handleApplicationShortcut(event) {
+      if (settingsOpen) return;
+      const pending = chordPendingRef.current;
+      if (pending) {
+        clearChordPending();
+        if (matchesKeybinding(event, pending.secondSegment)) {
+          event.preventDefault();
+          event.stopPropagation();
+          runShortcutAction(pending.commandId);
+          return;
+        }
+        // Not the expected second key: fall through and evaluate this keydown normally.
+      }
+      let action = "";
+      for (const commandId of [
+        "settings.open",
+        "file.open",
+        "project.open",
+        "browser.open",
+        "view.graph",
+        "view.code",
+        "view.toggleProjectPane",
+        "view.toggleAssistantPane",
+        "workflow.run",
+      ]) {
+        const segments = settingBinding(settings, commandId).split(" ").filter(Boolean);
+        if (segments.length > 1) {
+          if (matchesKeybinding(event, segments[0])) {
+            event.preventDefault();
+            event.stopPropagation();
+            chordPendingRef.current = {
+              commandId,
+              secondSegment: segments[1],
+              timeoutId: window.setTimeout(clearChordPending, 1500),
+            };
+            return;
+          }
+          continue;
+        }
+        if (matchesCommand(event, settings, commandId)) {
+          action = commandId;
+          break;
+        }
+      }
+      if (!action) return;
+      event.preventDefault();
+      event.stopPropagation();
+      runShortcutAction(action);
+    }
+    const unsubscribeCommand = window.goferBrowser?.onCommand?.((command) => {
+      if (command?.action === "open-browser") openIntegratedBrowserRef.current?.();
+    });
+    const unsubscribeOpenTab = window.goferBrowser?.onOpenTab?.((request) => {
+      if (request?.url) openIntegratedBrowserRef.current?.(request.url, { newTab: true });
+    });
+    window.addEventListener("keydown", handleApplicationShortcut, true);
+    return () => {
+      clearChordPending();
+      unsubscribeCommand?.();
+      unsubscribeOpenTab?.();
+      window.removeEventListener("keydown", handleApplicationShortcut, true);
+    };
+  }, [activeWorkflow, runState.running, settings, settingsOpen]);
+
+  useEffect(() => {
     radishMetadataPendingRef.current = false;
     window.clearTimeout(radishMetadataSaveTimerRef.current);
+    window.clearTimeout(radishAnalysisTimerRef.current);
+    radishAnalysisRequestRef.current += 1;
+    return () => {
+      window.clearTimeout(radishAnalysisTimerRef.current);
+      radishAnalysisRequestRef.current += 1;
+    };
   }, [activeWorkflow?.id]);
 
   useEffect(() => {
-    const sourcePath = activeWorkflow?.sourceFormat === "radish"
-      ? activeWorkflow.sourcePath ?? ""
-      : "";
-    setCodeOpenPaths(sourcePath ? [sourcePath] : []);
-    setActiveCodePath(sourcePath);
-  }, [activeWorkflow?.id, activeWorkflow?.sourceFormat, activeWorkflow?.sourcePath]);
+    const pending = pendingProjectFileRef.current;
+    const pendingPath = pendingCodePathForWorkflow(pending, activeWorkflow?.id);
+    if (!pendingPath) return;
+    setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [pendingPath]));
+    setActiveCodePath(pendingPath);
+    pendingProjectFileRef.current = null;
+  }, [activeWorkflow?.id]);
 
   useEffect(() => {
-    if (studioView === "code" && activeWorkflow?.sourceFormat !== "radish") {
+    if (studioView === "code" && !codeWorkspaceAvailable(activeWorkflow)) {
       setStudioView("graph");
     }
-  }, [activeWorkflow?.sourceFormat, studioView]);
+  }, [activeWorkflow, studioView]);
 
   useEffect(() => {
-    if (codeEditorOpened || activeWorkflow?.sourceFormat !== "radish") return undefined;
+    if (activeWorkflow?.sourceFormat !== "radish") return undefined;
     const controller = new AbortController();
     setRadishEditorState({ document: null, error: "", loading: true, saving: false });
     fetch(apiUrl(`/workflows/${encodeURIComponent(activeWorkflow.id)}/document`), {
@@ -298,33 +549,384 @@ export default function App() {
         });
       });
     return () => controller.abort();
-  }, [activeWorkflow?.id, activeWorkflow?.sourceFormat, codeEditorOpened]);
+  }, [activeWorkflow?.id, activeWorkflow?.sourceFormat]);
 
   function changeStudioView(nextView) {
-    if (nextView === "code" && activeWorkflow?.sourceFormat !== "radish") return;
+    if (nextView === "code" && !activeWorkflow?.projectRoot) return;
     setQuery("");
     setStudioView(nextView);
     if (nextView === "code") setCodeEditorOpened(true);
   }
 
-  function openCodeFile(path) {
-    if (!path || activeWorkflow?.sourceFormat !== "radish") return;
-    setCodeOpenPaths((current) => current.includes(path) ? current : [...current, path]);
+  function openCodeFile(path, options = {}) {
+    if (!path || !activeWorkflow?.projectRoot) return;
+    const currentPreview = previewCodePathRef.current;
+    const next = nextCodeFileOpenState(
+      codeOpenPaths,
+      currentPreview,
+      path,
+      options.preview === true,
+    );
+    setCodeOpenPaths(next.openPaths);
+    previewCodePathRef.current = next.previewPath;
+    setPreviewCodePath(next.previewPath);
     setActiveCodePath(path);
+    if (Number.isInteger(options.lineNumber) && options.lineNumber > 0) {
+      codeNavigationSequenceRef.current += 1;
+      setCodeNavigationRequest({
+        column: Number.isInteger(options.column) && options.column > 0 ? options.column : 1,
+        lineNumber: options.lineNumber,
+        path,
+        requestId: codeNavigationSequenceRef.current,
+      });
+    } else {
+      setCodeNavigationRequest(null);
+    }
     setCodeEditorOpened(true);
     setStudioView("code");
   }
 
+  function openIntegratedBrowser(initialUrl, options = {}) {
+    const requestedUrl = initialUrl || settings.browser.homepage || "about:blank";
+    const openBrowserPaths = codeOpenPaths.filter((path) => Boolean(browserTabs[path]));
+    if (!options.newTab && openBrowserPaths.length) {
+      const targetPath = browserTabs[activeCodePath]
+        ? activeCodePath
+        : openBrowserPaths.at(-1);
+      setActiveCodePath(targetPath);
+      setCodeEditorOpened(true);
+      setStudioView("code");
+      return targetPath;
+    }
+    const path = createBrowserTabPath();
+    setBrowserTabs((current) => ({
+      ...current,
+      [path]: { error: "", loading: true, title: "", url: requestedUrl },
+    }));
+    setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [path]));
+    setActiveCodePath(path);
+    setCodeEditorOpened(true);
+    setStudioView("code");
+    return path;
+  }
+
+  openIntegratedBrowserRef.current = openIntegratedBrowser;
+
+  function updateBrowserTab(path, nextState) {
+    setBrowserTabs((current) => current[path]
+      ? { ...current, [path]: { ...current[path], ...nextState } }
+      : current);
+  }
+
+  async function openMarkdownFileLink(href, sourcePath) {
+    try {
+      const target = await resolveMarkdownFileLinkTarget(
+        sourcePath,
+        href,
+        window.goferDesktop?.workspace?.getPathInfo,
+      );
+      if (target?.path) openCodeFile(target.path, { ...target, preview: true });
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Could not open the linked file",
+      });
+    }
+  }
+
+  function openAssistantFile(path, projectRoot) {
+    const resolvedPath = resolveDisplayPath(path, projectRoot);
+    if (!resolvedPath) return;
+    const targetWorkflow = workflows.find((workflow) =>
+      workflow.projectRoot === projectRoot && workflow.sourceFormat === "radish");
+    if (!targetWorkflow) {
+      setTopBarNotice({
+        type: "error",
+        message: "Open a Radish workflow from this project before opening the edited file.",
+      });
+      return;
+    }
+    if (targetWorkflow.id === activeWorkflow?.id) {
+      openCodeFile(resolvedPath);
+      return;
+    }
+    pendingProjectFileRef.current = { path: resolvedPath, workflowId: targetWorkflow.id };
+    setActiveWorkflowId(targetWorkflow.id);
+    setCodeEditorOpened(true);
+    setStudioView("code");
+  }
+
+  function pinCodeFile(path) {
+    if (!path || previewCodePathRef.current !== path) return;
+    previewCodePathRef.current = "";
+    setPreviewCodePath("");
+  }
+
   function closeCodeFile(path) {
-    if (!path || path === activeWorkflow?.sourcePath) return;
+    closeCodeFiles([path]);
+  }
+
+  function closeCodeFiles(paths) {
+    const closing = new Set(paths.filter(Boolean));
+    if (!closing.size) return;
     setCodeOpenPaths((current) => {
-      const index = current.indexOf(path);
-      const next = current.filter((candidate) => candidate !== path);
-      if (activeCodePath === path) {
-        setActiveCodePath(next[Math.max(0, index - 1)] ?? activeWorkflow?.sourcePath ?? "");
-      }
+      const next = current.filter((candidate) => !closing.has(candidate));
+      setActiveCodePath((currentActive) => {
+        if (!closing.has(currentActive)) return currentActive;
+        const index = current.indexOf(currentActive);
+        return next[Math.min(index, next.length - 1)] ?? next.at(-1) ?? "";
+      });
       return next;
     });
+    setPreviewCodePath((current) => {
+      if (!closing.has(current)) return current;
+      previewCodePathRef.current = "";
+      return "";
+    });
+    setBrowserTabs((current) => Object.fromEntries(
+      Object.entries(current).filter(([path]) => !closing.has(path)),
+    ));
+  }
+
+  function closeActiveCodeFile() {
+    radishEditorRef.current?.closeActive?.();
+  }
+
+  function editWorkflowFile(workflow) {
+    if (!workflow?.sourcePath || workflow.sourceFormat !== "radish") return;
+    if (workflow.id === activeWorkflow?.id) {
+      openCodeFile(workflow.sourcePath);
+      return;
+    }
+    pendingProjectFileRef.current = { path: workflow.sourcePath, workflowId: workflow.id };
+    setActiveWorkflowId(workflow.id);
+    setCodeEditorOpened(true);
+    setStudioView("code");
+    setQuery("");
+  }
+
+  async function reloadActiveRadishDocument() {
+    if (activeWorkflow?.sourceFormat !== "radish") return;
+    try {
+      const response = await fetch(
+        apiUrl(`/workflows/${encodeURIComponent(activeWorkflow.id)}/document`),
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || `Editor API returned ${response.status}`);
+      const nextState = { document: payload.document, error: "", loading: false, saving: false };
+      radishEditorStateRef.current = nextState;
+      setRadishEditorState(nextState);
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to reload workflow.rad",
+      });
+    }
+  }
+
+  function scheduleRadishAnalysis(source) {
+    if (activeWorkflow?.sourceFormat !== "radish") return;
+    const workflowId = activeWorkflow.id;
+    const requestId = ++radishAnalysisRequestRef.current;
+    window.clearTimeout(radishAnalysisTimerRef.current);
+    radishAnalysisTimerRef.current = window.setTimeout(async () => {
+      try {
+        const response = await fetch(
+          apiUrl(`/workflows/${encodeURIComponent(workflowId)}/document/analyze`),
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source }),
+          },
+        );
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error || `Analysis returned ${response.status}`);
+        if (requestId !== radishAnalysisRequestRef.current) return;
+        const nextState = mergeRadishAnalysisState(
+          radishEditorStateRef.current,
+          payload.document,
+          source,
+        );
+        if (nextState === radishEditorStateRef.current) return;
+        radishEditorStateRef.current = nextState;
+        setRadishEditorState(nextState);
+      } catch (error) {
+        if (requestId !== radishAnalysisRequestRef.current) return;
+        const currentState = radishEditorStateRef.current;
+        if (currentState?.document?.source !== source) return;
+        const nextState = {
+          ...currentState,
+          error: error instanceof Error ? error.message : "Unable to analyze Radish source",
+          loading: false,
+        };
+        radishEditorStateRef.current = nextState;
+        setRadishEditorState(nextState);
+      }
+    }, RADISH_ANALYSIS_DELAY_MS);
+  }
+
+  async function refreshRadishAfterFileSave(savedSource) {
+    if (activeWorkflow?.sourceFormat !== "radish") return null;
+    const response = await fetch(
+      apiUrl(`/workflows/${encodeURIComponent(activeWorkflow.id)}/document`),
+    );
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || `Editor API returned ${response.status}`);
+    const currentState = radishEditorStateRef.current;
+    if (currentState?.document?.source === savedSource) {
+      const nextState = { document: payload.document, error: "", loading: false, saving: false };
+      radishEditorStateRef.current = nextState;
+      setRadishEditorState(nextState);
+    }
+    void loadWorkflows({ silent: true });
+    return payload.document;
+  }
+
+  async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
+    const projectGrantId = window.goferDesktop.workspace.pathGrantForApi?.(projectRoot) ?? "";
+    const response = await fetch(apiUrl("/projects/open"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectGrantId: projectGrantId || undefined, projectRoot }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      throw new Error(payload.error || `Project API returned ${response.status}`);
+    }
+    const discovered = (payload.workflows ?? []).map((workflow) =>
+      summarizeWorkflow(workflow, dataDir));
+    if (rememberProject) {
+      setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+    }
+    setActiveProjectRoot(projectRoot);
+    if (!discovered.length) {
+      setActiveWorkflowId(undefined);
+      setCodeOpenPaths(focusPath ? [focusPath] : []);
+      setActiveCodePath(focusPath);
+      setCodeEditorOpened(true);
+      setStudioView("code");
+      setQuery("");
+      return { discovered, projectRoot };
+    }
+    for (const workflow of discovered) deletedWorkflowIdsRef.current.delete(workflow.id);
+    setWorkflows((current) => {
+      const discoveredIds = new Set(discovered.map((workflow) => workflow.id));
+      return [
+        ...current.filter((workflow) => !discoveredIds.has(workflow.id)),
+        ...discovered,
+      ];
+    });
+    const selectedWorkflow = discovered.find((workflow) => workflow.sourcePath === focusPath)
+      ?? discovered[0];
+    if (activeWorkflow?.id === selectedWorkflow.id) {
+      if (focusPath) openCodeFile(focusPath);
+    } else {
+      pendingProjectFileRef.current = {
+        path: focusPath || selectedWorkflow.sourcePath,
+        workflowId: selectedWorkflow.id,
+      };
+      setActiveWorkflowId(selectedWorkflow.id);
+    }
+    setCodeEditorOpened(true);
+    setStudioView("code");
+    setQuery("");
+    return { discovered, projectRoot };
+  }
+
+  async function openFile() {
+    if (!window.goferDesktop?.workspace?.selectPath) {
+      setTopBarNotice({ type: "error", message: "File selection is unavailable." });
+      return;
+    }
+    try {
+      const selectedPath = await window.goferDesktop.workspace.selectPath({
+        currentPath: activeWorkflow?.projectRoot ?? "",
+        fileOnly: true,
+      });
+      if (!selectedPath) return;
+      if (activeWorkflow?.sourceFormat === "radish") {
+        openCodeFile(selectedPath);
+        setQuery("");
+        return;
+      }
+      if (!window.goferDesktop.workspace.resolveProjectFile) {
+        setTopBarNotice({ type: "error", message: "Project file selection is unavailable." });
+        return;
+      }
+      const resolved = await window.goferDesktop.workspace.resolveProjectFile(selectedPath);
+      const projectRoot = resolved?.directory ?? "";
+      if (!projectRoot) throw new Error("Could not determine the selected file's project folder.");
+      const result = await openProjectAtPath(projectRoot, {
+        rememberProject: false,
+        focusPath: selectedPath,
+      });
+      if (result) {
+        setTopBarNotice({
+          type: "success",
+          message: result.discovered.length
+            ? `Opened ${projectNameFromPath(projectRoot)} and registered ${result.discovered.length} workflow${result.discovered.length === 1 ? "" : "s"}.`
+            : `Opened ${projectNameFromPath(projectRoot)}. No workflows found yet.`,
+        });
+      }
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to open file",
+      });
+    }
+  }
+
+  openFileRef.current = openFile;
+
+  async function openProjectFolder() {
+    if (!window.goferDesktop?.workspace?.selectPath) {
+      setTopBarNotice({ type: "error", message: "Folder selection is unavailable." });
+      return;
+    }
+    try {
+      const projectRoot = await window.goferDesktop.workspace.selectPath({
+        currentPath: activeWorkflow?.projectRoot ?? "",
+        directoryOnly: true,
+      });
+      if (!projectRoot) return;
+      const result = await openProjectAtPath(projectRoot, { rememberProject: true });
+      if (result) {
+        setTopBarNotice({
+          type: "success",
+          message: `Opened ${projectNameFromPath(projectRoot)} and registered ${result.discovered.length} workflow${result.discovered.length === 1 ? "" : "s"}.`,
+        });
+      }
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to open project folder",
+      });
+    }
+  }
+
+  openProjectFolderRef.current = openProjectFolder;
+
+  function selectRecentProject(projectRoot) {
+    const projectWorkflows = workflows.filter((workflow) => workflow.projectRoot === projectRoot);
+    if (!projectWorkflows.length) {
+      void openProjectAtPath(projectRoot, { rememberProject: true }).catch((error) => {
+        setTopBarNotice({ type: "error", message: error instanceof Error ? error.message : "Unable to open project" });
+      });
+      return;
+    }
+    const selectedWorkflow = activeWorkflow?.projectRoot === projectRoot
+      ? activeWorkflow
+      : projectWorkflows[0];
+    setActiveWorkflowId(selectedWorkflow.id);
+    setActiveProjectRoot(projectRoot);
+    setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+    setCodeEditorOpened(true);
+    setStudioView("code");
+    setQuery("");
+  }
+
+  function removeRecentProject(projectRoot) {
+    setRecentProjectRoots((current) => current.filter((root) => root !== projectRoot));
   }
 
   function handleCodeFilesystemChange(change) {
@@ -337,6 +939,16 @@ export default function App() {
       ));
       setActiveCodePath((current) =>
         replacePathPrefix(current, change.sourcePath, change.path, change.isDirectory));
+      setPreviewCodePath((current) => {
+        const next = replacePathPrefix(
+          current,
+          change.sourcePath,
+          change.path,
+          change.isDirectory,
+        );
+        previewCodePathRef.current = next;
+        return next;
+      });
     }
     if (change.kind === "delete") {
       setCodeOpenPaths((current) => {
@@ -346,6 +958,14 @@ export default function App() {
         }
         return next;
       });
+      if (pathMatchesChange(
+        previewCodePathRef.current,
+        change.path,
+        change.isDirectory,
+      )) {
+        previewCodePathRef.current = "";
+        setPreviewCodePath("");
+      }
     }
   }
 
@@ -499,6 +1119,10 @@ export default function App() {
         )
         .filter((workflow) => !deletedWorkflowIdsRef.current.has(workflow.id))
         .map((workflow) => summarizeWorkflow(workflow, payloadDataDir));
+      setRecentProjectRoots((current) => mergeRecentProjects(
+        current,
+        nextWorkflows.map((workflow) => workflow.projectRoot).filter(Boolean),
+      ));
       setWorkflows((current) => {
         const refreshedWorkflows = nextWorkflows.map((workflow) => {
           const localWorkflow = current.find((candidate) => candidate.id === workflow.id);
@@ -525,6 +1149,10 @@ export default function App() {
         if (nextWorkflows.some((workflow) => workflow.id === currentId)) {
           return currentId;
         }
+        const projectWorkflow = nextWorkflows.find(
+          (workflow) => workflow.projectRoot === initialStudioSession.projectRoot,
+        );
+        if (projectWorkflow) return projectWorkflow.id;
         return nextWorkflows[0]?.id;
       });
       setLoadState({ loading: false, error: "" });
@@ -536,7 +1164,7 @@ export default function App() {
         });
       }
     }
-  }, []);
+  }, [initialStudioSession.projectRoot]);
 
   const loadWorkflowTemplates = useCallback(async () => {
     try {
@@ -606,6 +1234,17 @@ export default function App() {
   }, [loadWorkflows]);
 
   useEffect(() => {
+    const trustProjectRoot = window.goferDesktop?.workspace?.trustProjectRoot;
+    if (!trustProjectRoot) return;
+    const projectRoots = new Set(
+      workflows.map((workflow) => workflow.projectRoot).filter(Boolean),
+    );
+    for (const projectRoot of projectRoots) {
+      void trustProjectRoot(projectRoot).catch(() => {});
+    }
+  }, [workflows]);
+
+  useEffect(() => {
     loadWorkflowTemplates();
   }, [loadWorkflowTemplates]);
 
@@ -623,10 +1262,6 @@ export default function App() {
 
     return () => window.clearInterval(intervalId);
   }, [loadDoctor, loadQueue, loadWorkflows]);
-
-  useEffect(() => {
-    window.localStorage.setItem("gofer-ui-theme", theme);
-  }, [theme]);
 
   const loadRetentionSettingsForWorkflow = useCallback(async (workflowId) => {
     if (!workflowId) return;
@@ -729,8 +1364,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    checkForUpdates({ silent: true });
-  }, [checkForUpdates]);
+    if (settings.general.checkForUpdates) checkForUpdates({ silent: true });
+  }, [checkForUpdates, settings.general.checkForUpdates]);
 
   async function applyUpdate(update) {
     if (!window.goferUpdates) return;
@@ -1975,6 +2610,48 @@ export default function App() {
     }
   }
 
+  async function chooseApplicationDataDirectory() {
+    const choose = window.goferDesktop?.dataDirectory?.choose;
+    if (!choose) return;
+    try {
+      const result = await choose({ currentPath: dataDir });
+      if (!result?.dataDir) return;
+      setDataDir(result.dataDir);
+      setTopBarNotice({ type: "success", message: "Application data directory changed" });
+      await loadWorkflows();
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to change the application data directory",
+      });
+    }
+  }
+
+  const panelDocument = radishEditorState?.document;
+  const panelDiagnostics = [
+    ...(panelDocument?.diagnostics ?? []),
+    ...(panelDocument?.preflight?.diagnostics ?? []),
+  ];
+  const panelRunResult = runState?.result?.workflowId === activeWorkflow?.id
+    ? runState.result
+    : null;
+  const panelRunEvents = logState.runEvents?.length
+    ? logState.runEvents
+    : panelRunResult?.runEvents ?? [];
+
+  function revealPanelDiagnostic(diagnostic) {
+    if (!activeWorkflow || activeWorkflow.sourceFormat !== "radish") return;
+    setCodeOpenPaths((current) => current.includes(activeWorkflow.sourcePath)
+      ? current
+      : [...current, activeWorkflow.sourcePath]);
+    setActiveCodePath(activeWorkflow.sourcePath);
+    setCodeEditorOpened(true);
+    setStudioView("code");
+    window.requestAnimationFrame(() => {
+      radishEditorRef.current?.revealDiagnostic?.(diagnostic);
+    });
+  }
+
   return (
     <main
       aria-busy={runState.running || logState.loading || undefined}
@@ -1990,15 +2667,18 @@ export default function App() {
       <div aria-atomic="true" aria-live="assertive" className="sr-only" role="alert">
         {runState.error}
       </div>
-      <WorkflowSidebar
+      {projectPaneVisible ? <WorkflowSidebar
         activeWorkflow={activeWorkflow}
         activeWorkflowId={activeWorkflow?.id}
         loading={loadState.loading}
         query={query}
         runState={runState}
+        settings={settings}
         workflows={filteredWorkflows}
         view={studioView}
         width={workflowPaneWidth}
+        newFileRequest={newCodeFileRequest}
+        recentProjectRoots={recentProjectRoots}
         onQueryChange={setQuery}
         onCreate={() => {
           setCreateState({ saving: false, error: "" });
@@ -2007,9 +2687,14 @@ export default function App() {
         onDeleteWorkflow={deleteWorkflow}
         onDuplicateWorkflow={duplicateWorkflow}
         onCodeFileOpen={openCodeFile}
+        activeCodePath={activeCodePath}
+        onCloseCodeFile={closeActiveCodeFile}
         onCodeFilesystemChange={handleCodeFilesystemChange}
         onRefresh={loadWorkflows}
         onRenameWorkflow={renameWorkflow}
+        onEditWorkflowFile={editWorkflowFile}
+        onSelectProject={selectRecentProject}
+        onRemoveRecentProject={removeRecentProject}
         onRunWorkflow={runWorkflowNow}
         onResizeStart={(event) =>
           startPaneResize(event, {
@@ -2017,7 +2702,7 @@ export default function App() {
             min: 240,
             side: "right",
             width: workflowPaneWidth,
-            onResize: setWorkflowPaneWidth,
+            onResize: (width) => changeSetting("layout.workflowPaneWidth", width),
           })
         }
         onResizeKeyDown={(event) =>
@@ -2025,26 +2710,30 @@ export default function App() {
             defaultValue: 272,
             max: 420,
             min: 240,
-            onResize: setWorkflowPaneWidth,
+            onResize: (width) => changeSetting("layout.workflowPaneWidth", width),
             width: workflowPaneWidth,
           })
         }
         onSelect={setActiveWorkflowId}
         onViewChange={changeStudioView}
-      />
+      /> : null}
 
-      <section className="flex min-w-0 flex-1 flex-col border-x border-line bg-[#f9fbfd]">
+      <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-x border-line bg-[#f9fbfd]">
         {activeWorkflow ? (
           <>
             <TopBar
-              editorState={radishEditorState}
+              activeCodePath={activeCodePath}
+              editorState={activeCodeDocumentState}
+              hideCodeLabel={Boolean(browserTabs[activeCodePath])}
               saveState={
                 saveStatesByWorkflowId[activeWorkflow.id] ??
                 (dirtyWorkflowsById[activeWorkflow.id]
                   ? { status: "saving", error: "" }
                   : undefined)
               }
+              settings={settings}
               theme={theme}
+              settingsOpen={settingsOpen}
               updateState={updateState}
               workflow={activeWorkflow}
               view={studioView}
@@ -2052,10 +2741,10 @@ export default function App() {
               onApplyUpdate={() => applyUpdate(updateState)}
               onOpenHistory={() => openWorkflowHistory(activeWorkflow)}
               onSaveRadish={() => radishEditorRef.current?.saveActive?.()}
+              onGraphToolbarTargetChange={setGraphToolbarTarget}
+              onToggleSettings={() => setSettingsOpen((current) => !current)}
               onRetrySave={() => retryWorkflowSave(activeWorkflow.id)}
-              onToggleTheme={() =>
-                setTheme((currentTheme) => (currentTheme === "dark" ? "light" : "dark"))
-              }
+              onToggleTheme={() => changeSetting("appearance.theme", theme === "dark" ? "light" : "dark")}
             />
             {studioView === "graph" ? (
               <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
@@ -2066,10 +2755,11 @@ export default function App() {
               logState={logState}
               approvalState={approvalState}
               notice={runState.error ? { type: "error", message: runState.error } : topBarNotice}
-              retentionSettings={retentionSettings}
               runState={runState}
               workflow={graphWorkflow}
+              toolbarTarget={graphToolbarTarget}
               radishDocument={radishEditorState?.document}
+              settings={settings}
               usedAgentIds={usedAgentIds}
               onLoadLatestLog={() => loadLatestLog(activeWorkflow.id)}
               onSelectRunLog={(runId) => loadRunLog(activeWorkflow.id, runId)}
@@ -2080,10 +2770,7 @@ export default function App() {
               onReplayRunLog={(runId, triggerId) =>
                 replayWorkflowTriggerLog(activeWorkflow.id, runId, triggerId)
               }
-              onPruneRunLogs={(options) => pruneWorkflowRunLogs(activeWorkflow.id, options)}
-              onRetentionSettingsChange={(nextSettings) =>
-                saveRetentionSettingsForWorkflow(activeWorkflow.id, nextSettings)
-              }
+              onSettingChange={changeSetting}
               onImportWorkflow={importWorkflow}
               onExportWorkflow={() => exportWorkflow(activeWorkflow)}
               onRunWorkflow={runWorkflowNow}
@@ -2117,39 +2804,116 @@ export default function App() {
                 }
               />
             </div>
-            {codeEditorOpened && activeWorkflow.sourceFormat === "radish" ? (
+            {codeEditorOpened && activeWorkflow.projectRoot ? (
               <div className={`${studioView === "code" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
                 <CodeWorkspace
                   active={studioView === "code"}
                   activePath={activeCodePath}
+                  browserTabs={browserTabs}
+                  navigationRequest={codeNavigationRequest}
                   ref={radishEditorRef}
                   openPaths={codeOpenPaths}
+                  previewPath={previewCodePath}
+                  radishDocument={radishEditorState?.document}
+                  radishDirty={Boolean(radishEditorState?.document?.dirty)}
                   theme={theme}
+                  settings={settings}
                   workflow={activeWorkflow}
                   onActivePathChange={setActiveCodePath}
+                  onActiveDocumentStateChange={setActiveCodeDocumentState}
+                  onBrowserStateChange={updateBrowserTab}
                   onClosePath={closeCodeFile}
-                  onDocumentStateChange={setRadishEditorState}
+                  onClosePaths={closeCodeFiles}
+                  onDocumentStateChange={(nextState) => {
+                    radishEditorStateRef.current = nextState;
+                    setRadishEditorState(nextState);
+                    if (nextState?.document?.dirty) pinCodeFile(activeWorkflow.sourcePath);
+                  }}
+                  onNewFile={() => setNewCodeFileRequest((current) => current + 1)}
+                  onOpenMarkdownPath={openMarkdownFileLink}
+                  onOpenPath={openCodeFile}
+                  onOpenPathsChange={setCodeOpenPaths}
+                  onPinPath={pinCodeFile}
+                  onRadishContentChange={scheduleRadishAnalysis}
+                  onRadishDiscard={reloadActiveRadishDocument}
+                  onRadishSaved={refreshRadishAfterFileSave}
+                  onSettingChange={changeSetting}
                 />
               </div>
             ) : null}
+            <UnifiedBottomPanel
+              diagnostics={panelDiagnostics}
+              onSettingChange={changeSetting}
+              projectRoot={activeWorkflow.projectRoot || ""}
+              settings={settings}
+              theme={theme}
+              onRevealDiagnostic={revealPanelDiagnostic}
+              timelineProps={{
+                error: logState.error,
+                loading: logState.loading,
+                logPath: logState.path,
+                onPruneRuns: (options) => pruneWorkflowRunLogs(activeWorkflow.id, options),
+                onReplayRun: (runId, triggerId) =>
+                  replayWorkflowTriggerLog(activeWorkflow.id, runId, triggerId),
+                onResumeRun: (runId, options) =>
+                  resumeWorkflowRunLog(activeWorkflow.id, runId, options),
+                onRetentionSettingsChange: (nextSettings) =>
+                  saveRetentionSettingsForWorkflow(activeWorkflow.id, nextSettings),
+                onSelectRun: (runId) => loadRunLog(activeWorkflow.id, runId),
+                onShowLatest: () => loadLatestLog(activeWorkflow.id),
+                onStopRun: (runId) => stopWorkflowRunLog(activeWorkflow.id, runId),
+                retentionSettings,
+                runEvents: panelRunEvents,
+                runs: logState.runs ?? [],
+                selectedRunId: logState.selectedRunId,
+                text: logState.text || panelRunResult?.logText || "",
+                title: "Workflow log",
+                usageSummary: logState.usageSummary ?? panelRunResult?.usageSummary ?? null,
+              }}
+            />
           </>
         ) : (
-          <EmptyWorkspace error={loadState.error} loading={loadState.loading} onRefresh={loadWorkflows} />
+          <EmptyWorkspace
+            error={loadState.error}
+            loading={loadState.loading}
+            onOpenSettings={() => setSettingsOpen(true)}
+            onRefresh={loadWorkflows}
+          />
         )}
       </section>
 
-      <ChatPane
+      {settingsOpen ? (
+        <SettingsPopover
+          dataDir={dataDir}
+          open
+          settings={settings}
+          onChange={changeSetting}
+          onChooseDataDirectory={chooseApplicationDataDirectory}
+          onClose={() => setSettingsOpen(false)}
+          onResetAll={() => setSettings(defaultSettingsSnapshot())}
+        />
+      ) : null}
+
+      {assistantPaneVisible ? <ChatPane
+        assistantDefaults={settings.assistant}
+        audioInputDeviceId={settings.devices.audioInputId}
+        recentProjectRoots={recentProjectRoots}
         width={chatPaneWidth}
         activeWorkflowId={activeWorkflow?.id}
         workflow={activeWorkflow}
         workflows={workflows}
+        onOpenMarkdownLink={(href, projectRoot) => openMarkdownFileLink(
+          href,
+          assistantMarkdownSourcePath(projectRoot),
+        )}
+        onOpenFile={openAssistantFile}
         onResizeStart={(event) =>
           startPaneResize(event, {
             max: 520,
             min: 300,
             side: "left",
             width: chatPaneWidth,
-            onResize: setChatPaneWidth,
+            onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
           })
         }
         onResizeKeyDown={(event) =>
@@ -2157,11 +2921,11 @@ export default function App() {
             defaultValue: 380,
             max: 520,
             min: 300,
-            onResize: setChatPaneWidth,
+            onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
             width: chatPaneWidth,
           })
         }
-      />
+      /> : null}
       {runPreview ? (
         <RunPreviewDialog
           plan={runPreview.plan}
@@ -2172,7 +2936,7 @@ export default function App() {
             executeWorkflowRun(runPreview.workflow, runPreview.triggerContext, parameters)
           }
           executionMode={executionMode}
-          onExecutionModeChange={setExecutionMode}
+          onExecutionModeChange={(mode) => changeSetting("general.executionMode", mode)}
           queueState={queueState}
         />
       ) : null}
@@ -2292,15 +3056,6 @@ function startPaneResize(event, { max, min, onResize, side, width }) {
 
   window.addEventListener("pointermove", handlePointerMove);
   window.addEventListener("pointerup", handlePointerUp);
-}
-
-function getInitialTheme() {
-  if (typeof window === "undefined") return "light";
-  const savedTheme = window.localStorage.getItem("gofer-ui-theme");
-  if (savedTheme === "dark" || savedTheme === "light") {
-    return savedTheme;
-  }
-  return window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
 }
 
 export function summarizeWorkflow(workflow, dataDir = "") {
@@ -2680,21 +3435,29 @@ function pathMatchesChange(path, changedPath, isDirectory) {
 }
 
 export function WorkflowSidebar({
+  activeCodePath,
   activeWorkflow,
   activeWorkflowId,
   loading,
   query,
   runState,
+  settings,
   workflows,
   view = "graph",
+  newFileRequest,
+  recentProjectRoots,
   onCodeFileOpen,
+  onCloseCodeFile,
   onCodeFilesystemChange,
   onCreate,
   onDeleteWorkflow,
   onDuplicateWorkflow,
+  onEditWorkflowFile,
   onQueryChange,
   onRefresh,
   onRenameWorkflow,
+  onSelectProject,
+  onRemoveRecentProject,
   onResizeKeyDown,
   onResizeStart,
   onRunWorkflow,
@@ -2712,7 +3475,14 @@ export function WorkflowSidebar({
     () => groupWorkflowsByProject(workflows, projectLabels),
     [projectLabels, workflows],
   );
-  const canOpenCode = activeWorkflow?.sourceFormat === "radish";
+  const recentProjects = useMemo(
+    () => mergeRecentProjects([], recentProjectRoots ?? []).map((root) => ({
+      name: projectLabels[root]?.trim() || projectNameFromPath(root),
+      root,
+    })),
+    [projectLabels, recentProjectRoots],
+  );
+  const canOpenCode = Boolean(activeWorkflow?.projectRoot);
 
   useEffect(() => {
     try {
@@ -2873,7 +3643,7 @@ export function WorkflowSidebar({
           <Search size={14} className="text-muted" />
           <input
             aria-label={view === "code" ? "Search files" : "Search workflows"}
-            className="min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
+            className="studio-search-input min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-slate-400"
             placeholder={view === "code" ? "Search files" : "Search workflows"}
             value={query}
             onChange={(event) => onQueryChange(event.target.value)}
@@ -2893,13 +3663,20 @@ export function WorkflowSidebar({
         </button>
       </div> : null}
 
-      <div className="workflow-scrollbar relative flex-1 overflow-y-auto px-2.5 pb-3 pt-1">
+      <div className={`workflow-scrollbar relative flex-1 px-2.5 pb-3 pt-1 ${view === "code" ? "min-h-0 overflow-hidden" : "overflow-y-auto"}`}>
         {view === "code" ? (
           <CodeFileExplorer
+            activeFilePath={activeCodePath}
+            newFileRequest={newFileRequest}
             query={query}
+            recentProjects={recentProjects}
+            settings={settings}
             workflow={activeWorkflow}
             onFilesystemChange={onCodeFilesystemChange}
+            onCloseActiveFile={onCloseCodeFile}
             onOpenFile={onCodeFileOpen}
+            onSelectProject={onSelectProject}
+            onRemoveRecentProject={onRemoveRecentProject}
           />
         ) : workflowGroups.length ? (
           workflowGroups.map(({ id, name, items, root }) => {
@@ -2990,6 +3767,7 @@ export function WorkflowSidebar({
                         workflow={workflow}
                         onDelete={() => onDeleteWorkflow(workflow)}
                         onDuplicate={() => onDuplicateWorkflow(workflow)}
+                        onEditFile={() => onEditWorkflowFile(workflow)}
                         onRename={(name) => onRenameWorkflow(workflow, name)}
                         onRun={() => onRunWorkflow(workflow)}
                         onSelect={() => onSelect(workflow.id)}
@@ -3081,6 +3859,191 @@ export function groupWorkflowsByProject(workflows, projectLabels = {}) {
     left.name.localeCompare(right.name) || left.root.localeCompare(right.root));
 }
 
+export function isOpenProjectShortcut(event) {
+  return !event.repeat
+    && !event.altKey
+    && !event.shiftKey
+    && (event.ctrlKey || event.metaKey)
+    && String(event.key ?? "").toLowerCase() === "o";
+}
+
+export function nextCodeFileOpenState(openPaths, previewPath, path, preview) {
+  const alreadyOpen = openPaths.includes(path);
+  const willPreview = preview && (!alreadyOpen || previewPath === path);
+  const withoutReplacedPreview = willPreview && previewPath && previewPath !== path
+    ? openPaths.filter((candidate) => candidate !== previewPath)
+    : openPaths;
+  return {
+    openPaths: withoutReplacedPreview.includes(path)
+      ? withoutReplacedPreview
+      : [...withoutReplacedPreview, path],
+    previewPath: willPreview ? path : previewPath === path ? "" : previewPath,
+  };
+}
+
+export function createBrowserTabPath() {
+  browserTabSequence += 1;
+  return `taskurotta-browser:${Date.now().toString(36)}:${browserTabSequence.toString(36)}`;
+}
+
+export function mergeCodeOpenPaths(current = [], additions = []) {
+  return [...new Set([...current, ...additions].filter(Boolean))];
+}
+
+export function pendingCodePathForWorkflow(pending, workflowId) {
+  return pending && pending.workflowId === workflowId ? pending.path ?? "" : "";
+}
+
+export function loadRecentProjectRoots() {
+  if (typeof window === "undefined") return [];
+  try {
+    const parsed = JSON.parse(window.localStorage?.getItem(RECENT_PROJECTS_STORAGE_KEY) ?? "[]");
+    return Array.isArray(parsed)
+      ? mergeRecentProjects([], parsed.filter((root) => typeof root === "string" && root.trim()))
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function loadStudioSession(storage = globalThis.window?.localStorage) {
+  try {
+    const parsed = JSON.parse(storage?.getItem(STUDIO_SESSION_STORAGE_KEY) ?? "{}");
+    return {
+      projectRoot: typeof parsed.projectRoot === "string" ? parsed.projectRoot.trim() : "",
+      view: ["graph", "code"].includes(parsed.view) ? parsed.view : "",
+      workflowId: typeof parsed.workflowId === "string" ? parsed.workflowId.trim() : "",
+    };
+  } catch {
+    return { projectRoot: "", view: "", workflowId: "" };
+  }
+}
+
+export function saveStudioSession(session, storage = globalThis.window?.localStorage) {
+  const normalized = {
+    projectRoot: typeof session?.projectRoot === "string" ? session.projectRoot.trim() : "",
+    view: ["graph", "code"].includes(session?.view) ? session.view : "",
+    workflowId: typeof session?.workflowId === "string" ? session.workflowId.trim() : "",
+  };
+  try {
+    storage?.setItem(STUDIO_SESSION_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // The current studio session still works when persistent storage is unavailable.
+  }
+  return normalized;
+}
+
+export function mergeRecentProjects(current = [], additions = []) {
+  return [...new Set([...current, ...additions].map((root) => String(root).trim()).filter(Boolean))];
+}
+
+export function rememberRecentProject(current = [], projectRoot = "") {
+  const root = String(projectRoot).trim();
+  return root ? [root, ...current.filter((candidate) => candidate !== root)] : current;
+}
+
+export function projectWorkspace(projectRoot = "") {
+  const root = String(projectRoot).trim();
+  return {
+    agents: {},
+    description: "Project without a registered workflow",
+    edges: [],
+    id: `project:${root}`,
+    name: projectNameFromPath(root),
+    nodes: [],
+    projectName: projectNameFromPath(root),
+    projectRoot: root,
+    sourceFormat: "project",
+    sourcePath: "",
+    status: "Project",
+    tags: [],
+  };
+}
+
+export function activeWorkspaceForProject(workflows = [], activeWorkflowId, activeProjectRoot = "") {
+  const projectRoot = String(activeProjectRoot).trim();
+  const matchedWorkflow = workflows.find((workflow) => (
+    workflow.id === activeWorkflowId
+    && (!projectRoot || workflow.projectRoot === projectRoot)
+  ));
+  const projectWorkflow = projectRoot
+    ? workflows.find((workflow) => workflow.projectRoot === projectRoot)
+    : workflows[0];
+  return matchedWorkflow ?? projectWorkflow ?? (projectRoot ? projectWorkspace(projectRoot) : undefined);
+}
+
+export function activeWorkspaceForView(
+  workflows = [],
+  activeWorkflowId,
+  activeProjectRoot = "",
+  view = "graph",
+) {
+  if (view === "graph") {
+    return workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
+  }
+  return activeWorkspaceForProject(workflows, activeWorkflowId, activeProjectRoot);
+}
+
+export function codeWorkspaceAvailable(workflow) {
+  return Boolean(String(workflow?.projectRoot ?? "").trim());
+}
+
+export function scopeChatThreadToProject(
+  thread,
+  projectRoot,
+  workflows = [],
+  preferredWorkflowId = null,
+  projectName = "",
+) {
+  const root = String(projectRoot ?? "").trim();
+  const scopedWorkflows = workflows.filter((workflow) => workflow?.projectRoot === root);
+  const selectedWorkflowId = scopedWorkflows.some(
+    (workflow) => workflow.id === preferredWorkflowId,
+  )
+    ? preferredWorkflowId
+    : scopedWorkflows[0]?.id ?? null;
+  return {
+    ...thread,
+    projectRoot: root,
+    projectName: String(projectName || (root ? projectNameFromPath(root) : "No project")),
+    selectedWorkflowId,
+  };
+}
+
+export function chatWorkflowContextForThread(thread, workflows = []) {
+  const projectRoot = String(thread?.projectRoot ?? "").trim();
+  const scopedWorkflows = projectRoot
+    ? workflows.filter((workflow) => workflow?.projectRoot === projectRoot)
+    : [];
+  const selectedWorkflowId = scopedWorkflows.some(
+    (workflow) => workflow.id === thread?.selectedWorkflowId,
+  )
+    ? thread.selectedWorkflowId
+    : scopedWorkflows[0]?.id ?? null;
+  return {
+    projectName: String(
+      thread?.projectName || (projectRoot ? projectNameFromPath(projectRoot) : "No project"),
+    ),
+    projectRoot,
+    selectedWorkflowId,
+    workflows: scopedWorkflows,
+  };
+}
+
+export function mergeRadishAnalysisState(currentState, analyzedDocument, source) {
+  if (!currentState?.document || currentState.document.source !== source) return currentState;
+  return {
+    ...currentState,
+    document: {
+      ...analyzedDocument,
+      dirty: currentState.document.dirty,
+    },
+    error: "",
+    loading: false,
+    saving: false,
+  };
+}
+
 export function loadProjectLabels() {
   if (typeof window === "undefined") return {};
   try {
@@ -3101,10 +4064,18 @@ function projectNameFromPath(pathValue) {
   return parts.at(-1) || "Unregistered";
 }
 
+export function assistantMarkdownSourcePath(projectRoot) {
+  const root = String(projectRoot ?? "").replace(/[\\/]+$/, "");
+  if (!root) return "";
+  const separator = root.includes("\\") && !root.includes("/") ? "\\" : "/";
+  return `${root}${separator}.taskurotta-assistant.md`;
+}
+
 function WorkflowListItem({
   active,
   onDelete,
   onDuplicate,
+  onEditFile,
   onRename,
   onRun,
   onSelect,
@@ -3163,6 +4134,11 @@ function WorkflowListItem({
           ? "bg-indigo-50"
           : "bg-transparent hover:bg-slate-100"
       }`}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        setMenuOpen(true);
+      }}
     >
       <div
         role="button"
@@ -3222,9 +4198,23 @@ function WorkflowListItem({
           <MoreVertical size={14} />
         </button>
         {menuOpen ? (
-          <div className="absolute right-0 top-8 z-40 w-48 rounded-lg border border-line bg-white p-1 shadow-panel">
+          <div className="absolute right-0 top-8 z-40 w-48 rounded-lg border border-line bg-white p-1 shadow-panel" role="menu">
             <button
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              role="menuitem"
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                setMenuOpen(false);
+                onEditFile();
+              }}
+            >
+              <Code2 size={15} />
+              Edit workflow file
+            </button>
+            <button
+              className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              role="menuitem"
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
@@ -3237,6 +4227,7 @@ function WorkflowListItem({
             </button>
             <button
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              role="menuitem"
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
@@ -3249,6 +4240,7 @@ function WorkflowListItem({
             </button>
             <button
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-slate-700 transition hover:bg-slate-50 hover:text-ink dark:hover:bg-[#2a2a2a]"
+              role="menuitem"
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
@@ -3262,6 +4254,7 @@ function WorkflowListItem({
             <div className="my-1 border-t border-line" />
             <button
               className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm text-red-700 transition hover:bg-red-50 dark:hover:bg-[#3a2424]"
+              role="menuitem"
               type="button"
               onClick={(event) => {
                 event.stopPropagation();
@@ -3280,104 +4273,86 @@ function WorkflowListItem({
 }
 
 export function TopBar({
+  activeCodePath = "",
   editorState,
+  hideCodeLabel = false,
   saveState,
+  settings = DEFAULT_APP_SETTINGS,
+  settingsOpen = false,
   theme,
   updateState,
   workflow,
   view = "graph",
   onApplyUpdate,
   onCheckForUpdates,
+  onGraphToolbarTargetChange,
   onOpenHistory,
   onRetrySave,
   onSaveRadish,
+  onToggleSettings,
   onToggleTheme,
 }) {
-  const nodeCount = workflow.nodes?.length ?? 0;
-  const edgeCount = workflow.edges?.length ?? 0;
   const hasUpdateBridge = Boolean(window.goferUpdates?.check);
-  const sourceParts = String(workflow.sourcePath ?? "").replaceAll("\\", "/").split("/").filter(Boolean);
-  const folderName = sourceParts.length > 1 ? sourceParts.at(-2) : "Unfiled";
-  const editorDocument = editorState?.document;
-  const editorDiagnostics = [
-    ...(editorDocument?.diagnostics ?? []),
-    ...(editorDocument?.preflight?.diagnostics ?? []),
-  ];
-  const editorErrorCount = editorDiagnostics.filter((item) => item.severity === "error").length;
-  const editorWarningCount = editorDiagnostics.filter((item) => item.severity === "warning").length;
-  const editorLineCount = editorDocument?.source
-    ? editorDocument.source.split(/\r\n|\r|\n/).length
-    : 0;
+  const label = hideCodeLabel && view === "code"
+    ? null
+    : topBarLabelParts(workflow, view, activeCodePath);
+  const editorDocument = editorState?.document ?? editorState;
   return (
-    <header className="studio-topbar flex h-[54px] shrink-0 items-center justify-between border-b border-line bg-white px-4">
-      <div className="flex min-w-0 items-center gap-3">
-        <div className="flex min-w-0 items-center gap-1.5">
-          <span className="shrink-0 text-xs text-muted">
-            {view === "code" ? workflow.projectName || folderName : folderName}
-          </span>
-          <span aria-hidden="true" className="text-muted">/</span>
-          <h2 className="truncate text-sm font-semibold">
-            {view === "code" ? "workflow.rad" : workflow.name}
-          </h2>
-        </div>
-        <div className="hidden items-center gap-1.5 xl:flex">
-          <span className="rounded-full border border-line bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-muted">
-            {view === "code"
-              ? editorLineCount
-                ? `${editorLineCount} lines`
-                : "Opening"
-              : workflow.invalid
-                ? workflow.sourceFormat === "radish"
-                  ? "Invalid Radish"
-                  : "Invalid TOML"
-                : `${nodeCount} nodes`}
-          </span>
-          {view === "code" && editorErrorCount ? (
-            <span className="rounded-full border border-red-200 bg-red-50 px-2 py-0.5 text-[10px] font-medium text-red-700">
-              {editorErrorCount} {editorErrorCount === 1 ? "error" : "errors"}
-            </span>
-          ) : null}
-          {view === "code" && editorWarningCount ? (
-            <span className="rounded-full border border-amber-200 bg-amber-50 px-2 py-0.5 text-[10px] font-medium text-amber-700">
-              {editorWarningCount} {editorWarningCount === 1 ? "warning" : "warnings"}
-            </span>
-          ) : null}
-          {view === "graph" && !workflow.invalid ? (
-            <span className="rounded-full border border-line bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-muted">
-              {edgeCount} edges
-            </span>
-          ) : null}
-          {view === "code" && editorDocument ? (
-            <span
-              className={`rounded-full border px-2 py-0.5 text-[10px] font-medium ${
-                editorDocument.dirty
-                  ? "border-indigo-200 bg-indigo-50 text-indigo-700"
-                  : "border-emerald-200 bg-emerald-50 text-emerald-700"
+    <header className="studio-topbar flex h-[54px] shrink-0 items-center justify-between gap-3 border-b border-line bg-white px-4">
+      <div
+        className={`flex min-w-0 flex-1 items-baseline overflow-hidden ${
+          view === "graph" ? "gap-1" : ""
+        }`}
+        title={label?.fullPath || undefined}
+      >
+        {label ? (
+          <>
+            {label.path ? (
+              <span
+                className={`flex min-w-0 items-baseline text-muted ${
+                  view === "graph"
+                    ? "shrink-0 text-[11px] leading-4"
+                    : "text-xs"
+                }`}
+              >
+                <span className="truncate">{label.path}</span>
+                <span className="shrink-0">{label.separator}</span>
+              </span>
+            ) : null}
+            <h2
+              className={`min-w-0 truncate font-semibold text-ink dark:text-white ${
+                view === "graph"
+                  ? "text-xl leading-6"
+                  : "max-w-[55%] shrink-0 text-[15px]"
               }`}
             >
-              {editorDocument.dirty ? "Unsaved" : "Saved"}
-            </span>
-          ) : null}
-        </div>
+              {label.name}
+            </h2>
+          </>
+        ) : null}
       </div>
-      <div className="flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-2">
         {view === "graph" ? <WorkflowSaveStatus saveState={saveState} onRetry={onRetrySave} /> : null}
+        {view === "graph" ? (
+          <>
+            <div
+              className="flex shrink-0 items-center gap-2"
+              data-graph-toolbar-target="true"
+              ref={onGraphToolbarTargetChange}
+            />
+            <span aria-hidden="true" className="h-5 w-px shrink-0 bg-line" />
+          </>
+        ) : null}
         {view === "code" && editorDocument ? (
           <button
-            className="inline-flex h-8 items-center gap-2 rounded-lg border border-line bg-white px-3 text-xs font-semibold text-ink transition hover:border-indigo-300 hover:text-indigo-700 disabled:cursor-default disabled:opacity-55"
+            aria-label="Save active file"
+            className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
             disabled={!editorDocument.dirty || editorState?.saving}
-            title={editorDocument.dirty ? "Save workflow.rad" : "workflow.rad is saved"}
+            title={editorDocument.dirty ? "Save active file" : "No changes to save"}
             type="button"
             onClick={onSaveRadish}
           >
-            {editorState?.saving ? (
-              <Loader2 aria-hidden="true" className="animate-spin" size={14} />
-            ) : editorDocument.dirty ? (
-              <Save aria-hidden="true" size={14} />
-            ) : (
-              <Check aria-hidden="true" size={14} />
-            )}
-            {editorState?.saving ? "Saving" : editorDocument.dirty ? "Save" : "Saved"}
+            <Save aria-hidden="true" size={15} />
           </button>
         ) : null}
         {hasUpdateBridge ? (
@@ -3415,6 +4390,16 @@ export function TopBar({
           )
         ) : null}
         <button
+          aria-label="Open settings"
+          aria-expanded={settingsOpen}
+          className={`studio-icon-button grid h-8 w-8 place-items-center rounded-lg transition hover:bg-slate-100 hover:text-ink ${settingsOpen ? "bg-slate-100 text-ink" : "text-muted"}`}
+          title={`Settings (${formatKeybinding(settingBinding(settings, "settings.open"))})`}
+          type="button"
+          onClick={onToggleSettings}
+        >
+          <SettingsIcon size={16} />
+        </button>
+        <button
           className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
           title="Workflow history"
           type="button"
@@ -3433,6 +4418,46 @@ export function TopBar({
       </div>
     </header>
   );
+}
+
+export function topBarProjectName(workflow) {
+  const projectName = String(workflow?.projectName ?? "").trim();
+  if (projectName) return projectName;
+  const projectRoot = String(workflow?.projectRoot ?? "").trim();
+  return projectRoot ? projectNameFromPath(projectRoot) : "Unfiled project";
+}
+
+export function topBarLabelParts(workflow, view = "graph", activeCodePath = "") {
+  if (view === "code") {
+    return splitTopBarPath(activeCodePath, "No file open");
+  }
+  const projectRoot = String(workflow?.projectRoot ?? "").replace(/[\\/]+$/, "");
+  const projectPath = projectRoot
+    ? projectNameFromPath(projectRoot)
+    : String(workflow?.projectName || "Unfiled project");
+  const workflowTitle = String(workflow?.name || workflow?.id || "Untitled workflow");
+  const separator = projectPath.includes("\\") && !projectPath.includes("/") ? "\\" : "/";
+  return {
+    fullPath: `${projectPath}${separator}${workflowTitle}`,
+    name: workflowTitle,
+    path: projectPath,
+    separator,
+  };
+}
+
+function splitTopBarPath(path, fallbackName) {
+  const fullPath = String(path ?? "").trim();
+  if (!fullPath) return { fullPath: fallbackName, name: fallbackName, path: "", separator: "" };
+  const separatorIndex = Math.max(fullPath.lastIndexOf("/"), fullPath.lastIndexOf("\\"));
+  if (separatorIndex < 0) {
+    return { fullPath, name: fullPath, path: "", separator: "" };
+  }
+  return {
+    fullPath,
+    name: fullPath.slice(separatorIndex + 1) || fallbackName,
+    path: fullPath.slice(0, separatorIndex),
+    separator: fullPath[separatorIndex],
+  };
 }
 
 function WorkflowSaveStatus({ saveState, onRetry }) {
@@ -3636,13 +4661,31 @@ function formatRevisionDate(value) {
   return date.toLocaleString();
 }
 
-function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, workflow, workflows }) {
+export function ChatPane({
+  activeWorkflowId,
+  assistantDefaults = {},
+  audioInputDeviceId = "default",
+  onOpenMarkdownLink,
+  onOpenFile,
+  onResizeKeyDown,
+  onResizeStart,
+  recentProjectRoots = [],
+  width,
+  workflow,
+  workflows = [],
+}) {
+  const prospectiveProjectRoot = String(workflow?.projectRoot ?? "").trim();
   const chatScrollRef = useRef(null);
   const conversationMenuRef = useRef(null);
+  const dragDepthRef = useRef(0);
+  const scopeMenuRef = useRef(null);
   const [draft, setDraft] = useState("");
-  const [providerId, setProviderId] = useState("codex");
-  const [model, setModel] = useState("");
-  const [effort, setEffort] = useState("");
+  const [attachments, setAttachments] = useState([]);
+  const [attachmentError, setAttachmentError] = useState("");
+  const [draggingFiles, setDraggingFiles] = useState(false);
+  const [providerId, setProviderId] = useState(assistantDefaults.provider || "codex");
+  const [model, setModel] = useState(assistantDefaults.model || "");
+  const [effort, setEffort] = useState(assistantDefaults.effort || "");
   const {
     capabilities: providers,
     error: providerDiscoveryError,
@@ -3657,13 +4700,32 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
   const [backgroundChatAnnouncement, setBackgroundChatAnnouncement] = useState("");
   const [showTypingByThread, setShowTypingByThread] = useState({});
   const [typingDelayByThread, setTypingDelayByThread] = useState({});
+  const [liveTurnByThread, setLiveTurnByThread] = useState({});
   const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
+  const [scopeMenuOpen, setScopeMenuOpen] = useState(false);
+  const [homeProjectRoot, setHomeProjectRoot] = useState(prospectiveProjectRoot);
   const chatAbortControllersRef = useRef({});
   const deletedChatThreadIdsRef = useRef(new Set());
   const activeThreadIdRef = useRef(null);
-  const workflowName = workflow?.name ?? "All workflows";
   const activeThread = threads.find((thread) => thread.id === activeThreadId);
+  const projectLabels = loadProjectLabels();
+  const scopedProjectRoot = String(
+    activeThread?.projectRoot ?? homeProjectRoot ?? prospectiveProjectRoot,
+  ).trim();
+  const scopedProjectName = projectLabels[scopedProjectRoot]?.trim()
+    || activeThread?.projectName
+    || (scopedProjectRoot ? projectNameFromPath(scopedProjectRoot) : "No project");
+  const scopeProjects = mergeRecentProjects(
+    scopedProjectRoot ? [scopedProjectRoot] : [],
+    mergeRecentProjects(
+      recentProjectRoots,
+      workflows.map((item) => item.projectRoot).filter(Boolean),
+    ),
+  ).map((root) => ({
+    name: projectLabels[root]?.trim() || projectNameFromPath(root),
+    root,
+  }));
   const messages = useMemo(
     () =>
       activeThreadId
@@ -3678,21 +4740,17 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
     ? chatAnnouncementByThread[activeThreadId] ?? ""
     : "";
   const showTypingIndicator = Boolean(activeThreadId && showTypingByThread[activeThreadId]);
+  const liveTurn = activeThreadId ? liveTurnByThread[activeThreadId] : null;
   const typingDelayKey = activeThreadId ? typingDelayByThread[activeThreadId] ?? 0 : 0;
-  const workflowContext = useMemo(
-    () => ({
-      id: activeThreadId ? `workflow-assistant:${activeThreadId}` : "workflow-assistant",
-      chatThreadId: activeThreadId,
-      selectedWorkflowId: activeWorkflowId ?? null,
-      workflows: workflows ?? [],
-    }),
-    [activeThreadId, activeWorkflowId, workflows],
-  );
   const chatItems = useMemo(() => buildChatItems(messages), [messages]);
 
   useEffect(() => {
     activeThreadIdRef.current = activeThreadId;
   }, [activeThreadId]);
+
+  useEffect(() => {
+    if (!activeThreadId) setHomeProjectRoot(prospectiveProjectRoot);
+  }, [activeThreadId, prospectiveProjectRoot]);
 
   useEffect(() => {
     const current = providers.find((provider) => provider.id === providerId);
@@ -3714,7 +4772,12 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
   useEffect(() => {
     if (!activeThreadId) {
       setDraft("");
+      setAttachments([]);
+      setAttachmentError("");
+      dragDepthRef.current = 0;
+      setDraggingFiles(false);
       setConversationMenuOpen(false);
+      setScopeMenuOpen(false);
       return;
     }
 
@@ -3727,9 +4790,63 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
           },
     );
     setDraft("");
+    setAttachments([]);
+    setAttachmentError("");
+    dragDepthRef.current = 0;
+    setDraggingFiles(false);
     setExpandedThoughtGroups({});
     setConversationMenuOpen(false);
+    setScopeMenuOpen(false);
   }, [activeThreadId]);
+
+  function addAttachments(files) {
+    const result = readChatAttachments(files, attachments);
+    setAttachments(result.attachments);
+    setAttachmentError(result.error);
+  }
+
+  function handleFileDragEnter(event) {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current += 1;
+    setDraggingFiles(true);
+  }
+
+  function handleFileDragOver(event) {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }
+
+  function handleFileDragLeave(event) {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+    if (!dragDepthRef.current) setDraggingFiles(false);
+  }
+
+  function handleFileDrop(event) {
+    if (!transferContainsFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDraggingFiles(false);
+    addAttachments(event.dataTransfer.files);
+  }
+
+  function handleClipboardPaste(event) {
+    const files = clipboardAttachmentFiles(event.clipboardData);
+    if (!files.length) return;
+    event.preventDefault();
+    addAttachments(files);
+  }
+
+  function openScopedMarkdownLink(href) {
+    onOpenMarkdownLink?.(href, scopedProjectRoot);
+  }
+
+  function openScopedFile(path) {
+    onOpenFile?.(path, scopedProjectRoot);
+  }
 
   useEffect(() => {
     if (!activeThreadId) return undefined;
@@ -3759,6 +4876,26 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
   }, [conversationMenuOpen]);
 
   useEffect(() => {
+    if (!scopeMenuOpen) return undefined;
+
+    function handlePointerDown(event) {
+      if (scopeMenuRef.current?.contains(event.target)) return;
+      setScopeMenuOpen(false);
+    }
+
+    function handleKeyDown(event) {
+      if (event.key === "Escape") setScopeMenuOpen(false);
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", handlePointerDown);
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [scopeMenuOpen]);
+
+  useEffect(() => {
     if (!showTypingIndicator) return;
 
     window.requestAnimationFrame(() => {
@@ -3768,30 +4905,64 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
 
   async function sendMessage() {
     const text = draft.trim();
-    if (!text || chatState.sending) return;
-    const targetThreadId = activeThreadId ?? createThread();
+    const selectedAttachments = attachments;
+    if ((!text && !selectedAttachments.length) || chatState.sending) return;
+    const clientTurnStartedAt = Date.now();
+    const targetThread = activeThread ?? createThread();
+    const targetThreadId = targetThread.id;
+    const workflowContext = chatWorkflowContextForThread(targetThread, workflows);
+    setChatStateByThread((current) => ({
+      ...current,
+      [targetThreadId]: { sending: true, error: "", hasNewResponse: false },
+    }));
+    setLiveTurnByThread((current) => ({
+      ...current,
+      [targetThreadId]: {
+        id: `live-turn-${targetThreadId}`,
+        role: "assistant",
+        kind: "turn-summary",
+        running: true,
+        startedAt: clientTurnStartedAt,
+        changes: null,
+      },
+    }));
+    let messageAttachments;
+    try {
+      messageAttachments = await uploadChatAttachments(selectedAttachments, targetThreadId);
+    } catch (error) {
+      setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
+      setChatStateByThread((current) => ({
+        ...current,
+        [targetThreadId]: {
+          sending: false,
+          error: error instanceof Error ? error.message : "The attached files could not be uploaded.",
+          hasNewResponse: false,
+        },
+      }));
+      return;
+    }
+    const titleSource = text || `Attached ${messageAttachments.map((item) => item.name).join(", ")}`;
     const targetThreadTitle =
       activeThread?.title && activeThread.title !== "New thread"
         ? activeThread.title
-        : threadTitleFromMessage(text);
+        : threadTitleFromMessage(titleSource);
     deletedChatThreadIdsRef.current.delete(targetThreadId);
 
     const userMessage = {
       id: uniqueClientId(),
       role: "user",
       body: text,
+      attachments: messageAttachments,
     };
     const nextMessages = [...messages, userMessage];
     updateThreadMessages(targetThreadId, nextMessages);
-    updateThreadTitleFromMessage(targetThreadId, text);
+    updateThreadTitleFromMessage(targetThreadId, titleSource);
     setDraft("");
-    setChatStateByThread((current) => ({
-      ...current,
-      [targetThreadId]: { sending: true, error: "", hasNewResponse: false },
-    }));
+    setAttachments([]);
     setBackgroundChatAnnouncement("");
     setChatAnnouncementByThread((current) => ({ ...current, [targetThreadId]: "" }));
     const thoughtGroupId = uniqueClientId();
+    let turnSummaryReceived = false;
     window.requestAnimationFrame(() => {
       scrollMessageNearTop(userMessage.id);
     });
@@ -3832,6 +5003,16 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
       }));
     }
 
+    function appendTurnSummary(event) {
+      if (!event?.completedAt && event?.durationMs == null && !event?.changes) return;
+      turnSummaryReceived = true;
+      appendAssistantMessage("", "turn-summary", {
+        completedAt: event.completedAt,
+        durationMs: event.durationMs,
+        changes: event.changes,
+      });
+    }
+
     const abortController = new AbortController();
     chatAbortControllersRef.current[targetThreadId] = abortController;
     try {
@@ -3845,7 +5026,9 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
           provider: providerId,
           model,
           effort: effort || undefined,
-          messages: nextMessages.map(({ role, body }) => ({ role, body })),
+          messages: nextMessages
+            .filter((message) => message.kind !== "turn-summary")
+            .map(chatMessageForRequest),
           workflow: {
             ...workflowContext,
             id: `workflow-assistant:${targetThreadId}`,
@@ -3904,7 +5087,24 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
               if (body.trim()) {
                 appendAssistantMessage(body, "final");
               }
+              appendTurnSummary(event);
+              setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
+            } else if (event.type === "changes") {
+              setLiveTurnByThread((current) => ({
+                ...current,
+                [targetThreadId]: {
+                  ...(current[targetThreadId] ?? {}),
+                  id: `live-turn-${targetThreadId}`,
+                  role: "assistant",
+                  kind: "turn-summary",
+                  running: true,
+                  startedAt: current[targetThreadId]?.startedAt ?? clientTurnStartedAt,
+                  changes: event.changes,
+                },
+              }));
             } else if (event.type === "error") {
+              appendTurnSummary(event);
+              setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
               throw new Error(event.error || "Workflow assistant failed");
             }
           }
@@ -3918,8 +5118,24 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
           finalReceived = true;
           const body = event.message?.body ?? "";
           if (body.trim()) appendAssistantMessage(body, "final");
+          appendTurnSummary(event);
         } else if (event?.type === "error") {
+          appendTurnSummary(event);
+          setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
           throw new Error(event.error || "Workflow assistant failed");
+        } else if (event?.type === "changes") {
+          setLiveTurnByThread((current) => ({
+            ...current,
+            [targetThreadId]: {
+              ...(current[targetThreadId] ?? {}),
+              id: `live-turn-${targetThreadId}`,
+              role: "assistant",
+              kind: "turn-summary",
+              running: true,
+              startedAt: current[targetThreadId]?.startedAt ?? clientTurnStartedAt,
+              changes: event.changes,
+            },
+          }));
         }
       }
 
@@ -3946,10 +5162,17 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
       if (error instanceof DOMException && error.name === "AbortError") {
         if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
         appendAssistantMessage("Workflow assistant stopped.", "final");
+        if (!turnSummaryReceived) {
+          appendTurnSummary({
+            completedAt: new Date().toISOString(),
+            durationMs: Date.now() - clientTurnStartedAt,
+          });
+        }
         setChatStateByThread((current) => ({
           ...current,
           [targetThreadId]: { sending: false, error: "", hasNewResponse: false },
         }));
+        setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
         setChatAnnouncementByThread((current) => ({
           ...current,
           [targetThreadId]: "Workflow assistant stopped.",
@@ -3957,6 +5180,13 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
         return;
       }
       if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
+      setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
+      if (!turnSummaryReceived) {
+        appendTurnSummary({
+          completedAt: new Date().toISOString(),
+          durationMs: Date.now() - clientTurnStartedAt,
+        });
+      }
       setChatStateByThread((current) => ({
         ...current,
         [targetThreadId]: {
@@ -3977,6 +5207,44 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
     setShowTypingByThread((current) => ({ ...current, [threadId]: false }));
   }
 
+  async function toggleAssistantChanges(threadId, messageId, changeSetId, redo) {
+    if (!threadId || !changeSetId) return;
+    const updateChangeState = (patch) => {
+      updateThreadMessages(threadId, (current) => current.map((message) =>
+        message.id === messageId
+          ? { ...message, changes: { ...message.changes, ...patch } }
+          : message
+      ));
+    };
+    const action = redo ? "redo" : "undo";
+    updateChangeState({ changing: true, changeError: "" });
+    try {
+      const response = await fetch(apiUrl(`/chat/changes/${action}`), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ changeSetId }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error || `${redo ? "Redo" : "Undo"} API returned ${response.status}`);
+      }
+      updateChangeState({ changing: false, undone: Boolean(payload.undone), changeError: "" });
+      setChatAnnouncementByThread((current) => ({
+        ...current,
+        [threadId]: redo
+          ? "Workflow assistant changes reapplied."
+          : "Workflow assistant changes undone.",
+      }));
+    } catch (error) {
+      updateChangeState({
+        changing: false,
+        changeError: error instanceof Error
+          ? error.message
+          : `The changes could not be ${redo ? "reapplied" : "undone"}.`,
+      });
+    }
+  }
+
   function updateThreadMessages(threadId, nextValue) {
     if (deletedChatThreadIdsRef.current.has(threadId)) return;
     setMessagesByThread((current) => {
@@ -3989,24 +5257,48 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
     });
   }
 
-  function createThread() {
+  function createThread(projectRoot = scopedProjectRoot) {
     const now = new Date().toISOString();
-    const thread = {
-      id: uniqueClientId(),
-      title: "New thread",
-      createdAt: now,
-      updatedAt: now,
-    };
+    const root = String(projectRoot ?? "").trim();
+    const thread = scopeChatThreadToProject(
+      {
+        id: uniqueClientId(),
+        title: "New thread",
+        createdAt: now,
+        updatedAt: now,
+      },
+      root,
+      workflows,
+      activeWorkflowId,
+      projectLabels[root]?.trim() || (root ? projectNameFromPath(root) : "No project"),
+    );
     const nextThreads = [thread, ...threads];
     persistChatThreads(nextThreads);
     setThreads(nextThreads);
     activeThreadIdRef.current = thread.id;
     setActiveThreadId(thread.id);
     setDraft("");
-    return thread.id;
+    setScopeMenuOpen(false);
+    return thread;
   }
 
   function openThread(threadId) {
+    const thread = threads.find((candidate) => candidate.id === threadId);
+    if (thread && !thread.projectRoot) {
+      const scopedThread = scopeChatThreadToProject(
+        thread,
+        scopedProjectRoot,
+        workflows,
+        activeWorkflowId,
+        projectLabels[scopedProjectRoot]?.trim()
+          || (scopedProjectRoot ? projectNameFromPath(scopedProjectRoot) : "No project"),
+      );
+      const nextThreads = threads.map((candidate) =>
+        candidate.id === threadId ? scopedThread : candidate,
+      );
+      persistChatThreads(nextThreads);
+      setThreads(nextThreads);
+    }
     activeThreadIdRef.current = threadId;
     setActiveThreadId(threadId);
     setChatStateByThread((current) => {
@@ -4019,10 +5311,41 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
     });
   }
 
+  function changeThreadProjectScope(projectRoot) {
+    const root = String(projectRoot ?? "").trim();
+    if (!root || root === scopedProjectRoot) {
+      setScopeMenuOpen(false);
+      return;
+    }
+    if (!activeThreadId) {
+      setHomeProjectRoot(root);
+      setScopeMenuOpen(false);
+      return;
+    }
+    setThreads((currentThreads) => {
+      const nextThreads = currentThreads.map((thread) =>
+        thread.id === activeThreadId
+          ? scopeChatThreadToProject(
+              thread,
+              root,
+              workflows,
+              activeWorkflowId,
+              projectLabels[root]?.trim() || projectNameFromPath(root),
+            )
+          : thread,
+      );
+      persistChatThreads(nextThreads);
+      return nextThreads;
+    });
+    setHomeProjectRoot(root);
+    setScopeMenuOpen(false);
+  }
+
   function showThreadList() {
     activeThreadIdRef.current = null;
     setActiveThreadId(null);
     setConversationMenuOpen(false);
+    setScopeMenuOpen(false);
   }
 
   function updateThreadTitleFromMessage(threadId, message) {
@@ -4055,6 +5378,11 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
       return next;
     });
     setChatStateByThread((current) => {
+      const next = { ...current };
+      delete next[threadId];
+      return next;
+    });
+    setLiveTurnByThread((current) => {
       const next = { ...current };
       delete next[threadId];
       return next;
@@ -4123,8 +5451,26 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
     <aside
       aria-busy={chatState.sending || undefined}
       className="studio-chat relative flex shrink-0 flex-col border-l border-line bg-white"
+      data-chat-pane="true"
       style={{ width }}
+      onDragEnter={handleFileDragEnter}
+      onDragLeave={handleFileDragLeave}
+      onDragOver={handleFileDragOver}
+      onDrop={handleFileDrop}
+      onPaste={handleClipboardPaste}
     >
+      {draggingFiles ? (
+        <div
+          aria-live="polite"
+          className="pointer-events-none absolute inset-2 z-[70] grid place-items-center rounded-[14px] border-2 border-dashed border-brand bg-indigo-50/95 text-indigo-700 dark:bg-[#252526]/95 dark:text-indigo-300"
+          role="status"
+        >
+          <div className="flex flex-col items-center gap-2 text-center">
+            <Paperclip aria-hidden="true" size={20} />
+            <span className="text-xs font-semibold">Drop files to attach</span>
+          </div>
+        </div>
+      ) : null}
       <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
         {chatAnnouncement}
       </div>
@@ -4149,7 +5495,7 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
         onPointerDown={onResizeStart}
       />
       <div className="flex h-[54px] shrink-0 items-center justify-between border-b border-line px-3.5">
-        <div className="flex min-w-0 items-center gap-2 text-xs font-semibold text-muted">
+        <div className="flex min-w-0 items-center gap-1 text-xs font-semibold text-muted">
           {activeThread ? (
             <button
               aria-label="Back to recent threads"
@@ -4161,8 +5507,58 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
               <ArrowLeft aria-hidden="true" size={16} />
             </button>
           ) : null}
-          <GitBranch aria-hidden="true" size={14} />
-          <span className="truncate">{workflow ? `Scoped to ${workflowName}` : "All workflows"}</span>
+          <div ref={scopeMenuRef} className="relative min-w-0">
+            <button
+              aria-expanded={scopeMenuOpen}
+              aria-haspopup="menu"
+              aria-label={`Scoped to ${scopedProjectName}. Change project scope`}
+              className="flex h-8 min-w-0 max-w-full items-center gap-1.5 rounded-lg px-2 text-xs font-semibold text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={chatState.sending || !scopeProjects.length}
+              title={chatState.sending ? "Project scope cannot change while the assistant is running" : scopedProjectRoot}
+              type="button"
+              onClick={() => {
+                setConversationMenuOpen(false);
+                setScopeMenuOpen((current) => !current);
+              }}
+            >
+              <GitBranch aria-hidden="true" className="shrink-0" size={14} />
+              <span className="min-w-0 truncate">Scoped to {scopedProjectName}</span>
+              <ChevronDown
+                aria-hidden="true"
+                className={`shrink-0 transition ${scopeMenuOpen ? "rotate-180" : ""}`}
+                size={12}
+              />
+            </button>
+            {scopeMenuOpen ? (
+              <div
+                aria-label="Assistant project scope"
+                className="absolute left-0 top-9 z-50 max-h-72 w-72 overflow-y-auto rounded-[14px] border border-line bg-white p-1.5 shadow-panel"
+                role="menu"
+              >
+                <p className="px-2 py-1 text-[10px] font-semibold text-muted">Recent projects</p>
+                {scopeProjects.map((project) => (
+                  <button
+                    key={project.root}
+                    className={`flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-xs transition hover:bg-slate-50 ${
+                      project.root === scopedProjectRoot
+                        ? "bg-indigo-50 font-semibold text-indigo-700"
+                        : "text-ink"
+                    }`}
+                    role="menuitem"
+                    title={project.root}
+                    type="button"
+                    onClick={() => changeThreadProjectScope(project.root)}
+                  >
+                    <FolderOpen aria-hidden="true" className="shrink-0 text-muted" size={13} />
+                    <span className="min-w-0 flex-1 truncate">{project.name}</span>
+                    {project.root === scopedProjectRoot ? (
+                      <Check aria-hidden="true" className="shrink-0" size={12} />
+                    ) : null}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </div>
         </div>
         <div ref={conversationMenuRef} className="relative flex items-center gap-1">
           <button
@@ -4170,7 +5566,7 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
             className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
             title="New thread"
             type="button"
-            onClick={createThread}
+            onClick={() => createThread()}
           >
             <Plus aria-hidden="true" size={17} />
           </button>
@@ -4180,7 +5576,10 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
             className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
             title="Recent threads"
             type="button"
-            onClick={() => setConversationMenuOpen((current) => !current)}
+            onClick={() => {
+              setScopeMenuOpen(false);
+              setConversationMenuOpen((current) => !current);
+            }}
           >
             <History aria-hidden="true" size={16} />
           </button>
@@ -4232,6 +5631,8 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
                 <ThoughtGroup
                   key={item.id}
                   expanded={expandedThoughtGroups[item.id] !== false}
+                  onOpenLink={openScopedMarkdownLink}
+                  onOpenFile={openScopedFile}
                   thoughts={item.thoughts}
                   onToggle={() =>
                     setExpandedThoughtGroups((current) => ({
@@ -4241,9 +5642,20 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
                   }
                 />
               ) : (
-                <ChatMessageBubble key={item.message.id} message={item.message} />
+                <ChatMessageBubble
+                  key={item.message.id}
+                  message={item.message}
+                  onOpenLink={openScopedMarkdownLink}
+                  onUndoChanges={() => toggleAssistantChanges(
+                    activeThreadId,
+                    item.message.id,
+                    item.message.changes?.id,
+                    Boolean(item.message.changes?.undone),
+                  )}
+                />
               ),
             )}
+            {liveTurn ? <TurnSummaryCard message={liveTurn} /> : null}
             {showTypingIndicator ? <TypingIndicator /> : null}
             {chatState.error ? (
               <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
@@ -4272,46 +5684,20 @@ function ChatPane({ activeWorkflowId, onResizeKeyDown, onResizeStart, width, wor
           {providerDiscoveryError ? (
             <p className="mb-2 text-xs text-red-600">{providerDiscoveryError}</p>
           ) : null}
-          <div
-            data-chat-composer
-            className="relative min-h-28 overflow-hidden rounded-[14px] border border-line bg-white transition focus-within:border-indigo-500 focus-within:ring-2 focus-within:ring-indigo-500/10"
-          >
-            <textarea
-              className="block h-28 max-h-32 w-full resize-none bg-transparent px-3 pb-12 pr-12 pt-3 text-sm leading-5 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed disabled:text-muted"
-              disabled={chatState.sending}
-              placeholder="Message this workflow"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  sendMessage();
-                }
-              }}
-            />
-            <button
-                className={`absolute bottom-2 right-2 z-10 grid h-8 w-8 place-items-center rounded-lg transition disabled:cursor-not-allowed disabled:opacity-60 ${
-                  chatState.sending
-                    ? "border border-line bg-white text-red-600 hover:border-red-200 hover:bg-red-50"
-                    : "bg-brand text-white hover:bg-indigo-700"
-                }`}
-                disabled={!chatState.sending && !draft.trim()}
-                title={chatState.sending ? "Stop workflow assistant" : "Send message"}
-                type="button"
-                onClick={() =>
-                  chatState.sending
-                    ? activeThreadId && stopAssistant(activeThreadId)
-                    : sendMessage()
-                }
-              >
-                {chatState.sending ? (
-                  <Square size={13} fill="currentColor" strokeWidth={1.7} />
-                ) : (
-                  <Send size={15} />
-                )}
-              </button>
-          </div>
-          <p className="mt-1.5 px-1 text-[10px] text-muted">Enter to send · Shift+Enter for a new line</p>
+          <ChatComposer
+            attachments={attachments}
+            attachmentError={attachmentError}
+            audioInputDeviceId={audioInputDeviceId}
+            contextKey={activeThreadId ?? "new-thread"}
+            draft={draft}
+            sending={chatState.sending}
+            onAddAttachments={addAttachments}
+            onAttachmentErrorChange={setAttachmentError}
+            onAttachmentsChange={setAttachments}
+            onDraftChange={setDraft}
+            onSend={sendMessage}
+            onStop={() => activeThreadId && stopAssistant(activeThreadId)}
+          />
       </div>
     </aside>
   );
@@ -4405,7 +5791,10 @@ function TypingIndicator() {
   );
 }
 
-function ChatMessageBubble({ message }) {
+function ChatMessageBubble({ message, onOpenLink, onUndoChanges }) {
+  if (message.kind === "turn-summary") {
+    return <TurnSummaryCard message={message} onUndo={onUndoChanges} />;
+  }
   const isSystem = message.role === "system" || message.kind === "system";
   const isUser = message.role === "user";
   return (
@@ -4427,111 +5816,212 @@ function ChatMessageBubble({ message }) {
         {isSystem ? (
           <span className="whitespace-pre-wrap">{message.body}</span>
         ) : (
-          <MarkdownMessage inverse={isUser} value={message.body} />
+          <>
+            {isUser ? <MessageAttachments attachments={message.attachments} inverse /> : null}
+            {message.body ? (
+              <MarkdownMessage inverse={isUser} onOpenLink={onOpenLink} value={message.body} />
+            ) : null}
+          </>
         )}
       </div>
     </div>
   );
 }
 
-function MarkdownMessage({ compact = false, inverse = false, value }) {
-  const blocks = parseMinimalMarkdown(value);
+function TurnSummaryCard({ message, onUndo }) {
+  const [reviewing, setReviewing] = useState(false);
+  const [showAllFiles, setShowAllFiles] = useState(false);
+  const changes = message.changes;
+  const files = Array.isArray(changes?.files) ? changes.files : [];
+  const visibleFiles = showAllFiles ? files : files.slice(0, 3);
+  const liveDurationMs = useLiveDuration(message.startedAt, message.running);
+  const timing = message.running
+    ? `Running for ${formatAssistantDuration(liveDurationMs)}`
+    : formatAssistantTurnTiming(message.completedAt, message.durationMs);
+
+  if (!changes) {
+    return (
+      <div
+        aria-label="Assistant running"
+        className="flex items-center gap-1.5 px-1 text-[10px] text-muted"
+        data-message-id={message.id}
+      >
+        {message.running ? <Loader2 aria-hidden="true" className="animate-spin" size={11} /> : null}
+        <span>{timing}</span>
+      </div>
+    );
+  }
+
   return (
-    <div className={`min-w-0 break-words ${compact ? "space-y-2" : "space-y-3"}`}>
-      {blocks.map((block, blockIndex) => {
-        const key = `${block.type}-${blockIndex}`;
-        if (block.type === "code") {
-          return (
-            <pre
-              key={key}
-              className={`workflow-scrollbar max-w-full overflow-auto rounded-md border px-3 py-2 font-mono text-[11px] leading-5 ${
-                inverse
-                  ? "border-white/20 bg-black/20 text-white"
-                  : "border-line bg-slate-50 text-slate-700 dark:bg-[#111113]"
-              }`}
+    <div className="space-y-1.5" data-message-id={message.id}>
+      <section
+        aria-label="Assistant file changes"
+        className="overflow-hidden rounded-lg border border-line bg-white dark:bg-[#181818]"
+      >
+        <div className="flex min-h-12 items-center gap-2.5 px-3 py-2">
+          <FileDiff aria-hidden="true" className="shrink-0 text-muted" size={16} />
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-baseline gap-x-2 text-xs">
+              <span className="inline-flex items-center gap-1.5 font-semibold text-ink">
+                {message.running ? <Loader2 aria-hidden="true" className="animate-spin text-brand" size={12} /> : null}
+                {message.running ? assistantLiveChangeLabel(files) : assistantChangeLabel(files)}
+              </span>
+              <span className="font-medium text-emerald-600">+{changes.additions ?? 0}</span>
+              <span className="font-medium text-red-500">-{changes.deletions ?? 0}</span>
+            </div>
+          </div>
+          <button
+            className="inline-flex h-8 items-center gap-1 rounded-md px-2 text-xs font-medium text-muted outline-none transition hover:bg-slate-50 hover:text-ink focus-visible:ring-2 focus-visible:ring-brand/30 disabled:cursor-not-allowed disabled:opacity-50 dark:hover:bg-[#242426]"
+            disabled={message.running || !changes.undoable || changes.changing}
+            title={!changes.undoable ? changes.undoUnavailableReason : undefined}
+            type="button"
+            onClick={onUndo}
+          >
+            {changes.changing ? (
+              <Loader2 aria-hidden="true" className="animate-spin" size={13} />
+            ) : changes.undone ? (
+              <Redo2 aria-hidden="true" size={13} />
+            ) : (
+              <Undo2 aria-hidden="true" size={13} />
+            )}
+            {changes.changing ? (changes.undone ? "Redoing" : "Undoing") : changes.undone ? "Redo" : "Undo"}
+          </button>
+          <button
+            aria-expanded={reviewing}
+            className="h-8 rounded-md border border-line px-2.5 text-xs font-medium text-ink outline-none transition hover:bg-slate-50 focus-visible:ring-2 focus-visible:ring-brand/30 dark:hover:bg-[#242426]"
+            type="button"
+            onClick={() => setReviewing((current) => !current)}
+          >
+            {reviewing ? "Close" : "Review"}
+          </button>
+        </div>
+        <div className="border-t border-line px-3 py-2">
+          <div className="space-y-1.5">
+            {visibleFiles.map((file) => (
+              <div className="flex min-w-0 items-center gap-2 text-[11px]" key={file.path}>
+                <span className="min-w-0 flex-1 truncate text-muted" title={file.path}>{file.path}</span>
+                <span className="shrink-0 font-medium text-emerald-600">+{file.additions ?? 0}</span>
+                <span className="shrink-0 font-medium text-red-500">-{file.deletions ?? 0}</span>
+              </div>
+            ))}
+          </div>
+          {files.length > 3 ? (
+            <button
+              className="mt-2 inline-flex items-center gap-1 text-[11px] text-muted outline-none transition hover:text-ink focus-visible:ring-2 focus-visible:ring-brand/30"
+              type="button"
+              onClick={() => setShowAllFiles((current) => !current)}
             >
-              <code>{block.text}</code>
-            </pre>
-          );
-        }
-        if (block.type === "heading") {
-          const Heading = `h${block.level}`;
-          return (
-            <Heading key={key} className="font-semibold leading-5 text-inherit">
-              <MarkdownInline inverse={inverse} tokens={block.tokens} />
-            </Heading>
-          );
-        }
-        if (block.type === "list") {
-          const List = block.ordered ? "ol" : "ul";
-          return (
-            <List
-              key={key}
-              className={`ml-5 space-y-1 ${block.ordered ? "list-decimal" : "list-disc"}`}
-            >
-              {block.items.map((tokens, itemIndex) => (
-                <li key={`${key}-${itemIndex}`}>
-                  <MarkdownInline inverse={inverse} tokens={tokens} />
-                </li>
-              ))}
-            </List>
-          );
-        }
-        if (block.type === "quote") {
-          return (
-            <blockquote
-              key={key}
-              className={`border-l pl-3 ${inverse ? "border-white/40" : "border-line text-muted"}`}
-            >
-              <MarkdownInline inverse={inverse} tokens={block.tokens} />
-            </blockquote>
-          );
-        }
-        return (
-          <p key={key}>
-            <MarkdownInline inverse={inverse} tokens={block.tokens} />
+              {showAllFiles ? "Show fewer files" : `Show ${files.length - 3} more files`}
+              <ChevronDown aria-hidden="true" className={`transition-transform ${showAllFiles ? "rotate-180" : ""}`} size={13} />
+            </button>
+          ) : null}
+        </div>
+        {reviewing ? (
+          <div className="max-h-80 space-y-3 overflow-auto border-t border-line bg-slate-50 px-3 py-3 dark:bg-[#111113]">
+            {files.map((file) => <AssistantDiffPreview file={file} key={file.path} />)}
+          </div>
+        ) : null}
+        {changes.changeError ? (
+          <p className="border-t border-red-200 bg-red-50 px-3 py-2 text-[11px] leading-4 text-red-700">
+            {changes.changeError}
           </p>
-        );
-      })}
+        ) : null}
+      </section>
+      <div className="px-1 text-[10px] text-muted">{timing}</div>
     </div>
   );
 }
 
-function MarkdownInline({ inverse, tokens }) {
-  return tokens.map((token, index) => {
-    const key = `${token.type}-${index}`;
-    if (token.type === "code") {
-      return (
-        <code
-          key={key}
-          className={`rounded px-1 py-0.5 font-mono text-[0.9em] ${
-            inverse ? "bg-white/15 text-white" : "bg-slate-100 text-ink dark:bg-[#2a2a2e]"
-          }`}
-        >
-          {token.text}
-        </code>
-      );
-    }
-    if (token.type === "strong") return <strong key={key}>{token.text}</strong>;
-    if (token.type === "emphasis") return <em key={key}>{token.text}</em>;
-    if (token.type === "link") {
-      return (
-        <a
-          key={key}
-          className={`underline underline-offset-2 ${inverse ? "text-white" : "text-brand"}`}
-          href={token.href}
-          rel="noreferrer"
-          target="_blank"
-        >
-          {token.text}
-        </a>
-      );
-    }
-    return token.text;
-  });
+function AssistantDiffPreview({ file }) {
+  return (
+    <section aria-label={`Diff for ${file.path}`}>
+      <h4 className="mb-1.5 truncate font-mono text-[10px] font-semibold text-ink" title={file.path}>
+        {file.path}
+      </h4>
+      <pre className="workflow-scrollbar overflow-x-auto rounded-md border border-line bg-white py-1 font-mono text-[10px] leading-4 dark:bg-[#181818]">
+        {String(file.diff || "No text preview available.").split("\n").map((line, index) => (
+          <span
+            className={`block min-w-max px-2 ${
+              line.startsWith("+") && !line.startsWith("+++")
+                ? "bg-emerald-50 text-emerald-800 dark:bg-emerald-950/30 dark:text-emerald-300"
+                : line.startsWith("-") && !line.startsWith("---")
+                ? "bg-red-50 text-red-700 dark:bg-red-950/30 dark:text-red-300"
+                : "text-slate-600 dark:text-[#b9b9b9]"
+            }`}
+            key={`${index}-${line}`}
+          >
+            {line || " "}
+          </span>
+        ))}
+      </pre>
+    </section>
+  );
 }
 
-function ThoughtGroup({ expanded, onToggle, thoughts }) {
+export function assistantChangeLabel(files) {
+  const count = files.length;
+  const noun = count === 1 ? "file" : "files";
+  if (count && files.every((file) => file.status === "added")) return `Created ${count} ${noun}`;
+  if (count && files.every((file) => file.status === "deleted")) return `Deleted ${count} ${noun}`;
+  return `Edited ${count} ${noun}`;
+}
+
+function assistantLiveChangeLabel(files) {
+  const count = files.length;
+  const noun = count === 1 ? "file" : "files";
+  if (count && files.every((file) => file.status === "added")) return `Creating ${count} ${noun}`;
+  if (count && files.every((file) => file.status === "deleted")) return `Deleting ${count} ${noun}`;
+  return `Editing ${count} ${noun}`;
+}
+
+function useLiveDuration(startedAt, running) {
+  const [durationMs, setDurationMs] = useState(() => (
+    running ? Math.max(0, Date.now() - Number(startedAt || Date.now())) : 0
+  ));
+
+  useEffect(() => {
+    if (!running) return undefined;
+    const update = () => setDurationMs(Math.max(0, Date.now() - Number(startedAt || Date.now())));
+    update();
+    const intervalId = window.setInterval(update, 1000);
+    return () => window.clearInterval(intervalId);
+  }, [running, startedAt]);
+
+  return durationMs;
+}
+
+export function formatAssistantDuration(durationMs) {
+  const milliseconds = Math.max(0, Number(durationMs) || 0);
+  const seconds = Math.floor(milliseconds / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+export function formatAssistantTurnTiming(completedAt, durationMs) {
+  const date = new Date(completedAt);
+  const completed = Number.isNaN(date.getTime())
+    ? "Completed"
+    : date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  const milliseconds = Math.max(0, Number(durationMs) || 0);
+  const seconds = Math.round(milliseconds / 1000);
+  const duration = milliseconds < 1000
+    ? "<1s"
+    : formatAssistantDuration(seconds * 1000);
+  return `${completed} · Ran for ${duration}`;
+}
+
+export function MarkdownMessage({ compact = false, inverse = false, onOpenLink, value }) {
+  return (
+    <MarkdownContent
+      compact={compact}
+      inverse={inverse}
+      value={value}
+      onOpenRelativeLink={onOpenLink}
+    />
+  );
+}
+
+function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) {
   const trace = buildThoughtTrace(thoughts);
   const count = trace.length;
 
@@ -4577,7 +6067,11 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
                         : "bg-slate-400"
                     }`}
                   />
-                  {entry.kind === "tool" || !entry.body ? (
+                  {shellTraceDetails(entry) ? (
+                    <ShellCommandDisclosure entry={entry} />
+                  ) : editTraceDetails(entry) ? (
+                    <EditDisclosure entry={entry} onOpenFile={onOpenFile} />
+                  ) : entry.kind === "tool" || !entry.body ? (
                     <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 text-xs leading-5">
                       {entry.title ? (
                         <span className="font-semibold text-ink">{entry.title}</span>
@@ -4589,10 +6083,10 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
                   ) : null}
                   {entry.kind === "summary" && entry.body ? (
                     <div className="text-xs leading-5 text-slate-600 dark:text-[#b9b9b9]">
-                      <MarkdownMessage compact value={entry.body} />
+                      <MarkdownMessage compact onOpenLink={onOpenLink} value={entry.body} />
                     </div>
                   ) : null}
-                  {entry.kind === "tool" && (entry.input || entry.output) ? (
+                  {entry.kind === "tool" && !shellTraceDetails(entry) && !editTraceDetails(entry) && (entry.input || entry.output) ? (
                     <div className="mt-2 overflow-hidden rounded-md border border-line bg-white dark:bg-[#181818]">
                       {entry.input ? <TracePayload label="In" value={entry.input} /> : null}
                       {entry.output ? <TracePayload label="Out" value={entry.output} divided={Boolean(entry.input)} /> : null}
@@ -4606,6 +6100,138 @@ function ThoughtGroup({ expanded, onToggle, thoughts }) {
       </div>
     </div>
   );
+}
+
+function EditDisclosure({ entry, onOpenFile }) {
+  const [expanded, setExpanded] = useState(false);
+  const details = editTraceDetails(entry);
+  if (!details) return null;
+
+  return (
+    <div className="min-w-0">
+      <button
+        aria-expanded={expanded}
+        className="group flex min-h-7 max-w-full items-center gap-1 rounded-md pr-1 text-left text-xs font-semibold text-ink outline-none transition hover:text-brand focus-visible:ring-2 focus-visible:ring-brand/30"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="truncate">Editing files</span>
+        <ChevronRight
+          aria-hidden="true"
+          className={`shrink-0 text-muted transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
+          size={14}
+        />
+      </button>
+      <div
+        className={`grid transition-[grid-template-rows,opacity] duration-150 ease-out ${
+          expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+        }`}
+      >
+        <div className="overflow-hidden">
+          {details.path ? (
+            <button
+              aria-label={`Open ${details.path} in code editor`}
+              className="mt-0.5 block w-full min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-left text-[10px] text-muted outline-none transition hover:text-brand focus-visible:rounded-sm focus-visible:ring-2 focus-visible:ring-brand/30"
+              style={{ direction: "rtl" }}
+              title={details.path}
+              type="button"
+              onClick={() => onOpenFile?.(details.path)}
+            >
+              {details.path}
+            </button>
+          ) : null}
+          <pre className="workflow-scrollbar mt-1 max-h-40 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-slate-50 px-2.5 py-2 font-mono text-[10px] leading-4 text-slate-600 dark:bg-[#111113] dark:text-[#b9b9b9]">
+            {details.input || "Waiting for edit details..."}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function editTraceDetails(entry) {
+  if (!entry || entry.kind !== "tool" || String(entry.title || "").trim().toLowerCase() !== "edit") {
+    return null;
+  }
+  let path = String(entry.detail || "").trim();
+  const input = String(entry.input || "").trim();
+  if (!path && input) {
+    try {
+      const parsed = JSON.parse(input);
+      path = String(parsed?.path || parsed?.file_path || "").trim();
+    } catch {
+      path = "";
+    }
+  }
+  return { input, path };
+}
+
+function ShellCommandDisclosure({ entry }) {
+  const [expanded, setExpanded] = useState(false);
+  const details = shellTraceDetails(entry);
+  if (!details) return null;
+
+  return (
+    <div className="min-w-0">
+      <button
+        aria-expanded={expanded}
+        className="group flex min-h-7 max-w-full items-center gap-1 rounded-md pr-1 text-left text-xs font-semibold text-ink outline-none transition hover:text-brand focus-visible:ring-2 focus-visible:ring-brand/30"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="truncate">Running {details.shell} commands</span>
+        <ChevronRight
+          aria-hidden="true"
+          className={`shrink-0 text-muted transition-transform duration-150 ${expanded ? "rotate-90" : ""}`}
+          size={14}
+        />
+      </button>
+      <div
+        className={`grid transition-[grid-template-rows,opacity] duration-150 ease-out ${
+          expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+        }`}
+      >
+        <div className="overflow-hidden">
+          <pre className="workflow-scrollbar mt-1 max-h-40 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded-md border border-line bg-slate-50 px-2.5 py-2 font-mono text-[10px] leading-4 text-slate-600 dark:bg-[#111113] dark:text-[#b9b9b9]">
+            {details.command || "Waiting for command..."}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function shellTraceDetails(entry) {
+  if (!entry || entry.kind !== "tool") return null;
+  const title = String(entry.title || "").trim();
+  const normalizedTitle = title.toLowerCase();
+  const shellTitles = new Map([
+    ["bash", "bash"],
+    ["sh", "sh"],
+    ["zsh", "zsh"],
+    ["fish", "fish"],
+    ["powershell", "PowerShell"],
+    ["pwsh", "PowerShell"],
+    ["cmd", "Command Prompt"],
+    ["command prompt", "Command Prompt"],
+    ["shell", "shell"],
+    ["terminal", "terminal"],
+  ]);
+  if (entry.category !== "shell" && !shellTitles.has(normalizedTitle)) return null;
+
+  let command = String(entry.command || "").trim();
+  if (!command && entry.input) {
+    try {
+      const parsed = JSON.parse(entry.input);
+      command = String(parsed?.command || parsed?.cmd || parsed?.script || "").trim();
+    } catch {
+      command = String(entry.input).trim();
+    }
+  }
+  return {
+    command,
+    shell: String(entry.shell || shellTitles.get(normalizedTitle) || "shell"),
+  };
 }
 
 function TracePayload({ divided = false, label, value }) {
@@ -4772,6 +6398,9 @@ export function buildThoughtTrace(thoughts) {
         : "",
       input: rawTrace.input ? String(rawTrace.input) : "",
       output: rawTrace.output ? String(rawTrace.output) : "",
+      category: rawTrace.category ? String(rawTrace.category) : "",
+      shell: rawTrace.shell ? String(rawTrace.shell) : "",
+      command: rawTrace.command ? String(rawTrace.command) : "",
       status: String(rawTrace.status || ""),
     };
 
@@ -4796,6 +6425,9 @@ export function buildThoughtTrace(thoughts) {
       body: entry.body || existing.body,
       input: existing.input || entry.input,
       output: entry.output || existing.output,
+      category: entry.category || existing.category,
+      shell: entry.shell || existing.shell,
+      command: entry.command || existing.command,
       status: entry.status || existing.status,
     };
   }
@@ -4818,123 +6450,6 @@ export function normalizeMarkdownText(value) {
     .replace(/[*_~`]/g, "")
     .replace(/\s+/g, " ")
     .trim();
-}
-
-export function parseMinimalMarkdown(value) {
-  const lines = String(value ?? "").replace(/\r\n?/g, "\n").split("\n");
-  const blocks = [];
-  let index = 0;
-
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) {
-      index += 1;
-      continue;
-    }
-
-    const fence = line.match(/^\s*```([^`]*)$/);
-    if (fence) {
-      const code = [];
-      index += 1;
-      while (index < lines.length && !/^\s*```\s*$/.test(lines[index])) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      blocks.push({ type: "code", language: fence[1].trim(), text: code.join("\n") });
-      continue;
-    }
-
-    const heading = line.match(/^\s{0,3}(#{1,3})\s+(.+)$/);
-    if (heading) {
-      blocks.push({
-        type: "heading",
-        level: heading[1].length,
-        tokens: parseInlineMarkdown(heading[2]),
-      });
-      index += 1;
-      continue;
-    }
-
-    const listItem = line.match(/^\s*(?:(\d+)[.)]|[-+*])\s+(.+)$/);
-    if (listItem) {
-      const ordered = Boolean(listItem[1]);
-      const items = [];
-      while (index < lines.length) {
-        const match = lines[index].match(/^\s*(?:(\d+)[.)]|[-+*])\s+(.+)$/);
-        if (!match || Boolean(match[1]) !== ordered) break;
-        items.push(parseInlineMarkdown(match[2]));
-        index += 1;
-      }
-      blocks.push({ type: "list", ordered, items });
-      continue;
-    }
-
-    const quote = line.match(/^\s*>\s?(.*)$/);
-    if (quote) {
-      const quoteLines = [];
-      while (index < lines.length) {
-        const match = lines[index].match(/^\s*>\s?(.*)$/);
-        if (!match) break;
-        quoteLines.push(match[1]);
-        index += 1;
-      }
-      blocks.push({ type: "quote", tokens: parseInlineMarkdown(quoteLines.join(" ")) });
-      continue;
-    }
-
-    const paragraph = [line.trim()];
-    index += 1;
-    while (index < lines.length && lines[index].trim() && !isMarkdownBlockStart(lines[index])) {
-      paragraph.push(lines[index].trim());
-      index += 1;
-    }
-    blocks.push({ type: "paragraph", tokens: parseInlineMarkdown(paragraph.join(" ")) });
-  }
-
-  return blocks;
-}
-
-function isMarkdownBlockStart(line) {
-  return /^\s*```/.test(line) ||
-    /^\s{0,3}#{1,3}\s+/.test(line) ||
-    /^\s*(?:(?:\d+)[.)]|[-+*])\s+/.test(line) ||
-    /^\s*>/.test(line);
-}
-
-function parseInlineMarkdown(value) {
-  const tokens = [];
-  const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|\*[^*\n]+\*|\[[^\]\n]+\]\([^\s)]+\))/g;
-  let cursor = 0;
-  for (const match of value.matchAll(pattern)) {
-    if (match.index > cursor) tokens.push({ type: "text", text: value.slice(cursor, match.index) });
-    const token = match[0];
-    if (token.startsWith("`")) {
-      tokens.push({ type: "code", text: token.slice(1, -1) });
-    } else if (token.startsWith("**")) {
-      tokens.push({ type: "strong", text: token.slice(2, -2) });
-    } else if (token.startsWith("*")) {
-      tokens.push({ type: "emphasis", text: token.slice(1, -1) });
-    } else {
-      const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      const href = safeMarkdownHref(link?.[2]);
-      if (link && href) tokens.push({ type: "link", text: link[1], href });
-      else tokens.push({ type: "text", text: token });
-    }
-    cursor = match.index + token.length;
-  }
-  if (cursor < value.length) tokens.push({ type: "text", text: value.slice(cursor) });
-  return tokens.length ? tokens : [{ type: "text", text: value }];
-}
-
-function safeMarkdownHref(value) {
-  if (typeof value !== "string") return "";
-  try {
-    const url = new URL(value);
-    return ["http:", "https:", "mailto:"].includes(url.protocol) ? url.href : "";
-  } catch {
-    return "";
-  }
 }
 
 export function parseChatStreamEvent(line) {
@@ -5807,7 +7322,7 @@ function TemplatePreviewList({ title, items }) {
   );
 }
 
-function EmptyWorkspace({ error, loading, onRefresh }) {
+function EmptyWorkspace({ error, loading, onOpenSettings, onRefresh }) {
   return (
     <div className="flex flex-1 items-center justify-center p-8">
       <div className="w-full max-w-md rounded-lg border border-line bg-white p-6 text-center shadow-panel">
@@ -5820,14 +7335,24 @@ function EmptyWorkspace({ error, loading, onRefresh }) {
         <p className="mt-2 text-sm leading-6 text-muted">
           {error || "Create or save a workflow TOML file in the Taskurotta data directory."}
         </p>
-        <button
-          className="mt-5 inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"
-          type="button"
-          onClick={onRefresh}
-        >
-          <RefreshCw size={15} />
-          Refresh
-        </button>
+        <div className="mt-5 flex justify-center gap-2">
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-slate-50"
+            type="button"
+            onClick={onOpenSettings}
+          >
+            <SettingsIcon size={15} />
+            Settings
+          </button>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"
+            type="button"
+            onClick={onRefresh}
+          >
+            <RefreshCw size={15} />
+            Refresh
+          </button>
+        </div>
       </div>
     </div>
   );

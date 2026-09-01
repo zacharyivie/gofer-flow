@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -8,6 +9,38 @@ from typer.testing import CliRunner
 from gofer.cli.main import app
 
 runner = CliRunner()
+
+
+def test_distribution_packages_radish_assistant_resources() -> None:
+    repository = Path(__file__).parents[2]
+    project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+    included = project["tool"]["hatch"]["build"]["targets"]["wheel"]["force-include"]
+
+    assert included["radish/spec"] == "gofer/radish/assets/docs"
+    assert (
+        included["skills/gofer-flow-workflow-builder"]
+        == "gofer/radish/assets/assistant-skill"
+    )
+    frozen_build = (repository / "gof.spec").read_text(encoding="utf-8")
+    assert '("radish/spec", "gofer/radish/assets/docs")' in frozen_build
+    assert (
+        '("skills/gofer-flow-workflow-builder", "gofer/radish/assets/assistant-skill")'
+        in frozen_build
+    )
+
+
+def test_radish_docs_reports_installed_authoring_resources() -> None:
+    result = runner.invoke(app, ["radish", "docs", "--format", "json"])
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["ok"] is True
+    assert Path(payload["overview"]).is_file()
+    assert Path(payload["grammar"]).is_file()
+    assert Path(payload["staticSemantics"]).is_file()
+    assert Path(payload["nodeContractsGuide"]).is_file()
+    assert (Path(payload["contractsRoot"]) / "agent.json").is_file()
+    assert (Path(payload["schemasRoot"]) / "ir.schema.json").is_file()
 
 
 def _read_file_source(name: str = "CLI slice") -> str:

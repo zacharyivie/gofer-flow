@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 
 block_cipher = None
@@ -8,6 +8,14 @@ block_cipher = None
 datas = []
 datas += collect_data_files("openpyxl")
 datas += collect_data_files("tzdata")
+datas += collect_data_files("vosk")
+datas += [
+    ("radish/contracts", "gofer/radish/assets/contracts"),
+    ("radish/providers", "gofer/radish/assets/providers"),
+    ("radish/schemas", "gofer/radish/assets/schemas"),
+    ("radish/spec", "gofer/radish/assets/docs"),
+    ("skills/gofer-flow-workflow-builder", "gofer/radish/assets/assistant-skill"),
+]
 
 hiddenimports = []
 hiddenimports += collect_submodules("apscheduler")
@@ -17,11 +25,15 @@ hiddenimports += collect_submodules("pydantic")
 hiddenimports += collect_submodules("pydantic_settings")
 hiddenimports += collect_submodules("sqlalchemy")
 hiddenimports += collect_submodules("typer")
+hiddenimports += collect_submodules("vosk")
+
+binaries = []
+binaries += collect_dynamic_libs("vosk")
 
 a = Analysis(
     ["packaging/pyinstaller/gof_entry.py"],
     pathex=["src"],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -4,7 +4,7 @@ const path = require("node:path");
 const { URL, fileURLToPath, pathToFileURL } = require("node:url");
 
 const LOCAL_DEV_ORIGINS = new Set(["http://127.0.0.1:5173", "http://localhost:5173"]);
-const SAFE_EXTERNAL_SCHEMES = new Set(["https:"]);
+const SAFE_EXTERNAL_SCHEMES = new Set(["http:", "https:", "mailto:"]);
 
 function createIpcSecurity({
   appRoot,

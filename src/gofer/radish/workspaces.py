@@ -15,7 +15,6 @@ from typing import Any, cast
 from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from jsonschema.exceptions import ValidationError  # type: ignore[import-untyped]
 
-from gofer.radish.artifacts import compile_radish_file
 from gofer.radish.contracts import canonical_json_bytes
 from gofer.utils.paths import get_data_dir
 
@@ -25,6 +24,16 @@ WORKSPACE_DIRECTORY = ".taskurotta"
 WORKFLOW_ENTRYPOINT = "workflow.rad"
 WORKFLOW_METADATA = "workflow.metadata.json"
 WORKFLOW_IGNORE = ".taskurottaignore"
+DISCOVERY_IGNORED_DIRECTORIES = {
+    ".git",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "node_modules",
+    "venv",
+}
 
 DEFAULT_TASKUROTTAIGNORE = """# Sensitive local configuration
 .env
@@ -49,6 +58,7 @@ __pycache__/
 logs/
 checkpoints/
 compiled/
+agent-memory/
 """
 
 
@@ -97,6 +107,8 @@ def create_registered_workflow(
     workflow_root = project_root / WORKSPACE_DIRECTORY / workflow_id
     workspace_created = False
     try:
+        from gofer.radish.artifacts import compile_radish_file
+
         workflow_root.mkdir(parents=True, exist_ok=False)
         workspace_created = True
         entrypoint = workflow_root / WORKFLOW_ENTRYPOINT
@@ -124,6 +136,73 @@ def create_registered_workflow(
             shutil.rmtree(workflow_root, ignore_errors=True)
         raise
     return registered
+
+
+def discover_registered_workflows(
+    project_root: Path,
+    *,
+    registry_dir: Path | None = None,
+) -> tuple[RegisteredWorkflow, ...]:
+    """Find Radish workflow directories in a project and register them without rewriting files."""
+    project_root = project_root.expanduser().resolve()
+    if not project_root.is_dir():
+        raise RadishWorkspaceError(f"Project folder does not exist: {project_root}")
+
+    candidates: dict[Path, list[Path]] = {}
+    for directory, child_directories, files in os.walk(project_root):
+        child_directories[:] = sorted(
+            child
+            for child in child_directories
+            if child not in DISCOVERY_IGNORED_DIRECTORIES
+            and (not child.startswith(".") or child == WORKSPACE_DIRECTORY)
+        )
+        radish_files = sorted(
+            Path(directory, filename).resolve()
+            for filename in files
+            if filename.lower().endswith(".rad")
+        )
+        if radish_files:
+            candidates[Path(directory).resolve()] = radish_files
+
+    registry_root = (registry_dir or get_data_dir()).expanduser().resolve()
+    document = _read_registry(registry_root)
+    existing = [_registered_workflow(item) for item in document["workflows"]]
+    existing_by_root = {workflow.workflow_root.resolve(): workflow for workflow in existing}
+    discovered: list[RegisteredWorkflow] = []
+    changed = False
+
+    for workflow_root, radish_files in sorted(candidates.items(), key=lambda item: str(item[0])):
+        registered = existing_by_root.get(workflow_root)
+        if registered is not None:
+            discovered.append(registered)
+            continue
+        entrypoint = next(
+            (path for path in radish_files if path.name.lower() == WORKFLOW_ENTRYPOINT),
+            radish_files[0],
+        )
+        workflow_name = workflow_root.name or entrypoint.stem
+        workflow_id = _allocate_workflow_id(
+            _slugify(workflow_name),
+            document,
+            project_root,
+            existing_workspace=workflow_root,
+        )
+        registered = RegisteredWorkflow(
+            workflow_id=workflow_id,
+            name=workflow_name,
+            project_root=project_root,
+            workflow_root=workflow_root,
+            entrypoint=entrypoint,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        _register(document, registered)
+        existing_by_root[workflow_root] = registered
+        discovered.append(registered)
+        changed = True
+
+    if changed:
+        _write_registry(registry_root, document)
+    return tuple(discovered)
 
 
 def list_registered_workflows(
@@ -271,13 +350,20 @@ def _allocate_workflow_id(
     requested: str,
     document: dict[str, Any],
     project_root: Path,
+    *,
+    existing_workspace: Path | None = None,
 ) -> str:
     registered_ids = {str(item["id"]).lower() for item in document["workflows"]}
     workspace = project_root / WORKSPACE_DIRECTORY
     suffix = 1
     while True:
         candidate = requested if suffix == 1 else f"{requested}-{suffix}"
-        if candidate.lower() not in registered_ids and not (workspace / candidate).exists():
+        candidate_workspace = workspace / candidate
+        workspace_available = not candidate_workspace.exists() or (
+            existing_workspace is not None
+            and candidate_workspace.resolve() == existing_workspace.resolve()
+        )
+        if candidate.lower() not in registered_ids and workspace_available:
             return candidate
         suffix += 1
 

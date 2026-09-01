@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   AlertCircle,
   Bell,
@@ -6,6 +7,7 @@ import {
   CalendarDays,
   Check,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Command,
   Copy,
@@ -47,6 +49,7 @@ import {
 } from "lucide-react";
 
 import { apiUrl } from "../lib/api.js";
+import { DEFAULT_APP_SETTINGS, matchesCommand } from "../lib/settings.js";
 import { Dialog } from "./Dialog.jsx";
 import GraphOutline from "./GraphOutline.jsx";
 import {
@@ -972,19 +975,19 @@ export default function DagCanvas({
   logState,
   notice,
   radishDocument = null,
-  retentionSettings = DEFAULT_RETENTION_SETTINGS,
   readOnly = false,
   runState,
+  settings = DEFAULT_APP_SETTINGS,
   workflow,
+  toolbarTarget = null,
   onExportWorkflow,
   onImportWorkflow,
   onLoadLatestLog,
   onDecideApproval,
-  onPruneRunLogs,
   onRadishMutation,
-  onRetentionSettingsChange,
   onRunWorkflow,
   onReplayRunLog,
+  onSettingChange,
   onResumeRunLog,
   onSelectRunLog,
   onStopRunLog,
@@ -994,7 +997,9 @@ export default function DagCanvas({
   usedAgentIds = [],
 }) {
   const canvasRef = useRef(null);
+  const graphActionsRef = useRef(null);
   const importInputRef = useRef(null);
+  const deleteSelectedNodeRef = useRef(null);
   const nodeDragMovedRef = useRef(false);
   const nodeDragSelectionRef = useRef([]);
   const [selectedNodeId, setSelectedNodeId] = useState();
@@ -1002,10 +1007,8 @@ export default function DagCanvas({
   const [draggingNodeId, setDraggingNodeId] = useState(null);
   const [panningPointerId, setPanningPointerId] = useState(null);
   const [selectionBox, setSelectionBox] = useState(null);
-  const [logCollapsed, setLogCollapsed] = useState(true);
   const [inspectorCollapsed, setInspectorCollapsed] = useState(true);
-  const [inspectorWidth, setInspectorWidth] = useState(340);
-  const [logHeight, setLogHeight] = useState(240);
+  const [inspectorWidth, setInspectorWidth] = useState(settings.layout.graphInspectorWidth);
   const [expandedFolderNodes, setExpandedFolderNodes] = useState({});
   const [providerProfiles, setProviderProfiles] = useState([]);
   const {
@@ -1041,6 +1044,24 @@ export default function DagCanvas({
   const [graphFullscreen, setGraphFullscreen] = useState(false);
   const [nodeContextMenu, setNodeContextMenu] = useState(null);
   const [nodeRenameDialog, setNodeRenameDialog] = useState(null);
+  deleteSelectedNodeRef.current = deleteSelectedNode;
+
+  useEffect(() => {
+    setInspectorWidth(settings.layout.graphInspectorWidth);
+  }, [settings.layout.graphInspectorWidth]);
+
+  useEffect(() => {
+    function handlePointerDown(event) {
+      const details = graphActionsRef.current;
+      if (details?.open && !details.contains(event.target)) {
+        details.removeAttribute("open");
+      }
+    }
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, []);
+
   const invalidWorkflow = Boolean(workflow.invalid);
   const radishMode = Boolean(radishDocument);
   const editingDisabled = invalidWorkflow || readOnly;
@@ -1088,7 +1109,6 @@ export default function DagCanvas({
     logState?.selectedRunId ??
     (logState?.path ? logState.path.split(/[\\/]/).pop() : null) ??
     (runResult?.logPath ? runResult.logPath.split(/[\\/]/).pop() : null);
-  const usageSummary = logState?.usageSummary ?? runResult?.usageSummary ?? null;
   const selectedNodeOutput = selectedNodeId
     ? runResult?.nodeOutputs?.[selectedNodeId] ?? historicalNodeOutputs?.[selectedNodeId] ?? null
     : null;
@@ -1118,10 +1138,6 @@ export default function DagCanvas({
   const pendingApprovalNode = pendingApproval ? nodesById[pendingApproval.nodeId] : null;
   const workflowLogText =
     logState?.text || runResult?.logText || formatWorkflowRunLog(runResult);
-  const displayedLog = selectedNodeId
-    ? extractNodeLog(workflowLogText, selectedNodeId) || selectedNodeOutput?.output || ""
-    : workflowLogText;
-  const logTitle = selectedNodeId ? `${selectedNodeId} last run` : "Workflow log";
   const nodeStatuses = useMemo(() => {
     return getNodeStatuses(workflowNodes, runResult, workflowLogText, runNodes, runEvents);
   }, [runEvents, runNodes, runResult, workflowNodes, workflowLogText]);
@@ -1245,7 +1261,7 @@ export default function DagCanvas({
       ) {
         return;
       }
-      if (event.key === "Delete" || event.key === "Backspace") {
+      if (matchesCommand(event, settings, "graph.deleteSelection")) {
         event.preventDefault();
         deleteEdge(selectedEdgeId);
       }
@@ -1253,7 +1269,7 @@ export default function DagCanvas({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [deleteEdge, readOnly, selectedEdgeId]);
+  }, [deleteEdge, readOnly, selectedEdgeId, settings]);
 
   useEffect(() => {
     function handleKeyDown(event) {
@@ -1281,7 +1297,7 @@ export default function DagCanvas({
 
       if (editingText) return;
 
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "a") {
+      if (matchesCommand(event, settings, "graph.selectAll")) {
         event.preventDefault();
         setSelectedEdgeId(null);
         setSelectedNodeIds(workflowNodes.map((node) => node.id));
@@ -1289,7 +1305,13 @@ export default function DagCanvas({
         return;
       }
 
-      if (event.key === "+" || event.key === "=") {
+      if (matchesCommand(event, settings, "graph.deleteSelection") && selectedNodeId) {
+        event.preventDefault();
+        deleteSelectedNodeRef.current?.();
+        return;
+      }
+
+      if (matchesCommand(event, settings, "graph.zoomIn")) {
         event.preventDefault();
         setViewport((current) => {
           const rect = canvasRef.current?.getBoundingClientRect();
@@ -1307,7 +1329,7 @@ export default function DagCanvas({
         return;
       }
 
-      if (event.key === "-" || event.key === "_") {
+      if (matchesCommand(event, settings, "graph.zoomOut")) {
         event.preventDefault();
         setViewport((current) => {
           const rect = canvasRef.current?.getBoundingClientRect();
@@ -1325,7 +1347,7 @@ export default function DagCanvas({
         return;
       }
 
-      if (event.key.toLowerCase() === "f") {
+      if (matchesCommand(event, settings, "graph.fit")) {
         event.preventDefault();
         const rect = canvasRef.current?.getBoundingClientRect();
         setViewport(
@@ -1339,7 +1361,7 @@ export default function DagCanvas({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [graphFullscreen, workflowNodes, selectedNodeIds]);
+  }, [graphFullscreen, settings, workflowNodes, selectedNodeId]);
 
   useEffect(() => {
     if (panningPointerId === null) return undefined;
@@ -2350,12 +2372,14 @@ export default function DagCanvas({
     const startWidth = inspectorWidth;
     const previousCursor = document.body.style.cursor;
     const previousUserSelect = document.body.style.userSelect;
+    let nextWidth = startWidth;
 
     document.body.style.cursor = "col-resize";
     document.body.style.userSelect = "none";
 
     function handlePointerMove(moveEvent) {
-      setInspectorWidth(clamp(startWidth - (moveEvent.clientX - startX), 280, 520));
+      nextWidth = clamp(startWidth - (moveEvent.clientX - startX), 280, 520);
+      setInspectorWidth(nextWidth);
     }
 
     function handlePointerUp() {
@@ -2363,33 +2387,7 @@ export default function DagCanvas({
       document.body.style.userSelect = previousUserSelect;
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
-    }
-
-    window.addEventListener("pointermove", handlePointerMove);
-    window.addEventListener("pointerup", handlePointerUp);
-  }
-
-  function startLogResize(event) {
-    event.preventDefault();
-    event.stopPropagation();
-
-    const startY = event.clientY;
-    const startHeight = logHeight;
-    const previousCursor = document.body.style.cursor;
-    const previousUserSelect = document.body.style.userSelect;
-
-    document.body.style.cursor = "row-resize";
-    document.body.style.userSelect = "none";
-
-    function handlePointerMove(moveEvent) {
-      setLogHeight(clamp(startHeight + startY - moveEvent.clientY, 140, 420));
-    }
-
-    function handlePointerUp() {
-      document.body.style.cursor = previousCursor;
-      document.body.style.userSelect = previousUserSelect;
-      window.removeEventListener("pointermove", handlePointerMove);
-      window.removeEventListener("pointerup", handlePointerUp);
+      onSettingChange?.("layout.graphInspectorWidth", nextWidth);
     }
 
     window.addEventListener("pointermove", handlePointerMove);
@@ -2398,7 +2396,7 @@ export default function DagCanvas({
 
   function handleInspectorResizeKeyDown(event) {
     const nextWidth = resizerValueForKey(event.key, inspectorWidth, {
-      defaultValue: 340,
+      defaultValue: DEFAULT_APP_SETTINGS.layout.graphInspectorWidth,
       max: 520,
       min: 280,
       shiftKey: event.shiftKey,
@@ -2406,19 +2404,7 @@ export default function DagCanvas({
     if (nextWidth === null) return;
     event.preventDefault();
     setInspectorWidth(nextWidth);
-  }
-
-  function handleLogResizeKeyDown(event) {
-    const nextHeight = resizerValueForKey(event.key, logHeight, {
-      defaultValue: 240,
-      max: 420,
-      min: 140,
-      orientation: "horizontal",
-      shiftKey: event.shiftKey,
-    });
-    if (nextHeight === null) return;
-    event.preventDefault();
-    setLogHeight(nextHeight);
+    onSettingChange?.("layout.graphInspectorWidth", nextWidth);
   }
 
   return (
@@ -2430,10 +2416,13 @@ export default function DagCanvas({
     >
       <div className="relative flex min-h-0 flex-1">
         <div className="flex min-w-0 flex-1 flex-col">
-        <div
-          className="relative z-20 flex shrink-0 items-center gap-2 overflow-visible border-b border-line bg-white px-4 py-2"
-          data-toolbar="graph-editor"
-        >
+        <GraphToolbarPortal fullscreen={graphFullscreen} target={toolbarTarget}>
+          <div
+            className={`relative z-[60] flex shrink-0 items-center gap-2 overflow-visible ${
+              graphFullscreen ? "border-b border-line bg-white px-4 py-2" : ""
+            }`}
+            data-toolbar="graph-editor"
+          >
           <div
             className="flex min-w-0 items-center gap-2 overflow-visible"
             data-toolbar-row="primary"
@@ -2469,18 +2458,6 @@ export default function DagCanvas({
             >
               <Square size={15} fill="currentColor" strokeWidth={1.7} />
             </button>
-            <ToolbarRunSelector
-              open={runMenuOpen}
-              runs={logState?.runs ?? []}
-              selectedRunId={logState?.selectedRunId}
-              onOpenChange={setRunMenuOpen}
-              onSelectRun={onSelectRunLog}
-              onShowLatest={onLoadLatestLog}
-              onReplayRun={onReplayRunLog}
-              onResumeRun={onResumeRunLog}
-              onStopRun={onStopRunLog}
-              selectedNodeId={selectedNodeId}
-            />
             <div className="relative shrink-0">
               <button
                 className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
@@ -2507,6 +2484,7 @@ export default function DagCanvas({
               ) : null}
             </div>
           </div>
+          <span aria-hidden="true" className="h-5 w-px shrink-0 bg-line" />
           <div
             className="flex min-w-0 flex-1 items-center gap-2 overflow-visible [&>button]:shrink-0"
             data-toolbar-row="secondary"
@@ -2544,7 +2522,7 @@ export default function DagCanvas({
               <Maximize2 size={16} />
             </button>
             <button
-              className="hidden"
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
               disabled={!selectedNodeIds.length}
               title="Fit selection"
               type="button"
@@ -2569,7 +2547,7 @@ export default function DagCanvas({
               <ZoomIn size={17} />
             </button>
             <button
-              className="hidden"
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
               title="Reset view"
               type="button"
               onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
@@ -2577,8 +2555,8 @@ export default function DagCanvas({
               <LocateFixed size={17} />
             </button>
             <button
-              className="hidden"
-              disabled={invalidWorkflow || !selectedNode}
+              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
+              disabled={editingDisabled || !selectedNode}
               title="Delete selected node"
               type="button"
               onClick={deleteSelectedNode}
@@ -2602,23 +2580,38 @@ export default function DagCanvas({
             >
               <Download size={17} />
             </button>
-            <details className="group/tools relative shrink-0">
+            <details ref={graphActionsRef} className="group/tools relative shrink-0">
               <summary
                 className="grid h-8 w-8 list-none place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink [&::-webkit-details-marker]:hidden"
                 title="More graph actions"
               >
                 <MoreHorizontal size={17} />
               </summary>
-              <div className="absolute left-0 top-10 z-50 w-48 rounded-[10px] border border-line bg-white p-1 shadow-panel">
-                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50 disabled:opacity-40" disabled={!selectedNodeIds.length} type="button" onClick={fitSelection}>
-                  <LocateFixed size={14} /> Fit selection
+              <div className="absolute right-0 top-10 z-[70] w-52 rounded-[10px] border border-line bg-white p-1 shadow-panel">
+                <button
+                  className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50"
+                  type="button"
+                  onClick={() => {
+                    graphActionsRef.current?.removeAttribute("open");
+                    showWorkflowSettings();
+                  }}
+                >
+                  <Settings2 size={14} /> Workflow settings
                 </button>
-                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50" type="button" onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}>
-                  <LocateFixed size={14} /> Reset view
-                </button>
-                <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50 disabled:opacity-40" disabled={editingDisabled || !selectedNode} type="button" onClick={deleteSelectedNode}>
-                  <Trash2 size={14} /> Delete selected node
-                </button>
+                <div className="my-1 border-t border-line" role="separator" />
+                <ToolbarRunSelector
+                  menu
+                  open={runMenuOpen}
+                  runs={logState?.runs ?? []}
+                  selectedRunId={logState?.selectedRunId}
+                  onOpenChange={setRunMenuOpen}
+                  onSelectRun={onSelectRunLog}
+                  onShowLatest={onLoadLatestLog}
+                  onReplayRun={onReplayRunLog}
+                  onResumeRun={onResumeRunLog}
+                  onStopRun={onStopRunLog}
+                  selectedNodeId={selectedNodeId}
+                />
                 {!radishMode ? (
                   <>
                     <button className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50" type="button" onClick={() => importInputRef.current?.click()}>
@@ -2632,7 +2625,8 @@ export default function DagCanvas({
               </div>
             </details>
           </div>
-        </div>
+          </div>
+        </GraphToolbarPortal>
 
         <div
           ref={canvasRef}
@@ -2978,7 +2972,6 @@ export default function DagCanvas({
             onRenameNode={renameRadishNode}
             onResizeStart={startInspectorResize}
             onResizeKeyDown={handleInspectorResizeKeyDown}
-            onShowWorkflowSettings={showWorkflowSettings}
             onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
           />
         ) : !invalidWorkflow && !readOnly ? (
@@ -3009,7 +3002,6 @@ export default function DagCanvas({
             onProviderProfilesChange={setProviderProfiles}
             onProviderCapabilitiesRefresh={refreshProviderCapabilities}
             onSettingsChange={(patch) => updateNodeSettings(selectedNode.id, patch)}
-            onShowWorkflowSettings={showWorkflowSettings}
             onToggleCollapsed={() => setInspectorCollapsed((current) => !current)}
             onTypeChange={(type) => updateNodeType(selectedNode.id, type)}
             onWorkflowChange={(patch) => onWorkflowChange({ ...workflow, ...patch })}
@@ -3017,30 +3009,6 @@ export default function DagCanvas({
           />
         ) : null}
       </div>
-      <LogOverlay
-        collapsed={logCollapsed}
-        error={logState?.error}
-        height={logHeight}
-        loading={logState?.loading}
-        logPath={logState?.path}
-        runs={logState?.runs ?? []}
-        runEvents={runEvents}
-        selectedRunId={logState?.selectedRunId}
-        retentionSettings={retentionSettings}
-        text={displayedLog}
-        title={logTitle}
-        usageSummary={usageSummary}
-        onResizeStart={startLogResize}
-        onResizeKeyDown={handleLogResizeKeyDown}
-        onSelectRun={onSelectRunLog}
-        onShowLatest={onLoadLatestLog}
-        onResumeRun={onResumeRunLog}
-        onReplayRun={onReplayRunLog}
-        onPruneRuns={onPruneRunLogs}
-        onRetentionSettingsChange={onRetentionSettingsChange}
-        onStopRun={onStopRunLog}
-        onToggle={() => setLogCollapsed((current) => !current)}
-      />
       {filePreviewPath ? (
         <TextFileDialog
           mode="preview"
@@ -3050,6 +3018,11 @@ export default function DagCanvas({
       ) : null}
     </div>
   );
+}
+
+function GraphToolbarPortal({ children, fullscreen, target }) {
+  if (fullscreen || !target) return children;
+  return createPortal(children, target);
 }
 
 function InvalidWorkflowCanvas({ workflow }) {
@@ -3286,34 +3259,6 @@ function GraphMinimap({
   );
 }
 
-function extractNodeLog(logText, nodeId) {
-  if (!logText || !nodeId) return "";
-  const lines = logText.split("\n");
-  const nodePrefix = ` - NODE - ${nodeId} - `;
-  const timestampPattern = /^\d{4}-\d{2}-\d{2}T/;
-  const selectedLines = [];
-  let includeContinuation = false;
-
-  for (const line of lines) {
-    if (line.includes(nodePrefix)) {
-      selectedLines.push(line);
-      includeContinuation = true;
-      continue;
-    }
-
-    if (timestampPattern.test(line)) {
-      includeContinuation = false;
-      continue;
-    }
-
-    if (includeContinuation) {
-      selectedLines.push(line);
-    }
-  }
-
-  return selectedLines.join("\n").trim();
-}
-
 function formatWorkflowRunLog(result) {
   if (!result) return "";
 
@@ -3423,6 +3368,7 @@ function getNodeStatusFromLog(logText, nodeId) {
 }
 
 function ToolbarRunSelector({
+  menu = false,
   onOpenChange,
   onReplayRun,
   onResumeRun,
@@ -3456,21 +3402,31 @@ function ToolbarRunSelector({
   return (
     <div ref={menuRef} className="relative shrink-0">
       <button
-        className={`flex h-8 max-w-[10rem] items-center gap-2 rounded-lg border px-2 text-xs font-medium transition ${
-          open
-            ? "border-slate-300 bg-white text-ink"
-            : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+        className={`${
+          menu
+            ? "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-xs text-ink hover:bg-slate-50"
+            : `flex h-8 max-w-[10rem] items-center gap-2 rounded-lg border px-2 text-xs font-medium transition ${
+                open
+                  ? "border-slate-300 bg-white text-ink"
+                  : "border-line bg-white text-muted hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+              }`
         }`}
         title="Select workflow run"
         type="button"
         onClick={() => onOpenChange(!open)}
       >
         <RunStatusDot status={status} />
-        <span className="max-w-[112px] truncate">{label}</span>
-        <ChevronDown size={14} className="shrink-0" />
+        <span className={`${menu ? "min-w-0 flex-1 text-left" : "max-w-[112px]"} truncate`}>
+          {label}
+        </span>
+        {menu ? (
+          <ChevronRight size={14} className="shrink-0 text-muted" />
+        ) : (
+          <ChevronDown size={14} className="shrink-0" />
+        )}
       </button>
       {open ? (
-        <div className="absolute left-0 top-9 z-50 w-[300px] overflow-hidden rounded-lg border border-line bg-white shadow-panel">
+        <div className={`absolute z-[80] w-[300px] overflow-hidden rounded-lg border border-line bg-white shadow-panel ${menu ? "right-full top-0 mr-1" : "left-0 top-9"}`}>
           <div className="flex items-center justify-between gap-2 border-b border-line px-3 py-2">
             <span className="truncate text-xs font-semibold text-ink">
               {selectedRun ? formatRunLabel(selectedRun) : "Latest run"}
@@ -3554,8 +3510,9 @@ function ToolbarRunSelector({
   );
 }
 
-function LogOverlay({
+export function RunTimelinePanel({
   collapsed,
+  embedded = false,
   error,
   height,
   loading,
@@ -3580,6 +3537,10 @@ function LogOverlay({
 }) {
   const [historyOpen, setHistoryOpen] = useState(false);
   const [retentionOpen, setRetentionOpen] = useState(false);
+  const [retentionDraft, setRetentionDraft] = useState(() => ({
+    ...DEFAULT_RETENTION_SETTINGS,
+    ...(retentionSettings ?? {}),
+  }));
   const [expandedRowIds, setExpandedRowIds] = useState({});
   const [filters, setFilters] = useState({
     attempt: "",
@@ -3602,16 +3563,15 @@ function LogOverlay({
     () => (timelineRows.length ? timelineRows : parseLogRows(displayText)),
     [displayText, timelineRows],
   );
-  const resolvedRetentionSettings = {
-    ...DEFAULT_RETENTION_SETTINGS,
-    ...(retentionSettings ?? {}),
-  };
+  const resolvedRetentionSettings = retentionDraft;
   const updateRetentionSetting = (key, value) => {
     const parsed = Number.parseInt(value, 10);
-    onRetentionSettingsChange?.({
+    const nextSettings = {
       ...resolvedRetentionSettings,
       [key]: Number.isNaN(parsed) ? 0 : Math.max(0, parsed),
-    });
+    };
+    setRetentionDraft(nextSettings);
+    onRetentionSettingsChange?.(nextSettings);
   };
   const pruneWithRetention = (dryRun) => {
     setRetentionOpen(false);
@@ -3647,6 +3607,13 @@ function LogOverlay({
   }, [displayText]);
 
   useEffect(() => {
+    setRetentionDraft({
+      ...DEFAULT_RETENTION_SETTINGS,
+      ...(retentionSettings ?? {}),
+    });
+  }, [retentionSettings]);
+
+  useEffect(() => {
     if (!historyOpen) return undefined;
 
     function handlePointerDown(event) {
@@ -3660,10 +3627,12 @@ function LogOverlay({
 
   return (
     <section
-      className="relative z-30 shrink-0 overflow-hidden border-t border-line bg-white text-ink shadow-[0_-12px_30px_rgba(15,23,42,0.08)] transition-[height]"
-      style={{ height: collapsed ? 44 : height }}
+      className={embedded
+        ? "flex h-full min-h-0 flex-col overflow-hidden bg-white text-ink"
+        : "relative z-30 shrink-0 overflow-hidden border-t border-line bg-white text-ink shadow-[0_-12px_30px_rgba(15,23,42,0.08)] transition-[height]"}
+      style={embedded ? undefined : { height: collapsed ? 44 : height }}
     >
-      {!collapsed ? (
+      {!embedded && !collapsed ? (
         <div
           aria-label="Resize workflow log"
           aria-orientation="horizontal"
@@ -3680,12 +3649,13 @@ function LogOverlay({
         />
       ) : null}
       <div
-        className="flex h-11 w-full items-center justify-between border-b border-line bg-[#f9fbfd] px-4 text-left transition hover:bg-slate-50"
-        role="button"
-        tabIndex={0}
-        title={collapsed ? "Expand log" : "Collapse log"}
-        onClick={onToggle}
+        className="flex h-11 w-full shrink-0 items-center justify-between border-b border-line bg-[#f9fbfd] px-4 text-left"
+        role={embedded ? undefined : "button"}
+        tabIndex={embedded ? undefined : 0}
+        title={embedded ? undefined : collapsed ? "Expand log" : "Collapse log"}
+        onClick={embedded ? undefined : onToggle}
         onKeyDown={(event) => {
+          if (embedded) return;
           if (event.key === "Enter" || event.key === " ") {
             event.preventDefault();
             onToggle();
@@ -3702,7 +3672,7 @@ function LogOverlay({
           </div>
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {!collapsed ? (
+          {!collapsed || embedded ? (
             <div
               ref={historyRef}
               className="relative flex items-center gap-1"
@@ -3876,14 +3846,16 @@ function LogOverlay({
               </div>
             </div>
           ) : null}
-          <span className="grid h-8 w-8 place-items-center rounded-md text-muted">
-            {collapsed ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
-          </span>
+          {!embedded ? (
+            <span className="grid h-8 w-8 place-items-center rounded-md text-muted">
+              {collapsed ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+            </span>
+          ) : null}
         </div>
       </div>
       <div
-        className="workflow-scrollbar overflow-auto bg-white dark:bg-[#1e1e1e]"
-        style={{ height: Math.max(0, height - 44) }}
+        className={`workflow-scrollbar overflow-auto bg-white dark:bg-[#1e1e1e] ${embedded ? "min-h-0 flex-1" : ""}`}
+        style={embedded ? undefined : { height: Math.max(0, height - 44) }}
       >
         <UsageSummaryStrip summary={usageSummary} />
         <table className="w-full table-fixed border-collapse text-left text-xs">
@@ -4945,7 +4917,6 @@ function RadishInspector({
   onRenameNode,
   onResizeKeyDown,
   onResizeStart,
-  onShowWorkflowSettings,
   onToggleCollapsed,
   runEvents = [],
   width,
@@ -5004,16 +4975,6 @@ function RadishInspector({
           onKeyDown={onResizeKeyDown}
           onPointerDown={onResizeStart}
         />
-      ) : null}
-      {collapsed ? (
-        <button
-          className="absolute left-[-140px] top-3 z-40 flex h-8 w-[132px] items-center justify-center gap-1.5 rounded-[10px] border border-line bg-white px-2 text-xs font-semibold text-muted shadow-panel transition hover:border-slate-300 hover:text-ink"
-          title="Show workflow settings"
-          type="button"
-          onClick={onShowWorkflowSettings}
-        >
-          <Settings2 size={14} /> Workflow settings
-        </button>
       ) : null}
       <div
         className={`flex h-full min-h-0 flex-col overflow-hidden transition-opacity duration-200 ${
@@ -5531,7 +5492,6 @@ function Inspector({
   onResizeStart,
   onResizeKeyDown,
   onSettingsChange,
-  onShowWorkflowSettings,
   onToggleCollapsed,
   onTypeChange,
   onWorkflowChange,
@@ -5745,27 +5705,15 @@ function Inspector({
           onPointerDown={onResizeStart}
         />
       ) : null}
-      {collapsed || edge ? (
-      <button
-        className={`absolute z-40 flex items-center justify-center border border-line bg-white text-muted shadow-panel transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink ${
-          collapsed
-            ? "left-[-140px] top-3 h-8 w-[132px] gap-1.5 rounded-[10px] px-2 text-xs font-semibold"
-            : "left-[-40px] top-3 h-8 w-8 rounded-[10px]"
-        }`}
-        title={
-          collapsed
-            ? "Show workflow settings and node inspector"
-            : "Hide workflow settings and node inspector"
-        }
-        type="button"
-        onClick={collapsed ? onShowWorkflowSettings : onToggleCollapsed}
-      >
-        {collapsed ? (
-          <><Settings2 size={14} /><span>Workflow settings</span></>
-        ) : (
+      {!collapsed && edge ? (
+        <button
+          className="absolute left-[-40px] top-3 z-40 flex h-8 w-8 items-center justify-center rounded-[10px] border border-line bg-white text-muted shadow-panel transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
+          title="Hide workflow settings and node inspector"
+          type="button"
+          onClick={onToggleCollapsed}
+        >
           <X size={15} />
-        )}
-      </button>
+        </button>
       ) : null}
 
       <div

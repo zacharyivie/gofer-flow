@@ -7,6 +7,7 @@ import html
 import json
 import os
 import secrets
+import shutil
 import signal
 import sys
 import tempfile
@@ -63,6 +64,7 @@ from gofer.ui.api import (
     list_workflow_run_logs_payload,
     list_workflow_templates_payload,
     mutate_radish_document_payload,
+    open_project_payload,
     open_radish_document_payload,
     preview_workflow_bundle_payload,
     provider_profiles_payload,
@@ -91,11 +93,27 @@ from gofer.ui.api import (
     workflow_template_payload,
 )
 from gofer.ui.chat import (
+    ChatChangeError,
     ChatProviderError,
     ensure_local_gofer_cli,
     provider_payload,
+    redo_chat_changes,
     run_workflow_chat,
     stream_workflow_chat,
+    undo_chat_changes,
+)
+from gofer.ui.chat_media import (
+    CHAT_ATTACHMENT_MAX_TOTAL_BYTES,
+    CHAT_AUDIO_CHUNK_MAX_BYTES,
+    CHAT_AUDIO_MAX_BYTES,
+    ChatMediaError,
+    attachment_thread_dir,
+    cancel_chat_transcription,
+    finish_chat_transcription,
+    start_chat_transcription,
+    store_chat_attachments,
+    stream_chat_transcription,
+    transcribe_chat_audio,
 )
 from gofer.utils.logging import get_logger
 from gofer.utils.paths import get_data_dir
@@ -652,6 +670,33 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             return
         if not self._authorize_ui_request("POST", parsed.path):
             return
+        if parsed.path == "/api/projects/open":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                project_root_value = str(body.get("projectRoot", "")).strip()
+                if not project_root_value:
+                    raise WorkflowCreateError("Project folder is required")
+                project_root = Path(project_root_value).expanduser()
+                try:
+                    self._assert_bundle_path_allowed(
+                        project_root,
+                        body.get("projectGrantId"),
+                        must_exist=True,
+                    )
+                except WorkflowBundleError as exc:
+                    raise WorkflowCreateError(str(exc)) from exc
+                payload = open_project_payload(
+                    project_root,
+                    registry_dir=self._request_data_dir(query),
+                )
+            except (WorkflowCreateError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._sync_schedules()
+            self._send_json(payload)
+            return
+
         if parsed.path == "/api/retention":
             query = parse_qs(parsed.query)
             try:
@@ -895,6 +940,116 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
 
             self._sync_schedules()
             self._send_json({"workflow": workflow}, status=201)
+            return
+
+        if parsed.path == "/api/chat/attachments":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json(limit=CHAT_ATTACHMENT_MAX_TOTAL_BYTES * 2)
+                payload = store_chat_attachments(body, self._request_data_dir(query))
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload, status=201)
+            return
+
+        if parsed.path == "/api/chat/transcribe":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json(limit=CHAT_AUDIO_MAX_BYTES * 2)
+                payload = transcribe_chat_audio(
+                    body,
+                    data_dir=self._request_data_dir(query),
+                )
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Workflow assistant transcription failed")
+                self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/chat/transcribe/start":
+            query = parse_qs(parsed.query)
+            try:
+                self._read_json()
+                payload = start_chat_transcription(data_dir=self._request_data_dir(query))
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Workflow assistant transcription session failed to start")
+                self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
+                return
+            self._send_json(payload, status=201)
+            return
+
+        if parsed.path == "/api/chat/transcribe/chunk":
+            try:
+                body = self._read_json(limit=CHAT_AUDIO_CHUNK_MAX_BYTES * 2)
+                payload = stream_chat_transcription(body)
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Workflow assistant transcription chunk failed")
+                self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/chat/transcribe/finish":
+            try:
+                payload = finish_chat_transcription(self._read_json())
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Workflow assistant transcription finalization failed")
+                self._send_json({"error": f"Transcription failed: {exc}"}, status=502)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/chat/transcribe/cancel":
+            try:
+                payload = cancel_chat_transcription(self._read_json())
+            except (ChatMediaError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/chat/changes/undo":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = undo_chat_changes(
+                    str(body.get("changeSetId") or ""),
+                    self._request_data_dir(query),
+                )
+            except (ChatChangeError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._sync_schedules()
+            self._send_json(payload)
+            return
+
+        if parsed.path == "/api/chat/changes/redo":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                payload = redo_chat_changes(
+                    str(body.get("changeSetId") or ""),
+                    self._request_data_dir(query),
+                )
+            except (ChatChangeError, json.JSONDecodeError) as exc:
+                self._send_json({"error": str(exc)}, status=409)
+                return
+            self._sync_schedules()
+            self._send_json(payload)
             return
 
         if parsed.path == "/api/chat/stream":
@@ -1420,6 +1575,10 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             except WorkflowUpdateError as exc:
                 self._send_json({"error": str(exc)}, status=400)
                 return
+            shutil.rmtree(
+                attachment_thread_dir(self._request_data_dir(query), thread_id),
+                ignore_errors=True,
+            )
             self._send_json(payload)
             return
 
@@ -1591,8 +1750,8 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
             "path": str(_canonical_path_for_containment(Path(target_path))),
         }
 
-    def _read_json(self) -> dict[str, Any]:
-        limit = self._resource_limits().max_api_request_body_bytes
+    def _read_json(self, *, limit: int | None = None) -> dict[str, Any]:
+        limit = limit or self._resource_limits().max_api_request_body_bytes
         content_length_header = self.headers.get("Content-Length")
         if content_length_header is None:
             raise json.JSONDecodeError("Content-Length is required", "", 0)

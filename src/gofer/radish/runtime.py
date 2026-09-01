@@ -61,6 +61,7 @@ from gofer.radish.provider_runtime import (
     default_provider_subscriptions,
     runtime_subscription_id,
 )
+from gofer.radish.storage import migrate_legacy_directory, workflow_owned_directory
 from gofer.subscriptions.base import Subscription
 from gofer.utils.paths import get_data_dir
 from gofer.utils.process import run_subprocess
@@ -751,7 +752,17 @@ async def _structured_agent_output(
 def _agent_memory_path(node_id: str, context: RuntimeContext) -> Path:
     safe_workflow = re.sub(r"[^a-zA-Z0-9_.-]+", "-", context.workflow_id)
     safe_node = re.sub(r"[^a-zA-Z0-9_.-]+", "-", node_id)
-    return context.data_dir / "radish" / "agent-memory" / safe_workflow / f"{safe_node}.json"
+    legacy_directory = context.data_dir / "radish" / "agent-memory" / safe_workflow
+    memory_directory = workflow_owned_directory(
+        context.workflow_id,
+        context.data_dir,
+        "agent-memory",
+    )
+    if memory_directory is None:
+        memory_directory = legacy_directory
+    else:
+        migrate_legacy_directory(legacy_directory, memory_directory)
+    return memory_directory / f"{safe_node}.json"
 
 
 def _load_agent_memory(node_id: str, mode: str, context: RuntimeContext) -> list[dict[str, str]]:

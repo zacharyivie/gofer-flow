@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import socket
 import threading
@@ -1110,6 +1111,10 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
         calls["create"] = (name, project_root, registry_dir)
         return {"id": "created"}
 
+    def fake_open_project(project_root, *, registry_dir):
+        calls["open_project"] = (project_root, registry_dir)
+        return {"projectRoot": str(project_root), "workflows": [{"id": "existing"}]}
+
     def fake_import(content, data_dir):
         calls["import"] = (content, data_dir)
         return {"id": "imported"}
@@ -1123,6 +1128,7 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
         return {"id": "copy"}
 
     monkeypatch.setattr(server_module, "create_registered_workflow_payload", fake_create)
+    monkeypatch.setattr(server_module, "open_project_payload", fake_open_project)
     monkeypatch.setattr(server_module, "import_workflow_payload", fake_import)
     monkeypatch.setattr(server_module, "rename_workflow_payload", fake_rename)
     monkeypatch.setattr(server_module, "duplicate_workflow_payload", fake_duplicate)
@@ -1135,6 +1141,12 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
         "/api/workflows",
         body={"name": "Created", "projectRoot": str(project_root)},
     )
+    open_project = _request(
+        tmp_path,
+        "POST",
+        "/api/projects/open",
+        body={"projectRoot": str(project_root)},
+    )
     imported = _request(tmp_path, "POST", "/api/workflows/import", body={"content": "toml"})
     renamed = _request(tmp_path, "POST", "/api/workflows/wf/rename", body={"name": "Renamed"})
     duplicate = _request(tmp_path, "POST", "/api/workflows/wf/duplicate", body={"name": "Copy"})
@@ -1142,6 +1154,12 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
     assert create.status == 201
     assert create.json() == {"workflow": {"id": "created"}}
     assert create.server.sync_calls == 1
+    assert open_project.status == 200
+    assert open_project.json() == {
+        "projectRoot": str(project_root),
+        "workflows": [{"id": "existing"}],
+    }
+    assert open_project.server.sync_calls == 1
     assert imported.status == 201
     assert renamed.status == 200
     assert renamed.server.sync_calls == 1
@@ -1149,6 +1167,7 @@ def test_ui_server_post_workflow_routes_and_syncs(monkeypatch, tmp_path) -> None
     assert duplicate.status == 201
     assert calls == {
         "create": ("Created", project_root, tmp_path),
+        "open_project": (project_root, tmp_path),
         "import": ("toml", tmp_path),
         "rename": ("wf", "Renamed", tmp_path),
         "duplicate": ("wf", "Copy", tmp_path),
@@ -1422,9 +1441,39 @@ def test_ui_server_chat_routes_and_stream_headers(monkeypatch, tmp_path) -> None
 
     monkeypatch.setattr(server_module, "run_workflow_chat", fake_chat)
     monkeypatch.setattr(server_module, "stream_workflow_chat", fake_stream)
+    monkeypatch.setattr(
+        server_module,
+        "undo_chat_changes",
+        lambda change_set_id, data_dir: {
+            "id": change_set_id,
+            "undone": True,
+            "dataDir": str(data_dir),
+        },
+    )
+    monkeypatch.setattr(
+        server_module,
+        "redo_chat_changes",
+        lambda change_set_id, data_dir: {
+            "id": change_set_id,
+            "undone": False,
+            "dataDir": str(data_dir),
+        },
+    )
 
     chat = _request(tmp_path, "POST", "/api/chat", body={"provider": "codex", "messages": []})
     stream = _request(tmp_path, "POST", "/api/chat/stream", body={"messages": []})
+    undo = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/changes/undo",
+        body={"changeSetId": "change-1"},
+    )
+    redo = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/changes/redo",
+        body={"changeSetId": "change-1"},
+    )
 
     assert chat.status == 200
     assert chat.json() == {"reply": "ok", "provider": "codex"}
@@ -1435,6 +1484,105 @@ def test_ui_server_chat_routes_and_stream_headers(monkeypatch, tmp_path) -> None
         '{"type": "message", "body": "one"}',
         '{"type": "done"}',
     ]
+    assert undo.status == 200
+    assert undo.json() == {"id": "change-1", "undone": True, "dataDir": str(tmp_path)}
+    assert redo.status == 200
+    assert redo.json() == {"id": "change-1", "undone": False, "dataDir": str(tmp_path)}
+
+
+def test_ui_server_uploads_binary_chat_attachments_and_transcribes_audio(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    def fake_transcribe(body, *, data_dir):
+        assert base64.b64decode(body["data"]) == b"recording"
+        assert data_dir == tmp_path
+        return {"text": "transcribed message"}
+
+    monkeypatch.setattr(server_module, "transcribe_chat_audio", fake_transcribe)
+    attachment = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/attachments",
+        body={
+            "threadId": "thread-1",
+            "files": [
+                {
+                    "name": "screen.png",
+                    "type": "image/png",
+                    "data": base64.b64encode(b"\x89PNG\x00binary").decode(),
+                }
+            ],
+        },
+    )
+    transcription = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/transcribe",
+        body={"data": base64.b64encode(b"recording").decode()},
+    )
+
+    assert attachment.status == 201
+    attachment_payload = cast(dict[str, Any], attachment.json())
+    stored = cast(dict[str, Any], attachment_payload["attachments"][0])
+    assert stored["name"] == "screen.png"
+    assert stored["type"] == "image/png"
+    path = tmp_path / "chat-attachments" / "thread-1" / stored["storageName"]
+    assert path.read_bytes() == b"\x89PNG\x00binary"
+    assert transcription.status == 200
+    assert transcription.json() == {"text": "transcribed message"}
+
+
+def test_ui_server_streams_local_transcription_sessions(monkeypatch, tmp_path) -> None:
+    session_id = "a" * 32
+
+    def fake_start(*, data_dir):
+        assert data_dir == tmp_path
+        return {"sessionId": session_id}
+
+    def fake_chunk(body):
+        assert body["sessionId"] == session_id
+        assert base64.b64decode(body["data"]) == b"\x01\x00"
+        return {"text": "words as"}
+
+    def fake_finish(body):
+        assert body == {"sessionId": session_id}
+        return {"text": "words as spoken"}
+
+    def fake_cancel(body):
+        assert body == {"sessionId": session_id}
+        return {"cancelled": True}
+
+    monkeypatch.setattr(server_module, "start_chat_transcription", fake_start)
+    monkeypatch.setattr(server_module, "stream_chat_transcription", fake_chunk)
+    monkeypatch.setattr(server_module, "finish_chat_transcription", fake_finish)
+    monkeypatch.setattr(server_module, "cancel_chat_transcription", fake_cancel)
+
+    started = _request(tmp_path, "POST", "/api/chat/transcribe/start", body={})
+    chunked = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/transcribe/chunk",
+        body={"data": base64.b64encode(b"\x01\x00").decode(), "sessionId": session_id},
+    )
+    finished = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/transcribe/finish",
+        body={"sessionId": session_id},
+    )
+    cancelled = _request(
+        tmp_path,
+        "POST",
+        "/api/chat/transcribe/cancel",
+        body={"sessionId": session_id},
+    )
+
+    assert started.status == 201
+    assert started.json() == {"sessionId": session_id}
+    assert chunked.json() == {"text": "words as"}
+    assert finished.json() == {"text": "words as spoken"}
+    assert cancelled.json() == {"cancelled": True}
 
 
 def test_ui_server_chat_stream_provider_error_is_ndjson(monkeypatch, tmp_path) -> None:

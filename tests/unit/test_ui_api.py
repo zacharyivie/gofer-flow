@@ -36,6 +36,7 @@ from gofer.ui.api import (
     list_workflow_payloads,
     list_workflow_run_logs_payload,
     mutate_radish_document_payload,
+    open_project_payload,
     open_radish_document_payload,
     prune_workflow_run_logs_payload,
     queue_workflow_run_payload,
@@ -125,6 +126,25 @@ def test_ui_creation_registers_radish_workflow_under_selected_project(tmp_path: 
     assert created["sourcePath"] == str(project / ".taskurotta" / "review-pr" / "workflow.rad")
     assert created["sourceFormat"] == "radish"
     assert [workflow["id"] for workflow in listed["workflows"]] == ["review-pr"]
+
+
+def test_open_project_payload_discovers_existing_radish_workflows(tmp_path: Path) -> None:
+    app_data = tmp_path / "app-data"
+    project = tmp_path / "project"
+    workflow_root = project / ".taskurotta" / "existing"
+    workflow_root.mkdir(parents=True)
+    source_path = workflow_root / "workflow.rad"
+    source_path.write_text(
+        'Radish: 1\n\nWorkflow:\n  name: "Existing"\n',
+        encoding="utf-8",
+    )
+
+    payload = open_project_payload(project, registry_dir=app_data)
+
+    assert payload["projectRoot"] == str(project)
+    assert [(workflow["id"], workflow["sourcePath"]) for workflow in payload["workflows"]] == [
+        ("existing", str(source_path)),
+    ]
 
 
 def test_radish_document_api_analyzes_and_saves_with_revisions(tmp_path: Path) -> None:

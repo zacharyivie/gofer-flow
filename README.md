@@ -165,8 +165,8 @@ Many commands also include a hidden `--data-dir` option used by tests and automa
 
 ## License
 
-Taskurotta is licensed under the Apache License, Version 2.0. See `LICENSE`
-and `NOTICE` for details.
+Taskurotta is licensed under the GNU Affero General Public License, version 3.0
+only. See `LICENSE` for the full terms.
 
 ## Workflow Commands
 

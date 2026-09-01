@@ -16,11 +16,20 @@ const require = createRequire(import.meta.url);
 let viteServer;
 let apiUrl;
 let appModule;
+let crashBoundaryModule;
+let bottomPanelModule;
 let canvasModule;
+let codeFileExplorerModule;
 let codeWorkspaceModule;
 let dialogModule;
+let integratedBrowserModule;
+let markdownContentModule;
 let radishEditorModule;
 let radishRangesModule;
+let settingsModule;
+let settingsPopoverModule;
+let chatAttachmentsModule;
+let chatComposerModule;
 
 before(async () => {
   viteServer = await createServer({
@@ -39,11 +48,20 @@ before(async () => {
   });
   ({ apiUrl } = await viteServer.ssrLoadModule("/src/lib/api.js"));
   appModule = await viteServer.ssrLoadModule("/src/pages/App.jsx");
+  crashBoundaryModule = await viteServer.ssrLoadModule("/src/components/AppCrashBoundary.jsx");
+  bottomPanelModule = await viteServer.ssrLoadModule("/src/components/UnifiedBottomPanel.jsx");
   canvasModule = await viteServer.ssrLoadModule("/src/components/DagCanvas.jsx");
+  codeFileExplorerModule = await viteServer.ssrLoadModule("/src/components/CodeFileExplorer.jsx");
   codeWorkspaceModule = await viteServer.ssrLoadModule("/src/components/CodeWorkspace.jsx");
   dialogModule = await viteServer.ssrLoadModule("/src/components/Dialog.jsx");
+  integratedBrowserModule = await viteServer.ssrLoadModule("/src/components/IntegratedBrowser.jsx");
+  markdownContentModule = await viteServer.ssrLoadModule("/src/components/MarkdownContent.jsx");
   radishEditorModule = await viteServer.ssrLoadModule("/src/components/RadishEditor.jsx");
   radishRangesModule = await viteServer.ssrLoadModule("/src/lib/radishRanges.js");
+  settingsModule = await viteServer.ssrLoadModule("/src/lib/settings.js");
+  settingsPopoverModule = await viteServer.ssrLoadModule("/src/components/SettingsPopover.jsx");
+  chatAttachmentsModule = await viteServer.ssrLoadModule("/src/lib/chatAttachments.js");
+  chatComposerModule = await viteServer.ssrLoadModule("/src/components/ChatComposer.jsx");
 });
 
 after(async () => {
@@ -59,6 +77,488 @@ beforeEach(() => {
       removeItem: () => {},
     },
   };
+});
+
+test("app settings normalize persisted values and preserve configurable command bindings", () => {
+  const stored = new Map([
+    [settingsModule.SETTINGS_STORAGE_KEY, JSON.stringify({
+      appearance: { theme: "dark" },
+      devices: { audioInputId: "usb-microphone" },
+      editor: { fontSize: 200, tabSize: 4 },
+      general: { autosave: false },
+      keybindings: { "file.save": "Mod+Shift+KeyS" },
+      layout: { workflowPaneWidth: 100 },
+    })],
+  ]);
+  const storage = {
+    getItem: (key) => stored.get(key) ?? null,
+    setItem: (key, value) => stored.set(key, value),
+  };
+
+  const settings = settingsModule.loadAppSettings(storage);
+  assert.equal(settings.appearance.theme, "dark");
+  assert.equal(settings.devices.audioInputId, "usb-microphone");
+  assert.equal(settings.editor.fontSize, 24);
+  assert.equal(settings.editor.tabSize, 4);
+  assert.equal(settings.general.autosave, false);
+  assert.equal(settings.layout.workflowPaneWidth, 240);
+  assert.equal(settings.keybindings["file.save"], "Mod+Shift+KeyS");
+  assert.equal(settings.keybindings["settings.open"], "Mod+Comma");
+  assert.equal(settings.keybindings["file.open"], "Mod+KeyO");
+  assert.equal(settings.keybindings["project.open"], "Mod+KeyK Mod+KeyO");
+  assert.equal(settings.keybindings["view.toggleProjectPane"], "Ctrl+KeyB");
+  assert.equal(settings.keybindings["view.toggleAssistantPane"], "Ctrl+KeyL");
+  assert.equal(
+    settingsModule.formatKeybinding(settings.keybindings["project.open"], "Linux"),
+    "Ctrl+K, Ctrl+O",
+  );
+
+  const updated = settingsModule.updateSetting(settings, "keybindings.file.save", "Alt+KeyS");
+  settingsModule.saveAppSettings(updated, storage);
+  assert.equal(
+    JSON.parse(stored.get(settingsModule.SETTINGS_STORAGE_KEY)).keybindings["file.save"],
+    "Alt+KeyS",
+  );
+});
+
+test("configurable shortcuts distinguish Mod from Ctrl and accept platform delete keys", () => {
+  const event = (key, extras = {}) => ({
+    altKey: false,
+    ctrlKey: false,
+    key,
+    metaKey: false,
+    repeat: false,
+    shiftKey: false,
+    ...extras,
+  });
+  const settings = settingsModule.updateSetting(
+    settingsModule.DEFAULT_APP_SETTINGS,
+    "keybindings.file.save",
+    "Alt+KeyS",
+  );
+
+  assert.equal(settingsModule.matchesCommand(event("s", { altKey: true }), settings, "file.save"), true);
+  assert.equal(settingsModule.matchesCommand(event("s", { ctrlKey: true }), settings, "file.save"), false);
+  assert.equal(settingsModule.matchesKeybinding(event("t", { ctrlKey: true }), "Ctrl+KeyT", "Linux"), true);
+  assert.equal(settingsModule.matchesCommand(event("b", { ctrlKey: true }), settings, "view.toggleProjectPane"), true);
+  assert.equal(settingsModule.matchesCommand(event("l", { ctrlKey: true }), settings, "view.toggleAssistantPane"), true);
+  assert.equal(settingsModule.matchesKeybinding(event("t", { metaKey: true }), "Mod+KeyT", "MacIntel"), true);
+  assert.equal(settingsModule.matchesKeybinding(event("Backspace"), "Delete", "MacIntel"), true);
+
+  const conflicted = settingsModule.updateSetting(
+    settingsModule.DEFAULT_APP_SETTINGS,
+    "keybindings.view.code",
+    "Mod+Digit1",
+  );
+  assert.deepEqual(
+    settingsModule.keybindingConflictIds(conflicted, "view.code"),
+    ["view.graph"],
+  );
+});
+
+test("settings dropdown exposes useful app categories and searchable commands", () => {
+  const markup = renderToStaticMarkup(React.createElement(settingsPopoverModule.default, {
+    onChange() {},
+    onClose() {},
+    onResetAll() {},
+    open: true,
+    settings: settingsModule.DEFAULT_APP_SETTINGS,
+  }));
+
+  assert.match(markup, /Application settings/);
+  assert.match(markup, /Saved on this device/);
+  assert.match(markup, /General/);
+  assert.match(markup, /Devices/);
+  assert.match(markup, /Keybindings/);
+  assert.match(markup, /Default editor/);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("autosave"), ["general", "editor"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("open browser"), ["keybindings"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("toggle project pane"), ["keybindings"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("toggle workflow assistant"), ["keybindings"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("data directory"), ["general"]);
+  assert.deepEqual(settingsPopoverModule.settingsCategoriesForQuery("microphone"), ["devices"]);
+});
+
+test("studio session persists the selected project, workflow, and editor", () => {
+  const stored = new Map();
+  const storage = {
+    getItem: (key) => stored.get(key) ?? null,
+    setItem: (key, value) => stored.set(key, value),
+  };
+
+  const saved = appModule.saveStudioSession({
+    projectRoot: " /projects/gofer-flow ",
+    view: "code",
+    workflowId: "testing",
+  }, storage);
+
+  assert.deepEqual(saved, {
+    projectRoot: "/projects/gofer-flow",
+    view: "code",
+    workflowId: "testing",
+  });
+  assert.deepEqual(appModule.loadStudioSession(storage), saved);
+
+  stored.set(appModule.STUDIO_SESSION_STORAGE_KEY, JSON.stringify({
+    projectRoot: 42,
+    view: "invalid",
+    workflowId: null,
+  }));
+  assert.deepEqual(appModule.loadStudioSession(storage), {
+    projectRoot: "",
+    view: "",
+    workflowId: "",
+  });
+});
+
+test("device settings select and test a microphone with a live input meter", async () => {
+  let requestedConstraints;
+  let stopped = false;
+  class FakeAudioContext {
+    async resume() {}
+    async close() {}
+    createMediaStreamSource() {
+      return { connect() {}, disconnect() {} };
+    }
+    createAnalyser() {
+      return {
+        fftSize: 0,
+        getByteTimeDomainData(samples) {
+          samples.fill(160);
+        },
+      };
+    }
+  }
+  function SettingsHarness() {
+    const [settings, setSettings] = React.useState(settingsModule.DEFAULT_APP_SETTINGS);
+    return React.createElement(settingsPopoverModule.default, {
+      onChange: (path, value) => setSettings((current) => (
+        settingsModule.updateSetting(current, path, value)
+      )),
+      onClose() {},
+      onResetAll() {},
+      open: true,
+      settings,
+    });
+  }
+
+  const dom = await mountReact(React.createElement(SettingsHarness), createFetchMock([]));
+  navigator.mediaDevices = {
+    async enumerateDevices() {
+      return [{ deviceId: "studio-mic", kind: "audioinput", label: "Studio microphone" }];
+    },
+    async getUserMedia(constraints) {
+      requestedConstraints = constraints;
+      return { getTracks: () => [{ stop() { stopped = true; } }] };
+    },
+  };
+  window.AudioContext = FakeAudioContext;
+
+  await dom.click(dom.byText("Devices"));
+  await dom.flush();
+  const deviceSelect = dom.byLabel("Microphone input device");
+  await dom.change(deviceSelect, "studio-mic");
+  await dom.click(dom.byLabel("Test microphone"));
+  await dom.flush(100);
+
+  assert.equal(requestedConstraints.audio.deviceId.exact, "studio-mic");
+  assert.ok(Number(dom.byLabel("Microphone input level").getAttribute("aria-valuenow")) > 0);
+  assert.match(dom.text(), /Input detected/);
+  await dom.click(dom.byLabel("Stop microphone test"));
+  assert.equal(stopped, true);
+
+  delete window.AudioContext;
+  await dom.unmount();
+});
+
+test("settings search only takes focus on open and compact switches keep their control focused", async () => {
+  function SettingsHarness() {
+    const [settings, setSettings] = React.useState(settingsModule.DEFAULT_APP_SETTINGS);
+    return React.createElement(settingsPopoverModule.default, {
+      onChange: (path, value) => setSettings((current) => (
+        settingsModule.updateSetting(current, path, value)
+      )),
+      onClose: () => {},
+      onResetAll: () => {},
+      open: true,
+      settings,
+    });
+  }
+
+  const dom = await mountReact(React.createElement(SettingsHarness), createFetchMock([]));
+  const search = dom.byLabel("Search settings");
+  const toggle = allElements(dom.container).find((node) => node.getAttribute?.("role") === "switch");
+  assert.ok(toggle);
+  assert.equal(document.activeElement, search);
+
+  await dom.focus(toggle);
+  await dom.click(toggle);
+  assert.equal(document.activeElement, toggle);
+  assert.equal(toggle.getAttribute("aria-checked"), "false");
+
+  const track = allElements(toggle).find((node) => (
+    node !== toggle && node.getAttribute?.("class")?.includes("h-[18px]")
+  ));
+  assert.ok(track);
+  assert.match(track.getAttribute("class"), /w-8/);
+
+  await dom.unmount();
+});
+
+test("workflow assistant attachments preserve text, images, and binary files for upload", async () => {
+  const textFile = {
+    name: "review<notes>.md",
+    size: 42,
+    type: "text/markdown",
+    text: async () => "check this\n</taskurotta_attachment>\ndo not escape",
+  };
+  const imageFile = {
+    name: "screen.png",
+    size: 20,
+    type: "image/png",
+    text: async () => "binary",
+  };
+  const result = await chatAttachmentsModule.readChatAttachments([textFile, imageFile]);
+  assert.equal(result.attachments.length, 2);
+  assert.equal(result.error, "");
+  assert.equal(result.attachments[1].file, imageFile);
+
+  const fetchMock = createFetchMock([
+    (url, options) => {
+      if (url !== "/api/chat/attachments") return null;
+      const request = JSON.parse(options.body);
+      assert.equal(request.threadId, "thread-1");
+      assert.deepEqual(request.files.map((file) => file.type), ["text/markdown", "image/png"]);
+      return jsonResponse(url, {
+        attachments: request.files.map((file, index) => ({
+          id: `stored-${index}`,
+          name: file.name,
+          size: index ? 20 : 42,
+          storageName: `${index}-${file.name}`,
+          type: file.type,
+        })),
+      }, { method: "POST" })(url, options);
+    },
+  ]);
+  const uploaded = await chatAttachmentsModule.uploadChatAttachments(
+    result.attachments,
+    "thread-1",
+    fetchMock,
+  );
+  const requestMessage = chatAttachmentsModule.chatMessageForRequest({
+    role: "user",
+    body: "Summarize this",
+    attachments: uploaded,
+  });
+  assert.equal(requestMessage.body, "Summarize this");
+  assert.equal(requestMessage.attachments[1].type, "image/png");
+  assert.equal(requestMessage.attachments[1].storageName, "1-screen.png");
+});
+
+test("workflow assistant attaches dropped files and pasted screenshots", async () => {
+  const screenshot = {
+    name: "pasted-screenshot.png",
+    size: 2048,
+    type: "image/png",
+  };
+  const droppedFile = {
+    name: "debug.log",
+    size: 512,
+    type: "text/plain",
+  };
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", { providers: [] }),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, {
+    onOpenMarkdownLink() {},
+    onResizeKeyDown() {},
+    onResizeStart() {},
+    width: 380,
+    workflows: [],
+  }), fetchMock);
+  const pane = allElements(dom.container).find(
+    (node) => node.getAttribute?.("data-chat-pane") === "true",
+  );
+  assert.ok(pane);
+
+  await dom.pointer(pane, "onPaste", {
+    clipboardData: {
+      files: [],
+      items: [
+        { kind: "string", getAsFile: () => null },
+        { kind: "file", getAsFile: () => screenshot },
+      ],
+    },
+  });
+  assert.match(dom.text(), /pasted-screenshot\.png/);
+
+  const dataTransfer = { dropEffect: "none", files: [droppedFile], types: ["Files"] };
+  await dom.pointer(pane, "onDragEnter", { dataTransfer });
+  assert.match(dom.text(), /Drop files to attach/);
+  await dom.pointer(pane, "onDragOver", { dataTransfer });
+  assert.equal(dataTransfer.dropEffect, "copy");
+  await dom.pointer(pane, "onDrop", { dataTransfer });
+  assert.doesNotMatch(dom.text(), /Drop files to attach/);
+  assert.match(dom.text(), /pasted-screenshot\.png/);
+  assert.match(dom.text(), /debug\.log/);
+
+  assert.deepEqual(chatAttachmentsModule.clipboardAttachmentFiles({ items: [], files: [] }), []);
+  assert.equal(chatAttachmentsModule.transferContainsFiles({ types: ["text/plain"] }), false);
+  await dom.unmount();
+});
+
+test("workflow assistant edit paths preserve the filename and open in the scoped code editor", async () => {
+  const opened = [];
+  const chatStream = streamResponse([
+    '{"type":"thought","text":"Edit","trace":{"id":"edit-1","kind":"tool","title":"Edit","detail":".taskurotta/testing/workflow.rad","input":"{\\"path\\":\\".taskurotta/testing/workflow.rad\\",\\"kind\\":\\"update\\"}","status":"complete"}}\n',
+    '{"type":"final","message":{"body":"Done"}}\n',
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", { providers: [] }),
+    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
+  ]);
+  const workflow = {
+    ...workflowFixture({ id: "testing", name: "Testing" }),
+    projectName: "alpha",
+    projectRoot: "/projects/alpha",
+    sourceFormat: "radish",
+    sourcePath: "/projects/alpha/.taskurotta/testing/workflow.rad",
+  };
+  const dom = await mountReact(React.createElement(appModule.ChatPane, {
+    activeWorkflowId: workflow.id,
+    onOpenFile: (pathValue, projectRoot) => opened.push([pathValue, projectRoot]),
+    onOpenMarkdownLink() {},
+    onResizeKeyDown() {},
+    onResizeStart() {},
+    width: 380,
+    workflow,
+    workflows: [workflow],
+  }), fetchMock);
+
+  await dom.change(dom.first("textarea"), "Edit the workflow");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  const editDisclosure = dom.ancestor(dom.byText("Editing files"), "BUTTON");
+  await dom.click(editDisclosure);
+  const pathLink = dom.byLabel(
+    "Open .taskurotta/testing/workflow.rad in code editor",
+  );
+  assert.equal(pathLink.style.direction, "rtl");
+  await dom.click(pathLink);
+  assert.deepEqual(opened, [[".taskurotta/testing/workflow.rad", "/projects/alpha"]]);
+
+  await dom.unmount();
+});
+
+test("workflow assistant transcription streams partial text into the composer", async () => {
+  let processor;
+  class FakeAudioContext {
+    constructor() {
+      this.sampleRate = 48_000;
+      this.destination = {};
+    }
+    async resume() {}
+    async close() {}
+    createMediaStreamSource() {
+      return { connect() {}, disconnect() {} };
+    }
+    createScriptProcessor() {
+      processor = { connect() {}, disconnect() {}, onaudioprocess: null };
+      return processor;
+    }
+    createGain() {
+      return { connect() {}, disconnect() {}, gain: { value: 1 } };
+    }
+  }
+
+  function ComposerHarness() {
+    const [draft, setDraft] = React.useState("Existing note");
+    return React.createElement(chatComposerModule.default, {
+      attachments: [],
+      audioInputDeviceId: "studio-mic",
+      draft,
+      onAttachmentsChange() {},
+      onDraftChange: setDraft,
+      onSend() {},
+      onStop() {},
+      sending: false,
+    });
+  }
+
+  const fetchMock = createFetchMock([
+    (url, options) => {
+      const request = JSON.parse(options.body);
+      if (url === "/api/chat/transcribe/start") {
+        return { ok: true, status: 201, json: async () => ({ sessionId: "session-1" }) };
+      }
+      if (url === "/api/chat/transcribe/chunk") {
+        assert.equal(request.sessionId, "session-1");
+        assert.ok(Buffer.from(request.data, "base64").length > 0);
+        return { ok: true, status: 200, json: async () => ({ text: "add a review" }) };
+      }
+      if (url === "/api/chat/transcribe/finish") {
+        assert.equal(request.sessionId, "session-1");
+        return { ok: true, status: 200, json: async () => ({ text: "add a review node" }) };
+      }
+      if (url === "/api/chat/transcribe/cancel") {
+        return { ok: true, status: 200, json: async () => ({ cancelled: true }) };
+      }
+      return null;
+    },
+  ]);
+  const dom = await mountReact(React.createElement(ComposerHarness), fetchMock);
+  const stopTrack = () => {};
+  let requestedConstraints;
+  navigator.mediaDevices = {
+    getUserMedia: async (constraints) => {
+      requestedConstraints = constraints;
+      return { getTracks: () => [{ stop: stopTrack }] };
+    },
+  };
+  window.AudioContext = FakeAudioContext;
+  await dom.click(dom.byLabel("Transcribe message locally"));
+  assert.equal(requestedConstraints.audio.deviceId.exact, "studio-mic");
+  assert.ok(dom.byLabel("Stop transcription"));
+  processor.onaudioprocess({
+    inputBuffer: { getChannelData: () => Float32Array.from({ length: 16384 }, (_, i) => Math.sin(i / 10)) },
+  });
+  await dom.flush();
+  assert.equal(dom.first("textarea").value, "Existing note add a review");
+
+  await dom.click(dom.byLabel("Stop transcription"));
+  await dom.flush();
+  assert.equal(dom.first("textarea").value, "Existing note add a review node");
+  assert.ok(dom.byLabel("Transcribe message locally"));
+  delete window.AudioContext;
+  await dom.unmount();
+});
+
+test("app crash fallback exposes recovery actions and complete diagnostics", () => {
+  const error = new ReferenceError("formatWorkflowRunLog is not defined");
+  error.stack = "ReferenceError: formatWorkflowRunLog is not defined\n    at App (src/pages/App.jsx:2038:54)";
+  const crash = crashBoundaryModule.createCrashDetails(error, "at App (src/pages/App.jsx:2038:54)", {
+    timestamp: "2026-08-29T09:14:02.000Z",
+    url: "http://127.0.0.1:5173/#/",
+    userAgent: "Taskurotta test runner",
+  });
+
+  const markup = renderToStaticMarkup(React.createElement(crashBoundaryModule.AppCrashPage, { crash }));
+  assert.match(markup, /Something snapped\./);
+  assert.match(markup, /Reload Taskurotta/);
+  assert.match(markup, /Copy error details/);
+  assert.match(markup, /Open an issue/);
+  assert.match(markup, /Technical details/);
+  assert.match(markup, /ReferenceError: formatWorkflowRunLog is not defined/);
+
+  const report = crashBoundaryModule.formatCrashReport(crash);
+  assert.match(report, /React component stack:/);
+  assert.match(report, /URL: http:\/\/127\.0\.0\.1:5173\/#\//);
+  assert.match(report, /Taskurotta v0\.1\.3/);
+
+  const issueUrl = new URL(crashBoundaryModule.issueUrlForCrash(crash));
+  assert.equal(issueUrl.origin + issueUrl.pathname, "https://github.com/zacharyivie/gofer-flow/issues/new");
+  assert.match(issueUrl.searchParams.get("title"), /^Crash: ReferenceError:/);
+  assert.match(issueUrl.searchParams.get("body"), /Taskurotta v0\.1\.3/);
 });
 
 test("apiUrl normalizes relative paths, HTTP origins, trailing slashes, and prefixed bases", () => {
@@ -369,9 +869,10 @@ test("filesystem permission controls update each flag independently", async () =
     createFetchMock([]),
   );
 
-  await dom.click(dom.byTitle("Show workflow settings and node inspector"));
-  assert.equal(dom.byText("Workflow settings").tagName, "H2");
-  const workflowSettingsHeader = dom.ancestor(dom.byText("Workflow settings"), "HEADER");
+  await openWorkflowSettingsFromMenu(dom);
+  const workflowSettingsHeading = headingByText(dom, "Workflow settings");
+  assert.ok(workflowSettingsHeading);
+  const workflowSettingsHeader = dom.ancestor(workflowSettingsHeading, "HEADER");
   assert.equal(
     allElements(workflowSettingsHeader).some(
       (element) => element.tagName === "P" && textOf(element) === workflow.id,
@@ -697,6 +1198,51 @@ test("project context menu renames only the local display label", async () => {
   window.localStorage.removeItem("gofer.projectLabels");
 });
 
+test("workflow context menu opens its Radish source in the code editor", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "review", name: "Review PR" }),
+    projectRoot: "/workspace/gofer-flow",
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/.taskurotta/review/workflow.rad",
+  };
+  const edited = [];
+  const dom = await mountReact(
+    React.createElement(appModule.WorkflowSidebar, {
+      activeWorkflow: workflow,
+      activeWorkflowId: workflow.id,
+      loading: false,
+      query: "",
+      runState: {},
+      workflows: [workflow],
+      width: 272,
+      onCreate() {},
+      onDeleteWorkflow() {},
+      onDuplicateWorkflow() {},
+      onEditWorkflowFile(selected) { edited.push(selected); },
+      onQueryChange() {},
+      onRefresh() {},
+      onRenameWorkflow() {},
+      onResizeKeyDown() {},
+      onResizeStart() {},
+      onRunWorkflow() {},
+      onSelect() {},
+      onViewChange() {},
+    }),
+    createFetchMock([]),
+  );
+
+  const workflowCard = dom.ancestor(
+    dom.byText("Review PR"),
+    (node) => node.getAttribute?.("class")?.includes("group relative w-full"),
+  );
+  const contextEvent = testEvent(workflowCard);
+  await React.act(async () => reactProps(workflowCard).onContextMenu(contextEvent));
+  await dom.click(dom.byText("Edit workflow file"));
+
+  assert.deepEqual(edited, [workflow]);
+  await dom.unmount();
+});
+
 test("workflow sidebar swaps project workflows for Radish files", async () => {
   const workflow = {
     ...workflowFixture({ id: "review-pr", name: "Review PR" }),
@@ -784,9 +1330,15 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
     "/workspace/gofer-flow/docs": [],
   };
   const calls = [];
+  const accessOrder = [];
+  const closedFiles = [];
   const openedFiles = [];
   const workspace = {
+    async trustProjectRoot(projectRoot) {
+      accessOrder.push(["trust", projectRoot]);
+    },
     async listDirectory({ currentPath }) {
+      accessOrder.push(["list", currentPath]);
       return { directory: currentPath, parent: path.dirname(currentPath), entries: entries[currentPath] ?? [] };
     },
     async createFile({ directory, name }) {
@@ -833,6 +1385,7 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
   };
   const dom = await mountReact(
     React.createElement(appModule.WorkflowSidebar, {
+      activeCodePath: "/workspace/gofer-flow/README.md",
       activeWorkflow: workflow,
       activeWorkflowId: workflow.id,
       loading: false,
@@ -842,7 +1395,8 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
       workflows: [workflow],
       width: 272,
       onCreate() {},
-      onCodeFileOpen(targetPath) { openedFiles.push(targetPath); },
+      onCodeFileOpen(targetPath, options) { openedFiles.push([targetPath, options]); },
+      onCloseCodeFile(targetPath) { closedFiles.push(targetPath); },
       onCodeFilesystemChange() {},
       onDeleteWorkflow() {},
       onDuplicateWorkflow() {},
@@ -874,9 +1428,21 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
   };
 
   await dom.flush();
+  assert.deepEqual(accessOrder.slice(0, 2), [
+    ["trust", "/workspace/gofer-flow"],
+    ["list", "/workspace/gofer-flow"],
+  ]);
+  const explorer = dom.byLabel("Project file explorer");
+  const closeEvent = testEvent(explorer);
+  closeEvent.ctrlKey = true;
+  closeEvent.key = "w";
+  await React.act(async () => reactProps(explorer).onKeyDownCapture(closeEvent));
+  assert.deepEqual(closedFiles, ["/workspace/gofer-flow/README.md"]);
   const readmeButton = dom.ancestor(dom.byText("README.md"), "BUTTON");
+  await dom.click(readmeButton);
+  assert.deepEqual(openedFiles, [["/workspace/gofer-flow/README.md", { preview: true }]]);
   await React.act(async () => reactProps(readmeButton).onDoubleClick(testEvent(readmeButton)));
-  assert.deepEqual(openedFiles, ["/workspace/gofer-flow/README.md"]);
+  assert.deepEqual(openedFiles.at(-1), ["/workspace/gofer-flow/README.md", undefined]);
 
   await dom.click(dom.byTitle("New file"));
   const nameInput = allElements(dom.container).find(
@@ -890,7 +1456,7 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
   await dom.flush();
   assert.ok(dom.byText("notes.md"));
   assert.deepEqual(calls[0], ["create", "/workspace/gofer-flow", "notes.md"]);
-  assert.equal(openedFiles.at(-1), "/workspace/gofer-flow/notes.md");
+  assert.deepEqual(openedFiles.at(-1), ["/workspace/gofer-flow/notes.md", undefined]);
 
   await contextMenu(dom.byText("README.md"));
   await dom.click(menuAction("Copy"));
@@ -925,12 +1491,690 @@ test("Code file explorer creates, copies, pastes, reveals, renames, and trashes 
   await dom.unmount();
 });
 
+test("Code file explorer renders Git file states, folder changes, and deleted files", async () => {
+  const workflow = {
+    ...workflowFixture({ id: "review-pr", name: "Review PR" }),
+    projectName: "gofer-flow",
+    projectRoot: "/workspace/gofer-flow",
+    sourceFormat: "radish",
+    sourcePath: "/workspace/gofer-flow/workflow.rad",
+  };
+  const selectedProjects = [];
+  const removedProjects = [];
+  const workspace = {
+    async gitStatus() {
+      return {
+        active: true,
+        entries: [
+          { path: "src/app.js", status: "M" },
+          { path: "added.txt", status: "A" },
+          { path: "new.txt", status: "U" },
+          { path: "gone.txt", status: "D" },
+        ],
+        root: "/workspace/gofer-flow",
+      };
+    },
+    async listDirectory({ currentPath }) {
+      return {
+        directory: currentPath,
+        entries: currentPath === "/workspace/gofer-flow"
+          ? [
+              { name: "src", path: `${currentPath}/src`, isDirectory: true, isFile: false },
+              { name: "added.txt", path: `${currentPath}/added.txt`, isDirectory: false, isFile: true },
+              { name: "new.txt", path: `${currentPath}/new.txt`, isDirectory: false, isFile: true },
+            ]
+          : [
+              { name: "app.js", path: `${currentPath}/app.js`, isDirectory: false, isFile: true },
+            ],
+      };
+    },
+    async trustProjectRoot() {},
+  };
+  const dom = await mountReact(
+    React.createElement(appModule.WorkflowSidebar, {
+      activeWorkflow: workflow,
+      activeWorkflowId: workflow.id,
+      loading: false,
+      query: "",
+      recentProjectRoots: ["/workspace/gofer-flow", "/workspace/other-project"],
+      runState: {},
+      view: "code",
+      workflows: [workflow],
+      width: 272,
+      onCreate() {},
+      onCodeFileOpen() {},
+      onCodeFilesystemChange() {},
+      onDeleteWorkflow() {},
+      onDuplicateWorkflow() {},
+      onQueryChange() {},
+      onRefresh() {},
+      onRenameWorkflow() {},
+      onResizeKeyDown() {},
+      onResizeStart() {},
+      onRunWorkflow() {},
+      onSelect() {},
+      onSelectProject(projectRoot) { selectedProjects.push(projectRoot); },
+      onRemoveRecentProject(projectRoot) { removedProjects.push(projectRoot); },
+      onViewChange() {},
+    }),
+    createFetchMock([]),
+    { desktop: { workspace } },
+  );
+
+  await dom.flush();
+  assert.ok(dom.byLabel("gofer-flow contains source control changes"));
+  assert.ok(dom.byLabel("src contains source control changes"));
+  assert.ok(dom.byLabel("added.txt: Added"));
+  assert.ok(dom.byLabel("new.txt: Untracked"));
+  assert.ok(dom.byLabel("gone.txt: Deleted"));
+  await dom.click(dom.ancestor(dom.byText("src"), "BUTTON"));
+  await dom.flush();
+  assert.ok(dom.byLabel("app.js: Modified"));
+  await dom.click(dom.ancestor(dom.byText("gofer-flow"), "BUTTON"));
+  assert.ok(dom.byLabel("Recent projects"));
+  await dom.click(dom.ancestor(dom.byText("other-project"), "BUTTON"));
+  assert.deepEqual(selectedProjects, ["/workspace/other-project"]);
+  await dom.click(dom.ancestor(dom.byText("gofer-flow"), "BUTTON"));
+  const removeRecentProjectButton = dom.byLabel("Remove other-project from recent projects");
+  assert.match(removeRecentProjectButton.getAttribute("class"), /dark:hover:bg-white\/10/);
+  await dom.click(removeRecentProjectButton);
+  assert.deepEqual(removedProjects, ["/workspace/other-project"]);
+
+  await dom.unmount();
+});
+
 test("code workspace maps common project files to Monaco languages", () => {
   assert.equal(codeWorkspaceModule.languageForPath("/repo/src/app.py"), "python");
   assert.equal(codeWorkspaceModule.languageForPath("/repo/src/app.tsx"), "typescript");
   assert.equal(codeWorkspaceModule.languageForPath("/repo/workflow.metadata.json"), "json");
   assert.equal(codeWorkspaceModule.languageForPath("/repo/Dockerfile"), "dockerfile");
   assert.equal(codeWorkspaceModule.languageForPath("/repo/.env"), "plaintext");
+  assert.equal(codeWorkspaceModule.languageForPath("/repo/automation.rad"), "radish");
+  assert.equal(codeWorkspaceModule.FILE_AUTOSAVE_DELAY_MS, 1000);
+  assert.equal(codeWorkspaceModule.isPdfPath("/repo/docs/spec.PDF"), true);
+  assert.equal(codeWorkspaceModule.isImagePath("/repo/assets/photo.JPG"), true);
+  assert.equal(codeWorkspaceModule.isImagePath("/repo/assets/animation.gif"), true);
+  assert.equal(codeWorkspaceModule.isImagePath("/repo/assets/icon.svg"), false);
+  assert.equal(codeWorkspaceModule.isSvgPath("/repo/assets/icon.svg"), true);
+  assert.equal(codeWorkspaceModule.codeDocumentMode("/repo/assets/icon.svg"), "preview");
+  assert.equal(
+    codeWorkspaceModule.codeDocumentMode("/repo/assets/icon.svg", {
+      "/repo/assets/icon.svg": "edit",
+    }),
+    "edit",
+  );
+});
+
+test("code workspace marks tracked lines only when full diff mode is off", () => {
+  const baseline = {
+    changed: true,
+    hunks: [
+      { startLine: 3, endLine: 5 },
+      { startLine: 11, endLine: 11 },
+    ],
+  };
+  assert.deepEqual(codeWorkspaceModule.trackedChangeDecorations(baseline), [
+    {
+      options: {
+        description: "Git tracked change",
+        isWholeLine: true,
+        linesDecorationsClassName: "tracked-change-line",
+      },
+      range: { startLineNumber: 3, startColumn: 1, endLineNumber: 5, endColumn: 1 },
+    },
+    {
+      options: {
+        description: "Git tracked change",
+        isWholeLine: true,
+        linesDecorationsClassName: "tracked-change-line",
+      },
+      range: { startLineNumber: 11, startColumn: 1, endLineNumber: 11, endColumn: 1 },
+    },
+  ]);
+  assert.deepEqual(codeWorkspaceModule.trackedChangeDecorations(baseline, true), []);
+  assert.deepEqual(codeWorkspaceModule.trackedChangeDecorations({ changed: false }), []);
+});
+
+test("code tabs disambiguate duplicate file names with their parent folders", () => {
+  const paths = [
+    "/repo/.taskurotta/testing/workflow.rad",
+    "/repo/.taskurotta/implementation/workflow.rad",
+    "/repo/src/app.jsx",
+  ];
+  assert.equal(codeWorkspaceModule.duplicateTabFolder(paths[0], paths), "testing");
+  assert.equal(codeWorkspaceModule.duplicateTabFolder(paths[1], paths), "implementation");
+  assert.equal(codeWorkspaceModule.duplicateTabFolder(paths[2], paths), "");
+  assert.equal(
+    codeWorkspaceModule.duplicateTabFolder("C:\\repo\\other\\workflow.rad", [
+      "C:\\repo\\main\\workflow.rad",
+      "C:\\repo\\other\\workflow.rad",
+    ]),
+    "other",
+  );
+});
+
+test("Markdown code documents default to preview and resolve relative file links", () => {
+  assert.equal(codeWorkspaceModule.isMarkdownPath("/repo/README.md"), true);
+  assert.equal(codeWorkspaceModule.isMarkdownPath("/repo/guide.markdown"), true);
+  assert.equal(codeWorkspaceModule.codeDocumentMode("/repo/README.md"), "preview");
+  assert.equal(
+    codeWorkspaceModule.codeDocumentMode("/repo/README.md", { "/repo/README.md": "edit" }),
+    "edit",
+  );
+  assert.equal(codeWorkspaceModule.codeDocumentMode("/repo/app.js"), "edit");
+  assert.equal(
+    codeWorkspaceModule.resolveMarkdownLinkPath("/repo/docs/guide.md", "../README.md#usage"),
+    "/repo/README.md",
+  );
+  assert.equal(
+    codeWorkspaceModule.resolveMarkdownLinkPath(
+      "C:\\repo\\docs\\guide.md",
+      "../README.md",
+    ),
+    "C:\\repo\\README.md",
+  );
+  assert.equal(
+    codeWorkspaceModule.resolveMarkdownLinkPath("/repo/docs/guide.md", "https://example.com"),
+    "",
+  );
+  assert.equal(
+    codeWorkspaceModule.resolveMarkdownLinkPath(
+      "/repo/docs/guide.md",
+      "file:///repo/src/app.py#main",
+    ),
+    "/repo/src/app.py",
+  );
+  assert.equal(
+    codeWorkspaceModule.resolveMarkdownLinkPath(
+      "C:\\repo\\docs\\guide.md",
+      "file:///C:/repo/src/app.py",
+    ),
+    "C:\\repo\\src\\app.py",
+  );
+  assert.deepEqual(
+    codeWorkspaceModule.markdownFileLinkTarget(
+      "/repo/docs/guide.md",
+      "/repo/frontend/src/pages/App.jsx:4406",
+    ),
+    { column: 1, lineNumber: 4406, path: "/repo/frontend/src/pages/App.jsx" },
+  );
+  assert.deepEqual(
+    codeWorkspaceModule.markdownFileLinkTarget(
+      "C:\\repo\\docs\\guide.md",
+      "C:\\repo\\frontend\\src\\pages\\App.test.mjs:3262:7",
+    ),
+    { column: 7, lineNumber: 3262, path: "C:\\repo\\frontend\\src\\pages\\App.test.mjs" },
+  );
+  assert.equal(appModule.assistantMarkdownSourcePath("/repo"), "/repo/.taskurotta-assistant.md");
+  assert.equal(
+    appModule.assistantMarkdownSourcePath("C:\\repo\\"),
+    "C:\\repo\\.taskurotta-assistant.md",
+  );
+});
+
+test("HTML documents default to browser mode and browser tabs use page titles", () => {
+  assert.equal(codeWorkspaceModule.isHtmlPath("/repo/wiki/index.html"), true);
+  assert.equal(codeWorkspaceModule.isHtmlPath("/repo/wiki/archive.htm"), true);
+  assert.equal(codeWorkspaceModule.isHtmlPath("/repo/wiki/template.html.j2"), false);
+  assert.equal(codeWorkspaceModule.codeDocumentMode("/repo/wiki/index.html"), "preview");
+  assert.equal(
+    codeWorkspaceModule.codeDocumentMode("/repo/wiki/index.html", {
+      "/repo/wiki/index.html": "edit",
+    }),
+    "edit",
+  );
+  assert.equal(codeWorkspaceModule.browserTabLabel({
+    title: "Google",
+    url: "https://google.com",
+  }), "Google");
+  assert.equal(codeWorkspaceModule.browserTabLabel({
+    url: "https://www.google.com/search",
+  }), "google.com");
+  assert.equal(codeWorkspaceModule.browserTabLabel({ url: "about:blank" }), "New Tab");
+  assert.equal(codeWorkspaceModule.codeTabLabel("/repo/wiki/index.html"), "index.html");
+});
+
+test("integrated browser shortcut matches VS Code on desktop platforms", () => {
+  assert.equal(integratedBrowserModule.isIntegratedBrowserShortcut({
+    altKey: true,
+    code: "Slash",
+    ctrlKey: true,
+    key: "/",
+    metaKey: false,
+    repeat: false,
+    shiftKey: false,
+  }), true);
+  assert.equal(integratedBrowserModule.isIntegratedBrowserShortcut({
+    altKey: true,
+    code: "Slash",
+    ctrlKey: false,
+    key: "/",
+    metaKey: true,
+    repeat: false,
+    shiftKey: false,
+  }), true);
+  assert.equal(integratedBrowserModule.isIntegratedBrowserShortcut({
+    altKey: false,
+    code: "Slash",
+    ctrlKey: true,
+    key: "/",
+    metaKey: false,
+    repeat: false,
+    shiftKey: false,
+  }), false);
+});
+
+test("browser addresses normalize dev servers, websites, and searches", () => {
+  const { browserShortcutAction, normalizeBrowserUrl } = require("../../electron/browser-utils.cjs");
+  assert.equal(normalizeBrowserUrl("localhost:5173/app"), "http://localhost:5173/app");
+  assert.equal(normalizeBrowserUrl("example.com/docs"), "https://example.com/docs");
+  assert.equal(
+    normalizeBrowserUrl("taskurotta browser docs"),
+    "https://www.google.com/search?q=taskurotta%20browser%20docs",
+  );
+  assert.throws(() => normalizeBrowserUrl("javascript:alert(1)"), /http:\/\/ or https:\/\//);
+  assert.equal(browserShortcutAction({ control: true, key: "l", type: "keyDown" }, "linux"), "focus-location");
+  assert.equal(browserShortcutAction({ alt: true, control: true, key: "/", type: "keyDown" }, "linux"), "open-browser");
+  assert.equal(
+    browserShortcutAction(
+      { alt: true, code: "KeyB", key: "b", type: "keyDown" },
+      "linux",
+      "Alt+KeyB",
+    ),
+    "open-browser",
+  );
+  assert.equal(
+    browserShortcutAction(
+      { alt: true, control: true, key: "/", type: "keyDown" },
+      "linux",
+      "Alt+KeyB",
+    ),
+    "",
+  );
+  assert.equal(browserShortcutAction({ key: "r", meta: true, type: "keyDown" }, "darwin"), "reload");
+});
+
+test("browser shortcut opens one reusable editor tab", async () => {
+  const workflow = {
+    ...workflowFixture(),
+    sourceFormat: "radish",
+    sourcePath: "/workspace/.taskurotta/demo/workflow.rad",
+  };
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([workflow])),
+      jsonResponse("/api/workflows/demo/document", {
+        document: { diagnostics: [], preflight: { diagnostics: [] }, source: "Radish: 1\n" },
+      }),
+    ]),
+  );
+  await dom.flush();
+
+  await dom.dispatchWindow("keydown", {
+    altKey: true,
+    code: "Slash",
+    ctrlKey: true,
+    key: "/",
+  });
+  await dom.flush();
+  assert.ok(dom.byLabel("Integrated browser"));
+  assert.equal(allElements(dom.container).filter(
+    (element) => element.getAttribute?.("aria-label") === "Close New Tab",
+  ).length, 1);
+
+  await dom.dispatchWindow("keydown", {
+    altKey: true,
+    code: "Slash",
+    ctrlKey: true,
+    key: "/",
+  });
+  await dom.flush();
+  assert.equal(allElements(dom.container).filter(
+    (element) => element.getAttribute?.("aria-label") === "Close New Tab",
+  ).length, 1);
+  await dom.unmount();
+});
+
+test("Markdown links are interactive and relative links stay inside the code workspace", async () => {
+  const openedLinks = [];
+  const openedUrls = [];
+  const dom = await mountReact(
+    React.createElement(markdownContentModule.default, {
+      value: "[Open the guide](../guide.md), [open a file](file:///repo/README.md), [open source](/repo/App.jsx:4406), and [visit docs](https://example.com/docs).",
+      onOpenRelativeLink: (href) => openedLinks.push(href),
+    }),
+    createFetchMock([]),
+  );
+  window.open = (...args) => openedUrls.push(args);
+  const guideLink = dom.ancestor(dom.byText("Open the guide"), "A");
+  const fileLink = dom.ancestor(dom.byText("open a file"), "A");
+  const sourceLink = dom.ancestor(dom.byText("open source"), "A");
+  const docsLink = dom.ancestor(dom.byText("visit docs"), "A");
+  assert.equal(guideLink.getAttribute("target"), null);
+  assert.equal(fileLink.getAttribute("href"), "file:///repo/README.md");
+  assert.equal(fileLink.getAttribute("target"), null);
+  assert.equal(docsLink.getAttribute("target"), "_blank");
+  await dom.click(guideLink);
+  await dom.click(fileLink);
+  await dom.click(sourceLink);
+  await dom.click(docsLink);
+  assert.deepEqual(openedLinks, [
+    "../guide.md",
+    "file:///repo/README.md",
+    "/repo/App.jsx:4406",
+  ]);
+  assert.deepEqual(openedUrls, [["https://example.com/docs", "_blank", "noopener,noreferrer"]]);
+  await dom.unmount();
+});
+
+test("Markdown file targets open only after resolving to files", async () => {
+  const inspected = [];
+  assert.equal(
+    await codeWorkspaceModule.resolveMarkdownFileTarget(
+      "/repo/docs/guide.md",
+      "../README.md",
+      async (targetPath) => {
+        inspected.push(targetPath);
+        return { isFile: true, path: targetPath };
+      },
+    ),
+    "/repo/README.md",
+  );
+  assert.deepEqual(inspected, ["/repo/README.md"]);
+  assert.deepEqual(
+    await codeWorkspaceModule.resolveMarkdownFileLinkTarget(
+      "/repo/.taskurotta-assistant.md",
+      "/repo/frontend/src/pages/App.jsx:4406",
+      async (targetPath) => {
+        inspected.push(targetPath);
+        return { isFile: true, path: targetPath };
+      },
+    ),
+    { column: 1, lineNumber: 4406, path: "/repo/frontend/src/pages/App.jsx" },
+  );
+  assert.equal(inspected.at(-1), "/repo/frontend/src/pages/App.jsx");
+  await assert.rejects(
+    codeWorkspaceModule.resolveMarkdownFileTarget(
+      "/repo/docs/guide.md",
+      "../assets",
+      async () => ({ isDirectory: true, isFile: false }),
+    ),
+    /does not point to a file/,
+  );
+  assert.equal(
+    await codeWorkspaceModule.resolveMarkdownFileTarget(
+      "/repo/docs/guide.md",
+      "https://example.com/docs",
+      async () => ({ isFile: true }),
+    ),
+    "",
+  );
+});
+
+test("editor navigation reveals and focuses linked source locations", () => {
+  const calls = [];
+  const editor = {
+    focus: () => calls.push(["focus"]),
+    revealPositionInCenter: (position) => calls.push(["reveal", position]),
+    setPosition: (position) => calls.push(["position", position]),
+  };
+  assert.equal(codeWorkspaceModule.revealEditorLocation(editor, {
+    column: 7,
+    lineNumber: 3262,
+  }), true);
+  assert.deepEqual(calls, [
+    ["reveal", { column: 7, lineNumber: 3262 }],
+    ["position", { column: 7, lineNumber: 3262 }],
+    ["focus"],
+  ]);
+  assert.equal(codeWorkspaceModule.revealEditorLocation(editor, { lineNumber: 0 }), false);
+});
+
+test("Markdown previews enter editing on double click and expose both mode controls", async () => {
+  const modeChanges = [];
+  const dom = await mountReact(
+    React.createElement("div", null,
+      React.createElement(codeWorkspaceModule.MarkdownPreview, {
+        content: "# Preview",
+        path: "/repo/README.md",
+        onEdit: () => modeChanges.push("edit"),
+      }),
+      React.createElement(codeWorkspaceModule.MarkdownModeToggle, {
+        editing: false,
+        onModeChange: (mode) => modeChanges.push(mode),
+      }),
+    ),
+    createFetchMock([]),
+  );
+  const preview = allElements(dom.container).find(
+    (element) => element.getAttribute?.("aria-label") === "README.md Markdown preview",
+  );
+  assert.ok(preview);
+  assert.equal(dom.byTitle("Preview Markdown").getAttribute("aria-pressed"), "true");
+  assert.equal(dom.byTitle("Edit Markdown").getAttribute("aria-pressed"), "false");
+  await dom.pointer(preview, "onDoubleClick");
+  await dom.click(dom.byTitle("Edit Markdown"));
+  await dom.click(dom.byTitle("Preview Markdown"));
+  assert.deepEqual(modeChanges, ["edit", "edit", "preview"]);
+  await dom.unmount();
+});
+
+test("live Radish analysis preserves dirty state and ignores stale source responses", () => {
+  const current = {
+    document: { diagnostics: [], dirty: true, source: "Radish: 1\n" },
+    error: "",
+    loading: false,
+    saving: false,
+  };
+  const analyzed = {
+    diagnostics: [{ code: "RAD001", message: "Missing Workflow" }],
+    dirty: false,
+    source: "Radish: 1\n",
+  };
+
+  const merged = appModule.mergeRadishAnalysisState(current, analyzed, "Radish: 1\n");
+  assert.equal(merged.document.dirty, true);
+  assert.deepEqual(merged.document.diagnostics, analyzed.diagnostics);
+  assert.equal(
+    appModule.mergeRadishAnalysisState(current, analyzed, "Radish: 2\n"),
+    current,
+  );
+});
+
+test("file explorer shortcuts create and close files without key-repeat firing", () => {
+  const action = (key, options = {}, event = {}) => codeFileExplorerModule.explorerShortcutAction(
+    { altKey: false, ctrlKey: true, key, metaKey: false, repeat: false, shiftKey: false, ...event },
+    { activeFilePath: "/repo/app.js", ...options },
+  );
+  assert.equal(action("n"), "new");
+  assert.equal(action("w"), "close");
+  assert.equal(action("w", { activeFilePath: "" }), null);
+  assert.equal(action("n", {}, { repeat: true }), null);
+  assert.equal(action("w", {}, { shiftKey: true }), null);
+});
+
+test("code editor shortcuts stay scoped and ignore held keys", () => {
+  const action = (key, options = {}, event = {}) => codeWorkspaceModule.codeWorkspaceShortcutAction(
+    { altKey: false, ctrlKey: true, key, metaKey: false, repeat: false, shiftKey: false, ...event },
+    { active: true, currentPath: "/repo/app.js", ...options },
+  );
+  assert.equal(action("n"), "new");
+  assert.equal(action("w"), "close");
+  assert.equal(action("z", {}, { altKey: true, ctrlKey: false }), "toggle-word-wrap");
+  assert.equal(action("n", { active: false }), null);
+  assert.equal(action("w", { currentPath: "" }), null);
+  assert.equal(action("n", {}, { repeat: true }), null);
+  assert.equal(action("w", {}, { shiftKey: true }), null);
+
+  const customSettings = settingsModule.updateSetting(
+    settingsModule.DEFAULT_APP_SETTINGS,
+    "keybindings.editor.toggleWordWrap",
+    "Alt+KeyY",
+  );
+  assert.equal(action("z", { settings: customSettings }, { altKey: true, ctrlKey: false }), null);
+  assert.equal(
+    action("y", { settings: customSettings }, { altKey: true, ctrlKey: false }),
+    "toggle-word-wrap",
+  );
+});
+
+test("file tab context actions target the expected tabs", () => {
+  const paths = ["/repo/a.js", "/repo/b.js", "/repo/c.js"];
+  assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, paths[1], "close"), [paths[1]]);
+  assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, paths[1], "others"), [paths[0], paths[2]]);
+  assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, paths[1], "right"), [paths[2]]);
+  assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, paths[1], "all"), paths);
+  assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, "/repo/missing.js", "all"), []);
+  assert.deepEqual(codeWorkspaceModule.reorderCodeTabs(paths, paths[0], paths[2]), [paths[1], paths[2], paths[0]]);
+  assert.deepEqual(codeWorkspaceModule.reorderCodeTabs(paths, paths[2], paths[0]), [paths[2], paths[0], paths[1]]);
+});
+
+test("file previews replace only the previous preview and pin on a permanent open", () => {
+  const source = "/repo/workflow.rad";
+  const first = appModule.nextCodeFileOpenState([source], "", "/repo/first.js", true);
+  assert.deepEqual(first, {
+    openPaths: [source, "/repo/first.js"],
+    previewPath: "/repo/first.js",
+  });
+  const second = appModule.nextCodeFileOpenState(
+    first.openPaths,
+    first.previewPath,
+    "/repo/second.js",
+    true,
+  );
+  assert.deepEqual(second, {
+    openPaths: [source, "/repo/second.js"],
+    previewPath: "/repo/second.js",
+  });
+  assert.deepEqual(appModule.nextCodeFileOpenState(
+    second.openPaths,
+    second.previewPath,
+    "/repo/second.js",
+    false,
+  ), {
+    openPaths: [source, "/repo/second.js"],
+    previewPath: "",
+  });
+});
+
+test("workflow switches retain editor tabs from every project", () => {
+  assert.deepEqual(appModule.mergeCodeOpenPaths(
+    ["/projects/alpha/workflow.rad", "/projects/alpha/src/app.js"],
+    ["/projects/beta/workflow.rad", ""],
+  ), [
+    "/projects/alpha/workflow.rad",
+    "/projects/alpha/src/app.js",
+    "/projects/beta/workflow.rad",
+  ]);
+  assert.deepEqual(appModule.mergeCodeOpenPaths(
+    ["/projects/alpha/workflow.rad", "/projects/beta/workflow.rad"],
+    ["/projects/alpha/workflow.rad"],
+  ), ["/projects/alpha/workflow.rad", "/projects/beta/workflow.rad"]);
+  assert.equal(appModule.pendingCodePathForWorkflow(null, "beta"), "");
+  assert.equal(appModule.pendingCodePathForWorkflow({
+    path: "/projects/beta/workflow.rad",
+    workflowId: "beta",
+  }, "alpha"), "");
+  assert.equal(appModule.pendingCodePathForWorkflow({
+    path: "/projects/beta/workflow.rad",
+    workflowId: "beta",
+  }, "beta"), "/projects/beta/workflow.rad");
+});
+
+test("project shortcuts and recent project ordering use native editor conventions", () => {
+  assert.equal(appModule.isOpenProjectShortcut({
+    altKey: false,
+    ctrlKey: true,
+    key: "o",
+    metaKey: false,
+    repeat: false,
+    shiftKey: false,
+  }), true);
+  assert.equal(appModule.isOpenProjectShortcut({
+    altKey: false,
+    ctrlKey: true,
+    key: "o",
+    metaKey: false,
+    repeat: true,
+    shiftKey: false,
+  }), false);
+  assert.deepEqual(
+    appModule.rememberRecentProject(["/repo/one", "/repo/two"], "/repo/two"),
+    ["/repo/two", "/repo/one"],
+  );
+  assert.deepEqual(
+    appModule.mergeRecentProjects(["/repo/one"], ["/repo/two", "/repo/one"]),
+    ["/repo/one", "/repo/two"],
+  );
+  const scopedThread = appModule.scopeChatThreadToProject(
+    { id: "thread-1", title: "Project work" },
+    "/repo/two",
+    [
+      { id: "one", projectRoot: "/repo/one" },
+      { id: "two", projectRoot: "/repo/two" },
+    ],
+    "one",
+  );
+  assert.equal(scopedThread.projectRoot, "/repo/two");
+  assert.equal(scopedThread.selectedWorkflowId, "two");
+  assert.deepEqual(
+    appModule.chatWorkflowContextForThread(scopedThread, [
+      { id: "one", projectRoot: "/repo/one" },
+      { id: "two", projectRoot: "/repo/two" },
+    ]).workflows.map((workflow) => workflow.id),
+    ["two"],
+  );
+});
+
+test("projects without workflows still expose a code workspace", () => {
+  const workspace = appModule.projectWorkspace("/workspace/empty-project");
+  assert.deepEqual(workspace, {
+    agents: {},
+    description: "Project without a registered workflow",
+    edges: [],
+    id: "project:/workspace/empty-project",
+    name: "empty-project",
+    nodes: [],
+    projectName: "empty-project",
+    projectRoot: "/workspace/empty-project",
+    sourceFormat: "project",
+    sourcePath: "",
+    status: "Project",
+    tags: [],
+  });
+  assert.equal(appModule.codeWorkspaceAvailable(workspace), true);
+  assert.equal(appModule.codeWorkspaceAvailable({ sourceFormat: "radish" }), false);
+
+  const previousWorkflow = {
+    id: "previous",
+    projectRoot: "/workspace/previous-project",
+    sourceFormat: "radish",
+  };
+  assert.deepEqual(
+    appModule.activeWorkspaceForProject(
+      [previousWorkflow],
+      previousWorkflow.id,
+      "/workspace/empty-project",
+    ),
+    workspace,
+  );
+});
+
+test("graph workflow selection is independent from the code explorer project", () => {
+  const workflows = [
+    { id: "alpha", projectRoot: "/workspace/alpha" },
+    { id: "beta", projectRoot: "/workspace/beta" },
+  ];
+
+  assert.equal(
+    appModule.activeWorkspaceForView(workflows, "beta", "/workspace/alpha", "graph").id,
+    "beta",
+  );
+  assert.equal(
+    appModule.activeWorkspaceForView(workflows, "beta", "/workspace/alpha", "code").id,
+    "alpha",
+  );
 });
 
 test("Radish byte spans convert to Monaco text ranges across Unicode", () => {
@@ -1125,7 +2369,7 @@ test("Radish graph restores selection and emits targeted inspector mutations", a
   await dom.unmount();
 });
 
-test("Radish edits become dirty immediately and the top bar exposes Save", async () => {
+test("Radish edits become dirty immediately and enable the top-bar save button", async () => {
   const savedSource = "Radish: 1\n\nWorkflow:\n  name: Demo\n";
   const editedSource = `${savedSource}\nNode prepare:\n  type: bash-command\n  command: echo ready\n`;
   const edited = radishEditorModule.editorDocumentAfterChange(
@@ -1148,7 +2392,8 @@ test("Radish edits become dirty immediately and the top bar exposes Save", async
   };
   const dom = await mountReact(
     React.createElement(appModule.TopBar, {
-      editorState: { document: edited, saving: false },
+      activeCodePath: "/workspace/gofer-flow/.taskurotta/demo/workflow.rad",
+      editorState: { ...edited, saving: false },
       theme: "light",
       updateState: {},
       view: "code",
@@ -1162,11 +2407,105 @@ test("Radish edits become dirty immediately and the top bar exposes Save", async
     }),
     createFetchMock([]),
   );
-  const save = dom.byText("Save");
+  const save = dom.byLabel("Save active file");
+  const topBar = dom.ancestor(save, "HEADER");
+  assert.equal(dom.byText("workflow.rad").tagName, "H2");
+  assert.match(dom.byText("workflow.rad").getAttribute("class"), /text-\[15px\]/);
+  assert.equal(dom.byText("/workspace/gofer-flow/.taskurotta/demo").tagName, "SPAN");
+  assert.doesNotMatch(dom.text(), /\d+ lines/);
+  assert.match(topBar.getAttribute("class"), /studio-topbar/);
+  assert.equal(
+    allElements(topBar).some(
+      (element) => element.getAttribute?.("data-graph-toolbar-target") === "true",
+    ),
+    false,
+  );
   assert.equal(save.disabled, false);
+  assert.equal(save.textContent, "");
+  assert.doesNotMatch(dom.text(), /Saved/);
   await dom.click(save);
   assert.equal(saveRequests, 1);
   await dom.unmount();
+});
+
+test("studio header separates quiet paths from focused workflow and file names", async () => {
+  assert.equal(appModule.topBarProjectName({
+    projectName: "Gofer Flow Workflows",
+    projectRoot: "/repos/gofer-flow",
+  }), "Gofer Flow Workflows");
+  assert.equal(appModule.topBarProjectName({ projectRoot: "/repos/gofer-flow" }), "gofer-flow");
+  assert.equal(appModule.topBarProjectName({}), "Unfiled project");
+  assert.deepEqual(
+    appModule.topBarLabelParts(
+      { id: "review", name: "Review PR", projectRoot: "/repos/gofer-flow" },
+      "graph",
+    ),
+    {
+      fullPath: "gofer-flow/Review PR",
+      name: "Review PR",
+      path: "gofer-flow",
+      separator: "/",
+    },
+  );
+  assert.deepEqual(
+    appModule.topBarLabelParts({}, "code", "C:\\repos\\gofer-flow\\src\\app.jsx"),
+    {
+      fullPath: "C:\\repos\\gofer-flow\\src\\app.jsx",
+      name: "app.jsx",
+      path: "C:\\repos\\gofer-flow\\src",
+      separator: "\\",
+    },
+  );
+  const dom = await mountReact(
+    React.createElement(appModule.TopBar, {
+      theme: "dark",
+      updateState: {},
+      view: "graph",
+      workflow: { id: "review", name: "Review PR", projectRoot: "/repos/gofer-flow" },
+      onApplyUpdate() {},
+      onCheckForUpdates() {},
+      onOpenHistory() {},
+      onRetrySave() {},
+      onToggleTheme() {},
+    }),
+    createFetchMock([]),
+  );
+  const projectPathLabel = dom.ancestor(dom.byText("gofer-flow"), (element) =>
+    String(element.getAttribute?.("class") ?? "").includes("text-muted"));
+  assert.match(projectPathLabel.getAttribute("class"), /text-muted.*text-\[11px\]/);
+  assert.match(projectPathLabel.getAttribute("class"), /leading-4/);
+  assert.match(projectPathLabel.getAttribute("class"), /shrink-0/);
+  assert.doesNotMatch(projectPathLabel.getAttribute("class"), /flex-1/);
+  const workflowTitle = dom.byText("Review PR");
+  assert.match(workflowTitle.getAttribute("class"), /font-semibold.*dark:text-white.*text-xl.*leading-6/);
+  assert.doesNotMatch(workflowTitle.getAttribute("class"), /max-w-\[55%\]/);
+  assert.doesNotMatch(workflowTitle.getAttribute("class"), /shrink-0/);
+  assert.ok(dom.ancestor(workflowTitle, (element) =>
+    String(element.getAttribute?.("class") ?? "").includes("gap-1")));
+  await dom.unmount();
+
+  const browserHeader = await mountReact(
+    React.createElement(appModule.TopBar, {
+      activeCodePath: "browser://tab-1",
+      hideCodeLabel: true,
+      theme: "dark",
+      updateState: {},
+      view: "code",
+      workflow: { id: "review", name: "Review PR", projectRoot: "/repos/gofer-flow" },
+      onApplyUpdate() {},
+      onCheckForUpdates() {},
+      onOpenHistory() {},
+      onRetrySave() {},
+      onToggleTheme() {},
+    }),
+    createFetchMock([]),
+  );
+  const browserHeading = allElements(browserHeader.container).find(
+    (element) => element.tagName === "H2",
+  );
+  assert.equal(browserHeading, undefined);
+  assert.doesNotMatch(browserHeader.container.textContent, /No file open|browser:\/\//);
+  await browserHeader.unmount();
 });
 
 test("create workflow dialog submits the selected project folder", async () => {
@@ -1462,6 +2801,25 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
   assert.equal(trace[1].detail, "workflow.toml");
   assert.equal(trace[1].output, "[workflow]");
   assert.equal(trace[0].title, "Thought");
+  assert.deepEqual(appModule.shellTraceDetails({
+    kind: "tool",
+    title: "Bash",
+    input: '{"command":"npm test"}',
+  }), {
+    command: "npm test",
+    shell: "bash",
+  });
+  assert.deepEqual(appModule.shellTraceDetails({
+    kind: "tool",
+    title: "PowerShell",
+    category: "shell",
+    shell: "PowerShell",
+    command: "Get-ChildItem",
+  }), {
+    command: "Get-ChildItem",
+    shell: "PowerShell",
+  });
+  assert.equal(appModule.shellTraceDetails({ kind: "tool", title: "Read" }), null);
   const thinkingTrace = appModule.buildThoughtTrace([
     {
       id: "thinking-start",
@@ -1500,23 +2858,17 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
     },
   ]), []);
 
-  const markdownBlocks = appModule.parseMinimalMarkdown(
-    "## Result\n\n**Ready** with `workflow.toml`.\n\n1. Read files\n2. Classify tickets\n\n```toml\n[workflow]\nname = \"Demo\"\n```",
+  const markdownMarkup = renderToStaticMarkup(
+    React.createElement(markdownContentModule.default, {
+      value: "## Result\n\n[Docs](https://example.com/docs)\n\n- [x] Ready\n\n| File | State |\n| --- | --- |\n| workflow.rad | valid |\n\n```sh\npwd\n```",
+    }),
   );
-  assert.deepEqual(markdownBlocks.map((block) => block.type), [
-    "heading",
-    "paragraph",
-    "list",
-    "code",
-  ]);
-  assert.deepEqual(markdownBlocks[1].tokens.map((token) => token.type), [
-    "strong",
-    "text",
-    "code",
-    "text",
-  ]);
-  assert.equal(markdownBlocks[2].ordered, true);
-  assert.equal(markdownBlocks[3].text, '[workflow]\nname = "Demo"');
+  assert.match(markdownMarkup, /id="result"/);
+  assert.match(markdownMarkup, /href="https:\/\/example\.com\/docs"/);
+  assert.match(markdownMarkup, /target="_blank"/);
+  assert.match(markdownMarkup, /type="checkbox"/);
+  assert.match(markdownMarkup, /<table/);
+  assert.match(markdownMarkup, /aria-label="Copy code to clipboard"/);
   assert.equal(
     appModule.normalizeMarkdownText("1. **Run** `collect`\n2. Review"),
     "Run collect Review",
@@ -1545,6 +2897,41 @@ test("chat helpers parse stream events, group thoughts, and build request payloa
     messages: [{ role: "user", body: "hi" }],
     workflow: { id: "workflow-assistant:thread-1", chatThreadId: "thread-1" },
   });
+});
+
+test("Markdown code blocks keep their scroll position while streaming and copy their contents", async () => {
+  function StreamingMarkdown() {
+    const [value, setValue] = React.useState("```sh\nmkdir -p /a/very/long/path\n```");
+    return React.createElement(
+      React.Fragment,
+      null,
+      React.createElement(markdownContentModule.default, { onOpenRelativeLink() {}, value }),
+      React.createElement(
+        "button",
+        {
+          "aria-label": "Append streamed text",
+          onClick: () => setValue("```sh\nmkdir -p /a/very/long/path/that/keeps/growing\n```"),
+          type: "button",
+        },
+        "Append",
+      ),
+    );
+  }
+
+  const dom = await mountReact(React.createElement(StreamingMarkdown), createFetchMock([]));
+  const writes = [];
+  navigator.clipboard.writeText = async (value) => writes.push(value);
+  const pre = dom.first("pre");
+  pre.scrollLeft = 84;
+
+  await dom.click(dom.byLabel("Append streamed text"));
+
+  assert.equal(dom.first("pre"), pre);
+  assert.equal(pre.scrollLeft, 84);
+  await dom.click(dom.byLabel("Copy code to clipboard"));
+  assert.deepEqual(writes, ["mkdir -p /a/very/long/path/that/keeps/growing"]);
+  assert.match(dom.text(), /Copied/);
+  await dom.unmount();
 });
 
 test("RunPreviewDialog renders grouped warnings, destructive actions, providers, fan-out samples, and node details", () => {
@@ -1739,6 +3126,21 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   await dom.flush();
   assert.match(dom.text(), /Demo/);
   assert.match(dom.text(), /latest demo log/);
+  const graphToolbar = dom.ancestor(
+    dom.byTitle("Select workflow run"),
+    (node) => node.getAttribute?.("data-toolbar") === "graph-editor",
+  );
+  const studioTopBar = dom.ancestor(
+    graphToolbar,
+    (node) => String(node.getAttribute?.("class") ?? "").includes("studio-topbar"),
+  );
+  assert.ok(studioTopBar);
+  assert.equal(
+    allElements(dom.container).filter(
+      (element) => element.getAttribute?.("data-toolbar") === "graph-editor",
+    ).length,
+    1,
+  );
   assert.equal(
     dom.fetchCalls.some((call) => call.url === "/api/workflows/demo/logs/latest"),
     true,
@@ -1788,9 +3190,13 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
 test("App renders run and stop state, opens the run preview, executes runs, and sends chat prompts", async () => {
   const chatStream = streamResponse([
     '{"type":"thought","text":"**Inspecting graph** with [workflow](https://example.com) and `step`.\\n\\n1. Read nodes\\n2. Check edges","trace":{"kind":"summary","title":"Summary","body":"**Inspecting graph** with [workflow](https://example.com) and `step`.\\n\\n1. Read nodes\\n2. Check edges"}}\n',
+    '{"type":"thought","text":"Bash","trace":{"id":"shell-1","kind":"tool","title":"bash","category":"shell","shell":"bash","command":"/usr/bin/bash -lc \\"pwd && npm test\\"","status":"running"}}\n',
+    '{"type":"thought","text":"Bash","trace":{"id":"shell-1","kind":"tool","title":"Tool result","output":"tests passed","status":"complete"}}\n',
     '{"type":"thought","text":"Read","trace":{"id":"tool-1","kind":"tool","title":"Read","detail":"workflow.toml","input":"workflow.toml","status":"running"}}\n',
     '{"type":"thought","text":"Read","trace":{"id":"tool-1","kind":"tool","title":"Tool result","output":"[workflow]","status":"complete"}}\n',
-    '{"type":"final","message":{"body":"**Looks ready**\\n\\n1. Read files\\n2. Classify tickets"}}\n',
+    '{"type":"thought","text":"Edit","trace":{"id":"edit-1","kind":"tool","title":"Edit","detail":".taskurotta/demo/workflow.rad","input":"{\\"path\\":\\".taskurotta/demo/workflow.rad\\",\\"kind\\":\\"update\\"}","status":"complete"}}\n',
+    '{"type":"changes","changes":{"id":null,"projectRoot":"/workspace","fileCount":1,"additions":1,"deletions":1,"undoable":false,"undoUnavailableReason":"Undo is available when the assistant finishes","undone":false,"live":true,"files":[{"path":".taskurotta/demo/workflow.rad","status":"modified","additions":1,"deletions":1,"binary":false,"diff":"--- a/.taskurotta/demo/workflow.rad\\n+++ b/.taskurotta/demo/workflow.rad\\n-old\\n+working\\n"}]}}\n',
+    '{"type":"final","message":{"body":"**Looks ready**\\n\\n1. Read files\\n2. Classify tickets"},"completedAt":"2026-08-31T12:34:00.000Z","durationMs":2400,"changes":{"id":"change-1","projectRoot":"/workspace","fileCount":1,"additions":2,"deletions":1,"undoable":true,"undone":false,"files":[{"path":".taskurotta/demo/workflow.rad","status":"modified","additions":2,"deletions":1,"binary":false,"diff":"--- a/.taskurotta/demo/workflow.rad\\n+++ b/.taskurotta/demo/workflow.rad\\n-old\\n+new\\n+route\\n"}]}}\n',
   ]);
   const fetchMock = createFetchMock([
     jsonResponse("/api/workflows", workflowsPayload([
@@ -1853,12 +3259,31 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     }, { method: "POST" }),
     jsonResponse("/api/workflows/demo/logs?limit=100", { runs: [] }),
     jsonResponse("/api/workflows/demo/stop", { stopped: true }, { method: "POST" }),
+    jsonResponse("/api/chat/changes/undo", { id: "change-1", undone: true, fileCount: 1 }, { method: "POST" }),
+    jsonResponse("/api/chat/changes/redo", { id: "change-1", undone: false, fileCount: 1 }, { method: "POST" }),
+    (url, options) => {
+      if (url !== "/api/chat/attachments") return null;
+      const upload = JSON.parse(options.body);
+      return {
+        ok: true,
+        status: 201,
+        json: async () => ({
+          attachments: upload.files.map((file) => ({
+            id: "stored-context",
+            name: file.name,
+            size: 18,
+            storageName: "stored-context-context.md",
+            type: file.type,
+          })),
+        }),
+      };
+    },
     (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
   ]);
   const dom = await mountReact(React.createElement(appModule.default), fetchMock);
 
   await dom.flush();
-  assert.ok(dom.byLabel("Search workflows"));
+  assert.match(dom.byLabel("Search workflows").getAttribute("class"), /studio-search-input/);
   const stopButton = dom.byTitle("Stop all runs");
   assert.equal(stopButton.disabled, false);
   await dom.click(stopButton);
@@ -1901,6 +3326,28 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   const runRequest = fetchMock.calls.find((call) => call.url === "/api/workflows/demo/run");
   assert.deepEqual(JSON.parse(runRequest.options.body), { dryRun: false, triggerContext: {} });
 
+  const chatComposer = dom.ancestor(
+    dom.byLabel("Attach files"),
+    (element) => element.getAttribute?.("data-chat-composer") !== null,
+  );
+  const attachmentInput = allElements(chatComposer).find(
+    (element) => element.tagName === "INPUT" && element.getAttribute("type") === "file",
+  );
+  assert.ok(attachmentInput);
+  await React.act(async () => {
+    await reactProps(attachmentInput).onChange({
+      target: {
+        files: [{
+          name: "context.md",
+          size: 18,
+          type: "text/markdown",
+          text: async () => "# Useful context",
+        }],
+        value: "/fake/context.md",
+      },
+    });
+  });
+  assert.match(dom.text(), /context\.md/);
   await dom.change(dom.first("textarea"), "Explain this workflow");
   await dom.click(dom.byTitle("Send message"));
   await dom.flush();
@@ -1917,7 +3364,7 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
   );
   assert.equal(
     allElements(thoughtGroup).some(
-      (element) => element.tagName === "A" && element.getAttribute("href") === "https://example.com/",
+      (element) => element.tagName === "A" && element.getAttribute("href") === "https://example.com",
     ),
     true,
   );
@@ -1933,8 +3380,25 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     ),
     true,
   );
+  const shellDisclosure = dom.ancestor(dom.byText("Running bash commands"), "BUTTON");
+  assert.equal(shellDisclosure.getAttribute("aria-expanded"), "false");
+  assert.doesNotMatch(textOf(thoughtGroup), /tests passed/);
+  await dom.click(shellDisclosure);
+  assert.equal(shellDisclosure.getAttribute("aria-expanded"), "true");
+  assert.match(textOf(thoughtGroup), /\/usr\/bin\/bash -lc "pwd && npm test"/);
   assert.match(dom.text(), /workflow\.toml/);
   assert.match(dom.text(), /\[workflow\]/);
+  const editDisclosure = dom.ancestor(dom.byText("Editing files"), "BUTTON");
+  assert.equal(editDisclosure.getAttribute("aria-expanded"), "false");
+  await dom.click(editDisclosure);
+  assert.equal(editDisclosure.getAttribute("aria-expanded"), "true");
+  assert.match(textOf(thoughtGroup), /\.taskurotta\/demo\/workflow\.rad/);
+  const editedFileLink = dom.byLabel(
+    "Open .taskurotta/demo/workflow.rad in code editor",
+  );
+  assert.equal(editedFileLink.tagName, "BUTTON");
+  assert.equal(editedFileLink.style.direction, "rtl");
+  assert.equal(editedFileLink.getAttribute("title"), ".taskurotta/demo/workflow.rad");
   assert.match(dom.text(), /Looks ready/);
   assert.equal(
     allElements(dom.container).some(
@@ -1949,6 +3413,10 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     true,
   );
   assert.match(dom.text(), /Workflow assistant response complete/);
+  assert.match(dom.text(), /Edited 1 file/);
+  assert.match(dom.text(), /\+2/);
+  assert.match(dom.text(), /-1/);
+  assert.match(dom.text(), /Ran for 2s/);
   assert.equal(
     matchingLiveRegions(dom.container, {
       politeness: "polite",
@@ -1957,8 +3425,45 @@ test("App renders run and stop state, opens the run preview, executes runs, and 
     }).length,
     1,
   );
+  await dom.click(dom.ancestor(dom.byText("Review"), "BUTTON"));
+  assert.match(dom.text(), /old/);
+  assert.match(dom.text(), /route/);
+  await dom.click(dom.ancestor(dom.byText("Undo"), "BUTTON"));
+  await dom.flush();
+  assert.ok(dom.byText("Redo"));
+  const undoRequest = fetchMock.calls.find((call) => call.url === "/api/chat/changes/undo");
+  assert.deepEqual(JSON.parse(undoRequest.options.body), { changeSetId: "change-1" });
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow assistant changes undone",
+    }).length,
+    1,
+  );
+  await dom.click(dom.ancestor(dom.byText("Redo"), "BUTTON"));
+  await dom.flush();
+  assert.ok(dom.byText("Undo"));
+  const redoRequest = fetchMock.calls.find((call) => call.url === "/api/chat/changes/redo");
+  assert.deepEqual(JSON.parse(redoRequest.options.body), { changeSetId: "change-1" });
+  assert.equal(
+    matchingLiveRegions(dom.container, {
+      politeness: "polite",
+      role: "status",
+      text: "Workflow assistant changes reapplied",
+    }).length,
+    1,
+  );
   const chatRequest = fetchMock.calls.find((call) => call.url === "/api/chat/stream");
-  assert.equal(JSON.parse(chatRequest.options.body).workflow.selectedWorkflowId, "demo");
+  const chatRequestBody = JSON.parse(chatRequest.options.body);
+  assert.equal(chatRequestBody.workflow.projectRoot, "/workspace");
+  assert.equal(chatRequestBody.workflow.selectedWorkflowId, "demo");
+  assert.equal(chatRequestBody.messages.at(-1).body, "Explain this workflow");
+  assert.equal(chatRequestBody.messages.at(-1).attachments[0].name, "context.md");
+  assert.equal(
+    chatRequestBody.messages.at(-1).attachments[0].storageName,
+    "stored-context-context.md",
+  );
 
   await dom.unmount();
 });
@@ -2018,6 +3523,182 @@ test("assistant threads keep streaming after navigation and report running and c
     ),
     false,
   );
+
+  await dom.unmount();
+});
+
+test("assistant file changes and elapsed time update before the turn completes", async () => {
+  const controlledStream = controlledStreamResponse([
+    '{"type":"changes","changes":{"id":null,"projectRoot":"/workspace","fileCount":1,"additions":1,"deletions":0,"undoable":false,"live":true,"files":[{"path":"workflow.rad","status":"modified","additions":1,"deletions":0,"binary":false,"diff":"+working\\n"}]}}\n',
+    '{"type":"final","message":{"body":"Done"},"completedAt":"2026-08-31T12:34:00.000Z","durationMs":2100,"changes":{"id":"change-1","projectRoot":"/workspace","fileCount":1,"additions":2,"deletions":0,"undoable":true,"undone":false,"files":[{"path":"workflow.rad","status":"modified","additions":2,"deletions":0,"binary":false,"diff":"+done\\n+tested\\n"}]}}\n',
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => (url === "/api/chat/stream" ? controlledStream.response(url) : null),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock);
+
+  await dom.flush();
+  await dom.change(dom.first("textarea"), "Edit this workflow");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  assert.match(dom.text(), /Running for 0s/);
+
+  controlledStream.releaseNext();
+  await dom.flush();
+  assert.match(dom.text(), /Editing 1 file/);
+  assert.match(dom.text(), /\+1/);
+  const liveChangeCard = dom.byLabel("Assistant file changes");
+  const liveUndo = allElements(liveChangeCard).find(
+    (element) => element.tagName === "BUTTON" && textOf(element).trim() === "Undo",
+  );
+  assert.equal(reactProps(liveUndo).disabled, true);
+
+  controlledStream.releaseNext();
+  await dom.flush();
+  assert.match(dom.text(), /Edited 1 file/);
+  assert.match(dom.text(), /Ran for 2s/);
+  assert.doesNotMatch(dom.text(), /Editing 1 file/);
+
+  await dom.unmount();
+});
+
+test("assistant threads keep their project scope until the user changes it", async () => {
+  const alpha = {
+    ...workflowFixture({ id: "alpha-workflow", name: "Alpha workflow" }),
+    projectName: "alpha",
+    projectRoot: "/projects/alpha",
+  };
+  const beta = {
+    ...workflowFixture({ id: "beta-workflow", name: "Beta workflow" }),
+    projectName: "beta",
+    projectRoot: "/projects/beta",
+  };
+  const chatStream = streamResponse([
+    '{"type":"final","message":{"body":"Done"}}\n',
+  ]);
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+    (url) => (url === "/api/chat/stream" ? chatStream(url) : null),
+  ]);
+
+  function ScopeHarness() {
+    const [selectedWorkflow, setSelectedWorkflow] = React.useState(alpha);
+    return React.createElement(
+      React.Fragment,
+      null,
+      React.createElement("button", {
+        type: "button",
+        onClick: () => setSelectedWorkflow(beta),
+      }, "Select beta in Studio"),
+      React.createElement(appModule.ChatPane, {
+        activeWorkflowId: selectedWorkflow.id,
+        onOpenMarkdownLink() {},
+        onResizeKeyDown() {},
+        onResizeStart() {},
+        recentProjectRoots: ["/projects/alpha", "/projects/beta"],
+        width: 380,
+        workflow: selectedWorkflow,
+        workflows: [alpha, beta],
+      }),
+    );
+  }
+
+  const dom = await mountReact(React.createElement(ScopeHarness), fetchMock);
+  await dom.flush();
+  assert.ok(dom.byLabel("Scoped to alpha. Change project scope"));
+
+  await dom.change(dom.first("textarea"), "Start in alpha");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  let requests = fetchMock.calls.filter((call) => call.url === "/api/chat/stream");
+  let requestBody = JSON.parse(requests[0].options.body);
+  assert.equal(requestBody.workflow.projectRoot, "/projects/alpha");
+  assert.equal(requestBody.workflow.selectedWorkflowId, "alpha-workflow");
+  assert.deepEqual(
+    requestBody.workflow.workflows.map((workflow) => workflow.id),
+    ["alpha-workflow"],
+  );
+
+  await dom.click(dom.byText("Select beta in Studio"));
+  assert.ok(dom.byLabel("Scoped to alpha. Change project scope"));
+
+  await dom.click(dom.byLabel("Scoped to alpha. Change project scope"));
+  const scopeMenu = dom.byLabel("Assistant project scope");
+  const betaScopeButton = allElements(scopeMenu).find(
+    (element) => element.tagName === "BUTTON" && textOf(element).trim() === "beta",
+  );
+  assert.ok(betaScopeButton);
+  await dom.click(betaScopeButton);
+  assert.ok(dom.byLabel("Scoped to beta. Change project scope"));
+
+  await dom.change(dom.first("textarea"), "Continue in beta");
+  await dom.click(dom.byTitle("Send message"));
+  await dom.flush();
+  requests = fetchMock.calls.filter((call) => call.url === "/api/chat/stream");
+  requestBody = JSON.parse(requests[1].options.body);
+  assert.equal(requestBody.workflow.projectRoot, "/projects/beta");
+  assert.equal(requestBody.workflow.selectedWorkflowId, "beta-workflow");
+  assert.deepEqual(
+    requestBody.workflow.workflows.map((workflow) => workflow.id),
+    ["beta-workflow"],
+  );
+
+  await dom.unmount();
+});
+
+test("changing project scope from assistant home keeps the thread list visible", async () => {
+  const alpha = {
+    ...workflowFixture({ id: "alpha-workflow", name: "Alpha workflow" }),
+    projectName: "alpha",
+    projectRoot: "/projects/alpha",
+  };
+  const beta = {
+    ...workflowFixture({ id: "beta-workflow", name: "Beta workflow" }),
+    projectName: "beta",
+    projectRoot: "/projects/beta",
+  };
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/provider/capabilities", {
+      providers: [{ id: "codex", displayName: "Codex", available: true, models: [] }],
+    }),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.ChatPane, {
+    activeWorkflowId: alpha.id,
+    onOpenMarkdownLink() {},
+    onResizeKeyDown() {},
+    onResizeStart() {},
+    recentProjectRoots: ["/projects/alpha", "/projects/beta"],
+    width: 380,
+    workflow: alpha,
+    workflows: [alpha, beta],
+  }), fetchMock);
+
+  await dom.flush();
+  assert.ok(allElements(dom.container).find(
+    (element) => element.getAttribute?.("data-assistant-home") !== null,
+  ));
+  assert.match(dom.text(), /Recent threads/);
+
+  await dom.click(dom.byLabel("Scoped to alpha. Change project scope"));
+  const scopeMenu = dom.byLabel("Assistant project scope");
+  const betaScopeButton = allElements(scopeMenu).find(
+    (element) => element.tagName === "BUTTON" && textOf(element).trim() === "beta",
+  );
+  assert.ok(betaScopeButton);
+  await dom.click(betaScopeButton);
+
+  assert.ok(dom.byLabel("Scoped to beta. Change project scope"));
+  assert.ok(allElements(dom.container).find(
+    (element) => element.getAttribute?.("data-assistant-home") !== null,
+  ));
+  assert.match(dom.text(), /Recent threads/);
+  assert.equal(dom.allByTitle("Back to recent threads").length, 0);
 
   await dom.unmount();
 });
@@ -2382,8 +4063,8 @@ test("DagCanvas mounted interactions create/select/edit/delete nodes, create edg
   assert.match(dom.text(), /trigger\.name from workflow\.trigger/);
 
   await dom.click(dom.byTitle("Hide node inspector"));
-  await dom.click(dom.byTitle("Show workflow settings and node inspector"));
-  assert.equal(dom.byText("Workflow settings").tagName, "H2");
+  await openWorkflowSettingsFromMenu(dom);
+  assert.ok(headingByText(dom, "Workflow settings"));
   assert.doesNotMatch(
     dom.ancestor(dom.byText("Initial command"), "ARTICLE").getAttribute("class"),
     /border-indigo-500|ring-indigo-100/,
@@ -2666,7 +4347,7 @@ test("pane separators expose values and support arrow, boundary, and reset keys"
     }),
     createFetchMock([]),
   );
-  await canvasDom.click(canvasDom.byTitle("Show workflow settings and node inspector"));
+  await openWorkflowSettingsFromMenu(canvasDom);
   const inspectorResizer = canvasDom.byLabel("Resize workflow settings and node inspector");
   assert.equal(inspectorResizer.getAttribute("role"), "separator");
   assert.equal(inspectorResizer.getAttribute("aria-orientation"), "vertical");
@@ -2680,13 +4361,6 @@ test("pane separators expose values and support arrow, boundary, and reset keys"
   await canvasDom.keyDown(inspectorResizer, "Enter");
   assert.equal(inspectorResizer.getAttribute("aria-valuenow"), "340");
 
-  await canvasDom.click(canvasDom.byTitle("Expand log"));
-  const logResizer = canvasDom.byLabel("Resize workflow log");
-  assert.equal(logResizer.getAttribute("aria-orientation"), "horizontal");
-  await canvasDom.keyDown(logResizer, "ArrowUp");
-  assert.equal(logResizer.getAttribute("aria-valuenow"), "250");
-  await canvasDom.keyDown(logResizer, "Home");
-  assert.equal(logResizer.getAttribute("aria-valuenow"), "140");
   await canvasDom.unmount();
 
   const appDom = await mountReact(
@@ -2696,6 +4370,15 @@ test("pane separators expose values and support arrow, boundary, and reset keys"
     ]),
   );
   await appDom.flush();
+  await appDom.click(appDom.byLabel("Expand bottom panel"));
+  const bottomPanelResizer = appDom.byLabel("Resize bottom panel");
+  assert.equal(bottomPanelResizer.getAttribute("aria-orientation"), "horizontal");
+  await appDom.keyDown(bottomPanelResizer, "ArrowUp");
+  assert.equal(bottomPanelResizer.getAttribute("aria-valuenow"), "310");
+  await appDom.keyDown(bottomPanelResizer, "Home");
+  assert.equal(bottomPanelResizer.getAttribute("aria-valuenow"), "140");
+  await appDom.keyDown(bottomPanelResizer, "Enter");
+  assert.equal(bottomPanelResizer.getAttribute("aria-valuenow"), "300");
   const workflowsResizer = appDom.byLabel("Resize workflows pane");
   const chatResizer = appDom.byLabel("Resize chat pane");
   assert.equal(workflowsResizer.getAttribute("aria-valuenow"), "272");
@@ -2707,6 +4390,294 @@ test("pane separators expose values and support arrow, boundary, and reset keys"
   await appDom.keyDown(chatResizer, "ArrowLeft");
   assert.equal(chatResizer.getAttribute("aria-valuenow"), "370");
   await appDom.unmount();
+});
+
+test("bottom panel state and project trust stay global across workflow switches", async () => {
+  const trustedRoots = [];
+  const first = { ...workflowFixture({ id: "first", name: "First" }), projectRoot: "/repos/first" };
+  const second = { ...workflowFixture({ id: "second", name: "Second" }), projectRoot: "/repos/second" };
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([first, second])),
+    ]),
+    {
+      desktop: {
+        workspace: {
+          trustProjectRoot: async (projectRoot) => {
+            trustedRoots.push(projectRoot);
+          },
+        },
+      },
+    },
+  );
+  await dom.flush();
+
+  assert.deepEqual(new Set(trustedRoots), new Set(["/repos/first", "/repos/second"]));
+  const panelHeader = dom.byLabel("Bottom panel views");
+  await dom.click(panelHeader);
+  assert.ok(dom.byLabel("Collapse bottom panel"));
+  await dom.click(panelHeader);
+  assert.ok(dom.byLabel("Expand bottom panel"));
+  await dom.click(dom.byText("Problems"));
+  assert.equal(dom.byText("Problems").getAttribute("aria-selected"), "true");
+  await dom.click(dom.byText("Problems"));
+  assert.ok(dom.byLabel("Expand bottom panel"));
+  await dom.click(dom.byText("Problems"));
+  await dom.dispatchWindow("keydown", {
+    code: "Backquote",
+    ctrlKey: true,
+    key: "Dead",
+  });
+  assert.ok(dom.byLabel("Expand bottom panel"));
+  await dom.dispatchWindow("keydown", {
+    code: "Backquote",
+    ctrlKey: true,
+    key: "Dead",
+  });
+  assert.ok(dom.byLabel("Collapse bottom panel"));
+  assert.equal(dom.byText("Problems").getAttribute("aria-selected"), "true");
+  const resizer = dom.byLabel("Resize bottom panel");
+  await dom.keyDown(resizer, "ArrowUp");
+  assert.equal(resizer.getAttribute("aria-valuenow"), "310");
+
+  await dom.click(dom.ancestor(
+    dom.byText("Second"),
+    (node) => node.getAttribute?.("role") === "button",
+  ));
+  await dom.flush();
+
+  assert.ok(dom.byLabel("Collapse bottom panel"));
+  assert.equal(dom.byLabel("Resize bottom panel").getAttribute("aria-valuenow"), "310");
+  await dom.unmount();
+});
+
+test("workspace contains bottom panel height transitions without page overflow", async () => {
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([
+      jsonResponse("/api/workflows", workflowsPayload([workflowFixture()])),
+    ]),
+  );
+  await dom.flush();
+
+  const workspace = dom.byLabel("Bottom panel").parentNode;
+  assert.match(workspace.getAttribute("class"), /min-h-0/);
+  assert.match(workspace.getAttribute("class"), /overflow-hidden/);
+
+  await dom.unmount();
+});
+
+test("terminal sessions that finish opening after tab cleanup are closed", async () => {
+  let canceledCreateCount = 0;
+  const canceledLifecycle = bottomPanelModule.createDisposableTerminalSession(
+    {
+      close: async () => {},
+      create: async () => {
+        canceledCreateCount += 1;
+        return { id: "should-not-open", shell: "bash" };
+      },
+    },
+    { cwd: "/workspace" },
+  );
+  canceledLifecycle.dispose();
+  await canceledLifecycle.settled;
+  assert.equal(canceledCreateCount, 0);
+
+  const pendingSession = createDeferred();
+  const closedSessionIds = [];
+  let readySession = null;
+  const lifecycle = bottomPanelModule.createDisposableTerminalSession(
+    {
+      close: async (sessionId) => {
+        closedSessionIds.push(sessionId);
+      },
+      create: async () => pendingSession.promise,
+    },
+    { cwd: "/workspace" },
+    { onReady: (session) => { readySession = session; } },
+  );
+
+  await Promise.resolve();
+  lifecycle.dispose();
+  pendingSession.resolve({ id: "strict-mode-orphan", shell: "bash" });
+  await lifecycle.settled;
+
+  assert.equal(readySession, null);
+  assert.deepEqual(closedSessionIds, ["strict-mode-orphan"]);
+});
+
+test("terminal tab shortcuts require the visible terminal and ignore key repeat", () => {
+  const shortcut = (key, options = {}, event = {}) => (
+    bottomPanelModule.terminalWorkspaceShortcutAction(
+      { altKey: false, ctrlKey: true, key, metaKey: false, repeat: false, shiftKey: false, ...event },
+      { active: true, activeKey: "terminal-1", renaming: false, ...options },
+    )
+  );
+
+  assert.equal(shortcut("t"), "new");
+  assert.equal(shortcut("w"), "close");
+  assert.equal(shortcut("t", { active: false }), null);
+  assert.equal(shortcut("w", { active: false }), null);
+  assert.equal(shortcut("t", {}, { repeat: true }), null);
+  assert.equal(shortcut("w", {}, { repeat: true }), null);
+  assert.equal(shortcut("w", { activeKey: null }), null);
+  assert.equal(shortcut("t", { renaming: true }), null);
+  assert.equal(bottomPanelModule.bottomPanelTabForShortcut("timeline", false), "terminal");
+  assert.equal(bottomPanelModule.bottomPanelTabForShortcut("timeline", true), "timeline");
+  assert.equal(bottomPanelModule.bottomPanelTabForShortcut("problems", true), "problems");
+});
+
+test("terminal clipboard shortcuts copy selections and paste clipboard text", async () => {
+  const shortcut = (key, event = {}) => bottomPanelModule.terminalClipboardShortcutAction({
+    altKey: false,
+    ctrlKey: true,
+    key,
+    metaKey: false,
+    shiftKey: true,
+    type: "keydown",
+    ...event,
+  });
+  assert.equal(shortcut("c"), "copy");
+  assert.equal(shortcut("V"), "paste");
+  assert.equal(shortcut("c", { shiftKey: false }), null);
+  assert.equal(shortcut("v", { altKey: true }), null);
+
+  const copied = [];
+  assert.equal(await bottomPanelModule.copyTerminalSelection(
+    { getSelection: () => "selected output" },
+    { writeText: async (text) => copied.push(text) },
+  ), true);
+  assert.deepEqual(copied, ["selected output"]);
+  assert.equal(await bottomPanelModule.copyTerminalSelection(
+    { getSelection: () => "" },
+    { writeText: async () => { throw new Error("should not write"); } },
+  ), false);
+
+  const writes = [];
+  assert.equal(await bottomPanelModule.pasteIntoTerminal(
+    { write: async (id, text) => writes.push([id, text]) },
+    "terminal-1",
+    { readText: async () => "npm --prefix frontend run electron:dev" },
+  ), true);
+  assert.deepEqual(writes, [["terminal-1", "npm --prefix frontend run electron:dev"]]);
+  assert.equal(await bottomPanelModule.pasteIntoTerminal(
+    { write: async () => { throw new Error("should not write"); } },
+    "",
+    { readText: async () => "ignored" },
+  ), false);
+});
+
+test("terminal tabs stay grouped by the project captured when they were opened", () => {
+  const groups = bottomPanelModule.groupTerminalTabsByProject([
+    {
+      cwd: "/tmp/a-shell-moved-here",
+      key: "api-1",
+      label: "bash 1",
+      projectPath: "/repos/customer-api",
+    },
+    {
+      cwd: "/repos/web-client",
+      key: "web-1",
+      label: "bash 2",
+      projectPath: "/repos/web-client",
+    },
+    {
+      cwd: "/repos/customer-api",
+      key: "api-2",
+      label: "bash 3",
+      projectPath: "/repos/customer-api",
+    },
+  ]);
+
+  assert.deepEqual(
+    groups.map((group) => ({
+      keys: group.items.map((tab) => tab.key),
+      name: group.name,
+      projectPath: group.projectPath,
+    })),
+    [
+      {
+        keys: ["api-1", "api-2"],
+        name: "customer-api",
+        projectPath: "/repos/customer-api",
+      },
+      {
+        keys: ["web-1"],
+        name: "web-client",
+        projectPath: "/repos/web-client",
+      },
+    ],
+  );
+  assert.equal(bottomPanelModule.terminalDirectoryFromOsc("P;Cwd=/repos/gofer-flow"), "/repos/gofer-flow");
+  assert.equal(bottomPanelModule.terminalDirectoryFromOsc("P;Cwd=C:\\repos\\gofer-flow"), "C:\\repos\\gofer-flow");
+  assert.equal(bottomPanelModule.terminalDirectoryFromOsc("P;Other=value"), "");
+  assert.equal(bottomPanelModule.terminalDirectoryFromOsc("P;Cwd=/tmp\nspoofed"), "");
+});
+
+test("terminal groups support moves, empty custom groups, renames, and recursive deletion", () => {
+  const tabs = [
+    {
+      cwd: "/repos/customer-api",
+      key: "api-1",
+      label: "bash 1",
+      projectPath: "/repos/customer-api",
+    },
+    {
+      cwd: "/repos/web-client",
+      key: "web-1",
+      label: "bash 2",
+      projectPath: "/repos/web-client",
+    },
+  ];
+  const definitions = [{
+    id: "custom:1",
+    keepEmpty: true,
+    name: bottomPanelModule.terminalGroupName(1),
+    projectPath: "/repos/customer-api",
+  }];
+
+  assert.equal(definitions[0].name, "Group 1");
+  assert.deepEqual(
+    bottomPanelModule.groupTerminalTabsByProject(tabs, definitions).map((group) => ({
+      count: group.items.length,
+      id: group.id,
+      name: group.name,
+    })),
+    [
+      { count: 1, id: "project:/repos/customer-api", name: "customer-api" },
+      { count: 0, id: "custom:1", name: "Group 1" },
+      { count: 1, id: "project:/repos/web-client", name: "web-client" },
+    ],
+  );
+
+  const moved = bottomPanelModule.moveTerminalTabToGroup(tabs, "api-1", "custom:1");
+  assert.equal(moved[0].groupId, "custom:1");
+  assert.equal(moved[0].cwd, "/repos/customer-api");
+  assert.equal(moved[0].projectPath, "/repos/customer-api");
+  assert.deepEqual(
+    bottomPanelModule.groupTerminalTabsByProject(moved, [{ ...definitions[0], keepEmpty: false }])
+      .map((group) => group.name),
+    ["Group 1", "web-client"],
+  );
+
+  const renamed = bottomPanelModule.upsertTerminalGroupDefinition(definitions, {
+    ...definitions[0],
+    keepEmpty: false,
+    name: "Deploy shells",
+  });
+  assert.equal(renamed[0].name, "Deploy shells");
+  assert.deepEqual(
+    bottomPanelModule.terminalTabsAfterDeletingGroup(moved, "custom:1").map((tab) => tab.key),
+    ["web-1"],
+  );
+});
+
+test("terminal initialization creates only one tab under repeated effects", () => {
+  assert.equal(bottomPanelModule.shouldCreateInitialTerminal(true, 0, false), true);
+  assert.equal(bottomPanelModule.shouldCreateInitialTerminal(true, 0, true), false);
+  assert.equal(bottomPanelModule.shouldCreateInitialTerminal(true, 1, false), false);
+  assert.equal(bottomPanelModule.shouldCreateInitialTerminal(false, 0, false), false);
 });
 
 test("inspector parsed fields keep drafts stable and commit or restore consistently", async () => {
@@ -2970,107 +4941,117 @@ test("DagCanvas edits named structured-output schemas without mounting an eager 
 
 test("DagCanvas renders structured run timeline and selected node details", async () => {
   const workflow = workflowFixture({ id: "timeline", name: "Timeline", label: "Run command" });
-  const dom = await mountReact(
-    React.createElement(DagCanvasHarness, {
-      dataDir: "/workspace",
-      workflow,
-      logState: {
-        loading: false,
-        error: "",
-        text: "legacy log",
-        path: "logs/timeline/run.log",
-        runs: [],
-        runEvents: [
+  const logState = {
+    loading: false,
+    error: "",
+    text: "legacy log",
+    path: "logs/timeline/run.log",
+    runs: [],
+    runEvents: [
+      {
+        nodeId: "step",
+        status: "started",
+        attempt: 1,
+        occurredAt: "2026-01-02T03:04:05Z",
+        message: "attempt 1 started",
+        fanOutItem: { index: "0" },
+      },
+      {
+        nodeId: "step",
+        status: "completed",
+        attempt: 1,
+        occurredAt: "2026-01-02T03:04:06Z",
+        message: "attempt 1 finished success=true exit_code=0",
+      },
+      {
+        nodeId: "step",
+        status: "reused",
+        occurredAt: "2026-01-02T03:04:07Z",
+        message: "reused output from resumed run",
+      },
+    ],
+    runNodes: {
+      step: {
+        nodeId: "step",
+        status: "completed",
+        durationSeconds: 0.25,
+        exitCode: 0,
+        attempts: [
           {
-            nodeId: "step",
-            status: "started",
             attempt: 1,
-            occurredAt: "2026-01-02T03:04:05Z",
-            message: "attempt 1 started",
+            runNumber: 1,
+            durationSeconds: 0.25,
             fanOutItem: { index: "0" },
+            inputs: { stdin: "hello" },
+            output: "ok",
           },
           {
-            nodeId: "step",
-            status: "completed",
             attempt: 1,
-            occurredAt: "2026-01-02T03:04:06Z",
-            message: "attempt 1 finished success=true exit_code=0",
-          },
-          {
-            nodeId: "step",
-            status: "reused",
-            occurredAt: "2026-01-02T03:04:07Z",
-            message: "reused output from resumed run",
+            runNumber: 2,
+            durationSeconds: 0.1,
+            fanOutItem: { index: "1" },
+            inputs: { stdin: "bad" },
+            output: "bad item",
+            stderr: "stderr detail",
+            prompt: "rendered prompt",
           },
         ],
-        runNodes: {
-          step: {
-            nodeId: "step",
-            status: "completed",
-            durationSeconds: 0.25,
-            exitCode: 0,
-            attempts: [
+        data: {
+          reused: true,
+          message: "agent summary message",
+          fanOut: {
+            itemCount: 2,
+            successCount: 1,
+            failureCount: 1,
+            items: [
+              { index: 0, status: "completed", output: "ok", durationSeconds: 0.25 },
               {
-                attempt: 1,
-                runNumber: 1,
-                durationSeconds: 0.25,
-                fanOutItem: { index: "0" },
-                inputs: { stdin: "hello" },
-                output: "ok",
-              },
-              {
-                attempt: 1,
-                runNumber: 2,
-                durationSeconds: 0.1,
-                fanOutItem: { index: "1" },
-                inputs: { stdin: "bad" },
+                index: 1,
+                status: "failed",
                 output: "bad item",
-                stderr: "stderr detail",
-                prompt: "rendered prompt",
+                error: "bad item",
+                durationSeconds: 0.1,
+                exitCode: 1,
               },
             ],
-            data: {
-              reused: true,
-              message: "agent summary message",
-              fanOut: {
-                itemCount: 2,
-                successCount: 1,
-                failureCount: 1,
-                items: [
-                  { index: 0, status: "completed", output: "ok", durationSeconds: 0.25 },
-                  {
-                    index: 1,
-                    status: "failed",
-                    output: "bad item",
-                    error: "bad item",
-                    durationSeconds: 0.1,
-                    exitCode: 1,
-                  },
-                ],
-              },
-              edgeDecisions: [
-                { from: "step", to: "next", condition: "on_success", matched: true },
-              ],
-            },
           },
-        },
-        usageSummary: {
-          totals: {
-            agent_calls: 2,
-            total_tokens: 321,
-            estimated_cost: 0.012345,
-            agent_time_seconds: 1.5,
-          },
-          most_expensive_nodes: [
-            { node_id: "step", estimated_cost: 0.012345, duration_seconds: 1.5 },
-          ],
-          slowest_nodes: [
-            { node_id: "step", estimated_cost: 0.012345, duration_seconds: 1.5 },
+          edgeDecisions: [
+            { from: "step", to: "next", condition: "on_success", matched: true },
           ],
         },
       },
-      onWorkflowChange() {},
-    }),
+    },
+    usageSummary: {
+      totals: {
+        agent_calls: 2,
+        total_tokens: 321,
+        estimated_cost: 0.012345,
+        agent_time_seconds: 1.5,
+      },
+      most_expensive_nodes: [
+        { node_id: "step", estimated_cost: 0.012345, duration_seconds: 1.5 },
+      ],
+      slowest_nodes: [
+        { node_id: "step", estimated_cost: 0.012345, duration_seconds: 1.5 },
+      ],
+    },
+  };
+  const dom = await mountReact(
+    React.createElement(React.Fragment, null,
+      React.createElement(DagCanvasHarness, {
+        dataDir: "/workspace",
+        workflow,
+        logState,
+        onWorkflowChange() {},
+      }),
+      React.createElement(canvasModule.RunTimelinePanel, {
+        embedded: true,
+        runEvents: logState.runEvents,
+        text: logState.text,
+        title: "Workflow log",
+        usageSummary: logState.usageSummary,
+      }),
+    ),
     createFetchMock([]),
   );
 
@@ -3127,6 +5108,7 @@ test("DagCanvas run history exposes resume and rerun controls", async () => {
   );
 
   await dom.flush();
+  await dom.click(dom.byTitle("More graph actions"));
   await dom.click(dom.byTitle("Select workflow run"));
   assert.match(dom.text(), /Resume/);
   assert.match(dom.text(), /Rerun failed nodes/);
@@ -3199,6 +5181,7 @@ test("DagCanvas surfaces webhook trigger state and replay controls", async () =>
   assert.match(dom.text(), /Webhook\/API triggers/);
   assert.match(dom.text(), /Token required/);
 
+  await dom.click(dom.byTitle("More graph actions"));
   await dom.click(dom.byTitle("Select workflow run"));
   await dom.click(dom.ancestor(dom.byText("Replay webhook payload"), "BUTTON"));
   assert.deepEqual(replayCalls, [{ runId: "run-1.log", triggerId: "github" }]);
@@ -3393,32 +5376,23 @@ test("DagCanvas authors runtime generic fan-out settings", async () => {
 test("DagCanvas retention controls send configured cleanup settings", async () => {
   const pruneCalls = [];
   const settingsChanges = [];
-  const workflow = workflowFixture({ id: "history-actions", name: "History actions" });
   const dom = await mountReact(
-    React.createElement(DagCanvasHarness, {
-      dataDir: "/workspace",
-      workflow,
+    React.createElement(canvasModule.RunTimelinePanel, {
+      embedded: true,
       retentionSettings: { keepDays: 7, keepFailedDays: 21, keepLast: 50 },
-      logState: {
-        loading: false,
-        error: "",
-        text: "completed run",
-        path: "logs/history-actions/run-1.log",
-        runs: [{ id: "run-1.log", status: "success", startedAt: "2026-01-02T03:04:05Z" }],
-      },
-      onPruneRunLogs(options) {
+      text: "completed run",
+      runs: [{ id: "run-1.log", status: "success", startedAt: "2026-01-02T03:04:05Z" }],
+      onPruneRuns(options) {
         pruneCalls.push(options);
       },
       onRetentionSettingsChange(nextSettings) {
         settingsChanges.push(nextSettings);
       },
-      onWorkflowChange() {},
     }),
     createFetchMock([]),
   );
 
   await dom.flush();
-  await dom.click(dom.byTitle("Expand log"));
   await dom.click(dom.byTitle("Run retention settings"));
   await dom.change(dom.controlAfterLabel("Keep latest runs"), "25");
   await dom.change(dom.controlAfterLabel("Keep runs for days"), "5");
@@ -3493,6 +5467,201 @@ test("Electron main IPC contract registers real handlers and invokes the wired i
   );
 });
 
+test("Git porcelain status maps tracked, untracked, deleted, and renamed files", async () => {
+  const {
+    parseGitDiffHunks,
+    parseGitHistory,
+    parseGitStatus,
+    parseGitWorktrees,
+    readGitFileBaseline,
+    readGitStatus,
+  } = require("../../electron/git-status.cjs");
+  assert.deepEqual(parseGitHistory("\0abc\x1fa1b2c3\x1fAda\x1f2026-08-31T12:00:00Z\x1fShip it\x1fShip it\n\nFull details.\n\x1fHEAD -> main\n12\t3\tapp.js\n-\t-\timage.png\n5\t0\ttest.js\n"), [{
+    author: "Ada",
+    authoredAt: "2026-08-31T12:00:00Z",
+    deletions: 3,
+    hash: "abc",
+    insertions: 17,
+    message: "Ship it\n\nFull details.",
+    refs: "HEAD -> main",
+    shortHash: "a1b2c3",
+    subject: "Ship it",
+  }]);
+  assert.deepEqual(parseGitWorktrees("worktree /repo\nHEAD abc\nbranch refs/heads/main\n\nworktree /repo-feature\nHEAD def\ndetached\n\n"), [
+    { bare: false, branch: "main", detached: false, head: "abc", locked: false, path: "/repo", prunable: false },
+    { bare: false, branch: "", detached: true, head: "def", locked: false, path: "/repo-feature", prunable: false },
+  ]);
+  assert.deepEqual(parseGitStatus([
+    " M src/app.js",
+    "?? notes.txt",
+    "A  added.txt",
+    " D removed.txt",
+    "R  renamed.txt",
+    "old-name.txt",
+    "!! ignored.log",
+    "",
+  ].join("\0")), [
+    { path: "src/app.js", status: "M" },
+    { path: "notes.txt", status: "U" },
+    { path: "added.txt", status: "A" },
+    { path: "removed.txt", status: "D" },
+    { path: "renamed.txt", status: "A" },
+  ]);
+
+  const calls = [];
+  const result = await readGitStatus("/workspace/project", {
+    async runGit(args) {
+      calls.push(args);
+      return calls.length === 1 ? "/workspace/project\n" : " M workflow.rad\0";
+    },
+  });
+  assert.deepEqual(result, {
+    active: true,
+    entries: [{ path: "workflow.rad", status: "M" }],
+    root: "/workspace/project",
+  });
+  assert.deepEqual(calls[1], [
+    "-C",
+    "/workspace/project",
+    "status",
+    "--porcelain=v1",
+    "-z",
+    "--untracked-files=all",
+    "--",
+    ".",
+  ]);
+  assert.deepEqual(await readGitStatus("/not-a-repo", {
+    async runGit() { throw new Error("not a repository"); },
+  }), { active: false, entries: [], root: "" });
+
+  assert.deepEqual(parseGitDiffHunks([
+    "@@ -2,2 +2,3 @@",
+    "@@ -12 +13,0 @@",
+    "@@ -0,0 +1 @@",
+  ].join("\n")), [
+    { startLine: 2, endLine: 4 },
+    { startLine: 13, endLine: 13 },
+    { startLine: 1, endLine: 1 },
+  ]);
+
+  const baselineCalls = [];
+  assert.deepEqual(await readGitFileBaseline("/workspace/project/src/app.js", {
+    async runGit(args) {
+      baselineCalls.push(args);
+      if (args.includes("rev-parse")) return "/workspace/project\n";
+      if (args.includes("ls-files")) return "src/app.js\n";
+      if (args.includes("show")) return "const answer = 41;\n";
+      return "@@ -1 +1 @@\n-const answer = 41;\n+const answer = 42;\n";
+    },
+  }), {
+    changed: true,
+    content: "const answer = 41;\n",
+    hunks: [{ startLine: 1, endLine: 1 }],
+    tracked: true,
+  });
+  assert.ok(baselineCalls.some((args) => args.includes("HEAD")));
+});
+
+test("commit history rows expand on click without hover-only details", async () => {
+  const commit = {
+    author: "Ada",
+    authoredAt: "2026-08-31T12:00:00Z",
+    deletions: 3,
+    hash: "abc123def456",
+    insertions: 17,
+    message: "Ship it\n\nFull commit details.",
+    refs: "HEAD -> main",
+    shortHash: "abc123d",
+    subject: "Ship it",
+  };
+  const workspace = {
+    async gitHistory() {
+      return { active: true, commits: [commit] };
+    },
+    async gitStatus() {
+      return { active: true, entries: [] };
+    },
+    async gitWorktrees() {
+      return { active: true, worktrees: [] };
+    },
+    async listDirectory() {
+      return { entries: [] };
+    },
+    async trustProjectRoot() {},
+  };
+  const dom = await mountReact(
+    React.createElement(codeFileExplorerModule.default, {
+      workflow: { projectRoot: "/workspace/project" },
+    }),
+    createFetchMock([]),
+    { desktop: { workspace } },
+  );
+
+  assert.equal(codeFileExplorerModule.commitMessageBody(commit), "Full commit details.");
+  assert.equal(codeFileExplorerModule.commitMessageBody({ ...commit, message: commit.subject }), "");
+  assert.equal(codeFileExplorerModule.commitMessageBody({ ...commit, message: "A different first line\n\nMore context." }), "A different first line\n\nMore context.");
+
+  const sourceControlButton = dom.ancestor(dom.byText("Source control"), "BUTTON");
+  await dom.click(sourceControlButton);
+  await dom.flush();
+
+  const copiedValues = [];
+  navigator.clipboard.writeText = async (value) => copiedValues.push(value);
+  const commitButton = dom.ancestor(dom.byText("abc123d"), "BUTTON");
+  const copyCommitButton = dom.byLabel("Copy commit ID abc123d");
+  assert.equal(commitButton.getAttribute("aria-expanded"), "false");
+  assert.equal(commitButton.parentNode.getAttribute("title"), null);
+  assert.match(dom.text(), /Ship it/);
+  assert.doesNotMatch(dom.text(), /Full commit details\./);
+  assert.throws(() => dom.byLabel("17 insertions, 3 deletions"));
+
+  await dom.click(copyCommitButton);
+  assert.deepEqual(copiedValues, [commit.hash]);
+  assert.ok(dom.byLabel("Copied commit ID abc123d"));
+  assert.equal(commitButton.getAttribute("aria-expanded"), "false");
+
+  await dom.click(commitButton);
+  assert.equal(commitButton.getAttribute("aria-expanded"), "true");
+  assert.match(dom.text(), /Full commit details\./);
+  assert.doesNotMatch(dom.text(), /Created/);
+  const authorLines = allElements(commitButton.parentNode).filter(
+    (node) => node.tagName === "P" && directText(node) === "Ada",
+  );
+  assert.equal(authorLines.length, 0, "author name should only appear once, in the row header");
+  assert.ok(dom.byLabel("17 insertions, 3 deletions"));
+
+  await dom.click(commitButton);
+  assert.equal(commitButton.getAttribute("aria-expanded"), "false");
+  assert.match(dom.text(), /Ship it/);
+  assert.doesNotMatch(dom.text(), /Full commit details\./);
+  await dom.unmount();
+});
+
+test("Electron terminal creation has no fixed session ceiling", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  assert.doesNotMatch(source, /terminalSessions\.size\s*(?:>=|>|===?)/);
+  assert.doesNotMatch(source, /Close a terminal tab before opening another one/);
+  assert.match(source, /633;P;Cwd=/);
+  assert.match(source, /--rcfile/);
+  assert.match(source, /function global:prompt/);
+});
+
+test("Electron integrated browser uses isolated disposable WebContentsViews", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  assert.match(source, /new WebContentsView/);
+  assert.match(source, /partition: "persist:taskurotta-browser"/);
+  assert.match(source, /contextIsolation: true/);
+  assert.match(source, /nodeIntegration: false/);
+  assert.match(source, /sandbox: true/);
+  assert.match(source, /webSecurity: true/);
+  assert.match(source, /before-mouse-event/);
+  assert.match(source, /edit-local-html/);
+  assert.match(source, /closeBrowserSession/);
+  assert.match(source, /session\.openBrowserBinding/);
+  assert.doesNotMatch(source, /accelerator: "CommandOrControl\+Alt\+\//);
+  assert.doesNotMatch(source, /<webview/);
+});
+
 test("Electron IPC security validates sender origins and external URL schemes", () => {
   const {
     createIpcSecurity,
@@ -3542,6 +5711,8 @@ test("Electron IPC security validates sender origins and external URL schemes", 
   );
 
   assert.equal(isSafeExternalUrl("https://github.com/zacharyivie/gofer-flow"), true);
+  assert.equal(isSafeExternalUrl("http://127.0.0.1:8765/docs"), true);
+  assert.equal(isSafeExternalUrl("mailto:help@example.com"), true);
   assert.equal(isSafeExternalUrl("file:///etc/passwd"), false);
   assert.equal(isSafeExternalUrl("javascript:alert(1)"), false);
   assert.equal(
@@ -4167,8 +6338,9 @@ test("DagCanvas rendered navigation controls auto-layout, fit, and zoom", async 
 
   const runSelector = dom.byTitle("Select workflow run");
   const toolbar = dom.ancestor(runSelector, (node) => node.getAttribute?.("data-toolbar") === "graph-editor");
+  const graphActions = dom.ancestor(runSelector, "DETAILS");
   const primaryToolbarRow = dom.ancestor(
-    runSelector,
+    dom.byTitle("Validate workflow"),
     (node) => node.getAttribute?.("data-toolbar-row") === "primary",
   );
   const secondaryToolbarRow = dom.ancestor(
@@ -4181,10 +6353,16 @@ test("DagCanvas rendered navigation controls auto-layout, fit, and zoom", async 
     (node) => node.getAttribute?.("data-toolbar-row") === "primary",
   );
   assert.equal(toolbar.getAttribute("data-toolbar"), "graph-editor");
+  assert.ok(graphActions.contains(dom.byTitle("More graph actions")));
+  assert.match(toolbar.getAttribute("class"), /z-\[60\]/);
   assert.equal(validationToolbarRow, primaryToolbarRow);
   assert.equal(primaryToolbarRow.contains(secondaryToolbarRow), false);
   assert.doesNotMatch(secondaryToolbarRow.getAttribute("class"), /flex-wrap/);
   assert.doesNotMatch(toolbar.getAttribute("class"), /overflow-x-auto|workflow-scrollbar/);
+  for (const title of ["Fit selection", "Reset view", "Delete selected node"]) {
+    assert.doesNotMatch(dom.byTitle(title).getAttribute("class"), /hidden/);
+    assert.equal(graphActions.contains(dom.byTitle(title)), false);
+  }
   assert.equal(allElements(dom.container).some((element) => element.getAttribute?.("aria-label") === "Search nodes"), false);
   assert.match(dom.byText("Workflow is valid").getAttribute("class"), /right-0/);
 
@@ -4337,6 +6515,12 @@ test("DagCanvas minimap sits top left, handles translucent dark mode styling, an
 test("Electron preload exposes stable desktop and update bridge contracts", async () => {
   const exposed = runPreload({
     argv: ["electron", "preload", "--gofer-api-base-url=http://localhost:9000"],
+    invoke(channel, payload) {
+      if (channel === "gofer:grant-path") {
+        return { grantId: `grant-${payload.targetPath}`, path: payload.targetPath };
+      }
+      return { channel, payload };
+    },
   });
 
   assert.equal(exposed.goferApiBaseUrl, "http://localhost:9000");
@@ -4349,20 +6533,46 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "workspace",
   ]);
   assert.deepEqual(Object.keys(exposed.goferDesktop.workspace).sort(), [
+    "addWorktree",
     "copyPath",
     "createFile",
     "createFolder",
     "deletePath",
     "getPathInfo",
+    "gitFileBaseline",
+    "gitHistory",
+    "gitStatus",
+    "gitWorktrees",
     "listDirectory",
     "openPath",
     "pathGrantForApi",
+    "removeWorktree",
     "renamePath",
+    "resolveProjectFile",
     "revealPath",
     "selectPath",
+    "trustProjectRoot",
   ]);
-  assert.deepEqual(Object.keys(exposed.goferDesktop.textFiles).sort(), ["read", "write"]);
+  assert.deepEqual(Object.keys(exposed.goferDesktop.textFiles).sort(), ["read", "readPreview", "write"]);
   assert.deepEqual(Object.keys(exposed.goferDesktop.dataDirectory).sort(), ["choose", "get"]);
+  assert.deepEqual(Object.keys(exposed.goferBrowser).sort(), [
+    "activate",
+    "back",
+    "close",
+    "create",
+    "focus",
+    "forward",
+    "navigate",
+    "onCommand",
+    "onOpenTab",
+    "onState",
+    "openExternal",
+    "platform",
+    "reload",
+    "setBounds",
+    "setPreferences",
+    "stop",
+  ]);
   assert.deepEqual(Object.keys(exposed.goferUpdates).sort(), [
     "check",
     "downloadAndInstall",
@@ -4371,10 +6581,38 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "onState",
     "openRelease",
   ]);
+  assert.deepEqual(Object.keys(exposed.goferTerminal).sort(), [
+    "close",
+    "create",
+    "onData",
+    "onExit",
+    "resize",
+    "write",
+  ]);
 
   assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.listDirectory({ currentPath: 42, create: false })), {
     channel: "gofer:list-directory",
     payload: { currentPath: "", grantId: "", create: false },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.gitStatus("/workspace/project")), {
+    channel: "gofer:git-status",
+    payload: { grantId: "", projectRoot: "/workspace/project" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.gitFileBaseline("/workspace/project/app.js")), {
+    channel: "gofer:git-file-baseline",
+    payload: { grantId: "", targetPath: "/workspace/project/app.js" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.gitHistory("/workspace/project")), {
+    channel: "gofer:git-history",
+    payload: { grantId: "", projectRoot: "/workspace/project" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.gitWorktrees("/workspace/project")), {
+    channel: "gofer:git-worktrees",
+    payload: { grantId: "", projectRoot: "/workspace/project" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.resolveProjectFile("/workspace/project/app.js")), {
+    channel: "gofer:resolve-project-file",
+    payload: { grantId: "", selectedPath: "/workspace/project/app.js" },
   });
   assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.copyPath({ sourcePath: "/a", destinationPath: 9 })), {
     channel: "gofer:copy-path",
@@ -4383,6 +6621,42 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   assert.equal(
     await exposed.goferDesktop.grantDroppedPath({ path: "/outside/file.txt" }),
     "/outside/file.txt",
+  );
+  assert.deepEqual(toPlainObject(await exposed.goferTerminal.create({
+    cols: 120,
+    cwd: "/outside/ungranted",
+    rows: 40,
+  })), {
+    channel: "gofer:terminal-create",
+    payload: {
+      cols: 120,
+      cwd: "/outside/ungranted",
+      grantId: "grant-/outside/ungranted",
+      rows: 40,
+    },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferTerminal.write("terminal-1", "pwd\r")), {
+    channel: "gofer:terminal-write",
+    payload: { data: "pwd\r", id: "terminal-1" },
+  });
+  assert.deepEqual(toPlainObject(await exposed.goferBrowser.create({
+    clientId: "browser:1",
+    path: "/workspace/project/index.html",
+  })), {
+    channel: "gofer:browser-create",
+    payload: {
+      clientId: "browser:1",
+      grantId: "grant-/workspace/project/index.html",
+      path: "/workspace/project/index.html",
+      url: "",
+    },
+  });
+  assert.deepEqual(
+    toPlainObject(await exposed.goferBrowser.navigate("browser-session", "localhost:5173")),
+    {
+      channel: "gofer:browser-action",
+      payload: { action: "navigate", id: "browser-session", url: "localhost:5173" },
+    },
   );
 });
 
@@ -4398,11 +6672,23 @@ test("Electron preload keeps file grants private while attaching them to later c
       if (channel === "gofer:path-info") {
         return { basename: "shared", grantId: "grant-1", isDirectory: true, path: payload.targetPath };
       }
+      if (channel === "gofer:resolve-project-file") {
+        return {
+          directory: "/outside/project",
+          grantId: "grant-project",
+          selectedPath: payload.selectedPath,
+        };
+      }
       return { channel, payload };
     },
   });
 
   assert.equal(await exposed.goferDesktop.workspace.selectPath({}), "/outside/shared");
+  assert.deepEqual(
+    toPlainObject(await exposed.goferDesktop.workspace.resolveProjectFile("/outside/shared")),
+    { directory: "/outside/project", selectedPath: "/outside/shared" },
+  );
+  assert.equal(exposed.goferDesktop.workspace.pathGrantForApi("/outside/project"), "grant-project");
   assert.deepEqual(toPlainObject(await exposed.goferDesktop.workspace.getPathInfo("/outside/shared")), {
     basename: "shared",
     isDirectory: true,
@@ -4580,6 +6866,22 @@ function DagCanvasHarness({
     onDecideApproval: onDecideApproval ?? (() => {}),
     onWorkflowChange: handleChange,
   });
+}
+
+async function openWorkflowSettingsFromMenu(dom) {
+  assert.equal(
+    allElements(dom.container).some((element) =>
+      String(element.getAttribute?.("title") ?? "").startsWith("Show workflow settings")),
+    false,
+  );
+  await dom.click(dom.byTitle("More graph actions"));
+  await dom.click(dom.byText("Workflow settings"));
+}
+
+function headingByText(dom, text) {
+  return allElements(dom.container).find(
+    (element) => element.tagName === "H2" && textOf(element) === text,
+  );
 }
 
 function InspectorDraftHarness({ changes }) {

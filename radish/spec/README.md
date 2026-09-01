@@ -71,9 +71,11 @@ and publishes IR only to Taskurotta's internal cache. `inspect-ir` prints that v
 for debugging and never creates a source-side IR file.
 
 `check` compiles and caches valid IR internally. `preflight` uses that artifact but checks
-the current machine on every invocation. `run` performs both steps, executes the IR, and
-writes a versioned run artifact under the application data directory. None of these
-commands writes IR beside the source.
+the current machine on every invocation. `run` performs both steps and executes the IR.
+Registered workflows store compiled artifacts and versioned run logs in their
+`.taskurotta/<workflow-id>/` folder. Standalone `.rad` files without a registered workflow
+folder use the application data directory. None of these commands writes IR beside the
+source file.
 
 `run --input NAME=JSON` accepts one declared workflow input per option. The run artifact
 records input names, not supplied values. Exit status `0` means the workflow passed. A

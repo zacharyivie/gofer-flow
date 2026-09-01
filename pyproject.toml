@@ -5,8 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "gofer-flow"
 version = "0.1.2"
-license = "Apache-2.0"
-license-files = ["LICENSE", "NOTICE"]
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "typer[all]>=0.12",
@@ -22,6 +22,7 @@ dependencies = [
     "questionary>=2.0",
     "jsonschema>=4.23",
     "tzdata>=2026.2",
+    "vosk>=0.3.45",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,8 @@ packages = ["src/gofer"]
 "radish/contracts" = "gofer/radish/assets/contracts"
 "radish/providers" = "gofer/radish/assets/providers"
 "radish/schemas" = "gofer/radish/assets/schemas"
+"radish/spec" = "gofer/radish/assets/docs"
+"skills/gofer-flow-workflow-builder" = "gofer/radish/assets/assistant-skill"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -59,7 +62,7 @@ strict = true
 python_version = "3.11"
 
 [[tool.mypy.overrides]]
-module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*", "openpyxl", "openpyxl.*"]
+module = ["networkx", "networkx.*", "tomli_w", "apscheduler", "apscheduler.*", "openpyxl", "openpyxl.*", "vosk", "vosk.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

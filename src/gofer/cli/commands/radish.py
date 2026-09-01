@@ -8,7 +8,13 @@ from typing import Any
 
 import typer
 
-from gofer.radish.artifacts import CompiledArtifact, RadishArtifactError, compile_radish_file
+from gofer.radish.artifacts import (
+    CompiledArtifact,
+    RadishArtifactError,
+    compile_radish_file,
+    radish_asset_root,
+    radish_docs_root,
+)
 from gofer.radish.diagnostics import RadishDiagnostic, RadishError, SourcePosition, SourceSpan
 from gofer.radish.formatter import RadishFormatError, format_radish_file
 from gofer.radish.preflight import run_preflight
@@ -24,6 +30,38 @@ from gofer.radish.workspaces import (
 )
 
 app = typer.Typer(help="Check Radish workflows and deployment readiness", no_args_is_help=True)
+
+
+@app.command("docs")
+def docs(
+    output_format: str = typer.Option("text", "--format", help="Output format: text or json."),
+) -> None:
+    """Print paths to the installed Radish documentation and node contracts."""
+    _require_format(output_format)
+    try:
+        docs_root = radish_docs_root()
+        asset_root = radish_asset_root()
+    except RadishArtifactError as exc:
+        if output_format == "json":
+            _emit_json({"command": "docs", "ok": False, "error": str(exc)})
+        else:
+            typer.echo(str(exc), err=True)
+        raise typer.Exit(2)
+    payload = {
+        "command": "docs",
+        "ok": True,
+        "docsRoot": str(docs_root),
+        "overview": str(docs_root / "README.md"),
+        "grammar": str(docs_root / "grammar.ebnf"),
+        "staticSemantics": str(docs_root / "static-semantics.md"),
+        "nodeContractsGuide": str(docs_root / "node-contracts.md"),
+        "contractsRoot": str(asset_root / "contracts"),
+        "schemasRoot": str(asset_root / "schemas"),
+    }
+    if output_format == "json":
+        _emit_json(payload)
+    else:
+        typer.echo(docs_root)
 
 
 @app.command("create")

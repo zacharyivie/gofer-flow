@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from pathlib import Path
 
@@ -9,9 +10,11 @@ import pytest
 
 from gofer.radish.run_service import run_radish_file
 from gofer.radish.runtime import HandlerResult, NodeHandlerRegistry, RuntimeErrorInfo
+from gofer.radish.workspaces import create_registered_workflow
 from gofer.ui.api import (
     latest_workflow_log_payload,
     list_workflow_run_logs_payload,
+    prune_workflow_run_logs_payload,
     workflow_run_log_payload,
 )
 
@@ -55,6 +58,62 @@ async def test_run_service_compiles_preflights_executes_and_persists_result(
         "workflow_completed",
     ]
     assert json.loads(result.path.read_text(encoding="utf-8")) == result.document
+
+
+@pytest.mark.anyio
+async def test_registered_workflow_run_is_stored_in_its_workspace(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    data_dir = tmp_path / "app-data"
+    workflow = create_registered_workflow(project, "Persisted run", registry_dir=data_dir)
+    workflow.entrypoint.write_text(_bash_source(), encoding="utf-8")
+
+    result = await run_radish_file(workflow.entrypoint, data_dir=data_dir)
+
+    assert result.ok
+    assert result.path.parent == workflow.workflow_root / "logs"
+    assert not (data_dir / "radish" / "runs" / workflow.workflow_id).exists()
+
+
+@pytest.mark.anyio
+async def test_registered_workflow_legacy_runs_move_out_of_app_data(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    data_dir = tmp_path / "app-data"
+    workflow = create_registered_workflow(project, "Legacy run", registry_dir=data_dir)
+    workflow.entrypoint.write_text(_bash_source(), encoding="utf-8")
+    result = await run_radish_file(workflow.entrypoint, data_dir=data_dir)
+    legacy_directory = data_dir / "radish" / "runs" / workflow.workflow_id
+    legacy_directory.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(result.path.parent, legacy_directory)
+
+    runs = list_workflow_run_logs_payload(workflow.workflow_id, data_dir)["runs"]
+
+    assert runs[0]["id"] == result.document["run_id"]
+    assert result.path.is_file()
+    assert not legacy_directory.exists()
+
+
+@pytest.mark.anyio
+async def test_registered_workflow_run_pruning_uses_workspace_logs(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    data_dir = tmp_path / "app-data"
+    workflow = create_registered_workflow(project, "Pruned run", registry_dir=data_dir)
+    workflow.entrypoint.write_text(_bash_source(), encoding="utf-8")
+    result = await run_radish_file(workflow.entrypoint, data_dir=data_dir)
+
+    payload = prune_workflow_run_logs_payload(
+        workflow.workflow_id,
+        data_dir,
+        keep_last=0,
+        keep_days=0,
+        keep_failed_days=0,
+        dry_run=False,
+    )
+
+    assert payload["deleted"] == [result.document["run_id"]]
+    assert not result.path.exists()
 
 
 @pytest.mark.anyio

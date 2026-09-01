@@ -12,6 +12,7 @@ from gofer.radish.artifacts import compile_radish_file
 from gofer.radish.diagnostics import RadishCompileError
 from gofer.radish.preflight import run_preflight
 from gofer.radish.workflow_runtime import execute_workflow
+from gofer.radish.workspaces import create_registered_workflow
 from gofer.subscriptions.base import Subscription
 
 
@@ -158,6 +159,39 @@ async def test_agent_repairs_invalid_structured_output_without_rerunning_graph_n
     assert len(subscription.calls) == 2
     assert result.latest_node_outputs["review"] == {"approved": False}
     assert "previous response did not satisfy" in subscription.calls[1]["prompt"]
+
+
+@pytest.mark.anyio
+async def test_registered_workflow_agent_memory_is_stored_in_its_workspace(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    data_dir = tmp_path / "data"
+    workflow = create_registered_workflow(project, "Agent memory", registry_dir=data_dir)
+    workflow.entrypoint.write_text(
+        """Radish: 1
+Workflow:
+  name: Agent memory
+Node review:
+  type: agent
+  provider: codex
+  prompt: Remember this
+  memory: all
+""",
+        encoding="utf-8",
+    )
+    artifact = compile_radish_file(workflow.entrypoint, data_dir=data_dir)
+
+    result = await execute_workflow(
+        artifact.ir,
+        subscriptions={"codex": FakeAgentSubscription(["remembered"])},
+        data_dir=data_dir,
+    )
+
+    assert result.outcome == "pass"
+    assert (workflow.workflow_root / "agent-memory" / "review.json").is_file()
+    assert not (data_dir / "radish" / "agent-memory" / workflow.workflow_id).exists()
 
 
 def test_agent_preflight_reports_provider_and_prompt_resources(tmp_path: Path) -> None:

@@ -53,6 +53,15 @@ body {
     env(safe-area-inset-left);
 }
 
+html[data-reduced-motion="true"] *,
+html[data-reduced-motion="true"] *::before,
+html[data-reduced-motion="true"] *::after {
+  scroll-behavior: auto !important;
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+
 button,
 input,
 textarea,
@@ -68,6 +77,14 @@ select:focus-visible,
 [role="button"]:focus-visible {
   outline: 2px solid rgb(var(--color-brand)) !important;
   outline-offset: 2px;
+}
+
+[data-chat-composer] textarea:focus-visible {
+  outline: none !important;
+}
+
+.studio-search-input:focus-visible {
+  outline: none !important;
 }
 
 @media (pointer: coarse) {
@@ -87,6 +104,17 @@ select:focus-visible,
 
 .workflow-scrollbar {
   scrollbar-color: #b9c6d3 transparent;
+  scrollbar-width: thin;
+}
+
+.terminal-host .xterm,
+.terminal-host .xterm-viewport,
+.terminal-host .xterm-screen {
+  height: 100%;
+}
+
+.terminal-host .xterm-viewport {
+  scrollbar-color: #a1a1aa transparent;
   scrollbar-width: thin;
 }
 
@@ -214,6 +242,41 @@ select:focus-visible,
   color: #d4d4d4;
 }
 
+.source-control-status--added,
+.source-control-status--untracked {
+  color: #065f46;
+}
+
+.source-control-status--modified {
+  color: #92400e;
+}
+
+.source-control-status--deleted {
+  color: #b91c1c;
+}
+
+.dark .source-control-status--added,
+.dark .source-control-status--untracked {
+  color: #6ee7b7;
+}
+
+.dark .source-control-status--modified {
+  color: #fbbf24;
+}
+
+.dark .source-control-status--deleted {
+  color: #fca5a5;
+}
+
+.monaco-editor .tracked-change-line {
+  border-left: 3px solid #3b82f6;
+  margin-left: 5px;
+}
+
+.dark .monaco-editor .tracked-change-line {
+  border-left-color: #60a5fa;
+}
+
 .dark .read-only\:bg-slate-50:read-only,
 .dark input:disabled,
 .dark textarea:disabled,
@@ -261,10 +324,6 @@ select:focus-visible,
 [data-picker-trigger][aria-expanded="true"] {
   background-color: var(--model-picker-active-bg) !important;
   color: var(--model-picker-active-fg) !important;
-}
-
-[data-toolbar="graph-editor"] {
-  min-height: 48px;
 }
 
 .dark .studio-sidebar {

@@ -127,14 +127,26 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       revealPath(targetPath),
     getPathInfo: (targetPath) =>
       getPathInfo(targetPath),
+    gitStatus: (projectRoot) =>
+      gitStatus(projectRoot),
+    gitFileBaseline: (targetPath) =>
+      gitFileBaseline(targetPath),
+    gitHistory: (projectRoot) => gitHistory(projectRoot),
+    gitWorktrees: (projectRoot) => gitWorktrees(projectRoot),
+    addWorktree: (options = {}) => addWorktree(options),
+    removeWorktree: (options = {}) => removeWorktree(options),
     pathGrantForApi: (targetPath) =>
       grantForPath(targetPath),
+    trustProjectRoot: (targetPath) =>
+      trustProjectRoot(targetPath),
     copyPath: (options = {}) =>
       copyPath(options),
     deletePath: (targetPath) =>
       deletePath(targetPath),
     renamePath: (options = {}) =>
       renamePath(options),
+    resolveProjectFile: (selectedPath) =>
+      resolveProjectFile(selectedPath),
     createFile: (options = {}) =>
       createFile(options),
     createFolder: (options = {}) =>
@@ -143,6 +155,8 @@ contextBridge.exposeInMainWorld("goferDesktop", {
       selectPath(options),
   },
   textFiles: {
+    readPreview: (targetPath) =>
+      readBinaryPreview(targetPath),
     read: (targetPath) =>
       readTextFile(targetPath),
     write: (options = {}) =>
@@ -156,6 +170,112 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     return payload?.path || targetPath;
   },
 });
+
+contextBridge.exposeInMainWorld("goferBrowser", {
+  platform: process.platform,
+  create: (options = {}) => createBrowser(options),
+  activate: (id, active) => browserAction(id, "activate", { active: active === true }),
+  back: (id) => browserAction(id, "back"),
+  close: (id) => browserAction(id, "close"),
+  focus: (id) => browserAction(id, "focus"),
+  forward: (id) => browserAction(id, "forward"),
+  navigate: (id, url) => browserAction(id, "navigate", { url }),
+  openExternal: (id) => browserAction(id, "open-external"),
+  reload: (id) => browserAction(id, "reload"),
+  setPreferences: (id, preferences = {}) => browserAction(id, "set-preferences", {
+    openBrowserBinding: typeof preferences.openBrowserBinding === "string"
+      ? preferences.openBrowserBinding.slice(0, 120)
+      : "",
+  }),
+  setBounds: (id, bounds) => browserAction(id, "set-bounds", { bounds }),
+  stop: (id) => browserAction(id, "stop"),
+  onCommand: (callback) => subscribeToBrowserEvent("gofer:browser-command", callback),
+  onOpenTab: (callback) => subscribeToBrowserEvent("gofer:browser-open-tab", callback),
+  onState: (callback) => subscribeToBrowserEvent("gofer:browser-state", callback),
+});
+
+contextBridge.exposeInMainWorld("goferTerminal", {
+  create: (options = {}) => createTerminal(options),
+  write: (id, data) =>
+    ipcRenderer.invoke("gofer:terminal-write", {
+      data: typeof data === "string" ? data : "",
+      id: typeof id === "string" ? id : "",
+    }),
+  resize: (id, cols, rows) =>
+    ipcRenderer.invoke("gofer:terminal-resize", {
+      cols: Number.isFinite(cols) ? cols : 80,
+      id: typeof id === "string" ? id : "",
+      rows: Number.isFinite(rows) ? rows : 24,
+    }),
+  close: (id) =>
+    ipcRenderer.invoke("gofer:terminal-close", {
+      id: typeof id === "string" ? id : "",
+    }),
+  onData: (callback) => subscribeToTerminalEvent("gofer:terminal-data", callback),
+  onExit: (callback) => subscribeToTerminalEvent("gofer:terminal-exit", callback),
+});
+
+async function createTerminal(options = {}) {
+  const requestedCwd = typeof options.cwd === "string" ? options.cwd : "";
+  if (requestedCwd && !grantForPath(requestedCwd)) {
+    await trustProjectRoot(requestedCwd);
+  }
+  const grantId = grantForPath(requestedCwd);
+  if (requestedCwd && !grantId) {
+    throw new Error("The workflow project folder could not be trusted.");
+  }
+  return ipcRenderer.invoke("gofer:terminal-create", {
+    cols: Number.isFinite(options.cols) ? options.cols : 80,
+    cwd: requestedCwd,
+    grantId,
+    rows: Number.isFinite(options.rows) ? options.rows : 24,
+  });
+}
+
+async function createBrowser(options = {}) {
+  const targetPath = typeof options.path === "string" ? options.path : "";
+  if (targetPath && !grantForPath(targetPath)) {
+    await trustProjectRoot(targetPath);
+  }
+  return ipcRenderer.invoke("gofer:browser-create", {
+    clientId: typeof options.clientId === "string" ? options.clientId : "",
+    grantId: grantForPath(targetPath),
+    ...(typeof options.openBrowserBinding === "string" && options.openBrowserBinding
+      ? { openBrowserBinding: options.openBrowserBinding.slice(0, 120) }
+      : {}),
+    path: targetPath,
+    url: typeof options.url === "string" ? options.url : "",
+  });
+}
+
+function browserAction(id, action, extra = {}) {
+  return ipcRenderer.invoke("gofer:browser-action", {
+    ...extra,
+    action,
+    id: typeof id === "string" ? id : "",
+  });
+}
+
+function subscribeToBrowserEvent(channel, callback) {
+  if (typeof callback !== "function") return () => {};
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
+
+async function trustProjectRoot(targetPath) {
+  if (typeof targetPath !== "string" || !targetPath.trim()) return null;
+  if (grantForPath(targetPath)) return targetPath;
+  const payload = await invokeDesktop("gofer:grant-path", { targetPath });
+  return payload?.path || targetPath;
+}
+
+function subscribeToTerminalEvent(channel, callback) {
+  if (typeof callback !== "function") return () => {};
+  const listener = (_event, payload) => callback(payload);
+  ipcRenderer.on(channel, listener);
+  return () => ipcRenderer.removeListener(channel, listener);
+}
 
 function listDirectory(options = {}) {
   return (
@@ -188,6 +308,48 @@ function getPathInfo(targetPath) {
   });
 }
 
+function gitStatus(projectRoot) {
+  return invokeDesktop("gofer:git-status", {
+    grantId: grantForPath(projectRoot),
+    projectRoot: typeof projectRoot === "string" ? projectRoot : "",
+  });
+}
+
+function gitFileBaseline(targetPath) {
+  return invokeDesktop("gofer:git-file-baseline", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function gitHistory(projectRoot) {
+  return invokeDesktop("gofer:git-history", { grantId: grantForPath(projectRoot), projectRoot });
+}
+
+function gitWorktrees(projectRoot) {
+  return invokeDesktop("gofer:git-worktrees", { grantId: grantForPath(projectRoot), projectRoot });
+}
+
+function addWorktree(options = {}) {
+  return invokeDesktop("gofer:git-worktree-add", {
+    branch: typeof options.branch === "string" ? options.branch : "",
+    createBranch: options.createBranch === true,
+    grantId: grantForPath(options.projectRoot),
+    projectRoot: typeof options.projectRoot === "string" ? options.projectRoot : "",
+    targetGrantId: grantForPath(options.targetPath),
+    targetPath: typeof options.targetPath === "string" ? options.targetPath : "",
+  });
+}
+
+function removeWorktree(options = {}) {
+  return invokeDesktop("gofer:git-worktree-remove", {
+    grantId: grantForPath(options.projectRoot),
+    projectRoot: typeof options.projectRoot === "string" ? options.projectRoot : "",
+    targetGrantId: grantForPath(options.targetPath),
+    targetPath: typeof options.targetPath === "string" ? options.targetPath : "",
+  });
+}
+
 function copyPath(options = {}) {
   return invokeDesktop("gofer:copy-path", {
     destinationGrantId: grantForPath(options.destinationPath),
@@ -215,6 +377,13 @@ function renamePath(options = {}) {
   });
 }
 
+function resolveProjectFile(selectedPath) {
+  return invokeDesktop("gofer:resolve-project-file", {
+    grantId: grantForPath(selectedPath),
+    selectedPath: typeof selectedPath === "string" ? selectedPath : "",
+  });
+}
+
 function createFile(options = {}) {
   return invokeDesktop("gofer:create-file", {
     directory: typeof options.directory === "string" ? options.directory : "",
@@ -233,6 +402,13 @@ function createFolder(options = {}) {
 
 function readTextFile(targetPath) {
   return invokeDesktop("gofer:read-text-file", {
+    grantId: grantForPath(targetPath),
+    targetPath: typeof targetPath === "string" ? targetPath : "",
+  });
+}
+
+function readBinaryPreview(targetPath) {
+  return invokeDesktop("gofer:read-binary-preview", {
     grantId: grantForPath(targetPath),
     targetPath: typeof targetPath === "string" ? targetPath : "",
   });

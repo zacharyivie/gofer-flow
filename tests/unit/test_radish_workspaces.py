@@ -9,6 +9,7 @@ from gofer.radish.workspaces import (
     DEFAULT_TASKUROTTAIGNORE,
     RadishWorkspaceError,
     create_registered_workflow,
+    discover_registered_workflows,
     find_registered_workflow,
     list_registered_workflows,
 )
@@ -33,8 +34,9 @@ def test_create_registered_workflow_uses_project_taskurotta_layout(tmp_path: Pat
     assert (expected_root / ".taskurottaignore").read_text(
         encoding="utf-8"
     ) == DEFAULT_TASKUROTTAIGNORE
-    artifacts = list((registry / "radish" / "artifacts").glob("*.json"))
+    artifacts = list((expected_root / "compiled").glob("*.json"))
     assert len(artifacts) == 1
+    assert not (registry / "radish" / "artifacts").exists()
     artifact = json.loads(artifacts[0].read_text(encoding="utf-8"))
     assert artifact["ir"]["workflow"]["id"] == "review-pr"
     assert find_registered_workflow("REVIEW-PR", registry_dir=registry) == workflow
@@ -90,3 +92,33 @@ def test_create_registered_workflow_requires_an_existing_project_folder(tmp_path
             "Build",
             registry_dir=tmp_path / "app-data",
         )
+
+
+def test_discover_registered_workflows_registers_existing_radish_directories(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    taskurotta_workflow = project / ".taskurotta" / "review"
+    custom_workflow = project / "automations" / "daily"
+    ignored_workflow = project / "node_modules" / "dependency"
+    for directory in (taskurotta_workflow, custom_workflow, ignored_workflow):
+        directory.mkdir(parents=True)
+    source = 'Radish: 1\n\nWorkflow:\n  name: "Existing"\n'
+    (taskurotta_workflow / "workflow.rad").write_text(source, encoding="utf-8")
+    (taskurotta_workflow / "helper.rad").write_text(source, encoding="utf-8")
+    (custom_workflow / "daily.rad").write_text(source, encoding="utf-8")
+    (ignored_workflow / "ignored.rad").write_text(source, encoding="utf-8")
+    registry = tmp_path / "app-data"
+
+    first = discover_registered_workflows(project, registry_dir=registry)
+    second = discover_registered_workflows(project, registry_dir=registry)
+
+    assert [(workflow.workflow_id, workflow.entrypoint) for workflow in first] == [
+        ("review", taskurotta_workflow / "workflow.rad"),
+        ("daily", custom_workflow / "daily.rad"),
+    ]
+    assert second == first
+    assert list_registered_workflows(registry_dir=registry) == tuple(
+        sorted(first, key=lambda workflow: (str(workflow.project_root), workflow.workflow_id))
+    )
+    assert (taskurotta_workflow / "workflow.rad").read_text(encoding="utf-8") == source

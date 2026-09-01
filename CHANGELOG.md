@@ -23,6 +23,22 @@ version 0.1.3 used the Gofer Flow name.
   actions.
 - Brought graph editing, node inspection, workflow settings, approvals, run
   controls, and timeline inspection to Radish workflows.
+- Added an integrated terminal, browser, and problems panel, with project-scoped
+  terminal groups, browser previews, and configurable keyboard shortcuts.
+- Added Git status decorations, deleted-file visibility, commit history, diff
+  previews, file preview tabs, split editors, and rendered previews for Markdown,
+  HTML, SVG, images, and PDFs.
+- Added persistent application settings for appearance, editor behavior, terminal
+  behavior, audio devices, data storage, motion, and command keybindings.
+- Added assistant file and image attachments, pasted screenshots, local voice
+  transcription, GitHub-flavored Markdown, interactive file links, and code-copy
+  controls.
+- Added reviewable assistant change summaries with live file diffs, shell and edit
+  traces, elapsed time, and guarded undo and redo actions.
+- Added crash recovery screens with reload, reset, diagnostic copy, and issue
+  reporting actions.
+- Added `gof radish docs` and bundled the Radish authoring documentation, schemas,
+  contracts, and workflow-builder skill in packaged installs.
 
 ### Changed
 
@@ -30,6 +46,14 @@ version 0.1.3 used the Gofer Flow name.
 - Made Radish source files the editable workflow definition while compiled IR
   and run artifacts remain internal implementation details.
 - Moved workflow organization from a global workspace model to project folders.
+- Discover and register existing Radish workflows when a project opens, including
+  projects that do not yet contain a workflow.
+- Store compiled artifacts, run logs, and agent memory inside each registered
+  workflow directory, with migration from the previous application-data layout.
+- Scope assistant threads and file access to their selected project, while keeping
+  Code project selection independent from Graph workflow selection.
+- Changed the project license from Apache-2.0 to AGPL-3.0-only and updated release
+  metadata and repository links.
 
 ### Fixed
 
@@ -39,6 +63,9 @@ version 0.1.3 used the Gofer Flow name.
   type changes, approval rendering, and runtime error reporting in the studio.
 - Prevented cancelled frontend requests from producing noisy backend broken-pipe
   tracebacks.
+- Fixed dirty Radish edits, stale live-analysis responses, duplicate file tab
+  labels, Markdown file navigation, and project-aware editor tab persistence.
+- Fixed terminal lifecycle, grouping, clipboard shortcuts, and late session cleanup.
 
 ## 0.1.3 - 2026-06-30
 
