@@ -3,6 +3,7 @@ import {
   ArrowLeft,
   ArrowRight,
   ExternalLink,
+  GitCompareArrows,
   Loader2,
   RefreshCw,
   X,
@@ -15,10 +16,12 @@ export default function IntegratedBrowser({
   initialUrl = "about:blank",
   localPath = "",
   onClose,
+  onShowDiff,
   onModeChange,
   onStateChange,
   openBrowserBinding = "Mod+Alt+Slash",
   searchUrl = "https://www.google.com/search?q={query}",
+  showDiffButton = false,
   showModeToggle = false,
 }) {
   const addressRef = useRef(null);
@@ -228,7 +231,14 @@ export default function IntegratedBrowser({
           onClick={() => run("openExternal")}
         ><ExternalLink size={14} /></BrowserButton>
         {showModeToggle ? (
-          <HtmlModeToggle editing={editing} onModeChange={onModeChange} />
+          <>
+            {showDiffButton ? (
+              <BrowserButton label="Compare HTML with HEAD" onClick={onShowDiff}>
+                <GitCompareArrows size={14} />
+              </BrowserButton>
+            ) : null}
+            <HtmlModeToggle editing={editing} onModeChange={onModeChange} />
+          </>
         ) : null}
       </div>
       <div ref={placeholderRef} className="relative min-h-0 flex-1 bg-white">

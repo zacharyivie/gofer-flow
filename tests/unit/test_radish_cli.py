@@ -87,7 +87,7 @@ def test_radish_check_compiles_to_internal_cache_and_reuses_valid_artifact(
     assert len(artifacts) == 1
     cached = json.loads(artifacts[0].read_text(encoding="utf-8"))
     assert cached["source_path"] == str(source)
-    assert cached["ir"]["compiler"]["version"] == "0.2.0"
+    assert cached["ir"]["compiler"]["version"] == "0.2.1"
     assert cached["ir"]["workflow"]["name"] == "CLI slice"
 
 

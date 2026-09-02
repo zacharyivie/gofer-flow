@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gofer-flow"
-version = "0.2.0"
+version = "0.2.1"
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
@@ -22,7 +22,7 @@ dependencies = [
     "questionary>=2.0",
     "jsonschema>=4.23",
     "tzdata>=2026.2",
-    "vosk>=0.3.45",
+    "vosk>=0.3.45; sys_platform != 'darwin'",
 ]
 
 [project.optional-dependencies]

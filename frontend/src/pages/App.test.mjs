@@ -109,6 +109,7 @@ test("app settings normalize persisted values and preserve configurable command 
   assert.equal(settings.keybindings["project.open"], "Mod+KeyK Mod+KeyO");
   assert.equal(settings.keybindings["view.toggleProjectPane"], "Ctrl+KeyB");
   assert.equal(settings.keybindings["view.toggleAssistantPane"], "Ctrl+KeyL");
+  assert.equal(settings.keybindings["browser.open"], "Ctrl+KeyJ");
   assert.equal(
     settingsModule.formatKeybinding(settings.keybindings["project.open"], "Linux"),
     "Ctrl+K, Ctrl+O",
@@ -1563,6 +1564,12 @@ test("Code file explorer renders Git file states, folder changes, and deleted fi
   );
 
   await dom.flush();
+  const projectTree = dom.byLabel("Project files");
+  const projectContents = dom.byLabel("Project contents");
+  assert.doesNotMatch(projectTree.getAttribute("class"), /overflow-y-auto/);
+  assert.match(projectContents.getAttribute("class"), /overflow-y-auto/);
+  assert.equal(dom.ancestor(dom.byText("gofer-flow"), "BUTTON").parentNode.parentNode, projectTree);
+  assert.equal(projectContents.parentNode, projectTree);
   assert.ok(dom.byLabel("gofer-flow contains source control changes"));
   assert.ok(dom.byLabel("src contains source control changes"));
   assert.ok(dom.byLabel("added.txt: Added"));
@@ -1634,6 +1641,18 @@ test("code workspace marks tracked lines only when full diff mode is off", () =>
   ]);
   assert.deepEqual(codeWorkspaceModule.trackedChangeDecorations(baseline, true), []);
   assert.deepEqual(codeWorkspaceModule.trackedChangeDecorations({ changed: false }), []);
+});
+
+test("code diff mode detects and displays whitespace-only changes", () => {
+  assert.deepEqual(codeWorkspaceModule.codeDiffEditorOptions({ fontSize: 14 }), {
+    diffAlgorithm: "advanced",
+    enableSplitViewResizing: true,
+    fontSize: 14,
+    ignoreTrimWhitespace: false,
+    originalEditable: false,
+    renderSideBySide: true,
+    renderWhitespace: "all",
+  });
 });
 
 test("code tabs disambiguate duplicate file names with their parent folders", () => {
@@ -1735,6 +1754,25 @@ test("HTML documents default to browser mode and browser tabs use page titles", 
   assert.equal(codeWorkspaceModule.codeTabLabel("/repo/wiki/index.html"), "index.html");
 });
 
+test("HTML preview exposes its diff action beside the read-write toggle", async () => {
+  let diffRequests = 0;
+  const dom = await mountReact(
+    React.createElement(integratedBrowserModule.default, {
+      active: true,
+      clientId: "html:/repo/index.html",
+      localPath: "/repo/index.html",
+      onShowDiff: () => { diffRequests += 1; },
+      showDiffButton: true,
+      showModeToggle: true,
+    }),
+    createFetchMock([]),
+  );
+  await dom.click(dom.byLabel("Compare HTML with HEAD"));
+  assert.equal(diffRequests, 1);
+  assert.ok(dom.byLabel("HTML view mode"));
+  await dom.unmount();
+});
+
 test("integrated browser shortcut matches VS Code on desktop platforms", () => {
   assert.equal(integratedBrowserModule.isIntegratedBrowserShortcut({
     altKey: true,
@@ -1813,10 +1851,9 @@ test("browser shortcut opens one reusable editor tab", async () => {
   await dom.flush();
 
   await dom.dispatchWindow("keydown", {
-    altKey: true,
-    code: "Slash",
+    code: "KeyJ",
     ctrlKey: true,
-    key: "/",
+    key: "j",
   });
   await dom.flush();
   assert.ok(dom.byLabel("Integrated browser"));
@@ -1825,15 +1862,46 @@ test("browser shortcut opens one reusable editor tab", async () => {
   ).length, 1);
 
   await dom.dispatchWindow("keydown", {
-    altKey: true,
-    code: "Slash",
+    code: "KeyJ",
     ctrlKey: true,
-    key: "/",
+    key: "j",
   });
   await dom.flush();
   assert.equal(allElements(dom.container).filter(
     (element) => element.getAttribute?.("aria-label") === "Close New Tab",
   ).length, 1);
+  await dom.unmount();
+});
+
+test("hiding the workflow assistant keeps its mounted thread state alive", async () => {
+  const workflow = workflowFixture();
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([jsonResponse("/api/workflows", workflowsPayload([workflow]))]),
+  );
+  await dom.flush();
+  const assistantPane = allElements(dom.container).find(
+    (element) => element.getAttribute?.("data-chat-pane") === "true",
+  );
+  assert.ok(assistantPane);
+
+  await dom.dispatchWindow("keydown", {
+    code: "KeyL",
+    ctrlKey: true,
+    key: "l",
+  });
+  await dom.flush();
+  const hiddenAssistantPane = allElements(dom.container).find(
+    (element) => element.getAttribute?.("data-chat-pane") === "true",
+  );
+  assert.equal(hiddenAssistantPane, assistantPane);
+  assert.equal(
+    dom.ancestor(
+      hiddenAssistantPane,
+      (element) => element.getAttribute?.("aria-hidden") === "true",
+    ).getAttribute("class"),
+    "hidden",
+  );
   await dom.unmount();
 });
 
@@ -2108,6 +2176,14 @@ test("project shortcuts and recent project ordering use native editor convention
     appModule.mergeRecentProjects(["/repo/one"], ["/repo/two", "/repo/one"]),
     ["/repo/one", "/repo/two"],
   );
+  assert.equal(appModule.mainWorktreeRoot({
+    root: "/repo/feature",
+    worktrees: [{ path: "/repo/main" }, { path: "/repo/feature" }],
+  }, "/repo/fallback"), "/repo/main");
+  assert.equal(codeFileExplorerModule.mainWorktreePath(
+    [{ path: "/repo/main" }, { path: "/repo/feature" }],
+    "/repo/fallback",
+  ), "/repo/main");
   const scopedThread = appModule.scopeChatThreadToProject(
     { id: "thread-1", title: "Project work" },
     "/repo/two",
@@ -2160,6 +2236,67 @@ test("projects without workflows still expose a code workspace", () => {
     ),
     workspace,
   );
+  assert.equal(
+    appModule.activeWorkspaceForView([], undefined, "", "code").sourceFormat,
+    "project",
+  );
+});
+
+test("IDE mode exposes project, file, and browser actions without a project", async () => {
+  const dom = await mountReact(
+    React.createElement(appModule.default),
+    createFetchMock([jsonResponse("/api/workflows", workflowsPayload([]))]),
+  );
+  await dom.flush();
+  await dom.click(dom.ancestor(dom.byText("Code"), "BUTTON"));
+  assert.ok(dom.byText("Open Project"));
+  assert.ok(dom.byText("Open File"));
+  assert.ok(dom.byText("Open Browser"));
+
+  await dom.dispatchWindow("keydown", {
+    code: "KeyJ",
+    ctrlKey: true,
+    key: "j",
+  });
+  await dom.flush();
+  assert.ok(dom.byLabel("Integrated browser"));
+  await dom.unmount();
+});
+
+test("Open File opens a selected file when the project is already loaded and no tab is open", async () => {
+  const workflow = workflowFixture();
+  const selectedPath = "/workspace/assets/preview.png";
+  const fetchMock = createFetchMock([
+    jsonResponse("/api/workflows", workflowsPayload([workflow])),
+    jsonResponse("/api/projects/open", { workflows: [workflow] }, { method: "POST" }),
+  ]);
+  const dom = await mountReact(React.createElement(appModule.default), fetchMock, {
+    desktop: {
+      textFiles: { read: async () => ({ content: "console.log('open');" }) },
+      workspace: {
+        gitFileBaseline: async () => ({ changed: false, tracked: true }),
+        gitWorktrees: async () => ({ root: "/workspace", worktrees: [{ path: "/workspace" }] }),
+        pathGrantForApi: () => "",
+        resolveProjectFile: async () => ({ directory: "/workspace", selectedPath }),
+        selectPath: async () => selectedPath,
+        trustProjectRoot: async () => {},
+      },
+    },
+  });
+
+  await dom.flush();
+  await dom.click(dom.ancestor(dom.byText("Code"), "BUTTON"));
+  assert.ok(dom.byText("Open File"));
+  await dom.click(dom.ancestor(dom.byText("Open File"), "BUTTON"));
+  await dom.flush();
+
+  assert.ok(dom.byText("preview.png"));
+  assert.equal(
+    fetchMock.calls.some((call) => call.url === "/api/projects/open" && call.options.method === "POST"),
+    true,
+  );
+
+  await dom.unmount();
 });
 
 test("graph workflow selection is independent from the code explorer project", () => {
@@ -3165,7 +3302,7 @@ test("App loads workflows, preserves local edits on silent refreshes, saves erro
   await dom.click(dom.allByTitle("Workflow actions")[0]);
   await dom.click(dom.byText("Delete workflow"));
   await dom.flush();
-  assert.equal(dom.fetchCalls.some((call) => call.url === "/api/workflows/demo" && call.options.method === "DELETE"), true);
+  assert.equal(dom.fetchCalls.some((call) => call.url === "/api/workflows/demo?sourceFormat=toml" && call.options.method === "DELETE"), true);
   assert.match(dom.text(), /Other/);
 
   await dom.click(dom.byTitle("Export workflow bundle"));
@@ -4529,7 +4666,7 @@ test("terminal tab shortcuts require the visible terminal and ignore key repeat"
   assert.equal(bottomPanelModule.bottomPanelTabForShortcut("problems", true), "problems");
 });
 
-test("terminal clipboard shortcuts copy selections and paste clipboard text", async () => {
+test("terminal clipboard shortcuts copy selections and leave paste to xterm", async () => {
   const shortcut = (key, event = {}) => bottomPanelModule.terminalClipboardShortcutAction({
     altKey: false,
     ctrlKey: true,
@@ -4555,18 +4692,47 @@ test("terminal clipboard shortcuts copy selections and paste clipboard text", as
     { writeText: async () => { throw new Error("should not write"); } },
   ), false);
 
-  const writes = [];
-  assert.equal(await bottomPanelModule.pasteIntoTerminal(
-    { write: async (id, text) => writes.push([id, text]) },
-    "terminal-1",
-    { readText: async () => "npm --prefix frontend run electron:dev" },
-  ), true);
-  assert.deepEqual(writes, [["terminal-1", "npm --prefix frontend run electron:dev"]]);
-  assert.equal(await bottomPanelModule.pasteIntoTerminal(
-    { write: async () => { throw new Error("should not write"); } },
-    "",
-    { readText: async () => "ignored" },
-  ), false);
+  const terminal = { getSelection: () => "" };
+  assert.equal(bottomPanelModule.handleTerminalClipboardShortcut({
+    altKey: false,
+    ctrlKey: true,
+    key: "v",
+    metaKey: false,
+    shiftKey: true,
+    type: "keydown",
+  }, terminal), false);
+  assert.equal(bottomPanelModule.handleTerminalClipboardShortcut({
+    altKey: false,
+    ctrlKey: false,
+    key: "v",
+    metaKey: false,
+    shiftKey: false,
+    type: "keydown",
+  }, terminal), null);
+});
+
+test("Ctrl+Backspace erases one word in terminal and code editors", () => {
+  const terminalEvent = (event = {}) => ({
+    altKey: false,
+    ctrlKey: true,
+    key: "Backspace",
+    metaKey: false,
+    shiftKey: false,
+    type: "keydown",
+    ...event,
+  });
+
+  assert.equal(bottomPanelModule.terminalWordEraseInput(terminalEvent()), "\x17");
+  assert.equal(bottomPanelModule.terminalWordEraseInput(terminalEvent({ ctrlKey: false })), null);
+  assert.equal(bottomPanelModule.terminalWordEraseInput(terminalEvent({ shiftKey: true })), null);
+  assert.equal(bottomPanelModule.terminalWordEraseInput(terminalEvent({ type: "keyup" })), null);
+
+  const monacoSource = fs.readFileSync(path.join(frontendRoot, "src/lib/monaco.js"), "utf8");
+  assert.match(
+    monacoSource,
+    /contrib\/wordOperations\/browser\/wordOperations/,
+    "Monaco must load its Ctrl+Backspace word-delete contribution",
+  );
 });
 
 test("terminal tabs stay grouped by the project captured when they were opened", () => {
@@ -5476,6 +5642,8 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     parseGitWorktrees,
     readGitFileBaseline,
     readGitStatus,
+    readGitWorktrees,
+    removeGitWorktree,
   } = require("../../electron/git-status.cjs");
   assert.deepEqual(parseGitHistory("\0abc\x1fa1b2c3\x1fAda\x1f2026-08-31T12:00:00Z\x1fShip it\x1fShip it\n\nFull details.\n\x1fHEAD -> main\n12\t3\tapp.js\n-\t-\timage.png\n5\t0\ttest.js\n"), [{
     author: "Ada",
@@ -5535,6 +5703,32 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     async runGit() { throw new Error("not a repository"); },
   }), { active: false, entries: [], root: "" });
 
+  const worktreeCalls = [];
+  const existingWorktreePath = os.tmpdir();
+  const listedWorktrees = await readGitWorktrees(existingWorktreePath, {
+    async runGit(args) {
+      worktreeCalls.push(args);
+      if (args.includes("rev-parse")) return `${existingWorktreePath}\n`;
+      if (args.includes("prune")) throw new Error("read-only Git metadata");
+      if (args.includes("list")) {
+        return `worktree ${existingWorktreePath}\nHEAD abc\nbranch refs/heads/main\n\nworktree /workspace/missing\nHEAD def\nbranch refs/heads/dev\nprunable gitdir file points to non-existent location\n\n`;
+      }
+      return "";
+    },
+  });
+  assert.deepEqual(worktreeCalls[1], [
+    "-C", existingWorktreePath, "worktree", "prune", "--expire", "now",
+  ]);
+  assert.deepEqual(listedWorktrees.worktrees, [{
+    bare: false,
+    branch: "main",
+    detached: false,
+    head: "abc",
+    locked: false,
+    path: existingWorktreePath,
+    prunable: false,
+  }]);
+
   assert.deepEqual(parseGitDiffHunks([
     "@@ -2,2 +2,3 @@",
     "@@ -12 +13,0 @@",
@@ -5561,9 +5755,26 @@ test("Git porcelain status maps tracked, untracked, deleted, and renamed files",
     tracked: true,
   });
   assert.ok(baselineCalls.some((args) => args.includes("HEAD")));
+
+  const removeCalls = [];
+  const missingPath = path.join(os.tmpdir(), "taskurotta-missing-worktree-test");
+  const removed = await removeGitWorktree("/workspace/project", missingPath, {
+    async runGit(args) {
+      removeCalls.push(args);
+      if (args.includes("rev-parse")) return "/workspace/project\n";
+      if (args.includes("list")) {
+        return `worktree /workspace/project\nHEAD abc\nbranch refs/heads/main\n\nworktree ${missingPath}\nHEAD def\nbranch refs/heads/old\nprunable gitdir file points to non-existent location\n\n`;
+      }
+      return "";
+    },
+  });
+  assert.deepEqual(removeCalls[0], [
+    "-C", "/workspace/project", "worktree", "prune", "--expire", "now",
+  ]);
+  assert.deepEqual(removed.worktrees, []);
 });
 
-test("commit history rows expand on click without hover-only details", async () => {
+test("commit history refreshes in the background and rows expand on click", async () => {
   const commit = {
     author: "Ada",
     authoredAt: "2026-08-31T12:00:00Z",
@@ -5575,15 +5786,25 @@ test("commit history rows expand on click without hover-only details", async () 
     shortHash: "abc123d",
     subject: "Ship it",
   };
+  let historyCalls = 0;
+  const refreshDeferred = createDeferred();
   const workspace = {
     async gitHistory() {
+      historyCalls += 1;
+      if (historyCalls === 2) return refreshDeferred.promise;
       return { active: true, commits: [commit] };
     },
     async gitStatus() {
       return { active: true, entries: [] };
     },
     async gitWorktrees() {
-      return { active: true, worktrees: [] };
+      return {
+        active: true,
+        worktrees: [
+          { branch: "main", path: "/workspace/project" },
+          { branch: "old-feature", missing: true, path: "/workspace/missing" },
+        ],
+      };
     },
     async listDirectory() {
       return { entries: [] };
@@ -5605,19 +5826,35 @@ test("commit history rows expand on click without hover-only details", async () 
   const sourceControlButton = dom.ancestor(dom.byText("Source control"), "BUTTON");
   await dom.click(sourceControlButton);
   await dom.flush();
+  assert.equal(historyCalls, 1);
+  assert.doesNotMatch(dom.text(), /\b1 commits\b/);
+
+  const activeWorktree = dom.ancestor(dom.byText("main"), "BUTTON");
+  assert.equal(activeWorktree.getAttribute("aria-current"), "page");
+  assert.doesNotMatch(dom.text(), /old-feature|missing · Missing/);
 
   const copiedValues = [];
   navigator.clipboard.writeText = async (value) => copiedValues.push(value);
   const commitButton = dom.ancestor(dom.byText("abc123d"), "BUTTON");
   const copyCommitButton = dom.byLabel("Copy commit ID abc123d");
+  const refreshButton = dom.byLabel("Refresh commit history");
   assert.equal(commitButton.getAttribute("aria-expanded"), "false");
   assert.equal(commitButton.parentNode.getAttribute("title"), null);
   assert.match(dom.text(), /Ship it/);
   assert.doesNotMatch(dom.text(), /Full commit details\./);
   assert.throws(() => dom.byLabel("17 insertions, 3 deletions"));
 
+  await dom.click(refreshButton);
+  assert.equal(historyCalls, 2);
+  assert.equal(reactProps(refreshButton).disabled, true);
+  assert.match(dom.text(), /Ship it/);
+  assert.doesNotMatch(dom.text(), /Loading history/);
+  refreshDeferred.resolve({ active: true, commits: [commit] });
+  await dom.flush();
+  assert.equal(reactProps(refreshButton).disabled, false);
+
   await dom.click(copyCommitButton);
-  assert.deepEqual(copiedValues, [commit.hash]);
+  assert.deepEqual(copiedValues, ["abc123de"]);
   assert.ok(dom.byLabel("Copied commit ID abc123d"));
   assert.equal(commitButton.getAttribute("aria-expanded"), "false");
 
@@ -5635,6 +5872,11 @@ test("commit history rows expand on click without hover-only details", async () 
   assert.equal(commitButton.getAttribute("aria-expanded"), "false");
   assert.match(dom.text(), /Ship it/);
   assert.doesNotMatch(dom.text(), /Full commit details\./);
+
+  await dom.click(sourceControlButton);
+  await dom.click(sourceControlButton);
+  await dom.flush();
+  assert.equal(historyCalls, 3);
   await dom.unmount();
 });
 

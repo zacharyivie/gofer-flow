@@ -36,6 +36,7 @@ export default function CodeFileExplorer({
   onSelectProject,
 }) {
   const rootPath = workflow?.projectRoot ?? "";
+  const gitPanelsLoadingRef = useRef(null);
   const gitStatusLoadingRef = useRef(false);
   const lastNewFileRequestRef = useRef(newFileRequest);
   const recentMenuRef = useRef(null);
@@ -123,7 +124,9 @@ export default function CodeFileExplorer({
   }, [loadDirectory, loadSourceControlStatus, rootPath]);
 
   const loadGitPanels = useCallback(async () => {
-    if (!rootPath) return;
+    if (!rootPath || gitPanelsLoadingRef.current?.rootPath === rootPath) return;
+    const request = { rootPath };
+    gitPanelsLoadingRef.current = request;
     setGitHistory((current) => ({ ...current, loading: true }));
     setWorktrees((current) => ({ ...current, loading: true }));
     try {
@@ -131,12 +134,16 @@ export default function CodeFileExplorer({
         window.goferDesktop?.workspace?.gitHistory?.(rootPath),
         window.goferDesktop?.workspace?.gitWorktrees?.(rootPath),
       ]);
+      if (gitPanelsLoadingRef.current !== request) return;
       setGitHistory({ active: Boolean(historyPayload?.active), commits: historyPayload?.commits ?? [], loading: false });
       setWorktrees({ active: Boolean(worktreePayload?.active), items: worktreePayload?.worktrees ?? [], loading: false });
     } catch (loadError) {
-      setGitHistory({ active: false, commits: [], loading: false });
-      setWorktrees({ active: false, items: [], loading: false });
+      if (gitPanelsLoadingRef.current !== request) return;
+      setGitHistory((current) => ({ ...current, loading: false }));
+      setWorktrees((current) => ({ ...current, loading: false }));
       setError(loadError instanceof Error ? loadError.message : "Unable to load Git information");
+    } finally {
+      if (gitPanelsLoadingRef.current === request) gitPanelsLoadingRef.current = null;
     }
   }, [rootPath]);
 
@@ -386,7 +393,7 @@ export default function CodeFileExplorer({
 
   async function copyCommitHash(commit) {
     try {
-      await navigator.clipboard.writeText(commit.hash);
+      await navigator.clipboard.writeText(commit.hash.slice(0, 8));
       setCopiedCommitHash(commit.hash);
       window.setTimeout(() => setCopiedCommitHash(""), 1400);
     } catch (copyError) {
@@ -449,7 +456,9 @@ export default function CodeFileExplorer({
       setWorktreeFormOpen(false);
       setWorktreeBranch("");
       setWorktreeFolder("");
-      onSelectProject?.(payload?.createdPath || worktreeFolder);
+      onSelectProject?.(payload?.createdPath || worktreeFolder, {
+        mainProjectRoot: mainWorktreePath(payload?.worktrees, rootPath),
+      });
     } catch (worktreeError) {
       setError(worktreeError instanceof Error ? worktreeError.message : "Unable to add worktree");
     }
@@ -555,13 +564,13 @@ export default function CodeFileExplorer({
       <div
         ref={treeRef}
         aria-label="Project files"
-        className="min-h-0 flex-1 overflow-y-auto outline-none"
+        className="flex min-h-0 flex-1 flex-col outline-none"
         role="tree"
         tabIndex={0}
         onContextMenu={(event) => showContextMenu(event)}
         onKeyDown={handleTreeKeyDown}
       >
-        <div ref={recentMenuRef} className="relative">
+        <div ref={recentMenuRef} className="relative z-10 shrink-0 bg-white">
           <button
             aria-expanded={recentMenuOpen}
             aria-haspopup="menu"
@@ -631,61 +640,63 @@ export default function CodeFileExplorer({
           ) : null}
         </div>
 
-        {rootLoading && !directories[rootPath] ? (
-          <div className="flex h-14 items-center justify-center gap-2 text-xs text-muted"><Loader2 className="animate-spin" size={13} />Loading files</div>
-        ) : null}
-        {!rootLoading && directories[rootPath]
-          && directoryEntriesWithGitChanges(rootPath, rootPath, directories[rootPath], sourceControl.entries).length === 0 ? (
-          <p className="px-6 py-3 text-xs text-muted">This project folder is empty.</p>
-        ) : null}
-        <div className="ml-2 border-l border-line pl-1">
-          {rows.map(({ depth, entry }) => {
-            const isExpanded = entry.isDirectory && expanded.has(entry.path);
-            const isLoading = loadingPaths.has(entry.path);
-            const selected = selectedPath === entry.path;
-            return (
-              <button
-                key={entry.path}
-                aria-expanded={entry.isDirectory ? isExpanded : undefined}
-                aria-selected={selected}
-                className={`flex h-7 w-full items-center gap-1.5 rounded-md pr-1.5 text-left text-xs ${selected ? "bg-indigo-100 font-medium text-indigo-700" : "text-ink hover:bg-slate-100"}`}
-                role="treeitem"
-                style={{ paddingLeft: `${6 + depth * 12}px` }}
-                title={`${entry.path}${entry.gitDeleted ? "\nDeleted from working tree" : ""}`}
-                type="button"
-                onClick={() => {
-                  if (entry.isDirectory) {
-                    void toggleDirectory(entry);
-                    return;
-                  }
-                  setSelectedPath(entry.path);
-                  if (!entry.gitDeleted) onOpenFile?.(entry.path, { preview: true });
-                }}
-                onDoubleClick={() => !entry.isDirectory && !entry.gitDeleted && onOpenFile?.(entry.path)}
-                onContextMenu={(event) => {
-                  if (entry.gitDeleted) {
-                    event.preventDefault();
-                    event.stopPropagation();
+        <div aria-label="Project contents" className="min-h-0 flex-1 overflow-y-auto" role="group">
+          {rootLoading && !directories[rootPath] ? (
+            <div className="flex h-14 items-center justify-center gap-2 text-xs text-muted"><Loader2 className="animate-spin" size={13} />Loading files</div>
+          ) : null}
+          {!rootLoading && directories[rootPath]
+            && directoryEntriesWithGitChanges(rootPath, rootPath, directories[rootPath], sourceControl.entries).length === 0 ? (
+            <p className="px-6 py-3 text-xs text-muted">This project folder is empty.</p>
+          ) : null}
+          <div className="ml-2 border-l border-line pl-1">
+            {rows.map(({ depth, entry }) => {
+              const isExpanded = entry.isDirectory && expanded.has(entry.path);
+              const isLoading = loadingPaths.has(entry.path);
+              const selected = selectedPath === entry.path;
+              return (
+                <button
+                  key={entry.path}
+                  aria-expanded={entry.isDirectory ? isExpanded : undefined}
+                  aria-selected={selected}
+                  className={`flex h-7 w-full items-center gap-1.5 rounded-md pr-1.5 text-left text-xs ${selected ? "bg-indigo-100 font-medium text-indigo-700" : "text-ink hover:bg-slate-100"}`}
+                  role="treeitem"
+                  style={{ paddingLeft: `${6 + depth * 12}px` }}
+                  title={`${entry.path}${entry.gitDeleted ? "\nDeleted from working tree" : ""}`}
+                  type="button"
+                  onClick={() => {
+                    if (entry.isDirectory) {
+                      void toggleDirectory(entry);
+                      return;
+                    }
                     setSelectedPath(entry.path);
-                    return;
-                  }
-                  showContextMenu(event, entry);
-                }}
-              >
-                {entry.isDirectory ? (
-                  isLoading ? <Loader2 className="shrink-0 animate-spin text-muted" size={12} /> : <ChevronDown className={`shrink-0 text-muted transition ${isExpanded ? "" : "-rotate-90"}`} size={12} />
-                ) : <span className="w-3 shrink-0" />}
-                <ExplorerIcon entry={entry} expanded={isExpanded} />
-                <span className="min-w-0 flex-1 truncate">{entry.name}</span>
-                <SourceControlDecoration
-                  directory={entry.isDirectory}
-                  path={entry.path}
-                  projectRoot={rootPath}
-                  statuses={sourceControl.entries}
-                />
-              </button>
-            );
-          })}
+                    if (!entry.gitDeleted) onOpenFile?.(entry.path, { preview: true });
+                  }}
+                  onDoubleClick={() => !entry.isDirectory && !entry.gitDeleted && onOpenFile?.(entry.path)}
+                  onContextMenu={(event) => {
+                    if (entry.gitDeleted) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      setSelectedPath(entry.path);
+                      return;
+                    }
+                    showContextMenu(event, entry);
+                  }}
+                >
+                  {entry.isDirectory ? (
+                    isLoading ? <Loader2 className="shrink-0 animate-spin text-muted" size={12} /> : <ChevronDown className={`shrink-0 text-muted transition ${isExpanded ? "" : "-rotate-90"}`} size={12} />
+                  ) : <span className="w-3 shrink-0" />}
+                  <ExplorerIcon entry={entry} expanded={isExpanded} />
+                  <span className="min-w-0 flex-1 truncate">{entry.name}</span>
+                  <SourceControlDecoration
+                    directory={entry.isDirectory}
+                    path={entry.path}
+                    projectRoot={rootPath}
+                    statuses={sourceControl.entries}
+                  />
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -699,7 +710,6 @@ export default function CodeFileExplorer({
           <ChevronDown className={`transition ${historyOpen ? "" : "-rotate-90"}`} size={12} />
           <History size={12} />
           <span className="flex-1">Source control</span>
-          {gitHistory.commits.length ? <span className="font-mono text-[9px] font-normal normal-case tracking-normal">{gitHistory.commits.length} commits</span> : null}
         </button>
         {historyOpen ? (
           <div className="h-[calc(100%-2rem)] overflow-y-auto px-1.5 pb-2">
@@ -715,18 +725,49 @@ export default function CodeFileExplorer({
                 <button className="h-7 w-full rounded bg-brand text-[11px] font-semibold text-white disabled:opacity-40" disabled={!worktreeBranch.trim() || !worktreeFolder} type="submit">Add worktree</button>
               </form>
             ) : null}
-            {worktrees.loading ? <p className="py-2 text-[11px] text-muted">Loading worktrees...</p> : worktrees.items.map((worktree) => (
-              <div key={worktree.path} className="group flex min-h-8 items-center gap-1 rounded px-1.5 hover:bg-slate-50">
-                <GitBranch className="shrink-0 text-muted" size={12} />
-                <button className="min-w-0 flex-1 py-1 text-left" title={worktree.path} type="button" onClick={() => onSelectProject?.(worktree.path)}>
-                  <span className="block truncate text-[11px] font-medium text-ink">{worktree.branch || "Detached HEAD"}</span>
-                  <span className="block truncate text-[9px] text-muted">{workspaceBasename(worktree.path)}</span>
-                </button>
-                {normalizeWorkspacePath(worktree.path) !== normalizeWorkspacePath(rootPath) ? <button aria-label={`Remove ${worktree.branch || "detached"} worktree`} className="grid h-6 w-6 place-items-center rounded text-muted opacity-0 hover:bg-red-50 hover:text-red-700 focus:opacity-100 group-hover:opacity-100" type="button" onClick={() => removeWorktree(worktree)}><Trash2 size={11} /></button> : null}
-              </div>
-            ))}
-            <div className="mt-2 flex h-7 items-center gap-1.5 border-t border-line pt-1 text-[10px] font-semibold text-ink"><GitCommitHorizontal size={12} />Commit history</div>
-            {gitHistory.loading ? <p className="py-2 text-[11px] text-muted">Loading history...</p> : null}
+            {worktrees.loading && !worktrees.items.length ? <p className="py-2 text-[11px] text-muted">Loading worktrees...</p> : null}
+            {worktrees.items.filter((worktree) => !worktree.missing && !worktree.prunable).map((worktree) => {
+              const activeWorktree = normalizeWorkspacePath(worktree.path) === normalizeWorkspacePath(rootPath);
+              return (
+                <div
+                  key={worktree.path}
+                  className="group relative flex min-h-8 items-center gap-1 rounded px-1.5 hover:bg-slate-50"
+                >
+                  {activeWorktree ? <span aria-hidden="true" className="absolute inset-y-1 left-0 w-px bg-brand" /> : null}
+                  <GitBranch className="shrink-0 text-muted" size={12} />
+                  <button
+                    aria-current={activeWorktree ? "page" : undefined}
+                    className="min-w-0 flex-1 py-1 text-left"
+                    title={worktree.path}
+                    type="button"
+                    onClick={() => onSelectProject?.(worktree.path, {
+                      mainProjectRoot: mainWorktreePath(worktrees.items, rootPath),
+                    })}
+                  >
+                    <span className="block truncate text-[11px] font-medium text-ink">{worktree.branch || "Detached HEAD"}</span>
+                    <span className="block truncate text-[9px] text-muted">
+                      {workspaceBasename(worktree.path)}
+                    </span>
+                  </button>
+                  {!activeWorktree ? <button aria-label={`Remove ${worktree.branch || "detached"} worktree`} className="grid h-6 w-6 place-items-center rounded text-muted opacity-0 hover:bg-red-50 hover:text-red-700 focus:opacity-100 group-hover:opacity-100" type="button" onClick={() => removeWorktree(worktree)}><Trash2 size={11} /></button> : null}
+                </div>
+              );
+            })}
+            <div className="mt-2 flex h-7 items-center gap-1.5 border-t border-line pt-1 text-[10px] font-semibold text-ink">
+              <GitCommitHorizontal size={12} />
+              <span className="flex-1">Commit history</span>
+              <button
+                aria-label="Refresh commit history"
+                className="grid h-6 w-6 place-items-center rounded text-muted outline-none hover:bg-slate-100 hover:text-ink focus-visible:bg-slate-100 focus-visible:text-ink disabled:cursor-default disabled:opacity-70"
+                disabled={gitHistory.loading || worktrees.loading}
+                title="Refresh commit history"
+                type="button"
+                onClick={() => void loadGitPanels()}
+              >
+                <RefreshCw className={gitHistory.loading || worktrees.loading ? "animate-spin" : ""} size={12} />
+              </button>
+            </div>
+            {gitHistory.loading && !gitHistory.commits.length ? <p className="py-2 text-[11px] text-muted">Loading history...</p> : null}
             {!gitHistory.loading && !gitHistory.active ? <p className="py-2 text-[11px] text-muted">This project is not a Git repository.</p> : null}
             {gitHistory.commits.map((commit) => {
               const isExpanded = expandedCommits.has(commit.hash);
@@ -1076,6 +1117,10 @@ function workspaceBasename(value = "") {
   const normalized = value.replace(/[\\/]+$/, "");
   const index = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
   return normalized.slice(index + 1);
+}
+
+export function mainWorktreePath(worktrees = [], fallback = "") {
+  return String(worktrees[0]?.path || fallback).trim();
 }
 
 function workspaceRelativePath(rootPath = "", targetPath = "") {

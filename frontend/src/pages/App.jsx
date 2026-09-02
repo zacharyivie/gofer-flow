@@ -71,6 +71,7 @@ import {
 const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
 const PROJECT_LABELS_STORAGE_KEY = "gofer.projectLabels";
 const RECENT_PROJECTS_STORAGE_KEY = "gofer.recentProjects";
+const LAST_WORKTREE_STORAGE_KEY = "gofer.lastWorktreeByProject";
 export const STUDIO_SESSION_STORAGE_KEY = "taskurotta.studioSession.v1";
 const DEFAULT_RETENTION_SETTINGS = {
   keepDays: 14,
@@ -221,6 +222,7 @@ export default function App() {
   const [browserTabs, setBrowserTabs] = useState({});
   const [newCodeFileRequest, setNewCodeFileRequest] = useState(0);
   const [recentProjectRoots, setRecentProjectRoots] = useState(loadRecentProjectRoots);
+  const [lastWorktreeByProject, setLastWorktreeByProject] = useState(loadLastWorktreeByProject);
   const [radishEditorState, setRadishEditorState] = useState(null);
   const [activeCodeDocumentState, setActiveCodeDocumentState] = useState(null);
   const [query, setQuery] = useState("");
@@ -374,6 +376,17 @@ export default function App() {
   }, [recentProjectRoots]);
 
   useEffect(() => {
+    try {
+      window.localStorage?.setItem(
+        LAST_WORKTREE_STORAGE_KEY,
+        JSON.stringify(lastWorktreeByProject),
+      );
+    } catch {
+      // Worktree selection remains available for this session when storage is unavailable.
+    }
+  }, [lastWorktreeByProject]);
+
+  useEffect(() => {
     saveStudioSession({
       projectRoot: activeProjectRoot,
       view: studioView,
@@ -382,26 +395,42 @@ export default function App() {
   }, [activeProjectRoot, activeWorkflowId, studioView]);
 
   useEffect(() => {
-    const projectRoot = activeWorkflow?.projectRoot;
-    if (!projectRoot) return;
-    setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
-  }, [activeWorkflow?.projectRoot]);
-
-  useEffect(() => {
     const getPathInfo = window.goferDesktop?.workspace?.getPathInfo;
     if (!getPathInfo || !recentProjectRoots.length) return undefined;
     let cancelled = false;
     void Promise.all(recentProjectRoots.map(async (projectRoot) => {
+      const selectedProjectRoot = lastWorktreeByProject[projectRoot] || projectRoot;
       try {
-        const info = await getPathInfo(projectRoot);
-        return info?.isDirectory ? projectRoot : "";
+        await window.goferDesktop?.workspace?.trustProjectRoot?.(selectedProjectRoot);
+        const info = await getPathInfo(selectedProjectRoot);
+        if (!info?.isDirectory) return null;
+        const worktreePayload = await window.goferDesktop?.workspace?.gitWorktrees?.(
+          selectedProjectRoot,
+        );
+        return {
+          mainProjectRoot: mainWorktreeRoot(worktreePayload, projectRoot),
+          selectedProjectRoot,
+        };
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        return /does not exist|no such file|not a directory/i.test(message) ? "" : projectRoot;
+        return /does not exist|no such file|not a directory/i.test(message)
+          ? null
+          : { mainProjectRoot: projectRoot, selectedProjectRoot: projectRoot };
       }
-    })).then((existingRoots) => {
+    })).then((projects) => {
       if (cancelled) return;
-      const nextRoots = existingRoots.filter(Boolean);
+      const existingProjects = projects.filter(Boolean);
+      const nextRoots = mergeRecentProjects(
+        [],
+        existingProjects.map((project) => project.mainProjectRoot),
+      );
+      const selections = Object.fromEntries(existingProjects.map((project) => [
+        project.mainProjectRoot,
+        project.selectedProjectRoot,
+      ]));
+      setLastWorktreeByProject((current) => Object.entries(selections).every(
+        ([mainRoot, selectedRoot]) => current[mainRoot] === selectedRoot,
+      ) ? current : { ...current, ...selections });
       setRecentProjectRoots((current) => (
         current.length === nextRoots.length
           && current.every((root, index) => root === nextRoots[index])
@@ -412,7 +441,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [recentProjectRoots]);
+  }, [lastWorktreeByProject, recentProjectRoots]);
 
   useEffect(() => {
     function runShortcutAction(action) {
@@ -517,12 +546,6 @@ export default function App() {
   }, [activeWorkflow?.id]);
 
   useEffect(() => {
-    if (studioView === "code" && !codeWorkspaceAvailable(activeWorkflow)) {
-      setStudioView("graph");
-    }
-  }, [activeWorkflow, studioView]);
-
-  useEffect(() => {
     if (activeWorkflow?.sourceFormat !== "radish") return undefined;
     const controller = new AbortController();
     setRadishEditorState({ document: null, error: "", loading: true, saving: false });
@@ -552,7 +575,6 @@ export default function App() {
   }, [activeWorkflow?.id, activeWorkflow?.sourceFormat]);
 
   function changeStudioView(nextView) {
-    if (nextView === "code" && !activeWorkflow?.projectRoot) return;
     setQuery("");
     setStudioView(nextView);
     if (nextView === "code") setCodeEditorOpened(true);
@@ -783,6 +805,14 @@ export default function App() {
   }
 
   async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
+    await window.goferDesktop.workspace.trustProjectRoot?.(projectRoot);
+    let mainProjectRoot = projectRoot;
+    try {
+      const worktreePayload = await window.goferDesktop.workspace.gitWorktrees?.(projectRoot);
+      mainProjectRoot = mainWorktreeRoot(worktreePayload, projectRoot);
+    } catch {
+      // Non-Git projects use their selected folder as the recent-project identity.
+    }
     const projectGrantId = window.goferDesktop.workspace.pathGrantForApi?.(projectRoot) ?? "";
     const response = await fetch(apiUrl("/projects/open"), {
       method: "POST",
@@ -796,13 +826,16 @@ export default function App() {
     const discovered = (payload.workflows ?? []).map((workflow) =>
       summarizeWorkflow(workflow, dataDir));
     if (rememberProject) {
-      setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+      setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
+      setLastWorktreeByProject((current) => ({ ...current, [mainProjectRoot]: projectRoot }));
     }
     setActiveProjectRoot(projectRoot);
     if (!discovered.length) {
       setActiveWorkflowId(undefined);
-      setCodeOpenPaths(focusPath ? [focusPath] : []);
-      setActiveCodePath(focusPath);
+      if (focusPath) {
+        setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [focusPath]));
+        setActiveCodePath(focusPath);
+      }
       setCodeEditorOpened(true);
       setStudioView("code");
       setQuery("");
@@ -818,9 +851,12 @@ export default function App() {
     });
     const selectedWorkflow = discovered.find((workflow) => workflow.sourcePath === focusPath)
       ?? discovered[0];
-    if (activeWorkflow?.id === selectedWorkflow.id) {
-      if (focusPath) openCodeFile(focusPath);
-    } else {
+    if (focusPath) {
+      setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [focusPath]));
+      setActiveCodePath(focusPath);
+      pinCodeFile(focusPath);
+    }
+    if (activeWorkflow?.id !== selectedWorkflow.id) {
       pendingProjectFileRef.current = {
         path: focusPath || selectedWorkflow.sourcePath,
         workflowId: selectedWorkflow.id,
@@ -906,20 +942,34 @@ export default function App() {
 
   openProjectFolderRef.current = openProjectFolder;
 
-  function selectRecentProject(projectRoot) {
-    const projectWorkflows = workflows.filter((workflow) => workflow.projectRoot === projectRoot);
+  function selectRecentProject(projectRoot, options = {}) {
+    const mainProjectRoot = options.mainProjectRoot || projectRoot;
+    const selectedProjectRoot = options.mainProjectRoot
+      ? projectRoot
+      : lastWorktreeByProject[mainProjectRoot] || projectRoot;
+    if (options.missing) {
+      setTopBarNotice({ type: "error", message: `Worktree folder is missing: ${selectedProjectRoot}` });
+      return;
+    }
+    const projectWorkflows = workflows.filter(
+      (workflow) => workflow.projectRoot === selectedProjectRoot,
+    );
     if (!projectWorkflows.length) {
-      void openProjectAtPath(projectRoot, { rememberProject: true }).catch((error) => {
+      void openProjectAtPath(selectedProjectRoot, { rememberProject: true }).catch((error) => {
         setTopBarNotice({ type: "error", message: error instanceof Error ? error.message : "Unable to open project" });
       });
       return;
     }
-    const selectedWorkflow = activeWorkflow?.projectRoot === projectRoot
+    const selectedWorkflow = activeWorkflow?.projectRoot === selectedProjectRoot
       ? activeWorkflow
       : projectWorkflows[0];
     setActiveWorkflowId(selectedWorkflow.id);
-    setActiveProjectRoot(projectRoot);
-    setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+    setActiveProjectRoot(selectedProjectRoot);
+    setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
+    setLastWorktreeByProject((current) => ({
+      ...current,
+      [mainProjectRoot]: selectedProjectRoot,
+    }));
     setCodeEditorOpened(true);
     setStudioView("code");
     setQuery("");
@@ -1119,10 +1169,6 @@ export default function App() {
         )
         .filter((workflow) => !deletedWorkflowIdsRef.current.has(workflow.id))
         .map((workflow) => summarizeWorkflow(workflow, payloadDataDir));
-      setRecentProjectRoots((current) => mergeRecentProjects(
-        current,
-        nextWorkflows.map((workflow) => workflow.projectRoot).filter(Boolean),
-      ));
       setWorkflows((current) => {
         const refreshedWorkflows = nextWorkflows.map((workflow) => {
           const localWorkflow = current.find((candidate) => candidate.id === workflow.id);
@@ -1716,6 +1762,7 @@ export default function App() {
     if (dirtyWorkflowsRef.current.get(workflowId)?.revision !== revision) {
       return undefined;
     }
+    if (deletedWorkflowIdsRef.current.has(workflowId)) return undefined;
 
     setSaveStatesByWorkflowId((current) => ({
       ...current,
@@ -2501,8 +2548,19 @@ export default function App() {
           : current,
       );
 
+      const pendingSave = inFlightSavesRef.current.get(workflow.id);
+      if (pendingSave) {
+        try {
+          await pendingSave;
+        } catch {
+          // Deletion still proceeds after a failed save.
+        }
+      }
+
       const response = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}`),
+        apiUrl(
+          `/workflows/${encodeURIComponent(workflow.id)}?sourceFormat=${encodeURIComponent(workflow.sourceFormat || "toml")}`,
+        ),
         {
           method: "DELETE",
         },
@@ -2804,7 +2862,7 @@ export default function App() {
                 }
               />
             </div>
-            {codeEditorOpened && activeWorkflow.projectRoot ? (
+            {codeEditorOpened && studioView === "code" ? (
               <div className={`${studioView === "code" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
                 <CodeWorkspace
                   active={studioView === "code"}
@@ -2830,7 +2888,10 @@ export default function App() {
                     if (nextState?.document?.dirty) pinCodeFile(activeWorkflow.sourcePath);
                   }}
                   onNewFile={() => setNewCodeFileRequest((current) => current + 1)}
+                  onOpenBrowser={() => openIntegratedBrowser()}
+                  onOpenFile={() => void openFile()}
                   onOpenMarkdownPath={openMarkdownFileLink}
+                  onOpenProject={() => void openProjectFolder()}
                   onOpenPath={openCodeFile}
                   onOpenPathsChange={setCodeOpenPaths}
                   onPinPath={pinCodeFile}
@@ -2894,38 +2955,40 @@ export default function App() {
         />
       ) : null}
 
-      {assistantPaneVisible ? <ChatPane
-        assistantDefaults={settings.assistant}
-        audioInputDeviceId={settings.devices.audioInputId}
-        recentProjectRoots={recentProjectRoots}
-        width={chatPaneWidth}
-        activeWorkflowId={activeWorkflow?.id}
-        workflow={activeWorkflow}
-        workflows={workflows}
-        onOpenMarkdownLink={(href, projectRoot) => openMarkdownFileLink(
-          href,
-          assistantMarkdownSourcePath(projectRoot),
-        )}
-        onOpenFile={openAssistantFile}
-        onResizeStart={(event) =>
-          startPaneResize(event, {
-            max: 520,
-            min: 300,
-            side: "left",
-            width: chatPaneWidth,
-            onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
-          })
-        }
-        onResizeKeyDown={(event) =>
-          handlePaneResizeKeyDown(event, {
-            defaultValue: 380,
-            max: 520,
-            min: 300,
-            onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
-            width: chatPaneWidth,
-          })
-        }
-      /> : null}
+      <div className={assistantPaneVisible ? "contents" : "hidden"} aria-hidden={!assistantPaneVisible}>
+        <ChatPane
+          assistantDefaults={settings.assistant}
+          audioInputDeviceId={settings.devices.audioInputId}
+          recentProjectRoots={recentProjectRoots}
+          width={chatPaneWidth}
+          activeWorkflowId={activeWorkflow?.id}
+          workflow={activeWorkflow}
+          workflows={workflows}
+          onOpenMarkdownLink={(href, projectRoot) => openMarkdownFileLink(
+            href,
+            assistantMarkdownSourcePath(projectRoot),
+          )}
+          onOpenFile={openAssistantFile}
+          onResizeStart={(event) =>
+            startPaneResize(event, {
+              max: 520,
+              min: 300,
+              side: "left",
+              width: chatPaneWidth,
+              onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
+            })
+          }
+          onResizeKeyDown={(event) =>
+            handlePaneResizeKeyDown(event, {
+              defaultValue: 380,
+              max: 520,
+              min: 300,
+              onResize: (width) => changeSetting("layout.assistantPaneWidth", width),
+              width: chatPaneWidth,
+            })
+          }
+        />
+      </div>
       {runPreview ? (
         <RunPreviewDialog
           plan={runPreview.plan}
@@ -3482,7 +3545,7 @@ export function WorkflowSidebar({
     })),
     [projectLabels, recentProjectRoots],
   );
-  const canOpenCode = Boolean(activeWorkflow?.projectRoot);
+  const canOpenCode = true;
 
   useEffect(() => {
     try {
@@ -3664,7 +3727,7 @@ export function WorkflowSidebar({
       </div> : null}
 
       <div className={`workflow-scrollbar relative flex-1 px-2.5 pb-3 pt-1 ${view === "code" ? "min-h-0 overflow-hidden" : "overflow-y-auto"}`}>
-        {view === "code" ? (
+        {view === "code" && activeWorkflow?.projectRoot ? (
           <CodeFileExplorer
             activeFilePath={activeCodePath}
             newFileRequest={newFileRequest}
@@ -3678,6 +3741,10 @@ export function WorkflowSidebar({
             onSelectProject={onSelectProject}
             onRemoveRecentProject={onRemoveRecentProject}
           />
+        ) : view === "code" ? (
+          <div className="px-3 py-4 text-xs leading-5 text-muted">
+            No project open. Use the IDE actions to open a project or file.
+          </div>
         ) : workflowGroups.length ? (
           workflowGroups.map(({ id, name, items, root }) => {
             const collapsed = Boolean(collapsedGroups[id]);
@@ -3906,6 +3973,31 @@ export function loadRecentProjectRoots() {
   }
 }
 
+export function loadLastWorktreeByProject() {
+  if (typeof window === "undefined") return {};
+  try {
+    const parsed = JSON.parse(
+      window.localStorage?.getItem(LAST_WORKTREE_STORAGE_KEY) ?? "{}",
+    );
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") return {};
+    return Object.fromEntries(Object.entries(parsed).filter(
+      ([projectRoot, worktreeRoot]) => (
+        typeof projectRoot === "string"
+        && projectRoot.trim()
+        && typeof worktreeRoot === "string"
+        && worktreeRoot.trim()
+      ),
+    ));
+  } catch {
+    return {};
+  }
+}
+
+export function mainWorktreeRoot(payload, fallback = "") {
+  const worktrees = Array.isArray(payload?.worktrees) ? payload.worktrees : [];
+  return String(worktrees[0]?.path || payload?.root || fallback).trim();
+}
+
 export function loadStudioSession(storage = globalThis.window?.localStorage) {
   try {
     const parsed = JSON.parse(storage?.getItem(STUDIO_SESSION_STORAGE_KEY) ?? "{}");
@@ -3981,7 +4073,8 @@ export function activeWorkspaceForView(
   if (view === "graph") {
     return workflows.find((workflow) => workflow.id === activeWorkflowId) ?? workflows[0];
   }
-  return activeWorkspaceForProject(workflows, activeWorkflowId, activeProjectRoot);
+  return activeWorkspaceForProject(workflows, activeWorkflowId, activeProjectRoot)
+    ?? projectWorkspace("");
 }
 
 export function codeWorkspaceAvailable(workflow) {

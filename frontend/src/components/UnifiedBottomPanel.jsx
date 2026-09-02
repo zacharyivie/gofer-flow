@@ -930,13 +930,13 @@ function TerminalSession({ active, onCwdChange, onLabelChange, projectRoot, sett
       if (sessionIdRef.current) void bridge.write(sessionIdRef.current, data).catch(() => {});
     });
     terminal.attachCustomKeyEventHandler((event) => {
-      const clipboardAction = terminalClipboardShortcutAction(event);
-      if (clipboardAction === "copy") {
-        void copyTerminalSelection(terminal).catch(() => {});
-        return false;
-      }
-      if (clipboardAction === "paste") {
-        void pasteIntoTerminal(bridge, sessionIdRef.current).catch(() => {});
+      const clipboardDecision = handleTerminalClipboardShortcut(event, terminal);
+      if (clipboardDecision !== null) return clipboardDecision;
+      const wordEraseInput = terminalWordEraseInput(event);
+      if (wordEraseInput !== null) {
+        if (sessionIdRef.current) {
+          void bridge.write(sessionIdRef.current, wordEraseInput).catch(() => {});
+        }
         return false;
       }
       if (
@@ -1161,16 +1161,31 @@ export async function copyTerminalSelection(
   return true;
 }
 
-export async function pasteIntoTerminal(
-  bridge,
-  sessionId,
-  clipboard = globalThis.navigator?.clipboard,
-) {
-  if (!sessionId || typeof clipboard?.readText !== "function") return false;
-  const text = await clipboard.readText();
-  if (!text) return false;
-  await bridge.write(sessionId, text);
-  return true;
+export function handleTerminalClipboardShortcut(event, terminal) {
+  const action = terminalClipboardShortcutAction(event);
+  if (action === "copy") {
+    void copyTerminalSelection(terminal).catch(() => {});
+    return false;
+  }
+  if (action === "paste") {
+    // Returning false skips xterm's keydown handling while preserving the browser paste event.
+    return false;
+  }
+  return null;
+}
+
+export function terminalWordEraseInput(event) {
+  if (
+    event.type !== "keydown"
+    || !event.ctrlKey
+    || event.metaKey
+    || event.altKey
+    || event.shiftKey
+    || event.key !== "Backspace"
+  ) {
+    return null;
+  }
+  return "\x17";
 }
 
 export function isBottomPanelShortcut(event) {

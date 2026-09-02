@@ -1,4 +1,5 @@
 const { execFile } = require("node:child_process");
+const fs = require("node:fs");
 const path = require("node:path");
 
 const GIT_OUTPUT_LIMIT = 16 * 1024 * 1024;
@@ -154,8 +155,17 @@ async function readGitWorktrees(projectRoot, options = {}) {
   const runner = options.runGit || runGit;
   try {
     const root = String(await runner(["-C", projectRoot, "rev-parse", "--show-toplevel"])).trim();
+    try {
+      await runner(["-C", root, "worktree", "prune", "--expire", "now"]);
+    } catch {
+      // Listing remains useful when Git metadata is read-only.
+    }
     const output = await runner(["-C", projectRoot, "worktree", "list", "--porcelain"]);
-    return { active: true, root, worktrees: parseGitWorktrees(output) };
+    return {
+      active: true,
+      root,
+      worktrees: parseGitWorktrees(output).filter((worktree) => fs.existsSync(worktree.path)),
+    };
   } catch {
     return { active: false, root: "", worktrees: [] };
   }
@@ -173,7 +183,11 @@ async function addGitWorktree(projectRoot, targetPath, branch, options = {}) {
 
 async function removeGitWorktree(projectRoot, targetPath, options = {}) {
   const runner = options.runGit || runGit;
-  await runner(["-C", projectRoot, "worktree", "remove", targetPath]);
+  if (fs.existsSync(targetPath)) {
+    await runner(["-C", projectRoot, "worktree", "remove", targetPath]);
+  } else {
+    await runner(["-C", projectRoot, "worktree", "prune", "--expire", "now"]);
+  }
   return readGitWorktrees(projectRoot, options);
 }
 

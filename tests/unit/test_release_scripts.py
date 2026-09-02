@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 from typing import Any, cast
 
@@ -67,6 +68,11 @@ def _write_mock_bin(bin_dir: Path, name: str, body: str) -> None:
 
 def _read_json(path: Path) -> dict[str, Any]:
     return cast(dict[str, Any], json.loads(path.read_text(encoding="utf8")))
+
+
+def _project_version(repo: Path) -> str:
+    document = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf8"))
+    return cast(str, document["project"]["version"])
 
 
 def test_release_metadata_uses_agpl_3_only() -> None:
@@ -188,9 +194,13 @@ def test_bump_version_rejects_invalid_arguments_before_mutating_fixture(tmp_path
 
 def test_bump_version_fails_when_expected_manifest_pattern_is_missing(tmp_path: Path) -> None:
     repo = _copy_release_fixture(tmp_path)
+    current_version = _project_version(repo)
     pyproject_path = repo / "pyproject.toml"
     pyproject_path.write_text(
-        pyproject_path.read_text(encoding="utf8").replace('version = "0.1.2"', "version: 0.1.2"),
+        pyproject_path.read_text(encoding="utf8").replace(
+            f'version = "{current_version}"',
+            f"version: {current_version}",
+        ),
         encoding="utf8",
     )
 
@@ -202,6 +212,7 @@ def test_bump_version_fails_when_expected_manifest_pattern_is_missing(tmp_path: 
 
 def test_package_cli_linux_uses_mocked_package_builders(tmp_path: Path) -> None:
     repo = _copy_release_fixture(tmp_path)
+    current_version = _project_version(repo)
     binary = repo / "dist" / "gof"
     binary.parent.mkdir()
     binary.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf8")
@@ -242,7 +253,7 @@ while [[ $# -gt 0 ]]; do
 done
 cat "$spec_path" >>"{log_path}"
 mkdir -p "$topdir/RPMS/x86_64"
-touch "$topdir/RPMS/x86_64/gofer-flow-cli-0.1.2-1.mock.x86_64.rpm"
+touch "$topdir/RPMS/x86_64/gofer-flow-cli-{current_version}-1.mock.x86_64.rpm"
 """,
     )
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
@@ -254,12 +265,12 @@ touch "$topdir/RPMS/x86_64/gofer-flow-cli-0.1.2-1.mock.x86_64.rpm"
     )
 
     assert result.returncode == 0, result.stderr
-    assert (output_dir / "gofer-flow-cli_0.1.2_amd64.deb").exists()
-    assert (output_dir / "gofer-flow-cli-0.1.2-1.mock.x86_64.rpm").exists()
+    assert (output_dir / f"gofer-flow-cli_{current_version}_amd64.deb").exists()
+    assert (output_dir / f"gofer-flow-cli-{current_version}-1.mock.x86_64.rpm").exists()
     command_log = log_path.read_text(encoding="utf8")
     assert "dpkg-deb --build --root-owner-group" in command_log
     assert "Package: gofer-flow-cli" in command_log
-    assert "Version: 0.1.2" in command_log
+    assert f"Version: {current_version}" in command_log
     assert "Architecture: amd64" in command_log
     assert "rpmbuild --define _topdir " in command_log
     assert "Name:           gofer-flow-cli" in command_log

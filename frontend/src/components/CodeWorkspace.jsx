@@ -12,6 +12,7 @@ import {
   FileCode2,
   FileJson2,
   FileText,
+  FolderOpen,
   Globe,
   GitCompareArrows,
   Loader2,
@@ -73,6 +74,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   onActiveDocumentStateChange,
   onNewFile,
   onOpenMarkdownPath,
+  onOpenBrowser,
+  onOpenFile,
+  onOpenProject,
   onOpenPath,
   onOpenPathsChange,
   onPinPath,
@@ -87,6 +91,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   const tabMenuFirstActionRef = useRef(null);
   const [fileStates, setFileStates] = useState({});
   const [documentModes, setDocumentModes] = useState({});
+  const [diffOnOpenPaths, setDiffOnOpenPaths] = useState(() => new Set());
   const [tabMenu, setTabMenu] = useState(null);
   const [draggedPath, setDraggedPath] = useState("");
   const [split, setSplit] = useState(null);
@@ -312,18 +317,27 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
           return (
           <div key={path} className={`${primaryPath === path ? "flex" : "hidden"} h-full min-h-0 flex-1 flex-col`}>
             {browserTab || pdf || (html && mode === "preview") ? (
-              <IntegratedBrowser
+              <PreviewBrowser
                 active={active && currentPath === path}
                 clientId={browserTab ? path : `html:${path}`}
                 initialUrl={browserTab?.url || "about:blank"}
                 localPath={browserTab ? "" : path}
                 openBrowserBinding={settingBinding(settings, "browser.open")}
                 searchUrl={settings.browser.searchUrl}
+                diffPath={html ? path : ""}
                 showModeToggle={html}
                 onClose={() => closeWorkspacePath(path)}
                 onModeChange={(nextMode) => {
                   setDocumentModes((current) => ({ ...current, [path]: nextMode }));
+                  if (nextMode === "preview") {
+                    setDiffOnOpenPaths((current) => withoutSetValue(current, path));
+                  }
                   if (nextMode === "edit") onPinPath?.(path);
+                }}
+                onShowDiff={() => {
+                  setDiffOnOpenPaths((current) => withSetValue(current, path));
+                  setDocumentModes((current) => ({ ...current, [path]: "edit" }));
+                  onPinPath?.(path);
                 }}
                 onStateChange={browserTab
                   ? (nextState) => onBrowserStateChange?.(path, nextState)
@@ -342,6 +356,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
                 : []}
               editing={mode === "edit"}
               html={html}
+              initialDiffMode={diffOnOpenPaths.has(path)}
               markdown={isMarkdownPath(path)}
               svg={svg}
               navigationRequest={navigationRequest?.path === path ? navigationRequest : null}
@@ -355,6 +370,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
               theme={theme}
               onModeChange={(mode) => {
                 setDocumentModes((current) => ({ ...current, [path]: mode }));
+                if (mode === "preview") {
+                  setDiffOnOpenPaths((current) => withoutSetValue(current, path));
+                }
                 if (mode === "edit") onPinPath?.(path);
               }}
               onOpenRelativeLink={(href) => {
@@ -394,8 +412,18 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
           );
         })}
         {!currentPath ? (
-          <div className="grid min-h-0 flex-1 place-items-center text-xs text-muted">
-            No file open
+          <div className="grid min-h-0 flex-1 place-items-center px-8">
+            <div className="w-full max-w-sm">
+              <p className="text-center text-sm font-semibold text-ink">Start in the IDE</p>
+              <p className="mt-1 text-center text-xs leading-5 text-muted">
+                Open a project, a single file, or a browser tab.
+              </p>
+              <div className="mt-4 space-y-2">
+                <EmptyWorkspaceAction icon={FolderOpen} label="Open Project" shortcut="Ctrl+K, Ctrl+O" onClick={onOpenProject} />
+                <EmptyWorkspaceAction icon={FileText} label="Open File" shortcut="Ctrl+O" onClick={onOpenFile} />
+                <EmptyWorkspaceAction icon={Globe} label="Open Browser" shortcut="Ctrl+J" onClick={onOpenBrowser} />
+              </div>
+            </div>
           </div>
         ) : null}
         </div>
@@ -475,6 +503,42 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   );
 });
 
+function PreviewBrowser({ diffPath = "", ...props }) {
+  const [diffAvailable, setDiffAvailable] = useState(false);
+  useEffect(() => {
+    if (!diffPath) {
+      setDiffAvailable(false);
+      return undefined;
+    }
+    let disposed = false;
+    const readBaseline = window.goferDesktop?.workspace?.gitFileBaseline;
+    if (!readBaseline) return undefined;
+    readBaseline(diffPath).then((baseline) => {
+      if (!disposed) setDiffAvailable(Boolean(baseline?.tracked && baseline?.changed));
+    }).catch(() => {
+      if (!disposed) setDiffAvailable(false);
+    });
+    return () => {
+      disposed = true;
+    };
+  }, [diffPath]);
+  return <IntegratedBrowser {...props} showDiffButton={diffAvailable} />;
+}
+
+function EmptyWorkspaceAction({ icon: Icon, label, onClick, shortcut }) {
+  return (
+    <button
+      className="flex h-10 w-full items-center gap-2 rounded-md border border-line bg-white px-3 text-left text-xs font-medium text-ink transition hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand"
+      type="button"
+      onClick={onClick}
+    >
+      <Icon aria-hidden="true" className="text-muted" size={15} />
+      <span className="flex-1">{label}</span>
+      <span className="text-[10px] font-normal text-muted">{shortcut}</span>
+    </button>
+  );
+}
+
 function SplitDropZone({ onDrop, side }) {
   return (
     <div
@@ -526,6 +590,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   editing = true,
   editorSettings = DEFAULT_APP_SETTINGS.editor,
   html = false,
+  initialDiffMode = false,
   markdown = false,
   svg = false,
   navigationRequest = null,
@@ -551,11 +616,12 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   const editableRef = useRef(false);
   const diagnosticsRef = useRef(diagnostics);
   const editorSettingsRef = useRef(editorSettings);
+  const gitBaselineRef = useRef(null);
   const onContentChangeRef = useRef(onContentChange);
   const onSavedRef = useRef(onSaved);
   const onStateChangeRef = useRef(onStateChange);
   const navigationRequestRef = useRef(navigationRequest);
-  const [diffMode, setDiffMode] = useState(false);
+  const [diffMode, setDiffMode] = useState(initialDiffMode);
   const [gitBaseline, setGitBaseline] = useState(null);
   const [state, setState] = useState({
     content: null,
@@ -586,6 +652,10 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
   useEffect(() => {
     void refreshGitBaseline();
   }, [refreshGitBaseline]);
+
+  useEffect(() => {
+    gitBaselineRef.current = gitBaseline;
+  }, [gitBaseline]);
 
   const save = useCallback(async () => {
     const model = modelRef.current;
@@ -718,6 +788,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       const monaco = loadRadishMonaco();
       monacoRef.current = monaco;
       const session = textEditorSessions.get(path);
+      const initialGitBaseline = gitBaselineRef.current;
       const model = monaco.editor.createModel(
         session?.content ?? "",
         languageForPath(path),
@@ -747,20 +818,17 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
         wordWrap: initialEditorSettings.wordWrap ? "on" : "off",
       };
       let editor;
-      if (diffMode && gitBaseline?.changed) {
+      if (diffMode && initialGitBaseline?.changed) {
         const originalModel = monaco.editor.createModel(
-          gitBaseline.content ?? "",
+          initialGitBaseline.content ?? "",
           languageForPath(path),
           monaco.Uri.parse(`git-head://${encodeURI(path)}`),
         );
         originalModelRef.current = originalModel;
-        const diffEditor = monaco.editor.createDiffEditor(containerRef.current, {
-          ...editorOptions,
-          diffAlgorithm: "advanced",
-          enableSplitViewResizing: true,
-          originalEditable: false,
-          renderSideBySide: true,
-        });
+        const diffEditor = monaco.editor.createDiffEditor(
+          containerRef.current,
+          codeDiffEditorOptions(editorOptions),
+        );
         diffEditor.setModel({ modified: model, original: originalModel });
         diffEditorRef.current = diffEditor;
         editor = diffEditor.getModifiedEditor();
@@ -770,7 +838,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       editorRef.current = editor;
       decorationIdsRef.current = editor.deltaDecorations(
         [],
-        trackedChangeDecorations(gitBaseline, diffMode),
+        trackedChangeDecorations(initialGitBaseline, diffMode),
       );
       contentListener = model.onDidChangeContent(() => {
         const content = model.getValue();
@@ -869,7 +937,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       monacoRef.current = null;
       originalModelRef.current = null;
     };
-  }, [diffMode, gitBaseline, path, save, theme]);
+  }, [diffMode, path, save, theme]);
 
   useEffect(() => {
     const editor = editorRef.current;
@@ -958,7 +1026,7 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
             onModeChange={onModeChange}
           />
         ) : null}
-        {editing && gitBaseline?.changed ? (
+        {gitBaseline?.changed ? (
           <button
             aria-label={diffMode ? "Hide file diff" : "Show file diff"}
             aria-pressed={diffMode}
@@ -971,7 +1039,10 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
             }`}
             title={diffMode ? "Hide file diff" : "Compare with HEAD"}
             type="button"
-            onClick={() => setDiffMode((current) => !current)}
+            onClick={() => {
+              if (!diffMode && !editing) onModeChange?.("edit");
+              setDiffMode((current) => !current);
+            }}
           >
             <GitCompareArrows aria-hidden="true" size={13} />
             Diff
@@ -1150,6 +1221,18 @@ export function trackedChangeDecorations(baseline, diffMode = false) {
       startLineNumber: hunk.startLine,
     },
   }));
+}
+
+export function codeDiffEditorOptions(editorOptions = {}) {
+  return {
+    ...editorOptions,
+    diffAlgorithm: "advanced",
+    enableSplitViewResizing: true,
+    ignoreTrimWhitespace: false,
+    originalEditable: false,
+    renderSideBySide: true,
+    renderWhitespace: "all",
+  };
 }
 
 export function fileTabCloseTargets(openPaths, path, action) {
@@ -1368,6 +1451,18 @@ function pathMatchesChange(path, changedPath, isDirectory) {
   const normalizedPath = String(path).replaceAll("\\", "/");
   const normalizedChanged = String(changedPath).replaceAll("\\", "/").replace(/\/$/, "");
   return normalizedPath === normalizedChanged || normalizedPath.startsWith(`${normalizedChanged}/`);
+}
+
+function withSetValue(current, value) {
+  const next = new Set(current);
+  next.add(value);
+  return next;
+}
+
+function withoutSetValue(current, value) {
+  const next = new Set(current);
+  next.delete(value);
+  return next;
 }
 
 export default CodeWorkspace;

@@ -46,6 +46,11 @@ function rememberPathGrant(payload) {
       rememberPathGrant(entry);
     }
   }
+  if (Array.isArray(payload.worktrees)) {
+    for (const worktree of payload.worktrees) {
+      rememberPathGrant(worktree);
+    }
+  }
   return payload;
 }
 

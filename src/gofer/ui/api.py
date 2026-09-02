@@ -111,6 +111,7 @@ from gofer.radish.workspaces import (
     RadishWorkspaceError,
     RegisteredWorkflow,
     create_registered_workflow,
+    delete_registered_workflow,
     discover_registered_workflows,
     list_registered_workflows,
 )
@@ -983,8 +984,20 @@ def import_workflow_bundle_payload(
     return plan.to_dict()
 
 
-def delete_workflow_payload(workflow_id: str, data_dir: Path | None = None) -> dict[str, Any]:
+def delete_workflow_payload(
+    workflow_id: str,
+    data_dir: Path | None = None,
+    *,
+    source_format: str | None = None,
+) -> dict[str, Any]:
     base = _data_dir(data_dir)
+    if source_format == "radish":
+        try:
+            delete_registered_workflow(workflow_id, registry_dir=base)
+        except (OSError, RadishWorkspaceError) as exc:
+            raise WorkflowUpdateError(str(exc)) from exc
+        delete_workflow_chat_prompt(base, workflow_id)
+        return {"workflowId": workflow_id, "deleted": True}
     path = _workflow_toml_path(workflow_id, base, error_cls=WorkflowUpdateError)
     if not path.exists():
         raise WorkflowUpdateError(f"Workflow '{workflow_id}' not found")

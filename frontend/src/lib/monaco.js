@@ -15,6 +15,7 @@ import "monaco-editor/esm/vs/editor/contrib/linesOperations/browser/linesOperati
 import "monaco-editor/esm/vs/editor/contrib/multicursor/browser/multicursor";
 import "monaco-editor/esm/vs/editor/contrib/suggest/browser/suggestController";
 import "monaco-editor/esm/vs/editor/contrib/wordHighlighter/browser/wordHighlighter";
+import "monaco-editor/esm/vs/editor/contrib/wordOperations/browser/wordOperations";
 
 if (typeof self !== "undefined") {
   self.MonacoEnvironment = {

@@ -50,7 +50,7 @@ from gofer.radish.schema_compat import (
 
 IR_SCHEMA_ID = "https://taskurotta.dev/radish/schema/ir-1.json"
 JSON_SCHEMA_ID = "https://json-schema.org/draft/2020-12/schema"
-RADISH_COMPILER_VERSION = "0.2.0"
+RADISH_COMPILER_VERSION = "0.2.1"
 
 _COMMON_NODE_FIELDS = {
     "allow-fail",

@@ -1675,7 +1675,14 @@ async function gitHistory(_event, options = {}) {
 
 async function gitWorktrees(_event, options = {}) {
   const projectRoot = await resolveGitProjectDirectory(options);
-  return readGitWorktrees(projectRoot);
+  const result = await readGitWorktrees(projectRoot);
+  const worktrees = await Promise.all(result.worktrees.map(async (worktree) => {
+    if (worktree.missing) return worktree;
+    const handle = pathHandle(worktree.path);
+    await registerBackendPathGrant(handle);
+    return { ...worktree, grantId: handle.grantId, path: handle.path };
+  }));
+  return { ...result, worktrees };
 }
 
 async function gitWorktreeAdd(_event, options = {}) {
@@ -1693,7 +1700,17 @@ async function gitWorktreeAdd(_event, options = {}) {
 
 async function gitWorktreeRemove(_event, options = {}) {
   const projectRoot = await resolveGitProjectDirectory(options);
-  const targetPath = resolveExactPath(options.targetPath, { grantId: options.targetGrantId, mustExist: true });
+  const listed = await readGitWorktrees(projectRoot);
+  const listedWorktree = listed.worktrees.find(
+    (worktree) => path.resolve(worktree.path) === path.resolve(String(options.targetPath || "")),
+  );
+  if (!listedWorktree) throw new Error("The selected path is not a registered worktree.");
+  const targetPath = listedWorktree.missing
+    ? listedWorktree.path
+    : resolveExactPath(options.targetPath, {
+        grantId: options.targetGrantId,
+        mustExist: true,
+      });
   if (path.resolve(targetPath) === path.resolve(projectRoot)) throw new Error("The current worktree cannot be removed.");
   return removeGitWorktree(projectRoot, targetPath);
 }

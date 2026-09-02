@@ -1195,7 +1195,10 @@ def test_ui_server_update_delete_run_and_stop_routes(monkeypatch, tmp_path) -> N
     monkeypatch.setattr(
         server_module,
         "delete_workflow_payload",
-        lambda workflow_id, data_dir: {"workflowId": workflow_id, "deleted": True},
+        lambda workflow_id, data_dir, **_kwargs: {
+            "workflowId": workflow_id,
+            "deleted": True,
+        },
     )
     monkeypatch.setattr(
         server_module,

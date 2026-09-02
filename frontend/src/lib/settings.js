@@ -4,7 +4,7 @@ export const KEYBINDING_COMMANDS = [
   { id: "settings.open", label: "Open settings", group: "Application", scope: "global", defaultBinding: "Mod+Comma" },
   { id: "file.open", label: "Open file", group: "Application", scope: "global", defaultBinding: "Mod+KeyO" },
   { id: "project.open", label: "Open project folder", group: "Application", scope: "global", defaultBinding: "Mod+KeyK Mod+KeyO" },
-  { id: "browser.open", label: "Open browser", group: "Application", scope: "global", defaultBinding: "Mod+Alt+Slash" },
+  { id: "browser.open", label: "Open browser", group: "Application", scope: "global", defaultBinding: "Ctrl+KeyJ" },
   { id: "view.graph", label: "Show graph editor", group: "Application", scope: "global", defaultBinding: "Mod+Digit1" },
   { id: "view.code", label: "Show code editor", group: "Application", scope: "global", defaultBinding: "Mod+Digit2" },
   { id: "view.toggleProjectPane", label: "Toggle project pane", group: "View", scope: "global", defaultBinding: "Ctrl+KeyB" },

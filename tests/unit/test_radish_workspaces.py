@@ -94,7 +94,7 @@ def test_create_registered_workflow_requires_an_existing_project_folder(tmp_path
         )
 
 
-def test_discover_registered_workflows_registers_existing_radish_directories(
+def test_discover_registered_workflows_only_checks_taskurotta_directories(
     tmp_path: Path,
 ) -> None:
     project = tmp_path / "project"
@@ -115,10 +115,67 @@ def test_discover_registered_workflows_registers_existing_radish_directories(
 
     assert [(workflow.workflow_id, workflow.entrypoint) for workflow in first] == [
         ("review", taskurotta_workflow / "workflow.rad"),
-        ("daily", custom_workflow / "daily.rad"),
     ]
     assert second == first
     assert list_registered_workflows(registry_dir=registry) == tuple(
         sorted(first, key=lambda workflow: (str(workflow.project_root), workflow.workflow_id))
     )
     assert (taskurotta_workflow / "workflow.rad").read_text(encoding="utf-8") == source
+
+
+def test_discovery_removes_previous_project_registrations_outside_taskurotta(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    workflow_root = project / ".taskurotta" / "kept"
+    stray_root = project / "fixtures" / "mistaken-workflow"
+    other_project = tmp_path / "other-project"
+    other_root = other_project / "fixtures" / "existing-workflow"
+    for directory in (workflow_root, stray_root, other_root):
+        directory.mkdir(parents=True)
+    source = 'Radish: 1\n\nWorkflow:\n  name: "Existing"\n'
+    (workflow_root / "workflow.rad").write_text(source, encoding="utf-8")
+    (stray_root / "workflow.rad").write_text(source, encoding="utf-8")
+    (other_root / "workflow.rad").write_text(source, encoding="utf-8")
+    registry = tmp_path / "app-data"
+    registry_path = registry / "radish" / "workspace-registry.json"
+    registry_path.parent.mkdir(parents=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "registry_version": 1,
+                "workflows": [
+                    {
+                        "id": "stray",
+                        "name": "Stray",
+                        "project_root": str(project),
+                        "workflow_root": str(stray_root),
+                        "entrypoint": str(stray_root / "workflow.rad"),
+                        "created_at": "2026-09-01T00:00:00+00:00",
+                    },
+                    {
+                        "id": "other",
+                        "name": "Other",
+                        "project_root": str(other_project),
+                        "workflow_root": str(other_root),
+                        "entrypoint": str(other_root / "workflow.rad"),
+                        "created_at": "2026-09-01T00:00:00+00:00",
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    discovered = discover_registered_workflows(project, registry_dir=registry)
+
+    assert [(workflow.workflow_id, workflow.workflow_root) for workflow in discovered] == [
+        ("kept", workflow_root),
+    ]
+    assert [
+        (workflow.workflow_id, workflow.workflow_root)
+        for workflow in list_registered_workflows(registry_dir=registry)
+    ] == [("kept", workflow_root)]
+    persisted = json.loads(registry_path.read_text(encoding="utf-8"))
+    assert [item["id"] for item in persisted["workflows"]] == ["other", "kept"]
+    assert (stray_root / "workflow.rad").read_text(encoding="utf-8") == source

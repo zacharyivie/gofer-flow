@@ -161,82 +161,31 @@ async function exercisePackagedMonacoWorker(baseUrl) {
 
 async function exerciseDesignRegressions() {
   await evaluate(() => {
-    const workflowScroll = document.querySelector("[aria-label='Search workflows']")
-      .closest("aside")
-      .querySelector(".workflow-scrollbar");
-    workflowScroll.dispatchEvent(new MouseEvent("contextmenu", {
+    const project = document.querySelector("[aria-label='gofer-flow workflows']");
+    project.dispatchEvent(new MouseEvent("contextmenu", {
       bubbles: true,
       cancelable: true,
       clientX: 120,
       clientY: 180,
     }));
   });
-  await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("button")]
-    .find((button) => button.textContent.includes("Create group")))));
-  await evaluate(() => [...document.querySelectorAll("button")]
-    .find((button) => button.textContent.includes("Create group")).click());
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("input[value='New group']"))));
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='gofer-flow project actions']"))));
+  await evaluate(() => [...document.querySelectorAll("[aria-label='gofer-flow project actions'] button")]
+    .find((button) => button.textContent.includes("Rename")).click());
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Project label for gofer-flow']"))));
   await evaluate(() => {
-    const input = document.querySelector("input[value='New group']");
+    const input = document.querySelector("[aria-label='Project label for gofer-flow']");
+    const inputWindow = input.ownerDocument.defaultView;
+    const valueSetter = Object.getOwnPropertyDescriptor(inputWindow.HTMLInputElement.prototype, "value").set;
+    valueSetter.call(input, "Taskurotta workspace");
+    input.dispatchEvent(new inputWindow.Event("input", { bubbles: true }));
     input.blur();
   });
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='New group workflows']"))));
-
-  await evaluate(() => {
-    const workflow = [...document.querySelectorAll("[draggable='true']")]
-      .find((item) => item.textContent.includes("Demo workflow"));
-    const target = document.querySelector("[aria-label='New group workflows']");
-    const values = new Map();
-    const transfer = {
-      effectAllowed: "all",
-      getData(type) { return values.get(type) ?? ""; },
-      setData(type, value) { values.set(type, value); },
-    };
-    const event = (type) => {
-      const nextEvent = new target.ownerDocument.defaultView.Event(type, { bubbles: true, cancelable: true });
-      Object.defineProperty(nextEvent, "dataTransfer", { value: transfer });
-      return nextEvent;
-    };
-    workflow.dispatchEvent(event("dragstart"));
-    target.dispatchEvent(event("dragover"));
-    target.dispatchEvent(event("drop"));
-  });
   await waitFor(() => evaluate(() => {
-    const group = document.querySelector("[aria-label='New group workflows']");
-    const stored = JSON.parse(localStorage.getItem("gofer.workflowGroups"));
-    return group?.textContent.includes("Demo workflow") && stored?.assignments?.demo;
-  }));
-
-  await evaluate(() => {
-    const group = document.querySelector("[aria-label='New group workflows']");
-    group.dispatchEvent(new MouseEvent("contextmenu", {
-      bubbles: true,
-      cancelable: true,
-      clientX: 140,
-      clientY: 150,
-    }));
-  });
-  await waitFor(() => evaluate(() => Boolean([...document.querySelectorAll("button")]
-    .find((button) => button.textContent.includes("Ungroup workflows")))));
-  assert.equal(
-    await evaluate(() => Boolean([...document.querySelectorAll("button")]
-      .find((button) => button.textContent.includes("Delete group")))),
-    false,
-  );
-  assert.equal(
-    await evaluate(() => Boolean([...document.querySelectorAll("button")]
-      .find((button) => button.textContent.includes("Ungroup workflows"))
-      ?.querySelector(".lucide-ungroup"))),
-    true,
-  );
-  await evaluate(() => [...document.querySelectorAll("button")]
-    .find((button) => button.textContent.includes("Ungroup workflows")).click());
-  await waitFor(() => evaluate(() => {
-    const stored = JSON.parse(localStorage.getItem("gofer.workflowGroups"));
-    return !document.querySelector("[aria-label='New group workflows']")
-      && document.querySelector("[aria-label='Unfiled workflows']")?.textContent.includes("Demo workflow")
-      && !stored?.groups?.some((group) => group.name === "New group")
-      && !stored?.assignments?.demo;
+    const project = document.querySelector("[aria-label='Taskurotta workspace workflows']");
+    const stored = JSON.parse(localStorage.getItem("gofer.projectLabels"));
+    return project?.textContent.includes("Demo workflow")
+      && stored?.["/workspace/gofer-flow"] === "Taskurotta workspace";
   }));
 
   const pickerWidths = await evaluate(() => {

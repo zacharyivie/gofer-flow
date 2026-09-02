@@ -3,6 +3,41 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## 0.2.1 - 2026-09-01
+
+### Added
+
+- Added IDE start actions for opening a project, file, or browser without an
+  active workflow.
+- Added diff controls to rendered HTML, Markdown, and SVG previews, including
+  whitespace-only change detection.
+- Added a source-control history refresh action with background loading and
+  request coalescing.
+
+### Changed
+
+- Remember the last active Git worktree for each recent project and keep the
+  main project root as the single recent-project entry.
+- Keep editor, browser, and assistant sessions alive while switching projects,
+  worktrees, and panes.
+- Changed the default integrated-browser shortcut to `Ctrl+J`.
+- Limited local Vosk speech transcription to supported non-macOS platforms.
+
+### Fixed
+
+- Fixed recent-project reopening, Windows path grants, missing worktree cleanup,
+  active-worktree identification, and stale Git worktree registrations.
+- Fixed workflow deletion so it waits for pending saves, removes registered
+  workspaces, and handles read-only files on Windows.
+- Fixed file opening, tab persistence, editor focus during autosave, sticky
+  project-root navigation, and Monaco word deletion.
+- Fixed terminal `Ctrl+Shift+V` duplicate pastes and `Ctrl+Backspace` word
+  deletion.
+- Fixed commit hash copying, source-control refresh behavior, and stale header
+  counters.
+- Fixed macOS packaging when Vosk is unavailable and updated the Linux browser
+  regression test for the current project-actions menu.
+
 ## 0.2.0 - 2026-09-01
 
 ### Added

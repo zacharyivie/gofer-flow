@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -143,18 +144,18 @@ def discover_registered_workflows(
     *,
     registry_dir: Path | None = None,
 ) -> tuple[RegisteredWorkflow, ...]:
-    """Find Radish workflow directories in a project and register them without rewriting files."""
+    """Register Radish workflows found below the project's .taskurotta directory."""
     project_root = project_root.expanduser().resolve()
     if not project_root.is_dir():
         raise RadishWorkspaceError(f"Project folder does not exist: {project_root}")
 
+    workspace_root = project_root / WORKSPACE_DIRECTORY
     candidates: dict[Path, list[Path]] = {}
-    for directory, child_directories, files in os.walk(project_root):
+    for directory, child_directories, files in os.walk(workspace_root):
         child_directories[:] = sorted(
             child
             for child in child_directories
-            if child not in DISCOVERY_IGNORED_DIRECTORIES
-            and (not child.startswith(".") or child == WORKSPACE_DIRECTORY)
+            if child not in DISCOVERY_IGNORED_DIRECTORIES and not child.startswith(".")
         )
         radish_files = sorted(
             Path(directory, filename).resolve()
@@ -166,10 +167,22 @@ def discover_registered_workflows(
 
     registry_root = (registry_dir or get_data_dir()).expanduser().resolve()
     document = _read_registry(registry_root)
+    registered_before = len(document["workflows"])
+    document["workflows"] = [
+        item
+        for item in document["workflows"]
+        if not (
+            Path(item["project_root"]).expanduser().resolve() == project_root
+            and not _path_is_within(
+                Path(item["workflow_root"]).expanduser().resolve(),
+                workspace_root,
+            )
+        )
+    ]
     existing = [_registered_workflow(item) for item in document["workflows"]]
     existing_by_root = {workflow.workflow_root.resolve(): workflow for workflow in existing}
     discovered: list[RegisteredWorkflow] = []
-    changed = False
+    changed = len(document["workflows"]) != registered_before
 
     for workflow_root, radish_files in sorted(candidates.items(), key=lambda item: str(item[0])):
         registered = existing_by_root.get(workflow_root)
@@ -205,12 +218,19 @@ def discover_registered_workflows(
     return tuple(discovered)
 
 
+def _path_is_within(path: Path, directory: Path) -> bool:
+    return path == directory or directory in path.parents
+
+
 def list_registered_workflows(
     *, registry_dir: Path | None = None
 ) -> tuple[RegisteredWorkflow, ...]:
     registry_root = (registry_dir or get_data_dir()).expanduser().resolve()
     document = _read_registry(registry_root)
     workflows = [_registered_workflow(item) for item in document["workflows"]]
+    workflows = [
+        workflow for workflow in workflows if _registered_workflow_is_in_workspace(workflow)
+    ]
     return tuple(sorted(workflows, key=lambda item: (str(item.project_root), item.workflow_id)))
 
 
@@ -230,6 +250,41 @@ def find_registered_workflow(
     if len(matches) > 1:
         raise RadishWorkspaceError(f"Workflow ID is registered more than once: {workflow_id}")
     return matches[0]
+
+
+def delete_registered_workflow(
+    workflow_id: str,
+    *,
+    registry_dir: Path | None = None,
+) -> RegisteredWorkflow:
+    """Delete one registered workflow workspace and remove its registry entry."""
+    registry_root = (registry_dir or get_data_dir()).expanduser().resolve()
+    document = _read_registry(registry_root)
+    matches = [
+        (index, item)
+        for index, item in enumerate(document["workflows"])
+        if str(item["id"]).lower() == workflow_id.lower()
+    ]
+    if len(matches) != 1:
+        raise RadishWorkspaceError(f"Registered workflow not found: {workflow_id}")
+    index, item = matches[0]
+    workflow = _registered_workflow(item)
+    workspace_root = workflow.project_root / WORKSPACE_DIRECTORY
+    if not _path_is_within(workflow.workflow_root, workspace_root):
+        raise RadishWorkspaceError(
+            f"Refusing to delete workflow outside {workspace_root}: {workflow.workflow_root}"
+        )
+    if workflow.workflow_root.exists():
+        shutil.rmtree(workflow.workflow_root, onerror=_remove_readonly_file)
+    document["workflows"].pop(index)
+    _write_registry(registry_root, document)
+    return workflow
+
+
+def _remove_readonly_file(function: Any, target_path: str, _error: Any) -> None:
+    """Retry Windows cleanup after making a read-only workflow file writable."""
+    os.chmod(target_path, stat.S_IWRITE)
+    function(target_path)
 
 
 def read_workflow_metadata(workflow: RegisteredWorkflow) -> dict[str, Any]:
@@ -377,6 +432,12 @@ def _registered_workflow(item: dict[str, Any]) -> RegisteredWorkflow:
         entrypoint=Path(item["entrypoint"]),
         created_at=item["created_at"],
     )
+
+
+def _registered_workflow_is_in_workspace(workflow: RegisteredWorkflow) -> bool:
+    project_root = workflow.project_root.expanduser().resolve()
+    workflow_root = workflow.workflow_root.expanduser().resolve()
+    return _path_is_within(workflow_root, project_root / WORKSPACE_DIRECTORY)
 
 
 def _slugify(value: str) -> str:

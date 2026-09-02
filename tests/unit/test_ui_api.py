@@ -1169,6 +1169,30 @@ def test_delete_workflow_payload_removes_toml_and_logs(tmp_path: Path) -> None:
     assert not chat_prompt_path.exists()
 
 
+def test_delete_workflow_payload_removes_registered_radish_workspace(tmp_path: Path) -> None:
+    app_data = tmp_path / "app-data"
+    project = tmp_path / "project"
+    project.mkdir()
+    created = create_registered_workflow_payload(
+        "Delete Radish",
+        project,
+        registry_dir=app_data,
+    )
+    workflow_root = Path(created["workflowRoot"])
+    source_path = Path(created["sourcePath"])
+    source_path.chmod(0o444)
+
+    result = delete_workflow_payload(
+        "delete-radish",
+        app_data,
+        source_format="radish",
+    )
+
+    assert result == {"workflowId": "delete-radish", "deleted": True}
+    assert not workflow_root.exists()
+    assert list_workflow_payloads(app_data)["workflows"] == []
+
+
 @pytest.mark.parametrize("workflow_id", ["../delete-me", "delete/me", "Delete-Me"])
 def test_delete_workflow_payload_rejects_unsafe_workflow_ids(
     tmp_path: Path,

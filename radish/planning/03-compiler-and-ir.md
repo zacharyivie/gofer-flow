@@ -151,7 +151,7 @@ The workflow registry should record:
   "projectRoot": "/projects/review-pr",
   "sourceHash": "sha256:...",
   "languageVersion": 1,
-  "compilerVersion": "0.2.0",
+  "compilerVersion": "0.2.1",
   "irVersion": 1,
   "irPath": ".../compiled/review-pr-2.json"
 }

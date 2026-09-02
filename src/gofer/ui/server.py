@@ -1617,6 +1617,7 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 payload = delete_workflow_payload(
                     workflow_id,
                     self._request_data_dir(query),
+                    source_format=query.get("sourceFormat", [None])[0],
                 )
             except WorkflowUpdateError as exc:
                 self._send_json({"error": str(exc)}, status=404)
