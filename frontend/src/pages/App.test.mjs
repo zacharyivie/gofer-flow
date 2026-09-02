@@ -2052,8 +2052,20 @@ test("live Radish analysis preserves dirty state and ignores stale source respon
 });
 
 test("file explorer shortcuts create and close files without key-repeat firing", () => {
+  const primaryModifier = /Mac|iPhone|iPad/i.test(globalThis.navigator?.platform ?? "")
+    ? { metaKey: true }
+    : { ctrlKey: true };
   const action = (key, options = {}, event = {}) => codeFileExplorerModule.explorerShortcutAction(
-    { altKey: false, ctrlKey: true, key, metaKey: false, repeat: false, shiftKey: false, ...event },
+    {
+      altKey: false,
+      ctrlKey: false,
+      key,
+      metaKey: false,
+      repeat: false,
+      shiftKey: false,
+      ...primaryModifier,
+      ...event,
+    },
     { activeFilePath: "/repo/app.js", ...options },
   );
   assert.equal(action("n"), "new");
@@ -2064,13 +2076,28 @@ test("file explorer shortcuts create and close files without key-repeat firing",
 });
 
 test("code editor shortcuts stay scoped and ignore held keys", () => {
+  const primaryModifier = /Mac|iPhone|iPad/i.test(globalThis.navigator?.platform ?? "")
+    ? { metaKey: true }
+    : { ctrlKey: true };
   const action = (key, options = {}, event = {}) => codeWorkspaceModule.codeWorkspaceShortcutAction(
-    { altKey: false, ctrlKey: true, key, metaKey: false, repeat: false, shiftKey: false, ...event },
+    {
+      altKey: false,
+      ctrlKey: false,
+      key,
+      metaKey: false,
+      repeat: false,
+      shiftKey: false,
+      ...primaryModifier,
+      ...event,
+    },
     { active: true, currentPath: "/repo/app.js", ...options },
   );
   assert.equal(action("n"), "new");
   assert.equal(action("w"), "close");
-  assert.equal(action("z", {}, { altKey: true, ctrlKey: false }), "toggle-word-wrap");
+  assert.equal(
+    action("z", {}, { altKey: true, ctrlKey: false, metaKey: false }),
+    "toggle-word-wrap",
+  );
   assert.equal(action("n", { active: false }), null);
   assert.equal(action("w", { currentPath: "" }), null);
   assert.equal(action("n", {}, { repeat: true }), null);
@@ -2081,9 +2108,12 @@ test("code editor shortcuts stay scoped and ignore held keys", () => {
     "keybindings.editor.toggleWordWrap",
     "Alt+KeyY",
   );
-  assert.equal(action("z", { settings: customSettings }, { altKey: true, ctrlKey: false }), null);
   assert.equal(
-    action("y", { settings: customSettings }, { altKey: true, ctrlKey: false }),
+    action("z", { settings: customSettings }, { altKey: true, ctrlKey: false, metaKey: false }),
+    null,
+  );
+  assert.equal(
+    action("y", { settings: customSettings }, { altKey: true, ctrlKey: false, metaKey: false }),
     "toggle-word-wrap",
   );
 });

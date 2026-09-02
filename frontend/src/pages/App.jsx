@@ -3604,8 +3604,8 @@ export function WorkflowSidebar({
     setProjectMenu(null);
   }
 
-  function commitProjectRename(root) {
-    const label = projectLabelDraft.trim();
+  function commitProjectRename(root, nextLabel = projectLabelDraft) {
+    const label = nextLabel.trim();
     const folderName = projectNameFromPath(root);
     setProjectLabels((current) => {
       if (!label || label === folderName) return withoutKey(current, root);
@@ -3778,7 +3778,7 @@ export function WorkflowSidebar({
                       className="ml-1 h-6 min-w-0 flex-1 rounded-md border border-indigo-300 bg-white px-1.5 text-xs font-semibold text-ink outline-none ring-2 ring-indigo-100"
                       maxLength={120}
                       value={projectLabelDraft}
-                      onBlur={() => commitProjectRename(root)}
+                      onBlur={(event) => commitProjectRename(root, event.currentTarget.value)}
                       onChange={(event) => setProjectLabelDraft(event.target.value)}
                       onClick={(event) => event.stopPropagation()}
                       onKeyDown={(event) => {

@@ -5,6 +5,9 @@ const apiBaseUrl = process.env.VITE_API_BASE_URL || "http://127.0.0.1:8765";
 
 export default defineConfig({
   base: "./",
+  build: {
+    chunkSizeWarningLimit: 3100,
+  },
   plugins: [react()],
   server: {
     proxy: {
