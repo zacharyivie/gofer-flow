@@ -184,9 +184,9 @@ async function exerciseDesignRegressions() {
   await waitFor(() => evaluate(() => {
     const project = document.querySelector("[aria-label='Taskurotta workspace workflows']");
     const stored = JSON.parse(localStorage.getItem("gofer.projectLabels"));
-    return project?.textContent.includes("Demo workflow")
+    return project?.textContent.includes("Radish editor")
       && stored?.["/workspace/gofer-flow"] === "Taskurotta workspace";
-  }));
+  }), 25, "project rename to update the gofer-flow workflow group and local storage");
 
   const pickerWidths = await evaluate(() => {
     const textarea = document.querySelector("textarea[placeholder='Message this workflow']");
@@ -919,13 +919,13 @@ async function evaluate(callback) {
   return result?.value;
 }
 
-async function waitFor(predicate, delay = 25) {
+async function waitFor(predicate, delay = 25, description = "browser condition") {
   const deadline = Date.now() + 7000;
   while (Date.now() < deadline) {
     if (await predicate()) return;
     await wait(delay);
   }
-  throw new Error("Timed out waiting for browser condition.");
+  throw new Error(`Timed out waiting for ${description}.`);
 }
 
 function wait(milliseconds) {
