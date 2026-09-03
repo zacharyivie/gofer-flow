@@ -173,20 +173,29 @@ async function exerciseDesignRegressions() {
   await evaluate(() => [...document.querySelectorAll("[aria-label='gofer-flow project actions'] button")]
     .find((button) => button.textContent.includes("Rename")).click());
   await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Project label for gofer-flow']"))));
-  await evaluate(() => {
+  assert.equal(await evaluate(() => {
     const input = document.querySelector("[aria-label='Project label for gofer-flow']");
-    const inputWindow = input.ownerDocument.defaultView;
-    const valueSetter = Object.getOwnPropertyDescriptor(inputWindow.HTMLInputElement.prototype, "value").set;
-    valueSetter.call(input, "Taskurotta workspace");
-    input.dispatchEvent(new inputWindow.Event("input", { bubbles: true }));
-    input.blur();
-  });
+    input.focus();
+    input.select();
+    return document.activeElement === input;
+  }), true);
+  await windowRef.webContents.insertText("Taskurotta workspace");
+  await waitFor(() => evaluate(() =>
+    document.querySelector("[aria-label='Project label for gofer-flow']")?.value
+      === "Taskurotta workspace",
+  ), 25, "native project label input");
+  await pressNativeKey("Enter");
+  await waitFor(() => evaluate(() =>
+    !document.querySelector("[aria-label='Project label for gofer-flow']"),
+  ), 25, "project rename input to commit");
   await waitFor(() => evaluate(() => {
     const project = document.querySelector("[aria-label='Taskurotta workspace workflows']");
+    return project?.textContent.includes("Radish editor");
+  }), 25, "renamed gofer-flow workflow group");
+  await waitFor(() => evaluate(() => {
     const stored = JSON.parse(localStorage.getItem("gofer.projectLabels"));
-    return project?.textContent.includes("Radish editor")
-      && stored?.["/workspace/gofer-flow"] === "Taskurotta workspace";
-  }), 25, "project rename to update the gofer-flow workflow group and local storage");
+    return stored?.["/workspace/gofer-flow"] === "Taskurotta workspace";
+  }), 25, "project rename to persist in local storage");
 
   const pickerWidths = await evaluate(() => {
     const textarea = document.querySelector("textarea[placeholder='Message this workflow']");
