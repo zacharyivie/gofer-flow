@@ -564,8 +564,9 @@ async function exerciseKeyboardGraphAndResizers() {
 }
 
 async function exerciseCreateDialog() {
+  await waitFor(() => evaluate(() => Boolean(document.querySelector("[title='New Workflow']"))));
   await evaluate(() => {
-    const opener = document.querySelector("[title='Create workflow']");
+    const opener = document.querySelector("[title='New Workflow']");
     opener.focus();
     opener.click();
   });
@@ -616,7 +617,7 @@ async function exerciseCreateDialog() {
   await waitFor(() => evaluate(() => !document.querySelector("[role='dialog']")));
   assert.equal(
     await evaluate(() => document.activeElement?.getAttribute("title")),
-    "Create workflow",
+    "New Workflow",
   );
 }
 

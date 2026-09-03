@@ -2608,8 +2608,11 @@ test("code editor shortcuts stay scoped and ignore held keys", () => {
   assert.equal(action("w", { currentPath: "" }), null);
   assert.equal(action("n", {}, { repeat: true }), null);
   assert.equal(action("w", {}, { shiftKey: true }), null);
-  assert.equal(action("Tab"), "next-tab");
-  assert.equal(action("Tab", {}, { shiftKey: true }), "previous-tab");
+  assert.equal(action("Tab", {}, { ctrlKey: true, metaKey: false }), "next-tab");
+  assert.equal(
+    action("Tab", {}, { ctrlKey: true, metaKey: false, shiftKey: true }),
+    "previous-tab",
+  );
   assert.equal(action("t", { browserActive: true }), "new-browser-tab");
   assert.equal(action("t", { browserActive: false }), null);
 
@@ -2629,16 +2632,20 @@ test("code editor shortcuts stay scoped and ignore held keys", () => {
 });
 
 test("workspace preview shortcuts close Markdown, local HTML, and SVG tabs", () => {
+  const primaryModifier = /Mac|iPhone|iPad/i.test(globalThis.navigator?.platform ?? "")
+    ? { metaKey: true }
+    : { ctrlKey: true };
   for (const previewPath of ["/repo/README.md", "/repo/index.html", "/repo/icon.svg"]) {
     assert.equal(codeWorkspaceModule.codeDocumentMode(previewPath), "preview");
     assert.equal(codeWorkspaceModule.codeWorkspaceShortcutAction(
       {
         altKey: false,
-        ctrlKey: true,
+        ctrlKey: false,
         key: "w",
         metaKey: false,
         repeat: false,
         shiftKey: false,
+        ...primaryModifier,
       },
       {
         active: true,

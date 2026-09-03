@@ -21,7 +21,12 @@ import {
   X,
 } from "lucide-react";
 import { diagnosticsToMarkers, diagnosticToMarker } from "../lib/radishRanges.js";
-import { DEFAULT_APP_SETTINGS, matchesCommand, settingBinding } from "../lib/settings.js";
+import {
+  DEFAULT_APP_SETTINGS,
+  matchesCommand,
+  matchesKeybinding,
+  settingBinding,
+} from "../lib/settings.js";
 import { Dialog } from "./Dialog.jsx";
 import MarkdownContent from "./MarkdownContent.jsx";
 import IntegratedBrowser, { HtmlModeToggle } from "./IntegratedBrowser.jsx";
@@ -1426,11 +1431,7 @@ export function codeWorkspaceShortcutAction(event, options = {}) {
   ) return event.shiftKey ? "previous-tab" : "next-tab";
   if (
     options.browserActive
-    && event.ctrlKey
-    && !event.altKey
-    && !event.metaKey
-    && !event.shiftKey
-    && String(event.key ?? "").toLowerCase() === "t"
+    && matchesKeybinding(event, "Mod+KeyT")
   ) return "new-browser-tab";
   if (matchesCommand(event, options.settings, "file.new")) return "new";
   if (matchesCommand(event, options.settings, "file.save") && options.currentPath) return "save";
