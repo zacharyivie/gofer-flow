@@ -5,7 +5,7 @@ Taskurotta is a Python CLI tool for defining and running graph-based agentic wor
 The installed command is `gof`.
 
 ## What It Can Do
-
+    
 - Run workflow nodes from start nodes through conditional edges, including recursive loops for improve/review or retry-until-output workflows.
 - Execute `bash_command`, `shell_script`, `python_script`, `http_request`, and `agent` nodes.
 - Use Claude Code or Codex through local CLIs, or direct OpenAI/Anthropic-compatible API profiles.

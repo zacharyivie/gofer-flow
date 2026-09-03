@@ -1038,6 +1038,7 @@ export default function DagCanvas({
   const [keyboardConnectionFrom, setKeyboardConnectionFrom] = useState(null);
   const [outlineFocusRequest, setOutlineFocusRequest] = useState(null);
   const [viewport, setViewport] = useState({ x: 0, y: 0, scale: 1 });
+  const workflowNodesRef = useRef([]);
   const [minimapDragging, setMinimapDragging] = useState(false);
   const [mapOpen, setMapOpen] = useState(false);
   const [mapTab, setMapTab] = useState("outline");
@@ -1080,6 +1081,7 @@ export default function DagCanvas({
       }),
     [workflow.nodes],
   );
+  workflowNodesRef.current = workflowNodes;
   const workflowEdges = useMemo(() => workflow.edges ?? [], [workflow.edges]);
   const edgeDiagnostics = useMemo(
     () => diagnosticsByTarget(validationDiagnostics, "edge"),
@@ -1230,7 +1232,14 @@ export default function DagCanvas({
     setDraggingNodeId(null);
     setPanningPointerId(null);
     setSelectionBox(null);
-    setViewport({ x: 0, y: 0, scale: 1 });
+    const rect = canvasRef.current?.getBoundingClientRect();
+    const nodes = workflowNodesRef.current;
+    setViewport(nodes.length
+      ? fitViewportToNodes(nodes, {
+          width: rect?.width || 960,
+          height: rect?.height || 640,
+        })
+      : { x: 0, y: 0, scale: 1 });
   }, [workflow.id]);
 
   useEffect(() => {
@@ -2071,6 +2080,7 @@ export default function DagCanvas({
     setNodeContextMenu(null);
     if (event.button === 0) {
       event.preventDefault();
+      event.currentTarget.focus({ preventScroll: true });
       const rect = canvasRef.current?.getBoundingClientRect();
       if (!rect) return;
       const start = {
@@ -2547,14 +2557,6 @@ export default function DagCanvas({
               <ZoomIn size={17} />
             </button>
             <button
-              className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink"
-              title="Reset view"
-              type="button"
-              onClick={() => setViewport({ x: 0, y: 0, scale: 1 })}
-            >
-              <LocateFixed size={17} />
-            </button>
-            <button
               className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink disabled:cursor-not-allowed disabled:opacity-40"
               disabled={editingDisabled || !selectedNode}
               title="Delete selected node"
@@ -2580,6 +2582,30 @@ export default function DagCanvas({
             >
               <Download size={17} />
             </button>
+            {radishMode ? (
+              <div className="flex items-center rounded-lg border border-line bg-white p-0.5">
+                <button
+                  className="inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600"
+                  title="Import a .taskurotta workflow"
+                  type="button"
+                  onClick={() => importInputRef.current?.click()}
+                >
+                  <Upload aria-hidden="true" size={14} />
+                  Import
+                </button>
+                <span aria-hidden="true" className="h-4 w-px bg-line" />
+                <button
+                  className="inline-flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 hover:text-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600 disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={editingDisabled}
+                  title="Export this workflow as a .taskurotta bundle"
+                  type="button"
+                  onClick={onExportWorkflow}
+                >
+                  <Download aria-hidden="true" size={14} />
+                  Export
+                </button>
+              </div>
+            ) : null}
             <details ref={graphActionsRef} className="group/tools relative shrink-0">
               <summary
                 className="grid h-8 w-8 list-none place-items-center rounded-lg border border-line bg-white text-muted transition hover:border-slate-300 hover:bg-slate-50 hover:text-ink [&::-webkit-details-marker]:hidden"
@@ -2630,9 +2656,12 @@ export default function DagCanvas({
 
         <div
           ref={canvasRef}
+          aria-label="Workflow graph visualization"
           className={`relative min-h-0 flex-1 overflow-hidden bg-[#f9fbfd] bg-[radial-gradient(circle_at_1px_1px,#d5dee8_1px,transparent_0)] [touch-action:none] ${
             panningPointerId !== null ? "cursor-grabbing" : "cursor-default"
           }`}
+          data-graph-visualization="true"
+          tabIndex={0}
           style={{
             backgroundPosition: `${viewport.x}px ${viewport.y}px`,
             backgroundSize: "22px 22px",

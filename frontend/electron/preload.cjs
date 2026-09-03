@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer, webUtils } = require("electron");
+const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 const API_BASE_URL_ARG = "--gofer-api-base-url=";
 const API_TOKEN_ARG = "--gofer-api-token=";
@@ -103,6 +103,13 @@ async function invokeDesktop(channel, payload = {}) {
 
 contextBridge.exposeInMainWorld("goferDesktop", {
   getDataDir: () => ipcRenderer.invoke("gofer:get-data-dir"),
+  appearance: {
+    setZoomFactor: (value) => {
+      const factor = Number.isFinite(value) ? Math.min(1.5, Math.max(0.8, value)) : 1;
+      webFrame.setZoomFactor(factor);
+      return factor;
+    },
+  },
   dataDirectory: {
     choose: async (options = {}) => {
       let selectedPath = null;
@@ -195,6 +202,7 @@ contextBridge.exposeInMainWorld("goferBrowser", {
   setBounds: (id, bounds) => browserAction(id, "set-bounds", { bounds }),
   stop: (id) => browserAction(id, "stop"),
   onCommand: (callback) => subscribeToBrowserEvent("gofer:browser-command", callback),
+  onOpenFile: (callback) => subscribeToBrowserEvent("gofer:browser-open-file", callback),
   onOpenTab: (callback) => subscribeToBrowserEvent("gofer:browser-open-tab", callback),
   onState: (callback) => subscribeToBrowserEvent("gofer:browser-state", callback),
 });

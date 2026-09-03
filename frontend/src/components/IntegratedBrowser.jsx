@@ -16,6 +16,8 @@ export default function IntegratedBrowser({
   initialUrl = "about:blank",
   localPath = "",
   onClose,
+  onCycleTab,
+  onNewTab,
   onShowDiff,
   onModeChange,
   onStateChange,
@@ -29,7 +31,9 @@ export default function IntegratedBrowser({
   const initialUrlRef = useRef(initialUrl);
   const initialOpenBrowserBindingRef = useRef(openBrowserBinding);
   const onCloseRef = useRef(onClose);
+  const onCycleTabRef = useRef(onCycleTab);
   const onModeChangeRef = useRef(onModeChange);
+  const onNewTabRef = useRef(onNewTab);
   const onStateChangeRef = useRef(onStateChange);
   const placeholderRef = useRef(null);
   const sessionIdRef = useRef("");
@@ -49,9 +53,11 @@ export default function IntegratedBrowser({
   useEffect(() => {
     activeRef.current = active;
     onCloseRef.current = onClose;
+    onCycleTabRef.current = onCycleTab;
     onModeChangeRef.current = onModeChange;
+    onNewTabRef.current = onNewTab;
     onStateChangeRef.current = onStateChange;
-  }, [active, onClose, onModeChange, onStateChange]);
+  }, [active, onClose, onCycleTab, onModeChange, onNewTab, onStateChange]);
 
   useEffect(() => {
     if (!bridge?.create) {
@@ -67,17 +73,21 @@ export default function IntegratedBrowser({
     const unsubscribeState = bridge.onState?.((nextState) => {
       if (nextState?.clientId !== clientId) return;
       if (disposed) return;
-      if (nextState.id) sessionIdRef.current = nextState.id;
+      if (!browserSessionEventMatches(sessionIdRef.current, nextState)) return;
       setState((current) => ({ ...current, ...nextState }));
       onStateChangeRef.current?.(nextState);
     });
     const unsubscribeCommand = bridge.onCommand?.((command) => {
-      if (!activeRef.current || (command?.clientId && command.clientId !== clientId)) return;
+      if (!activeRef.current || command?.clientId !== clientId) return;
+      if (!browserSessionEventMatches(sessionIdRef.current, command)) return;
       if (command?.action === "focus-location") {
         addressRef.current?.focus();
         addressRef.current?.select();
       }
       if (command?.action === "close") onCloseRef.current?.();
+      if (command?.action === "next-tab") onCycleTabRef.current?.(1);
+      if (command?.action === "previous-tab") onCycleTabRef.current?.(-1);
+      if (command?.action === "new-tab") onNewTabRef.current?.();
       if (command?.action === "edit-local-html") onModeChangeRef.current?.("edit");
     });
     bridge.create({
@@ -127,19 +137,46 @@ export default function IntegratedBrowser({
   }, [bridge, openBrowserBinding, state.id]);
 
   useEffect(() => {
+    if (!active) return undefined;
+    function handleBrowserChromeShortcut(event) {
+      const action = browserChromeShortcutAction(event, bridge?.platform);
+      if (!action) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (action === "focus-location") {
+        addressRef.current?.focus();
+        addressRef.current?.select();
+        return;
+      }
+      const id = sessionIdRef.current;
+      if (!id || !bridge?.[action]) return;
+      void bridge[action](id).catch(() => {});
+    }
+    window.addEventListener("keydown", handleBrowserChromeShortcut, true);
+    return () => window.removeEventListener("keydown", handleBrowserChromeShortcut, true);
+  }, [active, bridge]);
+
+  useEffect(() => {
     if (!addressFocused) setAddressDraft(displayBrowserUrl(state.url));
   }, [addressFocused, state.url]);
 
   useEffect(() => {
     if (typeof document.querySelector !== "function") return undefined;
     const updateOcclusion = () => {
-      setOccluded(Boolean(document.querySelector("[role='dialog'], [role='menu']")));
+      setOccluded(browserElementIsOccluded(
+        placeholderRef.current,
+        document.querySelectorAll("[role='dialog'], [role='menu']"),
+      ));
     };
     updateOcclusion();
     if (typeof MutationObserver === "undefined") return undefined;
     const observer = new MutationObserver(updateOcclusion);
     observer.observe(document.body, { childList: true, subtree: true });
-    return () => observer.disconnect();
+    window.addEventListener("resize", updateOcclusion);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateOcclusion);
+    };
   }, []);
 
   useLayoutEffect(() => {
@@ -180,6 +217,7 @@ export default function IntegratedBrowser({
     const id = sessionIdRef.current;
     if (!id || !addressDraft.trim()) return;
     addressRef.current?.blur();
+    setState((current) => ({ ...current, error: "" }));
     void bridge.navigate(id, browserAddress(addressDraft, searchUrl)).catch((error) => {
       setState((current) => ({
         ...current,
@@ -301,10 +339,54 @@ export function displayBrowserUrl(value) {
 
 export function browserAddress(value, searchUrl) {
   const input = String(value ?? "").trim();
-  if (!input || !/\s/.test(input) || /^[a-z][a-z\d+.-]*:/i.test(input)) return input;
+  if (!input || browserInputLooksLikeUrl(input)) return input;
   const template = String(searchUrl ?? "");
   if (!template.includes("{query}")) return input;
   return template.replace("{query}", encodeURIComponent(input));
+}
+
+function browserInputLooksLikeUrl(input) {
+  return /^[a-z][a-z\d+.-]*:/i.test(input)
+    || /^(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?(?:[/?#]|$)/i.test(input)
+    || /^[\w.-]+\.[a-z]{2,}(?::\d+)?(?:[/?#]|$)/i.test(input);
+}
+
+export function browserChromeShortcutAction(event, platform = "") {
+  if (event.repeat) return "";
+  const key = String(event.key ?? "").toLowerCase();
+  if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && key === "d") {
+    return "focus-location";
+  }
+  const primary = platform === "darwin" ? event.metaKey : event.ctrlKey;
+  if (primary && !event.altKey && !event.shiftKey && key === "r") return "reload";
+  if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && key === "arrowleft") {
+    return "back";
+  }
+  if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && key === "arrowright") {
+    return "forward";
+  }
+  return "";
+}
+
+export function browserElementIsOccluded(browserElement, overlayElements) {
+  if (!browserElement?.getBoundingClientRect) return false;
+  const browserBounds = browserElement.getBoundingClientRect();
+  if (browserBounds.width <= 0 || browserBounds.height <= 0) return false;
+  return Array.from(overlayElements ?? []).some((element) => {
+    if (!element?.getBoundingClientRect || element.hidden) return false;
+    if (element.getAttribute?.("aria-hidden") === "true") return false;
+    const overlayBounds = element.getBoundingClientRect();
+    return overlayBounds.width > 0
+      && overlayBounds.height > 0
+      && overlayBounds.left < browserBounds.right
+      && overlayBounds.right > browserBounds.left
+      && overlayBounds.top < browserBounds.bottom
+      && overlayBounds.bottom > browserBounds.top;
+  });
+}
+
+export function browserSessionEventMatches(sessionId, event) {
+  return Boolean(sessionId && event?.id === sessionId);
 }
 
 export function isIntegratedBrowserShortcut(event) {

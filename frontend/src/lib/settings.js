@@ -1,4 +1,5 @@
 export const SETTINGS_STORAGE_KEY = "taskurotta.settings.v1";
+export const TASKUROTTA_BROWSER_HOME = "taskurotta://home";
 
 export const KEYBINDING_COMMANDS = [
   { id: "settings.open", label: "Open settings", group: "Application", scope: "global", defaultBinding: "Mod+Comma" },
@@ -29,7 +30,7 @@ const DEFAULT_KEYBINDINGS = Object.fromEntries(
 );
 
 export const DEFAULT_APP_SETTINGS = Object.freeze({
-  version: 1,
+  version: 2,
   general: {
     autosave: true,
     defaultView: "graph",
@@ -54,7 +55,7 @@ export const DEFAULT_APP_SETTINGS = Object.freeze({
     wordWrap: false,
   },
   browser: {
-    homepage: "about:blank",
+    homepage: TASKUROTTA_BROWSER_HOME,
     searchUrl: "https://www.google.com/search?q={query}",
   },
   terminal: {
@@ -104,7 +105,8 @@ export function saveAppSettings(settings, storage = globalThis.window?.localStor
 
 export function normalizeAppSettings(value = {}) {
   const settings = mergeSettings(cloneDefaults(), value);
-  settings.version = 1;
+  const storedVersion = Number(value?.version) || 1;
+  settings.version = 2;
   settings.general.autosave = settings.general.autosave !== false;
   settings.general.defaultView = enumValue(settings.general.defaultView, ["graph", "code"], "graph");
   settings.general.executionMode = enumValue(settings.general.executionMode, ["local", "remote"], "local");
@@ -120,7 +122,13 @@ export function normalizeAppSettings(value = {}) {
   settings.editor.minimap = settings.editor.minimap !== false;
   settings.editor.tabSize = boundedNumber(settings.editor.tabSize, 1, 8, 2);
   settings.editor.wordWrap = settings.editor.wordWrap === true;
-  settings.browser.homepage = safeString(settings.browser.homepage, "about:blank", 2048);
+  settings.browser.homepage = safeString(
+    storedVersion < 2 && settings.browser.homepage === "about:blank"
+      ? TASKUROTTA_BROWSER_HOME
+      : settings.browser.homepage,
+    TASKUROTTA_BROWSER_HOME,
+    2048,
+  );
   settings.browser.searchUrl = searchUrlValue(settings.browser.searchUrl);
   settings.terminal.cursorBlink = settings.terminal.cursorBlink !== false;
   settings.terminal.fontSize = boundedNumber(settings.terminal.fontSize, 8, 28, 12.5);

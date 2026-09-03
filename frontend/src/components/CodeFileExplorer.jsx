@@ -41,6 +41,9 @@ export default function CodeFileExplorer({
   const lastNewFileRequestRef = useRef(newFileRequest);
   const recentMenuRef = useRef(null);
   const treeRef = useRef(null);
+  const activeFileRowRef = useRef(null);
+  const directoriesRef = useRef({});
+  const revealRequestRef = useRef(0);
   const [directories, setDirectories] = useState({});
   const [expanded, setExpanded] = useState(() => new Set());
   const [loadingPaths, setLoadingPaths] = useState(() => new Set());
@@ -63,6 +66,8 @@ export default function CodeFileExplorer({
   const [worktreeFolder, setWorktreeFolder] = useState("");
   const [worktreeCreateBranch, setWorktreeCreateBranch] = useState(false);
 
+  directoriesRef.current = directories;
+
   const loadDirectory = useCallback(async (directory, { clearError = true } = {}) => {
     if (!directory) return [];
     if (clearError) setError("");
@@ -74,7 +79,11 @@ export default function CodeFileExplorer({
       });
       if (!payload) throw new Error("The desktop filesystem bridge is unavailable.");
       const entries = payload.entries ?? [];
-      setDirectories((current) => ({ ...current, [directory]: entries }));
+      setDirectories((current) => {
+        const next = { ...current, [directory]: entries };
+        directoriesRef.current = next;
+        return next;
+      });
       if (directory === rootPath) setGrantRequired(false);
       return entries;
     } catch (loadError) {
@@ -109,6 +118,7 @@ export default function CodeFileExplorer({
   }, [rootPath]);
 
   const refreshTree = useCallback(async () => {
+    directoriesRef.current = {};
     setDirectories({});
     setExpanded(new Set(rootPath ? [rootPath] : []));
     setSourceControl({ active: false, entries: [] });
@@ -162,6 +172,34 @@ export default function CodeFileExplorer({
   }, [refreshTree, rootPath]);
 
   useEffect(() => {
+    const ancestorPaths = workspaceAncestorPaths(rootPath, activeFilePath);
+    if (!ancestorPaths.length) return undefined;
+
+    const request = revealRequestRef.current + 1;
+    revealRequestRef.current = request;
+    setSelectedPath(activeFilePath);
+    setExpanded((current) => {
+      const next = new Set(current);
+      for (const directory of ancestorPaths) next.add(directory);
+      return next;
+    });
+
+    async function revealActiveFile() {
+      for (const directory of ancestorPaths) {
+        if (revealRequestRef.current !== request) return;
+        if (!directoriesRef.current[directory]) {
+          await loadDirectory(directory, { clearError: false });
+        }
+      }
+    }
+
+    void revealActiveFile();
+    return () => {
+      if (revealRequestRef.current === request) revealRequestRef.current += 1;
+    };
+  }, [activeFilePath, loadDirectory, rootPath]);
+
+  useEffect(() => {
     if (!rootPath) return undefined;
     const refreshStatus = () => void loadSourceControlStatus();
     const interval = window.setInterval(refreshStatus, 2000);
@@ -203,6 +241,10 @@ export default function CodeFileExplorer({
     : parentWorkspacePath(selectedEntry?.path || selectedPath || rootPath);
 
   useEffect(() => {
+    activeFileRowRef.current?.scrollIntoView?.({ block: "nearest" });
+  }, [activeFilePath, rows]);
+
+  useEffect(() => {
     if (newFileRequest === lastNewFileRequestRef.current) return;
     lastNewFileRequestRef.current = newFileRequest;
     const directory = selectedDirectory || rootPath;
@@ -233,11 +275,7 @@ export default function CodeFileExplorer({
     }
     setExpanded((current) => withSetValue(current, entry.path));
     if (!directories[entry.path]) {
-      if (entry.gitDeleted) {
-        setDirectories((current) => ({ ...current, [entry.path]: [] }));
-      } else {
-        await loadDirectory(entry.path);
-      }
+      await loadDirectory(entry.path);
     }
   }
 
@@ -652,16 +690,21 @@ export default function CodeFileExplorer({
             {rows.map(({ depth, entry }) => {
               const isExpanded = entry.isDirectory && expanded.has(entry.path);
               const isLoading = loadingPaths.has(entry.path);
-              const selected = selectedPath === entry.path;
+              const selected = normalizeWorkspacePath(selectedPath)
+                === normalizeWorkspacePath(entry.path);
+              const active = normalizeWorkspacePath(activeFilePath)
+                === normalizeWorkspacePath(entry.path);
               return (
                 <button
                   key={entry.path}
+                  ref={active ? activeFileRowRef : undefined}
+                  aria-current={active ? "page" : undefined}
                   aria-expanded={entry.isDirectory ? isExpanded : undefined}
                   aria-selected={selected}
                   className={`flex h-7 w-full items-center gap-1.5 rounded-md pr-1.5 text-left text-xs ${selected ? "bg-indigo-100 font-medium text-indigo-700" : "text-ink hover:bg-slate-100"}`}
                   role="treeitem"
                   style={{ paddingLeft: `${6 + depth * 12}px` }}
-                  title={`${entry.path}${entry.gitDeleted ? "\nDeleted from working tree" : ""}`}
+                  title={entry.path}
                   type="button"
                   onClick={() => {
                     if (entry.isDirectory) {
@@ -669,18 +712,10 @@ export default function CodeFileExplorer({
                       return;
                     }
                     setSelectedPath(entry.path);
-                    if (!entry.gitDeleted) onOpenFile?.(entry.path, { preview: true });
+                    onOpenFile?.(entry.path, { preview: true });
                   }}
-                  onDoubleClick={() => !entry.isDirectory && !entry.gitDeleted && onOpenFile?.(entry.path)}
-                  onContextMenu={(event) => {
-                    if (entry.gitDeleted) {
-                      event.preventDefault();
-                      event.stopPropagation();
-                      setSelectedPath(entry.path);
-                      return;
-                    }
-                    showContextMenu(event, entry);
-                  }}
+                  onDoubleClick={() => !entry.isDirectory && onOpenFile?.(entry.path)}
+                  onContextMenu={(event) => showContextMenu(event, entry)}
                 >
                   {entry.isDirectory ? (
                     isLoading ? <Loader2 className="shrink-0 animate-spin text-muted" size={12} /> : <ChevronDown className={`shrink-0 text-muted transition ${isExpanded ? "" : "-rotate-90"}`} size={12} />
@@ -917,10 +952,10 @@ function SourceControlDecoration({ directory = false, path, projectRoot, statuse
   }
   const presentation = {
     A: { className: "source-control-status--added", label: "Added" },
-    D: { className: "source-control-status--deleted", label: "Deleted" },
     M: { className: "source-control-status--modified", label: "Modified" },
     U: { className: "source-control-status--untracked", label: "Untracked" },
   }[status];
+  if (!presentation) return null;
   return (
     <span
       aria-label={`${workspaceBasename(path)}: ${presentation.label}`}
@@ -1020,19 +1055,14 @@ export function directoryEntriesWithGitChanges(rootPath, directory, entries = []
   const relativeDirectory = workspaceRelativePath(rootPath, directory);
   const prefix = relativeDirectory ? `${relativeDirectory}/` : "";
   for (const change of statuses) {
+    if (change.status === "D") continue;
     if (!change.path.startsWith(prefix)) continue;
     const remainder = change.path.slice(prefix.length);
     if (!remainder || remainder.startsWith("../")) continue;
     const [name, ...rest] = remainder.split("/");
     if (!name || names.has(name.toLowerCase())) continue;
     const isDirectory = rest.length > 0;
-    const childPath = `${prefix}${name}`;
-    const relatedChanges = statuses.filter((candidate) => (
-      candidate.path === childPath || candidate.path.startsWith(`${childPath}/`)
-    ));
     next.push({
-      gitDeleted: relatedChanges.length > 0
-        && relatedChanges.every((candidate) => candidate.status === "D"),
       hidden: name.startsWith("."),
       isDirectory,
       isFile: !isDirectory,
@@ -1051,7 +1081,10 @@ export function sourceControlStatusForPath(rootPath, targetPath, statuses = [], 
   const relativePath = workspaceRelativePath(rootPath, targetPath);
   if (directory) {
     const prefix = relativePath ? `${relativePath}/` : "";
-    return statuses.some((change) => change.path === relativePath || change.path.startsWith(prefix))
+    return statuses.some((change) => (
+      change.status !== "D"
+      && (change.path === relativePath || change.path.startsWith(prefix))
+    ))
       ? "changed"
       : "";
   }
@@ -1088,6 +1121,27 @@ export function parentWorkspacePath(value = "") {
   const index = Math.max(normalized.lastIndexOf("/"), normalized.lastIndexOf("\\"));
   if (index <= 0) return normalized.slice(0, Math.max(index, 1)) || normalized;
   return normalized.slice(0, index);
+}
+
+export function workspaceAncestorPaths(rootPath = "", targetPath = "") {
+  const normalizedRoot = normalizeWorkspacePath(rootPath);
+  const normalizedTarget = normalizeWorkspacePath(targetPath);
+  if (
+    !normalizedRoot
+    || !normalizedTarget.startsWith(`${normalizedRoot}/`)
+  ) {
+    return [];
+  }
+
+  const relativePath = String(targetPath)
+    .replace(/\\/g, "/")
+    .slice(String(rootPath).replace(/\\/g, "/").replace(/\/+$/, "").length + 1);
+  const directoryNames = relativePath.split("/").filter(Boolean).slice(0, -1);
+  const ancestors = [rootPath.replace(/[\\/]+$/, "")];
+  for (const directoryName of directoryNames) {
+    ancestors.push(joinWorkspacePath(ancestors.at(-1), directoryName));
+  }
+  return ancestors;
 }
 
 export function explorerMenuPosition(clientX, clientY, viewportWidth = window.innerWidth, viewportHeight = window.innerHeight) {

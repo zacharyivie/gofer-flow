@@ -100,6 +100,12 @@ from gofer.core.workflow import (
 )
 from gofer.prompts.manager import PromptManager
 from gofer.radish.artifacts import RadishArtifactError, compile_radish_file
+from gofer.radish.bundles import (
+    RadishBundleError,
+    export_radish_bundle,
+    import_radish_bundle,
+    preview_radish_bundle,
+)
 from gofer.radish.diagnostics import RadishError
 from gofer.radish.editor import (
     DEFAULT_RADISH_EDITOR_SERVICE,
@@ -929,6 +935,59 @@ def export_workflow_bundle_payload(
     except BundleError as exc:
         raise WorkflowBundleError(str(exc)) from exc
     return {"bundlePath": str(output_path), "manifest": manifest.to_dict()}
+
+
+def export_radish_bundle_payload(
+    workflow_id: str,
+    output_path: Path,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
+    """Export a registered Radish workspace as a portable .taskurotta archive."""
+    base = _data_dir(data_dir)
+    try:
+        preview = export_radish_bundle(workflow_id, output_path, registry_dir=base)
+    except (RadishBundleError, RadishWorkspaceError, RadishArtifactError, RadishError) as exc:
+        raise WorkflowBundleError(str(exc)) from exc
+    bundle_path = output_path.expanduser().resolve()
+    if bundle_path.suffix.lower() != ".taskurotta":
+        bundle_path = bundle_path.with_name(f"{bundle_path.name}.taskurotta")
+    return {"bundlePath": str(bundle_path), "bundle": preview.to_dict()}
+
+
+def preview_radish_bundle_payload(
+    bundle_path: Path,
+    *,
+    resource_limits: ResourceLimits | None = None,
+) -> dict[str, Any]:
+    """Inspect a .taskurotta archive without writing project files."""
+    try:
+        return preview_radish_bundle(
+            bundle_path,
+            limits=resource_limits or DEFAULT_RESOURCE_LIMITS,
+        ).to_dict()
+    except RadishBundleError as exc:
+        raise WorkflowBundleError(str(exc)) from exc
+
+
+def import_radish_bundle_payload(
+    bundle_path: Path,
+    project_root: Path,
+    data_dir: Path | None = None,
+    *,
+    resource_limits: ResourceLimits | None = None,
+) -> dict[str, Any]:
+    """Install a .taskurotta archive into a project and register it."""
+    base = _data_dir(data_dir)
+    try:
+        registered = import_radish_bundle(
+            bundle_path,
+            project_root,
+            registry_dir=base,
+            limits=resource_limits or DEFAULT_RESOURCE_LIMITS,
+        )
+    except (RadishBundleError, RadishWorkspaceError, RadishArtifactError, RadishError) as exc:
+        raise WorkflowBundleError(str(exc)) from exc
+    return _registered_radish_payload(registered, base)
 
 
 def preview_workflow_bundle_payload(

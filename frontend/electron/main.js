@@ -25,13 +25,20 @@ const {
   readGitWorktrees,
   removeGitWorktree,
 } = require("./git-status.cjs");
-const { browserShortcutAction, normalizeBrowserUrl } = require("./browser-utils.cjs");
+const {
+  TASKUROTTA_HOME_URL,
+  browserLoadUrl,
+  browserShortcutAction,
+  normalizeBrowserUrl,
+} = require("./browser-utils.cjs");
 const { registerIpcHandlers } = require("./ipc-handlers.cjs");
+const { inspectPath } = require("./path-info.cjs");
 const { createIpcSecurity, isSafeExternalUrl } = require("./security.cjs");
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const distIndexPath = path.join(__dirname, "..", "dist", "index.html");
 const backendErrorHtmlPath = path.join(__dirname, "backend-error.html");
+const browserPreloadPath = path.join(__dirname, "browser-preload.cjs");
 
 if (process.platform === "linux" && !process.env.GTK_USE_PORTAL) {
   process.env.GTK_USE_PORTAL = "0";
@@ -75,6 +82,7 @@ let ipcSecurity;
 let backendErrorIpcSecurity;
 const terminalSessions = new Map();
 const browserSessions = new Map();
+const browserOwnersWithCleanup = new WeakSet();
 let updateState = {
   available: false,
   checking: false,
@@ -143,8 +151,8 @@ function createWindow(apiBaseUrl, apiToken = "") {
   }
 
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (isSafeExternalUrl(url)) {
-      shell.openExternal(url);
+    if (isSafeExternalUrl(url) && !mainWindow.webContents.isDestroyed()) {
+      mainWindow.webContents.send("gofer:browser-open-tab", { url });
     }
     return { action: "deny" };
   });
@@ -628,7 +636,7 @@ function createBrowser(event, options = {}) {
     url = pathToFileURL(targetPath).toString();
     grantId = typeof options.grantId === "string" ? options.grantId : "";
   } else if (options.url) {
-    url = normalizeBrowserUrl(options.url);
+    url = browserLoadUrl(normalizeBrowserUrl(options.url));
   }
 
   const id = crypto.randomUUID();
@@ -637,6 +645,7 @@ function createBrowser(event, options = {}) {
       backgroundThrottling: true,
       contextIsolation: true,
       nodeIntegration: false,
+      preload: browserPreloadPath,
       sandbox: true,
       webSecurity: true,
       partition: "persist:taskurotta-browser",
@@ -650,6 +659,7 @@ function createBrowser(event, options = {}) {
     error: "",
     grantId,
     id,
+    internalHomeUrl: url.startsWith("data:text/html") ? url : "",
     owner: event.sender,
     ownerId: event.sender.id,
     openBrowserBinding: typeof options.openBrowserBinding === "string"
@@ -658,12 +668,12 @@ function createBrowser(event, options = {}) {
     view,
   };
   browserSessions.set(id, session);
+  registerBrowserOwnerCleanup(event.sender);
   configureBrowserSession(session);
   void view.webContents.loadURL(url).catch((error) => {
     session.error = error instanceof Error ? error.message : String(error);
     emitBrowserState(session);
   });
-  event.sender.once("destroyed", () => closeBrowserSession(session));
   return browserSessionState(session, url);
 }
 
@@ -688,10 +698,15 @@ function browserAction(event, options = {}) {
       break;
     case "navigate":
       session.error = "";
-      void contents.loadURL(normalizeBrowserUrl(options.url)).catch((error) => {
-        session.error = error instanceof Error ? error.message : String(error);
-        emitBrowserState(session);
-      });
+      {
+        const normalizedUrl = normalizeBrowserUrl(options.url);
+        const loadUrl = browserLoadUrl(normalizedUrl);
+        session.internalHomeUrl = normalizedUrl === TASKUROTTA_HOME_URL ? loadUrl : "";
+        void contents.loadURL(loadUrl).catch((error) => {
+          session.error = error instanceof Error ? error.message : String(error);
+          emitBrowserState(session);
+        });
+      }
       break;
     case "open-external": {
       const url = contents.getURL();
@@ -741,11 +756,22 @@ function configureBrowserSession(session) {
   contents.on("will-navigate", (event, url) => {
     if (!isAllowedBrowserNavigation(session, url)) event.preventDefault();
   });
+  contents.on("ipc-message", (event, channel, payload) => {
+    if (event.senderFrame !== contents.mainFrame) return;
+    if (channel === "gofer:browser-link-clicked") openBrowserLink(session, payload?.url);
+    if (
+      channel === "gofer:browser-navigation"
+      && payload?.action === "back"
+      && contents.navigationHistory.canGoBack()
+    ) {
+      contents.navigationHistory.goBack();
+    }
+  });
   contents.on("before-input-event", (event, input) => {
     const action = browserShortcutAction(input, process.platform, session.openBrowserBinding);
     if (!action) return;
     event.preventDefault();
-    if (action === "focus-location" || action === "close") {
+    if (["focus-location", "close", "next-tab", "previous-tab", "new-tab"].includes(action)) {
       emitBrowserCommand(session, action);
       return;
     }
@@ -772,12 +798,36 @@ function configureBrowserSession(session) {
     });
   }
   contents.setWindowOpenHandler(({ url }) => {
-    if (isAllowedBrowserNavigation(session, url) && !session.owner.isDestroyed()) {
-      session.owner.send("gofer:browser-open-tab", { url });
+    if (isAllowedBrowserNavigation(session, url)) {
+      session.error = "";
+      void contents.loadURL(url).catch((error) => {
+        session.error = error instanceof Error ? error.message : String(error);
+        emitBrowserState(session);
+      });
     }
     return { action: "deny" };
   });
   contents.on("context-menu", (_event, params) => showBrowserContextMenu(session, params));
+}
+
+function openBrowserLink(session, value) {
+  if (!isAllowedBrowserNavigation(session, value) || session.owner.isDestroyed()) return;
+  const url = new URL(value);
+  if (url.protocol === "file:" && isMarkdownFilePath(url.pathname)) {
+    const targetPath = resolveExactPath(fileURLToPath(url), {
+      grantId: session.grantId,
+      mustExist: true,
+    });
+    if (!fs.statSync(targetPath).isFile()) return;
+    session.owner.send("gofer:browser-open-file", { path: targetPath });
+    return;
+  }
+  session.owner.send("gofer:browser-open-tab", { url: url.toString() });
+}
+
+function isMarkdownFilePath(value) {
+  return [".md", ".markdown", ".mdown", ".mkd"].some((extension) =>
+    String(value || "").toLowerCase().endsWith(extension));
 }
 
 function showBrowserContextMenu(session, params) {
@@ -814,6 +864,8 @@ function showBrowserContextMenu(session, params) {
 }
 
 function setBrowserSessionActive(session, active) {
+  const contents = browserSessionContents(session);
+  const restoreOwnerFocus = !active && contents?.isFocused() === true;
   if (active) {
     for (const candidate of browserSessions.values()) {
       if (candidate.ownerId === session.ownerId && candidate.id !== session.id) {
@@ -822,7 +874,8 @@ function setBrowserSessionActive(session, active) {
     }
   }
   session.view.setVisible(active);
-  if (active) session.view.webContents.focus();
+  if (active) contents?.focus();
+  else if (restoreOwnerFocus && !session.owner.isDestroyed()) session.owner.focus();
 }
 
 function setBrowserSessionBounds(session, bounds = {}) {
@@ -836,7 +889,20 @@ function setBrowserSessionBounds(session, bounds = {}) {
 }
 
 function browserSessionState(session, fallbackUrl = "about:blank") {
-  const contents = session.view.webContents;
+  const contents = browserSessionContents(session);
+  if (!contents) {
+    return {
+      canGoBack: false,
+      canGoForward: false,
+      clientId: session.clientId,
+      error: session.error || "Browser view is unavailable.",
+      id: session.id,
+      loading: false,
+      title: "",
+      url: fallbackUrl,
+    };
+  }
+  const currentUrl = contents.getURL() || fallbackUrl;
   return {
     canGoBack: contents.navigationHistory.canGoBack(),
     canGoForward: contents.navigationHistory.canGoForward(),
@@ -845,18 +911,25 @@ function browserSessionState(session, fallbackUrl = "about:blank") {
     id: session.id,
     loading: contents.isLoading(),
     title: contents.getTitle(),
-    url: contents.getURL() || fallbackUrl,
+    url: session.internalHomeUrl && currentUrl === session.internalHomeUrl
+      ? TASKUROTTA_HOME_URL
+      : currentUrl,
   };
 }
 
 function emitBrowserState(session) {
-  if (!session.owner.isDestroyed()) {
+  if (
+    browserSessions.get(session.id) === session
+    && browserSessionContents(session)
+    && !session.owner.isDestroyed()
+  ) {
     session.owner.send("gofer:browser-state", browserSessionState(session));
   }
 }
 
 function emitBrowserCommand(session, action) {
   if (!session.owner.isDestroyed()) {
+    if (action === "focus-location") session.owner.focus();
     session.owner.send("gofer:browser-command", {
       action,
       clientId: session.clientId,
@@ -875,11 +948,27 @@ function ownedBrowserSession(event, id) {
 
 function closeBrowserSession(session) {
   if (!session || !browserSessions.has(session.id)) return;
+  const contents = browserSessionContents(session);
+  const restoreOwnerFocus = contents?.isFocused() === true;
   browserSessions.delete(session.id);
+  session.view.setVisible(false);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.contentView.removeChildView(session.view);
   }
-  if (!session.view.webContents.isDestroyed()) session.view.webContents.close();
+  contents?.close();
+  if (restoreOwnerFocus && !session.owner.isDestroyed()) session.owner.focus();
+}
+
+function browserSessionContents(session) {
+  const contents = session?.view?.webContents;
+  return contents && !contents.isDestroyed() ? contents : null;
+}
+
+function registerBrowserOwnerCleanup(owner) {
+  if (browserOwnersWithCleanup.has(owner)) return;
+  browserOwnersWithCleanup.add(owner);
+  const ownerId = owner.id;
+  owner.once("destroyed", () => closeBrowsersForOwner(ownerId));
 }
 
 function closeBrowsersForOwner(ownerId) {
@@ -1158,19 +1247,23 @@ function setupAutoUpdater() {
 }
 
 async function checkForUpdates() {
-  if (!app.isPackaged || isSmokeTest) {
-    setUpdateState(await checkLatestReleaseFallback());
-    return getUpdateState();
-  }
-
   try {
-    await autoUpdater.checkForUpdates();
+    setUpdateState({ checking: true, error: "" });
+    if (!app.isPackaged || isSmokeTest) {
+      setUpdateState(await checkLatestReleaseFallback());
+    } else {
+      await autoUpdater.checkForUpdates();
+    }
   } catch (error) {
     if (isNoPublishedVersionsError(error)) {
       setNoReleasesUpdateState();
       return getUpdateState();
     }
-    throw error;
+    setUpdateState({
+      checking: false,
+      downloading: false,
+      error: error instanceof Error ? error.message : String(error),
+    });
   }
   return getUpdateState();
 }
@@ -1376,10 +1469,9 @@ async function pathInfo(_event, options = {}) {
 
   const targetPath = resolveExactPath(options.targetPath, {
     grantId: options.grantId,
-    mustExist: true,
+    mustExist: false,
   });
-  const stat = await fs.promises.stat(targetPath);
-  return pathInfoFromStat(targetPath, stat);
+  return inspectPath(targetPath);
 }
 
 async function resolveProjectFile(_event, options = {}) {
@@ -1578,16 +1670,6 @@ async function writeTextFile(_event, options = {}) {
   });
   await fs.promises.writeFile(targetPath, options.content, "utf-8");
   return pathHandle(targetPath);
-}
-
-function pathInfoFromStat(targetPath, stat) {
-  return {
-    basename: path.basename(targetPath),
-    extension: path.extname(targetPath),
-    isDirectory: stat.isDirectory(),
-    isFile: stat.isFile(),
-    path: targetPath,
-  };
 }
 
 function resolveNewChildPath(directory, name, grantId = "") {

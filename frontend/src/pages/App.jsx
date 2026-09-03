@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -10,9 +10,11 @@ import {
   Code2,
   Copy,
   Download,
+  FileArchive,
   FileDiff,
   FolderOpen,
   GitBranch,
+  Globe2,
   History,
   Loader2,
   Moon,
@@ -29,6 +31,7 @@ import {
   Sun,
   Trash2,
   Undo2,
+  Upload,
   Waypoints,
   X,
 } from "lucide-react";
@@ -42,6 +45,7 @@ import CodeWorkspace, {
 import MarkdownContent from "../components/MarkdownContent.jsx";
 import ChatComposer, { MessageAttachments } from "../components/ChatComposer.jsx";
 import SettingsPopover, { defaultSettingsSnapshot } from "../components/SettingsPopover.jsx";
+import TaskurottaMark from "../components/TaskurottaMark.jsx";
 import UnifiedBottomPanel from "../components/UnifiedBottomPanel.jsx";
 import {
   ProviderModelEffortFields,
@@ -71,8 +75,13 @@ import {
 const RETENTION_STORAGE_KEY = "gofer.retentionSettings";
 const PROJECT_LABELS_STORAGE_KEY = "gofer.projectLabels";
 const RECENT_PROJECTS_STORAGE_KEY = "gofer.recentProjects";
+export const RECENT_FILES_STORAGE_KEY = "gofer.recentFiles";
 const LAST_WORKTREE_STORAGE_KEY = "gofer.lastWorktreeByProject";
 export const STUDIO_SESSION_STORAGE_KEY = "taskurotta.studioSession.v1";
+export const TEXT_ZOOM_STORAGE_KEY = "taskurotta.textZoom.v1";
+export const TEXT_ZOOM_MIN = 80;
+export const TEXT_ZOOM_MAX = 150;
+export const TEXT_ZOOM_STEP = 10;
 const DEFAULT_RETENTION_SETTINGS = {
   keepDays: 14,
   keepFailedDays: 30,
@@ -116,6 +125,10 @@ function loadRetentionSettings() {
 function isBundleFile(file) {
   const name = file?.name?.toLowerCase?.() ?? "";
   return name.endsWith(".zip") || name.endsWith(".gof");
+}
+
+function isTaskurottaFile(file) {
+  return file?.name?.toLowerCase?.().endsWith(".taskurotta") ?? false;
 }
 
 async function fileToBase64(file) {
@@ -200,9 +213,51 @@ function previewTriggerLines(items = []) {
   });
 }
 
+export function workflowBundleFilename(workflow) {
+  const extension = workflow?.sourceFormat === "radish" ? ".taskurotta" : ".gof.zip";
+  return `${workflow?.id || "workflow"}${extension}`;
+}
+
+export function workflowBundlePath(directory, workflow) {
+  const value = String(directory ?? "").trim();
+  if (!value) return workflowBundleFilename(workflow);
+  const separator = value.includes("\\") && !value.includes("/") ? "\\" : "/";
+  const trimmedDirectory = value.replace(/[\\/]+$/, "");
+  return `${trimmedDirectory || separator}${trimmedDirectory ? separator : ""}${workflowBundleFilename(workflow)}`;
+}
+
+export function workflowExportEndpoint(workflow) {
+  return workflow?.sourceFormat === "radish"
+    ? `/radish/workflows/${encodeURIComponent(workflow.id)}/export`
+    : `/workflows/${encodeURIComponent(workflow.id)}/export`;
+}
+
+export async function discoverProjectWorkflows(projectRoot) {
+  const normalizedRoot = String(projectRoot ?? "").trim();
+  if (!normalizedRoot) return [];
+
+  await window.goferDesktop?.workspace?.trustProjectRoot?.(normalizedRoot);
+  const projectGrantId =
+    window.goferDesktop?.workspace?.pathGrantForApi?.(normalizedRoot) ?? "";
+  const response = await fetch(apiUrl("/projects/open"), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      projectGrantId: projectGrantId || undefined,
+      projectRoot: normalizedRoot,
+    }),
+  });
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error(payload.error || `Project API returned ${response.status}`);
+  }
+  return Array.isArray(payload.workflows) ? payload.workflows : [];
+}
+
 export default function App() {
   const [settings, setSettings] = useState(loadAppSettings);
   const [initialStudioSession] = useState(loadStudioSession);
+  const [textZoom, setTextZoom] = useState(loadTextZoom);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [systemDark, setSystemDark] = useState(
     () => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false,
@@ -221,6 +276,7 @@ export default function App() {
   const [codeNavigationRequest, setCodeNavigationRequest] = useState(null);
   const [browserTabs, setBrowserTabs] = useState({});
   const [newCodeFileRequest, setNewCodeFileRequest] = useState(0);
+  const [recentCodePaths, setRecentCodePaths] = useState(loadRecentCodePaths);
   const [recentProjectRoots, setRecentProjectRoots] = useState(loadRecentProjectRoots);
   const [lastWorktreeByProject, setLastWorktreeByProject] = useState(loadLastWorktreeByProject);
   const [radishEditorState, setRadishEditorState] = useState(null);
@@ -228,6 +284,7 @@ export default function App() {
   const [query, setQuery] = useState("");
   const [projectPaneVisible, setProjectPaneVisible] = useState(true);
   const [assistantPaneVisible, setAssistantPaneVisible] = useState(true);
+  const [assistantFocusRequest, setAssistantFocusRequest] = useState(0);
   const [dataDir, setDataDir] = useState("");
   const [loadState, setLoadState] = useState({ loading: true, error: "" });
   const [doctorState, setDoctorState] = useState({
@@ -239,12 +296,12 @@ export default function App() {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const [createState, setCreateState] = useState({ saving: false, error: "" });
   const [exportDialog, setExportDialog] = useState({
+    directory: "",
     error: "",
-    outputPath: "",
+    grantId: "",
     saving: false,
     workflow: null,
   });
-  const [workflowTemplates, setWorkflowTemplates] = useState([]);
   const [historyState, setHistoryState] = useState({
     diff: null,
     error: "",
@@ -304,6 +361,7 @@ export default function App() {
   const openFileRef = useRef(null);
   const chordPendingRef = useRef(null);
   const openIntegratedBrowserRef = useRef(null);
+  const openLinkedCodeFileRef = useRef(null);
   const changeStudioViewRef = useRef(null);
   const runWorkflowNowRef = useRef(null);
   const theme = resolvedTheme(settings, systemDark);
@@ -316,6 +374,11 @@ export default function App() {
     activeProjectRoot,
     studioView,
   );
+  const codeWorkspaceWorkflow = activeWorkspaceForProject(
+    workflows,
+    activeWorkflowId,
+    activeProjectRoot,
+  ) ?? projectWorkspace("");
   const graphWorkflow = useMemo(
     () => radishGraphWorkflow(activeWorkflow, radishEditorState?.document),
     [activeWorkflow, radishEditorState?.document],
@@ -339,6 +402,54 @@ export default function App() {
     const timer = window.setTimeout(() => saveAppSettings(settings), 120);
     return () => window.clearTimeout(timer);
   }, [settings]);
+
+  useLayoutEffect(() => {
+    const zoomFactor = textZoom / 100;
+    const setNativeZoom = window.goferDesktop?.appearance?.setZoomFactor;
+    if (setNativeZoom) {
+      setNativeZoom(zoomFactor);
+      document.documentElement.style.fontSize = "";
+      return;
+    }
+    document.documentElement.style.fontSize = `${textZoom}%`;
+  }, [textZoom]);
+
+  useEffect(() => () => {
+    window.goferDesktop?.appearance?.setZoomFactor?.(1);
+    document.documentElement.style.fontSize = "";
+  }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(TEXT_ZOOM_STORAGE_KEY, String(textZoom));
+    } catch {
+      // Text zoom remains available for this session when storage is unavailable.
+    }
+  }, [textZoom]);
+
+  useEffect(() => {
+    function handleTextZoomKeydown(event) {
+      const direction = textZoomDirection(event);
+      if (!direction) return;
+      event.preventDefault();
+      if (eventTargetsGraphVisualization(event)) return;
+      setTextZoom((current) => nextTextZoom(current, direction));
+    }
+
+    function handleTextZoomWheel(event) {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey || event.deltaY === 0) return;
+      event.preventDefault();
+      if (eventTargetsGraphVisualization(event)) return;
+      setTextZoom((current) => nextTextZoom(current, event.deltaY < 0 ? 1 : -1));
+    }
+
+    window.addEventListener("keydown", handleTextZoomKeydown, true);
+    window.addEventListener("wheel", handleTextZoomWheel, { capture: true, passive: false });
+    return () => {
+      window.removeEventListener("keydown", handleTextZoomKeydown, true);
+      window.removeEventListener("wheel", handleTextZoomWheel, true);
+    };
+  }, []);
 
   useEffect(() => {
     const colorScheme = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -374,6 +485,22 @@ export default function App() {
       // Recent projects remain available for this session when storage is unavailable.
     }
   }, [recentProjectRoots]);
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(
+        RECENT_FILES_STORAGE_KEY,
+        JSON.stringify(recentCodePaths),
+      );
+    } catch {
+      // Recent files remain available for this session when storage is unavailable.
+    }
+  }, [recentCodePaths]);
+
+  useEffect(() => {
+    if (!activeCodePath || browserTabs[activeCodePath]) return;
+    setRecentCodePaths((current) => rememberRecentFile(current, activeCodePath));
+  }, [activeCodePath, browserTabs]);
 
   useEffect(() => {
     try {
@@ -516,10 +643,14 @@ export default function App() {
     const unsubscribeOpenTab = window.goferBrowser?.onOpenTab?.((request) => {
       if (request?.url) openIntegratedBrowserRef.current?.(request.url, { newTab: true });
     });
+    const unsubscribeOpenFile = window.goferBrowser?.onOpenFile?.((request) => {
+      if (request?.path) void openLinkedCodeFileRef.current?.(request.path);
+    });
     window.addEventListener("keydown", handleApplicationShortcut, true);
     return () => {
       clearChordPending();
       unsubscribeCommand?.();
+      unsubscribeOpenFile?.();
       unsubscribeOpenTab?.();
       window.removeEventListener("keydown", handleApplicationShortcut, true);
     };
@@ -645,9 +776,8 @@ export default function App() {
       const target = await resolveMarkdownFileLinkTarget(
         sourcePath,
         href,
-        window.goferDesktop?.workspace?.getPathInfo,
       );
-      if (target?.path) openCodeFile(target.path, { ...target, preview: true });
+      if (target?.path) await openLinkedCodeFile(target.path, { ...target, preview: true });
     } catch (error) {
       setTopBarNotice({
         type: "error",
@@ -656,26 +786,50 @@ export default function App() {
     }
   }
 
-  function openAssistantFile(path, projectRoot) {
-    const resolvedPath = resolveDisplayPath(path, projectRoot);
-    if (!resolvedPath) return;
-    const targetWorkflow = workflows.find((workflow) =>
-      workflow.projectRoot === projectRoot && workflow.sourceFormat === "radish");
-    if (!targetWorkflow) {
+  async function openLinkedCodeFile(path, options = {}) {
+    if (!path) return;
+    await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
+    const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
+    if (info && !info.isFile) throw new Error(`The link does not point to a file: ${path}`);
+    openCodeFile(info?.path || path, options);
+  }
+
+  openLinkedCodeFileRef.current = openLinkedCodeFile;
+
+  async function openRecentCodeFile(path) {
+    if (!path) return;
+    try {
+      await window.goferDesktop?.workspace?.trustProjectRoot?.(path);
+      const info = await window.goferDesktop?.workspace?.getPathInfo?.(path);
+      if (info && !info.isFile) throw new Error(`The recent path is not a file: ${path}`);
+      const selectedPath = info?.path || path;
+      if (activeWorkflow?.projectRoot) {
+        openCodeFile(selectedPath);
+        return;
+      }
+      const resolved = await window.goferDesktop?.workspace?.resolveProjectFile?.(selectedPath);
+      const projectRoot = resolved?.directory ?? "";
+      if (!projectRoot) throw new Error("Could not determine the recent file's project folder.");
+      await openProjectAtPath(projectRoot, { focusPath: selectedPath });
+    } catch (error) {
       setTopBarNotice({
         type: "error",
-        message: "Open a Radish workflow from this project before opening the edited file.",
+        message: error instanceof Error ? error.message : "Unable to open recent file",
       });
-      return;
     }
-    if (targetWorkflow.id === activeWorkflow?.id) {
-      openCodeFile(resolvedPath);
-      return;
+  }
+
+  async function openAssistantFile(path, projectRoot) {
+    const resolvedPath = resolveDisplayPath(path, projectRoot);
+    if (!resolvedPath) return;
+    try {
+      await openLinkedCodeFile(resolvedPath);
+    } catch (error) {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Could not open the linked file",
+      });
     }
-    pendingProjectFileRef.current = { path: resolvedPath, workflowId: targetWorkflow.id };
-    setActiveWorkflowId(targetWorkflow.id);
-    setCodeEditorOpened(true);
-    setStudioView("code");
   }
 
   function pinCodeFile(path) {
@@ -805,7 +959,7 @@ export default function App() {
   }
 
   async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
-    await window.goferDesktop.workspace.trustProjectRoot?.(projectRoot);
+    const discoveredPayloads = await discoverProjectWorkflows(projectRoot);
     let mainProjectRoot = projectRoot;
     try {
       const worktreePayload = await window.goferDesktop.workspace.gitWorktrees?.(projectRoot);
@@ -813,17 +967,7 @@ export default function App() {
     } catch {
       // Non-Git projects use their selected folder as the recent-project identity.
     }
-    const projectGrantId = window.goferDesktop.workspace.pathGrantForApi?.(projectRoot) ?? "";
-    const response = await fetch(apiUrl("/projects/open"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectGrantId: projectGrantId || undefined, projectRoot }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      throw new Error(payload.error || `Project API returned ${response.status}`);
-    }
-    const discovered = (payload.workflows ?? []).map((workflow) =>
+    const discovered = discoveredPayloads.map((workflow) =>
       summarizeWorkflow(workflow, dataDir));
     if (rememberProject) {
       setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
@@ -1149,11 +1293,18 @@ export default function App() {
     }
   }
 
-  const loadWorkflows = useCallback(async ({ silent = false } = {}) => {
+  const loadWorkflows = useCallback(async ({
+    discoverProject = false,
+    projectRoot = activeProjectRoot,
+    silent = false,
+  } = {}) => {
     if (!silent) {
       setLoadState({ loading: true, error: "" });
     }
     try {
+      if (discoverProject && projectRoot) {
+        await discoverProjectWorkflows(projectRoot);
+      }
       const response = await fetch(apiUrl("/workflows"));
       if (!response.ok) {
         throw new Error(`Workflow API returned ${response.status}`);
@@ -1210,20 +1361,7 @@ export default function App() {
         });
       }
     }
-  }, [initialStudioSession.projectRoot]);
-
-  const loadWorkflowTemplates = useCallback(async () => {
-    try {
-      const response = await fetch(apiUrl("/workflow-templates"));
-      const payload = await response.json();
-      if (!response.ok) {
-        throw new Error(payload.error || `Workflow API returned ${response.status}`);
-      }
-      setWorkflowTemplates(payload.templates ?? []);
-    } catch {
-      setWorkflowTemplates([]);
-    }
-  }, []);
+  }, [activeProjectRoot, initialStudioSession.projectRoot]);
 
   const loadDoctor = useCallback(async ({ silent = false } = {}) => {
     if (!silent) {
@@ -1291,23 +1429,24 @@ export default function App() {
   }, [workflows]);
 
   useEffect(() => {
-    loadWorkflowTemplates();
-  }, [loadWorkflowTemplates]);
-
-  useEffect(() => {
     loadDoctor();
     loadQueue();
   }, [loadDoctor, loadQueue]);
 
   useEffect(() => {
     const intervalId = window.setInterval(() => {
-      loadWorkflows({ silent: true });
+      const projectRoot = activeProjectRoot || activeWorkflow?.projectRoot || "";
+      loadWorkflows({
+        discoverProject: Boolean(projectRoot),
+        projectRoot,
+        silent: true,
+      });
       loadDoctor({ silent: true });
       loadQueue({ silent: true });
     }, 2000);
 
     return () => window.clearInterval(intervalId);
-  }, [loadDoctor, loadQueue, loadWorkflows]);
+  }, [activeProjectRoot, activeWorkflow?.projectRoot, loadDoctor, loadQueue, loadWorkflows]);
 
   const loadRetentionSettingsForWorkflow = useCallback(async (workflowId) => {
     if (!workflowId) return;
@@ -2402,9 +2541,65 @@ export default function App() {
     }
   }
 
-  async function importWorkflow(file) {
-    if (!file) return;
+  async function importWorkflow(file, options = {}) {
+    if (!file) return false;
     try {
+      if (isTaskurottaFile(file)) {
+        let projectRoot = options.projectRoot?.trim()
+          || activeWorkflow?.projectRoot
+          || activeProjectRoot;
+        if (!projectRoot) {
+          projectRoot = await window.goferDesktop?.workspace?.selectPath?.({
+            directoryOnly: true,
+          });
+        }
+        if (!projectRoot) {
+          throw new Error("Choose a project folder for the imported workflow.");
+        }
+        const bundlePath = await window.goferDesktop?.grantDroppedPath?.(file);
+        const bundleRequest = bundlePath
+          ? {
+            bundlePath,
+            grantId: window.goferDesktop?.workspace?.pathGrantForApi?.(bundlePath) || undefined,
+          }
+          : { bundleContent: await fileToBase64(file), filename: file.name };
+        const previewResponse = await fetch(apiUrl("/radish/workflows/import/preview"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(bundleRequest),
+        });
+        const previewPayload = await previewResponse.json();
+        if (!previewResponse.ok) {
+          throw new Error(previewPayload.error || `Workflow API returned ${previewResponse.status}`);
+        }
+        const preview = previewPayload.bundle;
+        if (!window.confirm(
+          `Import "${preview.workflowName}" into ${projectNameFromPath(projectRoot)}?\n\n`
+          + `${preview.files.length} workflow file${preview.files.length === 1 ? "" : "s"} will be added under .taskurotta.`,
+        )) return false;
+        const projectGrantId = window.goferDesktop?.workspace?.pathGrantForApi?.(projectRoot) || undefined;
+        const importResponse = await fetch(apiUrl("/radish/workflows/import"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...bundleRequest, projectRoot, projectGrantId }),
+        });
+        const importPayload = await importResponse.json();
+        if (!importResponse.ok) {
+          throw new Error(importPayload.error || `Workflow API returned ${importResponse.status}`);
+        }
+        const imported = summarizeWorkflow(importPayload.workflow, dataDir);
+        deletedWorkflowIdsRef.current.delete(imported.id);
+        setWorkflows((current) => [
+          ...current.filter((candidate) => candidate.id !== imported.id),
+          imported,
+        ]);
+        setActiveProjectRoot(projectRoot);
+        setRecentProjectRoots((current) => rememberRecentProject(current, projectRoot));
+        setActiveWorkflowId(imported.id);
+        setStudioView("graph");
+        setTopBarNotice({ type: "success", message: `Imported ${imported.name}` });
+        return true;
+      }
       if (isBundleFile(file)) {
         const bundleContent = await fileToBase64(file);
         const previewResponse = await fetch(apiUrl("/workflows/import/preview"), {
@@ -2438,7 +2633,7 @@ export default function App() {
         await loadWorkflows({ silent: true });
         setActiveWorkflowId(imported.workflowId);
         setTopBarNotice({ type: "success", message: `Imported ${imported.workflowName}` });
-        return;
+        return true;
       }
 
       const content = await file.text();
@@ -2459,45 +2654,99 @@ export default function App() {
       setWorkflows((current) => [...current, nextWorkflow]);
       setActiveWorkflowId(nextWorkflow.id);
       setTopBarNotice({ type: "success", message: `Imported ${nextWorkflow.name}` });
+      return true;
     } catch (error) {
+      const message = error instanceof Error ? error.message : "Unable to import workflow";
       setTopBarNotice({
         type: "error",
-        message: error instanceof Error ? error.message : "Unable to import workflow",
+        message,
       });
+      if (options.reportDialogError) {
+        setCreateState({ saving: false, error: message });
+      }
+      return false;
+    }
+  }
+
+  async function importWorkflowFromDialog(file, projectRoot) {
+    setCreateState({ saving: true, error: "" });
+    const imported = await importWorkflow(file, {
+      projectRoot,
+      reportDialogError: true,
+    });
+    if (imported) {
+      setCreateDialogOpen(false);
+      setCreateState({ saving: false, error: "" });
+    } else {
+      setCreateState((current) => ({ ...current, saving: false }));
     }
   }
 
   async function exportWorkflow(workflow) {
     if (!workflow) return;
-    const defaultPath = `${dataDir ? `${dataDir.replace(/\/$/, "")}/` : ""}${workflow.id}.gof.zip`;
+    const defaultDirectory = workflow.sourceFormat === "radish" ? workflow.projectRoot : dataDir;
     setExportDialog({
+      directory: defaultDirectory || "",
       error: "",
-      outputPath: defaultPath,
+      grantId: window.goferDesktop?.workspace?.pathGrantForApi?.(defaultDirectory) || "",
       saving: false,
       workflow,
     });
   }
 
-  async function confirmExportWorkflow(outputPath) {
+  async function chooseExportDirectory() {
+    const selectPath = window.goferDesktop?.workspace?.selectPath;
+    if (!selectPath) {
+      setExportDialog((current) => ({ ...current, error: "Folder selection is unavailable." }));
+      return;
+    }
+    try {
+      const directory = await selectPath({
+        currentPath: exportDialog.directory || exportDialog.workflow?.projectRoot || dataDir,
+        directoryOnly: true,
+      });
+      if (!directory) return;
+      setExportDialog((current) => ({
+        ...current,
+        directory,
+        error: "",
+        grantId: window.goferDesktop?.workspace?.pathGrantForApi?.(directory) || "",
+      }));
+    } catch (error) {
+      setExportDialog((current) => ({
+        ...current,
+        error: error instanceof Error ? error.message : "Unable to choose an export folder",
+      }));
+    }
+  }
+
+  async function confirmExportWorkflow(directory) {
     const workflow = exportDialog.workflow;
-    if (!workflow || !outputPath.trim()) return;
+    if (!workflow || !directory.trim()) return;
     setExportDialog((current) => ({ ...current, error: "", saving: true }));
     try {
+      if (workflow.sourceFormat === "radish" && workflow.projectRoot) {
+        await discoverProjectWorkflows(workflow.projectRoot);
+      }
+      const outputPath = workflowBundlePath(directory, workflow);
       const response = await fetch(
-        apiUrl(`/workflows/${encodeURIComponent(workflow.id)}/export`),
+        apiUrl(workflowExportEndpoint(workflow)),
         {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
           },
-          body: JSON.stringify({ outputPath: outputPath.trim() }),
+          body: JSON.stringify({
+            outputPath,
+            grantId: exportDialog.grantId || undefined,
+          }),
         },
       );
       const payload = await response.json();
       if (!response.ok) {
         throw new Error(payload.error || `Workflow API returned ${response.status}`);
       }
-      setExportDialog({ error: "", outputPath: "", saving: false, workflow: null });
+      setExportDialog({ directory: "", error: "", grantId: "", saving: false, workflow: null });
       setTopBarNotice({ type: "success", message: `Exported bundle to ${payload.bundlePath}` });
     } catch (error) {
       setExportDialog((current) => ({
@@ -2571,6 +2820,21 @@ export default function App() {
       }
 
       const remainingWorkflows = workflows.filter((candidate) => candidate.id !== workflow.id);
+      closeCodeFiles([workflow.sourcePath]);
+      setRecentCodePaths((current) => removeCodePath(current, workflow.sourcePath));
+      setCodeNavigationRequest((current) =>
+        current?.path === workflow.sourcePath ? null : current,
+      );
+      if (
+        pendingProjectFileRef.current?.workflowId === workflow.id
+        || pendingProjectFileRef.current?.path === workflow.sourcePath
+      ) {
+        pendingProjectFileRef.current = null;
+      }
+      if (activeWorkflow?.id === workflow.id) {
+        radishEditorStateRef.current = null;
+        setRadishEditorState(null);
+      }
       setWorkflows((current) => current.filter((candidate) => candidate.id !== workflow.id));
       setActiveWorkflowId((currentId) =>
         currentId === workflow.id ? remainingWorkflows[0]?.id : currentId,
@@ -2696,6 +2960,10 @@ export default function App() {
   const panelRunEvents = logState.runEvents?.length
     ? logState.runEvents
     : panelRunResult?.runEvents ?? [];
+  const panelWorkflowId = activeWorkflow?.sourceFormat === "project"
+    ? ""
+    : activeWorkflow?.id ?? "";
+  const panelProjectRoot = activeWorkflow?.projectRoot || activeProjectRoot || "";
 
   function revealPanelDiagnostic(diagnostic) {
     if (!activeWorkflow || activeWorkflow.sourceFormat !== "radish") return;
@@ -2713,7 +2981,7 @@ export default function App() {
   return (
     <main
       aria-busy={runState.running || logState.loading || undefined}
-      className={`flex h-screen min-h-[720px] min-w-[1180px] bg-canvas text-ink ${theme}`}
+      className={`flex h-full min-h-0 min-w-0 overflow-hidden bg-canvas text-ink ${theme}`}
     >
       <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
         {!runState.running && runState.result
@@ -2748,7 +3016,7 @@ export default function App() {
         activeCodePath={activeCodePath}
         onCloseCodeFile={closeActiveCodeFile}
         onCodeFilesystemChange={handleCodeFilesystemChange}
-        onRefresh={loadWorkflows}
+        onRefresh={() => loadWorkflows({ discoverProject: true })}
         onRenameWorkflow={renameWorkflow}
         onEditWorkflowFile={editWorkflowFile}
         onSelectProject={selectRecentProject}
@@ -2862,85 +3130,125 @@ export default function App() {
                 }
               />
             </div>
-            {codeEditorOpened && studioView === "code" ? (
-              <div className={`${studioView === "code" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
-                <CodeWorkspace
-                  active={studioView === "code"}
-                  activePath={activeCodePath}
-                  browserTabs={browserTabs}
-                  navigationRequest={codeNavigationRequest}
-                  ref={radishEditorRef}
-                  openPaths={codeOpenPaths}
-                  previewPath={previewCodePath}
-                  radishDocument={radishEditorState?.document}
-                  radishDirty={Boolean(radishEditorState?.document?.dirty)}
-                  theme={theme}
-                  settings={settings}
-                  workflow={activeWorkflow}
-                  onActivePathChange={setActiveCodePath}
-                  onActiveDocumentStateChange={setActiveCodeDocumentState}
-                  onBrowserStateChange={updateBrowserTab}
-                  onClosePath={closeCodeFile}
-                  onClosePaths={closeCodeFiles}
-                  onDocumentStateChange={(nextState) => {
-                    radishEditorStateRef.current = nextState;
-                    setRadishEditorState(nextState);
-                    if (nextState?.document?.dirty) pinCodeFile(activeWorkflow.sourcePath);
-                  }}
-                  onNewFile={() => setNewCodeFileRequest((current) => current + 1)}
-                  onOpenBrowser={() => openIntegratedBrowser()}
-                  onOpenFile={() => void openFile()}
-                  onOpenMarkdownPath={openMarkdownFileLink}
-                  onOpenProject={() => void openProjectFolder()}
-                  onOpenPath={openCodeFile}
-                  onOpenPathsChange={setCodeOpenPaths}
-                  onPinPath={pinCodeFile}
-                  onRadishContentChange={scheduleRadishAnalysis}
-                  onRadishDiscard={reloadActiveRadishDocument}
-                  onRadishSaved={refreshRadishAfterFileSave}
-                  onSettingChange={changeSetting}
-                />
-              </div>
-            ) : null}
-            <UnifiedBottomPanel
-              diagnostics={panelDiagnostics}
-              onSettingChange={changeSetting}
-              projectRoot={activeWorkflow.projectRoot || ""}
-              settings={settings}
-              theme={theme}
-              onRevealDiagnostic={revealPanelDiagnostic}
-              timelineProps={{
-                error: logState.error,
-                loading: logState.loading,
-                logPath: logState.path,
-                onPruneRuns: (options) => pruneWorkflowRunLogs(activeWorkflow.id, options),
-                onReplayRun: (runId, triggerId) =>
-                  replayWorkflowTriggerLog(activeWorkflow.id, runId, triggerId),
-                onResumeRun: (runId, options) =>
-                  resumeWorkflowRunLog(activeWorkflow.id, runId, options),
-                onRetentionSettingsChange: (nextSettings) =>
-                  saveRetentionSettingsForWorkflow(activeWorkflow.id, nextSettings),
-                onSelectRun: (runId) => loadRunLog(activeWorkflow.id, runId),
-                onShowLatest: () => loadLatestLog(activeWorkflow.id),
-                onStopRun: (runId) => stopWorkflowRunLog(activeWorkflow.id, runId),
-                retentionSettings,
-                runEvents: panelRunEvents,
-                runs: logState.runs ?? [],
-                selectedRunId: logState.selectedRunId,
-                text: logState.text || panelRunResult?.logText || "",
-                title: "Workflow log",
-                usageSummary: logState.usageSummary ?? panelRunResult?.usageSummary ?? null,
-              }}
-            />
           </>
         ) : (
-          <EmptyWorkspace
-            error={loadState.error}
-            loading={loadState.loading}
-            onOpenSettings={() => setSettingsOpen(true)}
-            onRefresh={loadWorkflows}
-          />
+          <>
+            {studioView === "graph" ? (
+              <TopBar
+                settings={settings}
+                theme={theme}
+                settingsOpen={settingsOpen}
+                updateState={updateState}
+                view="graph"
+                onCheckForUpdates={() => checkForUpdates()}
+                onApplyUpdate={() => applyUpdate(updateState)}
+                onOpenHistory={() => {}}
+                onToggleSettings={() => setSettingsOpen((current) => !current)}
+                onToggleTheme={() => changeSetting("appearance.theme", theme === "dark" ? "light" : "dark")}
+              />
+            ) : null}
+            <EmptyWorkspace
+              error={loadState.error}
+              loading={loadState.loading}
+              notice={topBarNotice}
+              projectRoot={panelProjectRoot}
+              onCreate={() => {
+                setCreateState({ saving: false, error: "" });
+                setCreateDialogOpen(true);
+              }}
+              onImport={importWorkflow}
+              onOpenAssistant={() => {
+                setAssistantPaneVisible(true);
+                setAssistantFocusRequest((current) => current + 1);
+              }}
+              onOpenProject={() => void openProjectFolder()}
+              onOpenSettings={() => setSettingsOpen(true)}
+              onRefresh={() => loadWorkflows({ discoverProject: true })}
+            />
+          </>
         )}
+        {codeEditorOpened ? (
+          <div className={`${studioView === "code" ? "flex" : "hidden"} min-h-0 flex-1 flex-col`}>
+            <CodeWorkspace
+              active={studioView === "code"}
+              activePath={activeCodePath}
+              browserTabs={browserTabs}
+              navigationRequest={codeNavigationRequest}
+              ref={radishEditorRef}
+              openPaths={codeOpenPaths}
+              previewPath={previewCodePath}
+              recentPaths={recentCodePaths}
+              radishDocument={radishEditorState?.document}
+              radishDirty={Boolean(radishEditorState?.document?.dirty)}
+              theme={theme}
+              settings={settings}
+              workflow={codeWorkspaceWorkflow}
+              onActivePathChange={setActiveCodePath}
+              onActiveDocumentStateChange={setActiveCodeDocumentState}
+              onBrowserStateChange={updateBrowserTab}
+              onClosePath={closeCodeFile}
+              onClosePaths={closeCodeFiles}
+              onDocumentStateChange={(nextState) => {
+                radishEditorStateRef.current = nextState;
+                setRadishEditorState(nextState);
+                if (nextState?.document?.dirty) pinCodeFile(codeWorkspaceWorkflow.sourcePath);
+              }}
+              onNewFile={() => setNewCodeFileRequest((current) => current + 1)}
+              onOpenBrowser={(options) => openIntegratedBrowser(undefined, options)}
+              onOpenFile={() => void openFile()}
+              onOpenMarkdownPath={openMarkdownFileLink}
+              onOpenProject={() => void openProjectFolder()}
+              onOpenPath={(path) => void openRecentCodeFile(path)}
+              onOpenPathsChange={setCodeOpenPaths}
+              onPinPath={pinCodeFile}
+              onRadishContentChange={scheduleRadishAnalysis}
+              onRadishDiscard={reloadActiveRadishDocument}
+              onRadishSaved={refreshRadishAfterFileSave}
+              onSettingChange={changeSetting}
+            />
+          </div>
+        ) : null}
+        <UnifiedBottomPanel
+          diagnostics={panelDiagnostics}
+          onSettingChange={changeSetting}
+          projectRoot={panelProjectRoot}
+          settings={settings}
+          theme={theme}
+          onRevealDiagnostic={revealPanelDiagnostic}
+          timelineProps={{
+            error: logState.error,
+            loading: logState.loading,
+            logPath: logState.path,
+            onPruneRuns: panelWorkflowId
+              ? (options) => pruneWorkflowRunLogs(panelWorkflowId, options)
+              : undefined,
+            onReplayRun: panelWorkflowId
+              ? (runId, triggerId) => replayWorkflowTriggerLog(panelWorkflowId, runId, triggerId)
+              : undefined,
+            onResumeRun: panelWorkflowId
+              ? (runId, options) => resumeWorkflowRunLog(panelWorkflowId, runId, options)
+              : undefined,
+            onRetentionSettingsChange: panelWorkflowId
+              ? (nextSettings) => saveRetentionSettingsForWorkflow(panelWorkflowId, nextSettings)
+              : undefined,
+            onSelectRun: panelWorkflowId
+              ? (runId) => loadRunLog(panelWorkflowId, runId)
+              : undefined,
+            onShowLatest: panelWorkflowId
+              ? () => loadLatestLog(panelWorkflowId)
+              : undefined,
+            onStopRun: panelWorkflowId
+              ? (runId) => stopWorkflowRunLog(panelWorkflowId, runId)
+              : undefined,
+            retentionSettings,
+            runEvents: panelRunEvents,
+            runs: logState.runs ?? [],
+            selectedRunId: logState.selectedRunId,
+            text: logState.text || panelRunResult?.logText || "",
+            title: "Workflow log",
+            usageSummary: logState.usageSummary ?? panelRunResult?.usageSummary ?? null,
+          }}
+        />
       </section>
 
       {settingsOpen ? (
@@ -2957,6 +3265,7 @@ export default function App() {
 
       <div className={assistantPaneVisible ? "contents" : "hidden"} aria-hidden={!assistantPaneVisible}>
         <ChatPane
+          composerFocusRequest={assistantFocusRequest}
           assistantDefaults={settings.assistant}
           audioInputDeviceId={settings.devices.audioInputId}
           recentProjectRoots={recentProjectRoots}
@@ -2969,6 +3278,11 @@ export default function App() {
             assistantMarkdownSourcePath(projectRoot),
           )}
           onOpenFile={openAssistantFile}
+          onResponseComplete={(projectRoot) => loadWorkflows({
+            discoverProject: true,
+            projectRoot,
+            silent: true,
+          })}
           onResizeStart={(event) =>
             startPaneResize(event, {
               max: 520,
@@ -3004,11 +3318,10 @@ export default function App() {
         />
       ) : null}
       <CreateWorkflowDialog
-        defaultProjectRoot={activeWorkflow?.projectRoot ?? ""}
+        defaultProjectRoot={panelProjectRoot}
         error={createState.error}
         open={createDialogOpen}
         saving={createState.saving}
-        templates={workflowTemplates}
         onClose={() => {
           if (!createState.saving) {
             setCreateDialogOpen(false);
@@ -3016,19 +3329,21 @@ export default function App() {
           }
         }}
         onCreate={createWorkflow}
+        onImport={importWorkflowFromDialog}
       />
 
       <ExportWorkflowDialog
+        directory={exportDialog.directory}
         error={exportDialog.error}
         open={Boolean(exportDialog.workflow)}
-        outputPath={exportDialog.outputPath}
         saving={exportDialog.saving}
         workflow={exportDialog.workflow}
         onClose={() => {
           if (!exportDialog.saving) {
-            setExportDialog({ error: "", outputPath: "", saving: false, workflow: null });
+            setExportDialog({ directory: "", error: "", grantId: "", saving: false, workflow: null });
           }
         }}
+        onChooseFolder={chooseExportDirectory}
         onExport={confirmExportWorkflow}
       />
 
@@ -3047,7 +3362,80 @@ export default function App() {
           }
         />
       ) : null}
+      <TextZoomBar value={textZoom} />
     </main>
+  );
+}
+
+export function loadTextZoom(storage = globalThis.window?.localStorage) {
+  try {
+    const stored = Number(storage?.getItem(TEXT_ZOOM_STORAGE_KEY));
+    return Number.isFinite(stored) && stored
+      ? clampNumber(stored, TEXT_ZOOM_MIN, TEXT_ZOOM_MAX)
+      : 100;
+  } catch {
+    return 100;
+  }
+}
+
+export function nextTextZoom(current, direction) {
+  const value = Number(current);
+  const normalized = Number.isFinite(value)
+    ? Math.round(value / TEXT_ZOOM_STEP) * TEXT_ZOOM_STEP
+    : 100;
+  return clampNumber(
+    normalized + Math.sign(direction) * TEXT_ZOOM_STEP,
+    TEXT_ZOOM_MIN,
+    TEXT_ZOOM_MAX,
+  );
+}
+
+export function textZoomDirection(event) {
+  if (
+    !(event.ctrlKey || event.metaKey)
+    || event.altKey
+    || (event.shiftKey && event.key !== "+")
+  ) {
+    return 0;
+  }
+  const key = String(event.key ?? "");
+  const code = String(event.code ?? "");
+  if (key === "+" || key === "=" || code === "Equal" || code === "NumpadAdd") return 1;
+  if (key === "-" || key === "_" || code === "Minus" || code === "NumpadSubtract") return -1;
+  return 0;
+}
+
+export function eventTargetsGraphVisualization(event) {
+  let target = event?.target;
+  while (target) {
+    if (target.getAttribute?.("data-graph-visualization") === "true") return true;
+    target = target.parentNode;
+  }
+  return false;
+}
+
+export function TextZoomBar({ value = 100 }) {
+  const progress = ((value - TEXT_ZOOM_MIN) / (TEXT_ZOOM_MAX - TEXT_ZOOM_MIN)) * 100;
+  const description = `App zoom ${value}%.`;
+  return (
+    <div
+      aria-label={description}
+      aria-valuemax={TEXT_ZOOM_MAX}
+      aria-valuemin={TEXT_ZOOM_MIN}
+      aria-valuenow={value}
+      className="pointer-events-none fixed bottom-1 right-3 z-[100] flex items-center gap-1.5 text-[9px] tabular-nums text-muted opacity-60"
+      data-text-zoom
+      role="meter"
+      title={description}
+    >
+      <span>Zoom {value}%</span>
+      <span aria-hidden="true" className="relative h-px w-14 overflow-hidden bg-line">
+        <span
+          className="absolute inset-y-0 left-0 bg-current"
+          style={{ width: `${progress}%` }}
+        />
+      </span>
+    </div>
   );
 }
 
@@ -3622,7 +4010,7 @@ export function WorkflowSidebar({
 
   return (
     <aside
-      className="studio-sidebar relative flex shrink-0 flex-col border-r border-line bg-white"
+      className="studio-sidebar relative flex h-full min-h-0 shrink-0 flex-col overflow-hidden border-r border-line bg-white"
       style={{ width }}
     >
       <div
@@ -3642,9 +4030,7 @@ export function WorkflowSidebar({
       <div className="px-3.5 pb-2 pt-3.5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2.5">
-            <span className="grid h-8 w-8 place-items-center rounded-[9px] bg-brand text-white shadow-sm">
-              <Waypoints size={17} />
-            </span>
+            <TaskurottaMark className="h-8 w-8" />
             <div>
               <h1 className="text-[13px] font-semibold leading-tight">Taskurotta</h1>
               <p className="text-[11px] leading-tight text-muted">
@@ -3717,12 +4103,12 @@ export function WorkflowSidebar({
       {view === "graph" ? <div className="px-3.5 pb-2">
         <button
           className="flex h-9 w-full items-center justify-center gap-2 rounded-lg bg-brand px-3 text-xs font-semibold text-white shadow-sm transition hover:bg-indigo-700"
-          title="Create workflow"
+          title="New Workflow"
           type="button"
           onClick={onCreate}
         >
           <Plus size={15} />
-          Create workflow
+          New Workflow
         </button>
       </div> : null}
 
@@ -3971,6 +4357,28 @@ export function loadRecentProjectRoots() {
   } catch {
     return [];
   }
+}
+
+export function loadRecentCodePaths(storage = globalThis.window?.localStorage) {
+  try {
+    const parsed = JSON.parse(storage?.getItem(RECENT_FILES_STORAGE_KEY) ?? "[]");
+    return Array.isArray(parsed)
+      ? parsed.reduceRight((paths, path) => rememberRecentFile(paths, path), [])
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+export function rememberRecentFile(current = [], path = "") {
+  const nextPath = typeof path === "string" ? path.trim() : "";
+  if (!nextPath || nextPath.startsWith("taskurotta-browser:")) return current;
+  return [nextPath, ...current.filter((candidate) => candidate !== nextPath)].slice(0, 8);
+}
+
+export function removeCodePath(current = [], path = "") {
+  if (!path) return current;
+  return current.filter((candidate) => candidate !== path);
 }
 
 export function loadLastWorktreeByProject() {
@@ -4386,7 +4794,7 @@ export function TopBar({
   onToggleTheme,
 }) {
   const hasUpdateBridge = Boolean(window.goferUpdates?.check);
-  const label = hideCodeLabel && view === "code"
+  const label = !workflow || (view === "code" && (hideCodeLabel || !activeCodePath))
     ? null
     : topBarLabelParts(workflow, view, activeCodePath);
   const editorDocument = editorState?.document ?? editorState;
@@ -4425,8 +4833,8 @@ export function TopBar({
         ) : null}
       </div>
       <div className="flex shrink-0 items-center gap-2">
-        {view === "graph" ? <WorkflowSaveStatus saveState={saveState} onRetry={onRetrySave} /> : null}
-        {view === "graph" ? (
+        {view === "graph" && workflow ? <WorkflowSaveStatus saveState={saveState} onRetry={onRetrySave} /> : null}
+        {view === "graph" && workflow ? (
           <>
             <div
               className="flex shrink-0 items-center gap-2"
@@ -4493,8 +4901,9 @@ export function TopBar({
           <SettingsIcon size={16} />
         </button>
         <button
-          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
-          title="Workflow history"
+          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
+          disabled={!workflow}
+          title={workflow ? "Workflow history" : "Workflow history is available after you create a workflow"}
           type="button"
           onClick={onOpenHistory}
         >
@@ -4758,8 +5167,10 @@ export function ChatPane({
   activeWorkflowId,
   assistantDefaults = {},
   audioInputDeviceId = "default",
+  composerFocusRequest = 0,
   onOpenMarkdownLink,
   onOpenFile,
+  onResponseComplete,
   onResizeKeyDown,
   onResizeStart,
   recentProjectRoots = [],
@@ -4769,6 +5180,8 @@ export function ChatPane({
 }) {
   const prospectiveProjectRoot = String(workflow?.projectRoot ?? "").trim();
   const chatScrollRef = useRef(null);
+  const chatPinnedToBottomRef = useRef(true);
+  const renderedConversationRef = useRef({ threadId: null, textKey: "" });
   const conversationMenuRef = useRef(null);
   const dragDepthRef = useRef(0);
   const scopeMenuRef = useRef(null);
@@ -4791,8 +5204,6 @@ export function ChatPane({
   const [chatStateByThread, setChatStateByThread] = useState({});
   const [chatAnnouncementByThread, setChatAnnouncementByThread] = useState({});
   const [backgroundChatAnnouncement, setBackgroundChatAnnouncement] = useState("");
-  const [showTypingByThread, setShowTypingByThread] = useState({});
-  const [typingDelayByThread, setTypingDelayByThread] = useState({});
   const [liveTurnByThread, setLiveTurnByThread] = useState({});
   const [expandedThoughtGroups, setExpandedThoughtGroups] = useState({});
   const [conversationMenuOpen, setConversationMenuOpen] = useState(false);
@@ -4832,14 +5243,43 @@ export function ChatPane({
   const chatAnnouncement = activeThreadId
     ? chatAnnouncementByThread[activeThreadId] ?? ""
     : "";
-  const showTypingIndicator = Boolean(activeThreadId && showTypingByThread[activeThreadId]);
   const liveTurn = activeThreadId ? liveTurnByThread[activeThreadId] : null;
-  const typingDelayKey = activeThreadId ? typingDelayByThread[activeThreadId] ?? 0 : 0;
   const chatItems = useMemo(() => buildChatItems(messages), [messages]);
+  const conversationItems = useMemo(() => {
+    if (!liveTurn || chatItems.some((item) => item.message?.id === liveTurn.id)) return chatItems;
+    return [...chatItems, { type: "message", message: liveTurn }];
+  }, [chatItems, liveTurn]);
+  const latestUserMessageId = useMemo(
+    () => messages.findLast((message) => message.role === "user")?.id ?? null,
+    [messages],
+  );
+  const liveTurnLayoutKey = liveTurn?.changes
+    ? `${liveTurn.id}\u0000${JSON.stringify(liveTurn.changes.files ?? [])}`
+    : liveTurn?.id ?? "";
+  const conversationTextKey = useMemo(
+    () => `${messages.map((message) => `${message.id}\u0000${message.body ?? ""}`).join("\u0001")}\u0002${liveTurnLayoutKey}`,
+    [liveTurnLayoutKey, messages],
+  );
 
   useEffect(() => {
     activeThreadIdRef.current = activeThreadId;
   }, [activeThreadId]);
+
+  useLayoutEffect(() => {
+    const previous = renderedConversationRef.current;
+    const threadChanged = previous.threadId !== activeThreadId;
+    const textChanged = previous.textKey !== conversationTextKey;
+    renderedConversationRef.current = {
+      threadId: activeThreadId,
+      textKey: conversationTextKey,
+    };
+
+    if (!activeThreadId) return;
+    if (threadChanged) chatPinnedToBottomRef.current = true;
+    if (threadChanged || (textChanged && chatPinnedToBottomRef.current)) {
+      scrollConversationToBottom(chatScrollRef.current);
+    }
+  }, [activeThreadId, conversationTextKey]);
 
   useEffect(() => {
     if (!activeThreadId) setHomeProjectRoot(prospectiveProjectRoot);
@@ -4942,21 +5382,6 @@ export function ChatPane({
   }
 
   useEffect(() => {
-    if (!activeThreadId) return undefined;
-
-    if (!chatState.sending) {
-      setShowTypingByThread((current) => ({ ...current, [activeThreadId]: false }));
-      return undefined;
-    }
-
-    const timeoutId = window.setTimeout(() => {
-      setShowTypingByThread((current) => ({ ...current, [activeThreadId]: true }));
-    }, 2000);
-
-    return () => window.clearTimeout(timeoutId);
-  }, [activeThreadId, chatState.sending, typingDelayKey]);
-
-  useEffect(() => {
     if (!conversationMenuOpen) return undefined;
 
     function handlePointerDown(event) {
@@ -4988,19 +5413,19 @@ export function ChatPane({
     };
   }, [scopeMenuOpen]);
 
-  useEffect(() => {
-    if (!showTypingIndicator) return;
-
-    window.requestAnimationFrame(() => {
-      scrollElementIntoView("typing-indicator");
-    });
-  }, [showTypingIndicator]);
-
-  async function sendMessage() {
-    const text = draft.trim();
-    const selectedAttachments = attachments;
-    if ((!text && !selectedAttachments.length) || chatState.sending) return;
+  async function sendMessage(editedMessage = null) {
+    const editedMessageIndex = editedMessage
+      ? messages.findIndex((message) => message.id === editedMessage.id && message.role === "user")
+      : -1;
+    const originalMessage = editedMessageIndex >= 0 ? messages[editedMessageIndex] : null;
+    const text = originalMessage ? String(editedMessage.body ?? "").trim() : draft.trim();
+    const selectedAttachments = originalMessage ? [] : attachments;
+    const hasMessageAttachments = Boolean(
+      originalMessage?.attachments?.length || selectedAttachments.length,
+    );
+    if ((!text && !hasMessageAttachments) || chatState.sending) return;
     const clientTurnStartedAt = Date.now();
+    const turnSummaryId = uniqueClientId();
     const targetThread = activeThread ?? createThread();
     const targetThreadId = targetThread.id;
     const workflowContext = chatWorkflowContextForThread(targetThread, workflows);
@@ -5011,7 +5436,7 @@ export function ChatPane({
     setLiveTurnByThread((current) => ({
       ...current,
       [targetThreadId]: {
-        id: `live-turn-${targetThreadId}`,
+        id: turnSummaryId,
         role: "assistant",
         kind: "turn-summary",
         running: true,
@@ -5021,7 +5446,9 @@ export function ChatPane({
     }));
     let messageAttachments;
     try {
-      messageAttachments = await uploadChatAttachments(selectedAttachments, targetThreadId);
+      messageAttachments = originalMessage
+        ? originalMessage.attachments ?? []
+        : await uploadChatAttachments(selectedAttachments, targetThreadId);
     } catch (error) {
       setLiveTurnByThread((current) => ({ ...current, [targetThreadId]: null }));
       setChatStateByThread((current) => ({
@@ -5041,25 +5468,26 @@ export function ChatPane({
         : threadTitleFromMessage(titleSource);
     deletedChatThreadIdsRef.current.delete(targetThreadId);
 
-    const userMessage = {
-      id: uniqueClientId(),
-      role: "user",
-      body: text,
-      attachments: messageAttachments,
-    };
-    const nextMessages = [...messages, userMessage];
+    const userMessage = originalMessage
+      ? { ...originalMessage, body: text }
+      : {
+          id: uniqueClientId(),
+          role: "user",
+          body: text,
+          attachments: messageAttachments,
+        };
+    const nextMessages = originalMessage
+      ? [...messages.slice(0, editedMessageIndex), userMessage]
+      : [...messages, userMessage];
     updateThreadMessages(targetThreadId, nextMessages);
     updateThreadTitleFromMessage(targetThreadId, titleSource);
     setDraft("");
     setAttachments([]);
+    if (originalMessage) setExpandedThoughtGroups({});
     setBackgroundChatAnnouncement("");
     setChatAnnouncementByThread((current) => ({ ...current, [targetThreadId]: "" }));
     const thoughtGroupId = uniqueClientId();
     let turnSummaryReceived = false;
-    window.requestAnimationFrame(() => {
-      scrollMessageNearTop(userMessage.id);
-    });
-
     function appendAssistantMessage(body, kind = "final", extra = {}) {
       if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
       const assistantMessageId = uniqueClientId();
@@ -5078,28 +5506,13 @@ export function ChatPane({
           },
         ];
       });
-      window.requestAnimationFrame(() => {
-        scrollElementIntoView(
-          kind === "thought" && extra.groupId
-            ? `thought-group-${extra.groupId}`
-            : assistantMessageId,
-        );
-      });
-    }
-
-    function restartTypingDelay() {
-      if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
-      setShowTypingByThread((current) => ({ ...current, [targetThreadId]: false }));
-      setTypingDelayByThread((current) => ({
-        ...current,
-        [targetThreadId]: (current[targetThreadId] ?? 0) + 1,
-      }));
     }
 
     function appendTurnSummary(event) {
       if (!event?.completedAt && event?.durationMs == null && !event?.changes) return;
       turnSummaryReceived = true;
       appendAssistantMessage("", "turn-summary", {
+        id: turnSummaryId,
         completedAt: event.completedAt,
         durationMs: event.durationMs,
         changes: event.changes,
@@ -5159,7 +5572,6 @@ export function ChatPane({
                 groupId: thoughtGroupId,
                 trace: event.trace && typeof event.trace === "object" ? event.trace : undefined,
               });
-              restartTypingDelay();
             } else if (event.type === "compaction") {
               const compactedMessages = Array.isArray(event.messages)
                 ? event.messages
@@ -5173,7 +5585,6 @@ export function ChatPane({
                   { role: "system" },
                 );
               }
-              restartTypingDelay();
             } else if (event.type === "final") {
               finalReceived = true;
               const body = event.message?.body ?? "";
@@ -5187,7 +5598,7 @@ export function ChatPane({
                 ...current,
                 [targetThreadId]: {
                   ...(current[targetThreadId] ?? {}),
-                  id: `live-turn-${targetThreadId}`,
+                  id: turnSummaryId,
                   role: "assistant",
                   kind: "turn-summary",
                   running: true,
@@ -5221,7 +5632,7 @@ export function ChatPane({
             ...current,
             [targetThreadId]: {
               ...(current[targetThreadId] ?? {}),
-              id: `live-turn-${targetThreadId}`,
+              id: turnSummaryId,
               role: "assistant",
               kind: "turn-summary",
               running: true,
@@ -5251,6 +5662,7 @@ export function ChatPane({
         ...current,
         [targetThreadId]: "Workflow assistant response complete.",
       }));
+      void onResponseComplete?.(workflowContext.projectRoot);
     } catch (error) {
       if (error instanceof DOMException && error.name === "AbortError") {
         if (deletedChatThreadIdsRef.current.has(targetThreadId)) return;
@@ -5297,7 +5709,6 @@ export function ChatPane({
 
   function stopAssistant(threadId) {
     chatAbortControllersRef.current[threadId]?.abort();
-    setShowTypingByThread((current) => ({ ...current, [threadId]: false }));
   }
 
   async function toggleAssistantChanges(threadId, messageId, changeSetId, redo) {
@@ -5348,6 +5759,11 @@ export function ChatPane({
       window.localStorage.setItem(chatStorageKeyFor(threadId), JSON.stringify(nextMessages));
       return { ...current, [threadId]: nextMessages };
     });
+  }
+
+  function editUserMessage(messageId, body) {
+    if (!activeThreadId || chatState.sending) return;
+    void sendMessage({ id: messageId, body });
   }
 
   function createThread(projectRoot = scopedProjectRoot) {
@@ -5480,16 +5896,6 @@ export function ChatPane({
       delete next[threadId];
       return next;
     });
-    setShowTypingByThread((current) => {
-      const next = { ...current };
-      delete next[threadId];
-      return next;
-    });
-    setTypingDelayByThread((current) => {
-      const next = { ...current };
-      delete next[threadId];
-      return next;
-    });
     if (activeThreadId === threadId) {
       activeThreadIdRef.current = null;
       setActiveThreadId(null);
@@ -5518,32 +5924,10 @@ export function ChatPane({
     }
   }
 
-  function scrollMessageNearTop(messageId) {
-    const scrollContainer = chatScrollRef.current;
-    const messageElement = scrollContainer?.querySelector(`[data-message-id="${messageId}"]`);
-    if (!scrollContainer || !messageElement) return;
-
-    scrollContainer.scrollTo({
-      top: messageElement.offsetTop - 12,
-      behavior: prefersReducedMotion() ? "auto" : "smooth",
-    });
-  }
-
-  function scrollElementIntoView(elementId) {
-    const scrollContainer = chatScrollRef.current;
-    const element = scrollContainer?.querySelector(`[data-message-id="${elementId}"]`);
-    if (!scrollContainer || !element) return;
-
-    element.scrollIntoView({
-      behavior: prefersReducedMotion() ? "auto" : "smooth",
-      block: "nearest",
-    });
-  }
-
   return (
     <aside
       aria-busy={chatState.sending || undefined}
-      className="studio-chat relative flex shrink-0 flex-col border-l border-line bg-white"
+      className="studio-chat relative flex h-full min-h-0 shrink-0 flex-col overflow-hidden border-l border-line bg-white"
       data-chat-pane="true"
       style={{ width }}
       onDragEnter={handleFileDragEnter}
@@ -5693,7 +6077,11 @@ export function ChatPane({
 
       <div
         ref={chatScrollRef}
-        className="workflow-scrollbar flex-1 space-y-4 overflow-y-auto px-3.5 py-4"
+        data-chat-scroll="true"
+        className="workflow-scrollbar min-h-0 flex-1 space-y-4 overflow-y-auto px-3.5 py-4"
+        onScroll={(event) => {
+          chatPinnedToBottomRef.current = conversationIsAtBottom(event.currentTarget);
+        }}
       >
         {!activeThread ? (
           <div className="min-h-full" data-assistant-home>
@@ -5719,7 +6107,7 @@ export function ChatPane({
           </div>
         ) : (
           <>
-            {chatItems.map((item) =>
+            {conversationItems.map((item) =>
               item.type === "thought-group" ? (
                 <ThoughtGroup
                   key={item.id}
@@ -5737,7 +6125,9 @@ export function ChatPane({
               ) : (
                 <ChatMessageBubble
                   key={item.message.id}
+                  canEdit={!chatState.sending && item.message.id === latestUserMessageId}
                   message={item.message}
+                  onEdit={editUserMessage}
                   onOpenLink={openScopedMarkdownLink}
                   onUndoChanges={() => toggleAssistantChanges(
                     activeThreadId,
@@ -5748,8 +6138,6 @@ export function ChatPane({
                 />
               ),
             )}
-            {liveTurn ? <TurnSummaryCard message={liveTurn} /> : null}
-            {showTypingIndicator ? <TypingIndicator /> : null}
             {chatState.error ? (
               <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700">
                 {chatState.error}
@@ -5783,6 +6171,7 @@ export function ChatPane({
             audioInputDeviceId={audioInputDeviceId}
             contextKey={activeThreadId ?? "new-thread"}
             draft={draft}
+            focusRequest={composerFocusRequest}
             sending={chatState.sending}
             onAddAttachments={addAttachments}
             onAttachmentErrorChange={setAttachmentError}
@@ -5867,29 +6256,58 @@ function ThreadActivityIndicator({ state }) {
   return null;
 }
 
-function TypingIndicator() {
-  return (
-    <div className="flex justify-start" data-message-id="typing-indicator" role="status">
-      <div className="max-w-[86%] rounded-lg border border-line bg-white px-3 py-2 text-sm leading-6 text-slate-700 shadow-sm">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted">Workflow assistant is typing</span>
-          <span className="flex items-center gap-1">
-            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.2s]" />
-            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted [animation-delay:-0.1s]" />
-            <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted" />
-          </span>
-        </div>
-      </div>
-    </div>
-  );
+export function conversationIsAtBottom(element, tolerance = 4) {
+  if (!element) return false;
+  return element.scrollHeight - element.scrollTop - element.clientHeight <= tolerance;
 }
 
-function ChatMessageBubble({ message, onOpenLink, onUndoChanges }) {
+export function scrollConversationToBottom(element) {
+  if (!element) return;
+  element.scrollTop = element.scrollHeight;
+}
+
+function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUndoChanges }) {
+  const [copied, setCopied] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [editDraft, setEditDraft] = useState(message.body);
+  const copyResetTimerRef = useRef(null);
+
+  useEffect(() => () => window.clearTimeout(copyResetTimerRef.current), []);
+
   if (message.kind === "turn-summary") {
     return <TurnSummaryCard message={message} onUndo={onUndoChanges} />;
   }
   const isSystem = message.role === "system" || message.kind === "system";
   const isUser = message.role === "user";
+
+  async function copyMessage() {
+    try {
+      await navigator.clipboard.writeText(message.body);
+      setCopied(true);
+      window.clearTimeout(copyResetTimerRef.current);
+      copyResetTimerRef.current = window.setTimeout(() => setCopied(false), 2000);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  function beginEditing() {
+    setEditDraft(message.body);
+    setEditing(true);
+  }
+
+  function cancelEditing() {
+    setEditDraft(message.body);
+    setEditing(false);
+  }
+
+  function saveEdit() {
+    const body = editDraft.trim();
+    if (!body && !message.attachments?.length) return;
+    onEdit?.(message.id, body);
+    setEditing(false);
+  }
+
   return (
     <div
       data-message-id={message.id}
@@ -5910,8 +6328,63 @@ function ChatMessageBubble({ message, onOpenLink, onUndoChanges }) {
           <span className="whitespace-pre-wrap">{message.body}</span>
         ) : (
           <>
+            {isUser ? (
+              <div className="mb-1 flex h-5 items-center justify-end gap-0.5">
+                {canEdit ? (
+                  <button
+                    aria-label="Edit message"
+                    className="grid h-5 w-5 place-items-center rounded text-indigo-100 outline-none transition hover:bg-white/15 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70"
+                    title="Edit message"
+                    type="button"
+                    onClick={beginEditing}
+                  >
+                    <PencilLine aria-hidden="true" size={11} />
+                  </button>
+                ) : null}
+                <button
+                  aria-label={copied ? "Message copied" : "Copy message"}
+                  className="grid h-5 w-5 place-items-center rounded text-indigo-100 outline-none transition hover:bg-white/15 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70"
+                  title={copied ? "Message copied" : "Copy message"}
+                  type="button"
+                  onClick={() => void copyMessage()}
+                >
+                  {copied ? <Check aria-hidden="true" size={11} /> : <Copy aria-hidden="true" size={11} />}
+                </button>
+              </div>
+            ) : null}
             {isUser ? <MessageAttachments attachments={message.attachments} inverse /> : null}
-            {message.body ? (
+            {isUser && editing ? (
+              <div className="space-y-2">
+                <textarea
+                  aria-label="Edit message text"
+                  autoFocus
+                  className="workflow-scrollbar max-h-48 min-h-20 w-full resize-y rounded-md border border-white/35 bg-white/10 px-2.5 py-2 text-sm leading-5 text-white outline-none placeholder:text-indigo-200 focus:border-white/70 focus:ring-2 focus:ring-white/25"
+                  value={editDraft}
+                  onChange={(event) => setEditDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") cancelEditing();
+                    if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) saveEdit();
+                  }}
+                />
+                <div className="flex justify-end gap-1.5">
+                  <button
+                    className="h-7 rounded-md px-2 text-xs font-medium text-indigo-100 outline-none transition hover:bg-white/15 hover:text-white focus-visible:ring-2 focus-visible:ring-white/70"
+                    type="button"
+                    onClick={cancelEditing}
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    className="h-7 rounded-md bg-white px-2.5 text-xs font-semibold text-brand outline-none transition hover:bg-indigo-50 focus-visible:ring-2 focus-visible:ring-white/70 disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={!editDraft.trim() && !message.attachments?.length}
+                    type="button"
+                    onClick={saveEdit}
+                  >
+                    Send again
+                  </button>
+                </div>
+              </div>
+            ) : message.body ? (
               <MarkdownMessage inverse={isUser} onOpenLink={onOpenLink} value={message.body} />
             ) : null}
           </>
@@ -6164,6 +6637,8 @@ function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) 
                     <ShellCommandDisclosure entry={entry} />
                   ) : editTraceDetails(entry) ? (
                     <EditDisclosure entry={entry} onOpenFile={onOpenFile} />
+                  ) : entry.kind === "tool" && (entry.input || entry.output) ? (
+                    <ToolTraceDisclosure entry={entry} />
                   ) : entry.kind === "tool" || !entry.body ? (
                     <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 text-xs leading-5">
                       {entry.title ? (
@@ -6179,12 +6654,6 @@ function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) 
                       <MarkdownMessage compact onOpenLink={onOpenLink} value={entry.body} />
                     </div>
                   ) : null}
-                  {entry.kind === "tool" && !shellTraceDetails(entry) && !editTraceDetails(entry) && (entry.input || entry.output) ? (
-                    <div className="mt-2 overflow-hidden rounded-md border border-line bg-white dark:bg-[#181818]">
-                      {entry.input ? <TracePayload label="In" value={entry.input} /> : null}
-                      {entry.output ? <TracePayload label="Out" value={entry.output} divided={Boolean(entry.input)} /> : null}
-                    </div>
-                  ) : null}
                 </div>
               ))}
             </div>
@@ -6193,6 +6662,71 @@ function ThoughtGroup({ expanded, onOpenFile, onOpenLink, onToggle, thoughts }) 
       </div>
     </div>
   );
+}
+
+function ToolTraceDisclosure({ entry }) {
+  const [expanded, setExpanded] = useState(false);
+  const detail = toolTraceDisclosureDetail(entry);
+  const isSearch = entry.category === "search"
+    || String(entry.title || "").trim().toLowerCase().includes("search");
+
+  return (
+    <div className="min-w-0">
+      <button
+        aria-expanded={expanded}
+        className="group -ml-1 flex min-h-7 w-[calc(100%+0.25rem)] items-center gap-2 rounded-md px-1 text-left text-xs outline-none transition-colors hover:bg-slate-100/70 focus-visible:ring-2 focus-visible:ring-brand/30 dark:hover:bg-[#242426]"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span className="shrink-0 font-semibold text-ink group-hover:text-brand">
+          {entry.title || "Tool"}
+        </span>
+        {detail && (!isSearch || expanded) ? (
+          <span className="min-w-0 flex-1 truncate text-muted" title={detail}>{detail}</span>
+        ) : (
+          <span className="flex-1" />
+        )}
+        <ChevronRight
+          aria-hidden="true"
+          className={`shrink-0 text-muted transition-transform duration-150 group-hover:text-ink ${expanded ? "rotate-90" : ""}`}
+          size={14}
+        />
+      </button>
+      <div
+        className={`grid transition-[grid-template-rows,opacity] duration-150 ease-out ${
+          expanded ? "grid-rows-[1fr] opacity-100" : "grid-rows-[0fr] opacity-0"
+        }`}
+      >
+        <div className="overflow-hidden">
+          <div className="mt-1 overflow-hidden rounded-md border border-line bg-white dark:bg-[#181818]">
+            {entry.input ? <TracePayload label="In" value={entry.input} /> : null}
+            {entry.output ? <TracePayload label="Out" value={entry.output} divided={Boolean(entry.input)} /> : null}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function toolTraceDisclosureDetail(entry) {
+  const detail = String(entry?.detail || "").trim();
+  if (detail) return detail;
+
+  const title = String(entry?.title || "").trim().toLowerCase();
+  if (entry?.category !== "search" && !title.includes("search")) return "";
+
+  const input = String(entry?.input || "").trim();
+  if (!input) return "";
+  try {
+    const parsed = JSON.parse(input);
+    const query = parsed?.query
+      ?? parsed?.q
+      ?? parsed?.search_query?.[0]?.q
+      ?? parsed?.image_query?.[0]?.q;
+    return typeof query === "string" ? query.trim() : "";
+  } catch {
+    return input.includes("\n") ? "" : input;
+  }
 }
 
 function EditDisclosure({ entry, onOpenFile }) {
@@ -7061,27 +7595,30 @@ export function CreateWorkflowDialog({
   error,
   open,
   saving,
-  templates,
   onClose,
   onCreate,
+  onImport,
 }) {
   const [name, setName] = useState("");
-  const [mode, setMode] = useState("blank");
-  const [templateName, setTemplateName] = useState("");
+  const [mode, setMode] = useState("create");
   const [projectRoot, setProjectRoot] = useState("");
   const [projectError, setProjectError] = useState("");
   const [pickingProject, setPickingProject] = useState(false);
-
-  const selectedTemplate = templates.find((item) => item.name === templateName) ?? null;
+  const [importFile, setImportFile] = useState(null);
+  const [importError, setImportError] = useState("");
+  const [dragActive, setDragActive] = useState(false);
+  const importInputRef = useRef(null);
 
   useEffect(() => {
     if (open) {
       setName("");
-      setMode("blank");
-      setTemplateName("");
+      setMode("create");
       setProjectRoot(defaultProjectRoot);
       setProjectError("");
       setPickingProject(false);
+      setImportFile(null);
+      setImportError("");
+      setDragActive(false);
     }
   }, [defaultProjectRoot, open]);
 
@@ -7094,11 +7631,29 @@ export function CreateWorkflowDialog({
       setProjectError("Choose the project folder that will own this workflow.");
       return;
     }
+    if (mode === "import") {
+      if (!importFile) {
+        setImportError("Choose a .taskurotta bundle to import.");
+        return;
+      }
+      onImport(importFile, selectedProject);
+      return;
+    }
     onCreate(name, {
       projectRoot: selectedProject,
       projectGrantId: window.goferDesktop?.workspace?.pathGrantForApi?.(selectedProject) ?? "",
-      template: mode === "template" ? templateName : "",
     });
+  }
+
+  function chooseImportFile(file) {
+    if (!file) return;
+    if (!isTaskurottaFile(file)) {
+      setImportFile(null);
+      setImportError("Choose a .taskurotta bundle.");
+      return;
+    }
+    setImportFile(file);
+    setImportError("");
   }
 
   async function pickProjectFolder() {
@@ -7127,7 +7682,7 @@ export function CreateWorkflowDialog({
 
   return (
     <Dialog
-      description="Create a workflow inside a project folder"
+      description="Create a new workflow or import an existing workflow bundle"
       onClose={onClose}
       panelClassName="w-full max-w-[560px] rounded-lg border border-line bg-white shadow-panel"
       panelProps={{ "aria-busy": saving || undefined }}
@@ -7137,7 +7692,7 @@ export function CreateWorkflowDialog({
         <div className="flex items-center justify-between border-b border-line px-5 py-4">
           <div>
             <h2 className="text-base font-semibold">New workflow</h2>
-            <p className="text-xs text-muted">Stored under the project&apos;s .taskurotta folder</p>
+            <p className="text-xs text-muted">Create one from scratch or import a bundle</p>
           </div>
           <button
             className="grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
@@ -7151,43 +7706,111 @@ export function CreateWorkflowDialog({
         </div>
 
         <div className="space-y-4 px-5 py-5">
-          <div className="grid grid-cols-2 gap-2 rounded-lg bg-slate-100 p-1">
+          <div className="grid grid-cols-2 gap-1 rounded-lg bg-slate-100 p-1" role="tablist" aria-label="Workflow source">
             <button
-              className={`h-9 rounded-md text-sm font-medium transition ${
-                mode === "blank" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
+              aria-selected={mode === "create"}
+              className={`inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium transition ${
+                mode === "create" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
               }`}
               disabled={saving}
+              role="tab"
               type="button"
-              onClick={() => setMode("blank")}
+              onClick={() => setMode("create")}
             >
-              Blank
+              <Plus aria-hidden="true" size={15} />
+              Create new
             </button>
             <button
-              className={`h-9 rounded-md text-sm font-medium transition ${
-                mode === "template" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
-              } disabled:cursor-not-allowed disabled:opacity-50`}
-              disabled
-              title="Templates will return after they have been migrated to Radish"
+              aria-selected={mode === "import"}
+              className={`inline-flex h-9 items-center justify-center gap-2 rounded-md text-sm font-medium transition ${
+                mode === "import" ? "bg-white text-ink shadow-sm" : "text-muted hover:text-ink"
+              }`}
+              disabled={saving}
+              role="tab"
               type="button"
               onClick={() => {
-                setMode("template");
-                setTemplateName((current) => current || templates[0]?.name || "");
+                setMode("import");
+                setProjectError("");
               }}
             >
-              Template
+              <Upload aria-hidden="true" size={15} />
+              Import
             </button>
           </div>
-          <label className="block">
-            <span className="text-xs font-medium text-muted">Name</span>
-            <input
-              autoFocus
-              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
-              disabled={saving}
-              placeholder="Daily Analysis"
-              value={name}
-              onChange={(event) => setName(event.target.value)}
-            />
-          </label>
+          {mode === "create" ? (
+            <label className="block">
+              <span className="text-xs font-medium text-muted">Name</span>
+              <input
+                autoFocus
+                className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-indigo-500"
+                disabled={saving}
+                placeholder="Daily Analysis"
+                value={name}
+                onChange={(event) => setName(event.target.value)}
+              />
+            </label>
+          ) : (
+            <div>
+              <span className="text-xs font-medium text-muted">Workflow bundle</span>
+              <input
+                ref={importInputRef}
+                accept=".taskurotta"
+                className="hidden"
+                type="file"
+                onChange={(event) => {
+                  chooseImportFile(event.target.files?.[0]);
+                  event.target.value = "";
+                }}
+              />
+              <button
+                aria-describedby={importError ? "workflow-import-error" : "workflow-import-hint"}
+                className={`mt-1 flex min-h-24 w-full items-center gap-3 rounded-lg border border-dashed px-4 text-left transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${dragActive ? "border-indigo-500 bg-indigo-50" : "border-indigo-200 bg-slate-50 hover:border-indigo-400 hover:bg-indigo-50/60"}`}
+                disabled={saving}
+                type="button"
+                onClick={() => importInputRef.current?.click()}
+                onDragEnter={(event) => {
+                  event.preventDefault();
+                  setDragActive(true);
+                }}
+                onDragLeave={(event) => {
+                  if (!event.currentTarget.contains(event.relatedTarget)) setDragActive(false);
+                }}
+                onDragOver={(event) => {
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "copy";
+                }}
+                onDrop={(event) => {
+                  event.preventDefault();
+                  setDragActive(false);
+                  chooseImportFile(event.dataTransfer.files?.[0]);
+                }}
+              >
+                <span className="grid h-10 w-10 shrink-0 place-items-center rounded-lg bg-indigo-100 text-indigo-700">
+                  <FileArchive aria-hidden="true" size={19} />
+                </span>
+                <span className="min-w-0 flex-1">
+                  <span className="block truncate text-sm font-medium text-ink">
+                    {importFile?.name || "Choose a .taskurotta bundle"}
+                  </span>
+                  <span className="mt-1 block text-xs text-muted">
+                    {importFile ? "Ready to import" : "Browse or drop a bundle here"}
+                  </span>
+                </span>
+                <span className="shrink-0 text-xs font-semibold text-indigo-700">
+                  {importFile ? "Replace" : "Browse"}
+                </span>
+              </button>
+              {importError ? (
+                <p className="mt-1 text-xs text-rose-700" id="workflow-import-error" role="alert">
+                  {importError}
+                </p>
+              ) : (
+                <p className="mt-1 text-xs text-muted" id="workflow-import-hint">
+                  Taskurotta checks the bundle before adding it to your project.
+                </p>
+              )}
+            </div>
+          )}
           <div>
             <span className="text-xs font-medium text-muted">Project folder</span>
             <div className="mt-1 flex gap-2">
@@ -7218,65 +7841,12 @@ export function CreateWorkflowDialog({
               </p>
             ) : (
               <p className="mt-1 text-xs text-muted" id="project-folder-hint">
-                Taskurotta will create .taskurotta/&lt;workflow-id&gt; inside this folder.
+                {mode === "create"
+                  ? "Taskurotta will create .taskurotta/<workflow-id> inside this folder."
+                  : "Taskurotta will add the imported workflow under .taskurotta."}
               </p>
             )}
           </div>
-          {mode === "template" ? (
-            <>
-              <label className="block">
-                <span className="text-xs font-medium text-muted">Template</span>
-                <select
-                  className="mt-1 h-10 w-full rounded-lg border border-line bg-white px-3 text-sm outline-none transition focus:border-teal-500"
-                  disabled={saving}
-                  value={templateName}
-                  onChange={(event) => setTemplateName(event.target.value)}
-                >
-                  <option value="" disabled>
-                    Select a template
-                  </option>
-                  {templates.map((template) => (
-                    <option key={template.name} value={template.name}>
-                      {template.title}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {selectedTemplate ? (
-                <div className="rounded-lg border border-line bg-slate-50 px-3 py-3 text-sm">
-                  <div className="font-medium text-ink">{selectedTemplate.purpose}</div>
-                  <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                    <TemplatePreviewList
-                      title="Inputs"
-                      items={(selectedTemplate.required_inputs ?? []).map(
-                        (item) => `${item.name} (${item.type ?? "string"})`,
-                      )}
-                    />
-                    <TemplatePreviewList
-                      title="Providers"
-                      items={(selectedTemplate.provider_assumptions ?? []).map(
-                        (item) => `${item.agentId}: ${item.subscription}`,
-                      )}
-                    />
-                    <TemplatePreviewList
-                      title="Nodes"
-                      items={(selectedTemplate.generated_nodes ?? []).map(
-                        (item) => `${item.id} (${item.type})`,
-                      )}
-                    />
-                    <TemplatePreviewList
-                      title="Assets"
-                      items={(selectedTemplate.assets ?? []).map((item) => item.path)}
-                    />
-                  </div>
-                </div>
-              ) : (
-                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                  Template previews are unavailable.
-                </div>
-              )}
-            </>
-          ) : null}
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700" role="alert">
               {error}
@@ -7295,11 +7865,17 @@ export function CreateWorkflowDialog({
           </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={saving || !projectRoot.trim() || (mode === "blank" && !name.trim()) || (mode === "template" && !templateName)}
+            disabled={saving || !projectRoot.trim() || (mode === "create" ? !name.trim() : !importFile)}
             type="submit"
           >
-            {saving ? <Loader2 size={15} className="animate-spin" /> : <Plus size={15} />}
-            Create
+            {saving ? (
+              <Loader2 aria-hidden="true" size={15} className="animate-spin" />
+            ) : mode === "create" ? (
+              <Plus aria-hidden="true" size={15} />
+            ) : (
+              <Upload aria-hidden="true" size={15} />
+            )}
+            {saving ? (mode === "create" ? "Creating..." : "Importing...") : mode === "create" ? "Create" : "Import"}
           </button>
         </div>
       </form>
@@ -7308,27 +7884,22 @@ export function CreateWorkflowDialog({
 }
 
 export function ExportWorkflowDialog({
+  directory,
   error,
   open,
-  outputPath,
   saving,
   workflow,
   onClose,
+  onChooseFolder,
   onExport,
 }) {
-  const [draftPath, setDraftPath] = useState(outputPath || "");
-
-  useEffect(() => {
-    if (open) {
-      setDraftPath(outputPath || "");
-    }
-  }, [open, outputPath]);
+  const radishBundle = workflow?.sourceFormat === "radish";
 
   if (!open) return null;
 
   function handleSubmit(event) {
     event.preventDefault();
-    onExport(draftPath);
+    onExport(directory);
   }
 
   return (
@@ -7344,7 +7915,11 @@ export function ExportWorkflowDialog({
           <div>
             <h2 className="text-base font-semibold">Export workflow bundle</h2>
             <p className="text-xs text-muted">
-              {workflow?.name ? `Create a portable bundle for ${workflow.name}` : "Create a portable workflow bundle"}
+              {radishBundle
+                ? "Includes workflow files except those matched by .taskurottaignore"
+                : workflow?.name
+                  ? `Create a portable bundle for ${workflow.name}`
+                  : "Create a portable workflow bundle"}
             </p>
           </div>
           <button
@@ -7359,17 +7934,29 @@ export function ExportWorkflowDialog({
         </div>
 
         <div className="space-y-4 px-5 py-5">
-          <label className="block">
-            <span className="text-xs font-medium text-muted">Output path</span>
-            <input
+          <div>
+            <span className="text-xs font-medium text-muted">Export folder</span>
+            <button
               autoFocus
-              className="mt-1 h-10 w-full rounded-lg border border-line px-3 text-sm outline-none transition focus:border-teal-500"
+              className="mt-1 flex h-10 w-full min-w-0 items-center gap-2 rounded-lg border border-line bg-white px-3 text-left text-sm outline-none transition hover:border-slate-300 focus-visible:border-teal-500 focus-visible:ring-2 focus-visible:ring-teal-100 disabled:cursor-not-allowed disabled:opacity-60"
               disabled={saving}
-              placeholder="/path/to/workflow.gof.zip"
-              value={draftPath}
-              onChange={(event) => setDraftPath(event.target.value)}
-            />
-          </label>
+              title="Choose export folder"
+              type="button"
+              onClick={onChooseFolder}
+            >
+              <FolderOpen aria-hidden="true" className="shrink-0 text-muted" size={16} />
+              <span className={`min-w-0 flex-1 truncate ${directory ? "text-ink" : "text-muted"}`}>
+                {directory || "Choose a folder"}
+              </span>
+              <span className="shrink-0 text-xs font-medium text-brand">Choose</span>
+            </button>
+          </div>
+          <div className="rounded-lg bg-slate-50 px-3 py-2">
+            <div className="text-[11px] font-medium text-muted">Bundle filename</div>
+            <code className="mt-0.5 block truncate text-xs text-ink">
+              {workflowBundleFilename(workflow)}
+            </code>
+          </div>
           {error ? (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm leading-5 text-red-700" role="alert">
               {error}
@@ -7388,7 +7975,7 @@ export function ExportWorkflowDialog({
           </button>
           <button
             className="inline-flex h-9 items-center gap-2 rounded-lg bg-brand px-3 text-sm font-medium text-white transition hover:bg-teal-700 disabled:cursor-not-allowed disabled:opacity-60"
-            disabled={saving || !draftPath.trim()}
+            disabled={saving || !directory.trim()}
             title="Confirm workflow export"
             type="submit"
           >
@@ -7401,50 +7988,210 @@ export function ExportWorkflowDialog({
   );
 }
 
-function TemplatePreviewList({ title, items }) {
-  const visibleItems = items?.length ? items.slice(0, 4) : ["None"];
-  return (
-    <div>
-      <div className="text-xs font-semibold text-muted">{title}</div>
-      <ul className="mt-1 space-y-1 text-xs leading-5 text-slate-700">
-        {visibleItems.map((item) => (
-          <li key={item}>{item}</li>
-        ))}
-      </ul>
-    </div>
-  );
-}
+function EmptyWorkspace({
+  error,
+  loading,
+  notice,
+  onCreate,
+  onImport,
+  onOpenAssistant,
+  onOpenProject,
+  onOpenSettings,
+  onRefresh,
+  projectRoot,
+}) {
+  const importInputRef = useRef(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState("");
+  const projectName = projectNameFromPath(projectRoot);
 
-function EmptyWorkspace({ error, loading, onOpenSettings, onRefresh }) {
-  return (
-    <div className="flex flex-1 items-center justify-center p-8">
-      <div className="w-full max-w-md rounded-lg border border-line bg-white p-6 text-center shadow-panel">
-        <div className="mx-auto grid h-11 w-11 place-items-center rounded-lg bg-slate-100 text-slate-700">
-          {loading ? <Loader2 size={22} className="animate-spin" /> : <AlertCircle size={22} />}
+  async function startImport(file) {
+    if (!file) return;
+    if (!isTaskurottaFile(file)) {
+      setImportError("Choose a .taskurotta bundle.");
+      return;
+    }
+    setImportError("");
+    setImporting(true);
+    try {
+      await onImport(file);
+    } finally {
+      setImporting(false);
+    }
+  }
+
+  if (loading) {
+    return (
+      <div className="flex flex-1 items-center justify-center bg-[#f9fbfd]">
+        <div className="flex items-center gap-2 text-sm text-muted" role="status">
+          <Loader2 aria-hidden="true" className="animate-spin" size={18} />
+          Loading workflows
         </div>
-        <h2 className="mt-4 text-base font-semibold">
-          {loading ? "Loading workflows" : "No workflow selected"}
+      </div>
+    );
+  }
+  return (
+    <div className="relative flex flex-1 items-center overflow-auto bg-[#f9fbfd] px-[clamp(24px,6vw,88px)] py-[clamp(28px,6vh,56px)]">
+      <div aria-hidden="true" className="absolute inset-0 bg-[radial-gradient(circle_at_1px_1px,#dbe3ec_1px,transparent_0)] bg-[size:22px_22px] opacity-45" />
+      <div aria-hidden="true" className="absolute right-[4%] top-1/2 hidden h-64 w-80 -translate-y-1/2 2xl:block">
+        <div className="absolute left-4 top-24 h-px w-52 -rotate-[15deg] bg-indigo-200" />
+        <div className="absolute left-24 top-24 h-px w-44 rotate-[24deg] bg-indigo-200" />
+        <div className="absolute left-10 top-16 h-16 w-32 rounded-[14px] bg-white shadow-panel">
+          <span className="absolute left-4 top-4 h-2 w-14 rounded-full bg-indigo-200" />
+          <span className="absolute left-4 top-8 h-2 w-20 rounded-full bg-slate-200" />
+        </div>
+        <div className="absolute bottom-10 right-4 h-16 w-32 rounded-[14px] bg-white shadow-panel">
+          <span className="absolute left-4 top-4 h-2 w-16 rounded-full bg-indigo-200" />
+          <span className="absolute left-4 top-8 h-2 w-12 rounded-full bg-slate-200" />
+        </div>
+        <div className="absolute right-24 top-2 h-14 w-28 rounded-[14px] bg-white shadow-panel">
+          <span className="absolute left-4 top-4 h-2 w-12 rounded-full bg-indigo-200" />
+          <span className="absolute left-4 top-8 h-2 w-16 rounded-full bg-slate-200" />
+        </div>
+      </div>
+      <div className="empty-workspace-panel relative z-10 w-full max-w-[800px] rounded-2xl p-[clamp(24px,4vw,40px)]">
+        <div className="mb-5 grid h-11 w-11 place-items-center rounded-xl bg-indigo-50 text-brand">
+          <Waypoints aria-hidden="true" size={24} />
+        </div>
+        <h2 className="max-w-lg text-[28px] font-semibold leading-[1.15] tracking-[-0.025em] text-ink">
+          Build your first local workflow
         </h2>
-        <p className="mt-2 text-sm leading-6 text-muted">
-          {error || "Create or save a workflow TOML file in the Taskurotta data directory."}
+        <p className="mt-3 max-w-[56ch] text-sm leading-6 text-slate-600">
+          Connect commands, scripts, and agents on the graph. Your workflow stays in the project and runs on your machine.
         </p>
-        <div className="mt-5 flex justify-center gap-2">
-          <button
-            className="inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-slate-50"
-            type="button"
-            onClick={onOpenSettings}
+        {error ? (
+          <div className="mt-5 flex max-w-lg items-start gap-2 rounded-[10px] bg-red-50 px-3 py-2.5 text-sm text-red-800" role="alert">
+            <AlertCircle aria-hidden="true" className="mt-0.5 shrink-0" size={16} />
+            <span className="min-w-0 flex-1">{error}</span>
+            <button className="shrink-0 font-medium underline underline-offset-2" type="button" onClick={onRefresh}>Retry</button>
+          </div>
+        ) : null}
+        {!error && notice?.message ? (
+          <div
+            className={`mt-5 flex max-w-xl items-start gap-2 rounded-[10px] px-3 py-2.5 text-sm ${notice.type === "error" ? "bg-red-50 text-red-800" : "bg-emerald-50 text-emerald-800"}`}
+            role={notice.type === "error" ? "alert" : "status"}
           >
-            <SettingsIcon size={15} />
-            Settings
+            {notice.type === "error" ? <AlertCircle aria-hidden="true" className="mt-0.5 shrink-0" size={16} /> : <Check aria-hidden="true" className="mt-0.5 shrink-0" size={16} />}
+            <span>{notice.message}</span>
+          </div>
+        ) : null}
+        <input
+          ref={importInputRef}
+          accept=".taskurotta"
+          className="hidden"
+          type="file"
+          onChange={(event) => {
+            const file = event.target.files?.[0];
+            if (file) void startImport(file);
+            event.target.value = "";
+          }}
+        />
+        <section
+          aria-busy={importing || undefined}
+          className={`empty-import-zone mt-6 flex max-w-2xl items-center gap-4 rounded-xl border border-dashed p-4 ${dragActive ? "empty-import-zone--active" : ""}`}
+          onDragEnter={(event) => {
+            event.preventDefault();
+            setDragActive(true);
+          }}
+          onDragLeave={(event) => {
+            if (!event.currentTarget.contains(event.relatedTarget)) setDragActive(false);
+          }}
+          onDragOver={(event) => {
+            event.preventDefault();
+            event.dataTransfer.dropEffect = "copy";
+          }}
+          onDrop={(event) => {
+            event.preventDefault();
+            setDragActive(false);
+            void startImport(event.dataTransfer.files?.[0]);
+          }}
+        >
+          <span className="empty-import-icon grid h-12 w-12 shrink-0 place-items-center rounded-xl text-brand">
+            <FileArchive aria-hidden="true" size={23} />
+          </span>
+          <div className="min-w-0 flex-1">
+            <h3 className="text-sm font-semibold text-ink">Bring in an existing workflow</h3>
+            <p className="mt-1 text-xs leading-5 text-muted">
+              {projectRoot
+                ? <>The bundle will be added to <strong className="font-semibold text-ink">{projectName}</strong> under <code className="font-mono text-[11px]">.taskurotta</code>.</>
+                : "Choose a bundle, then select the project folder where it should live."}
+            </p>
+            {importError ? <p className="mt-1 text-xs font-medium text-red-700" role="alert">{importError}</p> : null}
+          </div>
+          <button
+            className="inline-flex h-10 shrink-0 items-center gap-2 rounded-lg bg-brand px-4 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 disabled:cursor-wait disabled:opacity-70 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            disabled={importing}
+            type="button"
+            onClick={() => importInputRef.current?.click()}
+          >
+            {importing ? <Loader2 aria-hidden="true" className="animate-spin" size={16} /> : <Upload aria-hidden="true" size={16} />}
+            {importing ? "Importing..." : "Import workflow"}
+          </button>
+        </section>
+        <p className="mt-2 max-w-2xl text-center text-[11px] leading-4 text-muted">Drop a .taskurotta bundle here</p>
+        <div className="mt-5 flex flex-wrap items-center gap-2.5">
+          <span className="mr-1 text-xs font-medium text-muted">Starting fresh?</span>
+          <button
+            className="inline-flex h-9 items-center gap-2 rounded-lg border border-line bg-white px-3.5 text-sm font-medium text-ink transition hover:border-slate-300 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600"
+            type="button"
+            onClick={onCreate}
+          >
+            <Plus aria-hidden="true" size={16} />
+            New Workflow
           </button>
           <button
-            className="inline-flex h-9 items-center gap-2 rounded-lg bg-ink px-3 text-sm font-medium text-white transition hover:bg-slate-700"
+            className="inline-flex h-9 items-center gap-2 px-2 text-sm font-medium text-slate-600 transition hover:text-ink focus-visible:rounded-md focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600"
             type="button"
-            onClick={onRefresh}
+            onClick={onOpenProject}
           >
-            <RefreshCw size={15} />
-            Refresh
+            <FolderOpen aria-hidden="true" size={16} />
+            Open project
           </button>
+        </div>
+        <button className="mt-3 text-xs text-muted underline-offset-2 hover:text-ink hover:underline" type="button" onClick={onOpenSettings}>Workspace settings</button>
+        <div className="mt-6 grid gap-5 border-t border-line pt-5 md:grid-cols-3 md:gap-0 md:divide-x md:divide-line">
+          <div className="flex items-start gap-3 md:pr-5">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-indigo-50 text-indigo-600">
+              <Bot aria-hidden="true" size={16} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-ink">Workflow assistant</p>
+              <p className="mt-1 text-xs leading-5 text-muted">
+                Describe the automation you need. Installed Codex or Claude Code can use your existing subscription to build it.
+              </p>
+              <button
+                className="mt-2 inline-flex h-7 items-center gap-1 rounded-md text-xs font-semibold text-indigo-700 transition hover:text-indigo-900 focus-visible:outline focus-visible:outline-2 focus-visible:outline-indigo-600"
+                type="button"
+                onClick={onOpenAssistant}
+              >
+                Open workflow assistant
+                <ChevronRight aria-hidden="true" size={14} />
+              </button>
+            </div>
+          </div>
+          <div className="flex items-start gap-3 md:px-5">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-indigo-50 text-indigo-600">
+              <Code2 aria-hidden="true" size={16} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-ink">A full IDE, built in</p>
+              <p className="mt-1 text-xs leading-5 text-muted">
+                Edit project files, run commands in the terminal, and work with source control without switching tools.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-start gap-3 md:pl-5">
+            <span className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-indigo-50 text-indigo-600">
+              <Globe2 aria-hidden="true" size={16} />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-ink">Integrated browser</p>
+              <p className="mt-1 text-xs leading-5 text-muted">
+                Open web apps and documentation beside your project while you build and test workflows.
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     </div>

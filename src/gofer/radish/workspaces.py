@@ -139,6 +139,64 @@ def create_registered_workflow(
     return registered
 
 
+def install_registered_workflow(
+    project_root: Path,
+    staged_root: Path,
+    name: str,
+    requested_id: str,
+    *,
+    registry_dir: Path | None = None,
+) -> RegisteredWorkflow:
+    """Move a validated workflow workspace into a project and register it."""
+    project_root = project_root.expanduser().resolve()
+    staged_root = staged_root.expanduser().resolve()
+    if not project_root.is_dir():
+        raise RadishWorkspaceError(f"Project folder does not exist: {project_root}")
+    if not staged_root.is_dir() or not (staged_root / WORKFLOW_ENTRYPOINT).is_file():
+        raise RadishWorkspaceError("Imported workflow is missing workflow.rad")
+    workflow_name = name.strip()
+    if not workflow_name:
+        raise RadishWorkspaceError("Imported workflow name is required")
+
+    registry_root = (registry_dir or get_data_dir()).expanduser().resolve()
+    document = _read_registry(registry_root)
+    workflow_id = _allocate_workflow_id(
+        _slugify(requested_id or workflow_name),
+        document,
+        project_root,
+    )
+    workflow_root = project_root / WORKSPACE_DIRECTORY / workflow_id
+    workflow_root.parent.mkdir(parents=True, exist_ok=True)
+    installed = False
+    try:
+        shutil.move(str(staged_root), str(workflow_root))
+        installed = True
+        entrypoint = workflow_root / WORKFLOW_ENTRYPOINT
+        if not (workflow_root / WORKFLOW_METADATA).is_file():
+            _write_json_atomic(workflow_root / WORKFLOW_METADATA, _initial_metadata())
+        if not (workflow_root / WORKFLOW_IGNORE).is_file():
+            _write_text_atomic(workflow_root / WORKFLOW_IGNORE, DEFAULT_TASKUROTTAIGNORE)
+
+        from gofer.radish.artifacts import compile_radish_file
+
+        compile_radish_file(entrypoint, data_dir=registry_root, workflow_id=workflow_id)
+        registered = RegisteredWorkflow(
+            workflow_id=workflow_id,
+            name=workflow_name,
+            project_root=project_root,
+            workflow_root=workflow_root,
+            entrypoint=entrypoint,
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        _register(document, registered)
+        _write_registry(registry_root, document)
+        return registered
+    except Exception:
+        if installed:
+            shutil.rmtree(workflow_root, ignore_errors=True)
+        raise
+
+
 def discover_registered_workflows(
     project_root: Path,
     *,

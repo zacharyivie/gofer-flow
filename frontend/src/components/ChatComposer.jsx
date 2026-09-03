@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { FileText, Loader2, Mic, Paperclip, Send, Square, X } from "lucide-react";
 
 import {
@@ -17,6 +17,7 @@ export default function ChatComposer({
   audioInputDeviceId = "default",
   contextKey = "",
   draft,
+  focusRequest = 0,
   onAddAttachments = () => {},
   onAttachmentErrorChange = () => {},
   onAttachmentsChange,
@@ -47,6 +48,15 @@ export default function ChatComposer({
     if (!transcribing || !textareaRef.current) return;
     textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
   }, [draft, transcribing]);
+
+  useLayoutEffect(() => {
+    resizeChatComposerTextarea(textareaRef.current);
+  }, [draft]);
+
+  useEffect(() => {
+    if (!focusRequest) return;
+    textareaRef.current?.focus();
+  }, [focusRequest]);
 
   function attachFiles(event) {
     const input = event.target;
@@ -261,6 +271,16 @@ export default function ChatComposer({
       <p className="mt-1.5 px-1 text-[10px] text-muted">Enter to send · Shift+Enter for a new line</p>
     </>
   );
+}
+
+export function resizeChatComposerTextarea(textarea) {
+  if (!textarea) return;
+  textarea.style.height = "auto";
+  const contentHeight = Number(textarea.scrollHeight);
+  if (!Number.isFinite(contentHeight)) return;
+  const height = Math.min(Math.max(contentHeight, 56), 128);
+  textarea.style.height = `${height}px`;
+  textarea.style.overflowY = contentHeight > 128 ? "auto" : "hidden";
 }
 
 export function MessageAttachments({ attachments = [], inverse = false }) {

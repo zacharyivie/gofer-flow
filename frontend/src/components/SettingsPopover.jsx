@@ -250,7 +250,7 @@ function categoryRows(category, settings, onChange, providerState, appControls) 
     row("html", "HTML files", "Choose the mode used when a local HTML file opens.", <SelectControl value={settings.editor.htmlDefault} onChange={(value) => onChange("editor.htmlDefault", value)} options={[["preview", "Browse"], ["edit", "Edit"]]} />),
   ];
   if (category === "browser") return [
-    row("homepage", "New-tab page", "Address loaded when you open an integrated browser tab.", <TextControl value={settings.browser.homepage} placeholder="about:blank" onCommit={(value) => onChange("browser.homepage", value)} />),
+    row("homepage", "Home page", "Address loaded when you open a new integrated browser tab.", <TextControl value={settings.browser.homepage} placeholder={DEFAULT_APP_SETTINGS.browser.homepage} onCommit={(value) => onChange("browser.homepage", value)} />),
     row("search", "Search URL", "Use {query} where the encoded search terms belong.", <TextControl value={settings.browser.searchUrl} placeholder="https://www.google.com/search?q={query}" onCommit={(value) => onChange("browser.searchUrl", value)} />),
   ];
   if (category === "terminal") return [

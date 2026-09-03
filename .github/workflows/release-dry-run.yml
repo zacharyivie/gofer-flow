@@ -1,0 +1,18 @@
+name: Release dry run
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-dry-run:
+    name: Build and test origin/main
+    uses: ./.github/workflows/release-build.yml
+    with:
+      checkout_ref: refs/heads/main
+      publish_release: false

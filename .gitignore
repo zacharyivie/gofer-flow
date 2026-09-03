@@ -13,6 +13,9 @@ build/
 # local dev testing files
 math problems/
 
+# Taskurotta Workflows
+.taskurotta/
+
 # Virtual environments
 .venv/
 .uv-cache/

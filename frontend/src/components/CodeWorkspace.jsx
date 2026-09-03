@@ -17,16 +17,23 @@ import {
   GitCompareArrows,
   Loader2,
   PencilLine,
+  Save,
   X,
 } from "lucide-react";
 import { diagnosticsToMarkers, diagnosticToMarker } from "../lib/radishRanges.js";
 import { DEFAULT_APP_SETTINGS, matchesCommand, settingBinding } from "../lib/settings.js";
+import { Dialog } from "./Dialog.jsx";
 import MarkdownContent from "./MarkdownContent.jsx";
 import IntegratedBrowser, { HtmlModeToggle } from "./IntegratedBrowser.jsx";
 
 const textEditorSessions = new Map();
 const discardedSessionPaths = new Set();
 export const FILE_AUTOSAVE_DELAY_MS = 1000;
+
+export function codeCloseProtection(dirtyPaths, autosaveEnabled) {
+  if (!dirtyPaths.length) return "close";
+  return autosaveEnabled ? "confirm-discard" : "prompt-to-save";
+}
 
 export function applyCodeFilesystemChange(change) {
   if (!change?.path) return;
@@ -61,6 +68,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   openPaths,
   navigationRequest,
   previewPath,
+  recentPaths = [],
   radishDocument,
   radishDirty = false,
   settings = DEFAULT_APP_SETTINGS,
@@ -87,12 +95,14 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   browserTabs = {},
 }, ref) {
   const textEditorRefs = useRef(new Map());
+  const workspaceRef = useRef(null);
   const tabMenuRef = useRef(null);
   const tabMenuFirstActionRef = useRef(null);
   const [fileStates, setFileStates] = useState({});
   const [documentModes, setDocumentModes] = useState({});
   const [diffOnOpenPaths, setDiffOnOpenPaths] = useState(() => new Set());
   const [tabMenu, setTabMenu] = useState(null);
+  const [unsavedClosePrompt, setUnsavedClosePrompt] = useState(null);
   const [draggedPath, setDraggedPath] = useState("");
   const [split, setSplit] = useState(null);
   const sourcePath = workflow?.sourcePath ?? "";
@@ -122,27 +132,56 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     });
   }, [browserTabs, currentPath, fileStates, onActiveDocumentStateChange]);
 
-  const closeWorkspacePaths = useCallback((paths) => {
-    const targets = [...new Set(paths)].filter((path) => openPaths.includes(path));
-    if (!targets.length) return;
-    const dirtyPaths = targets.filter((path) => (
-      path === sourcePath ? radishDirty : Boolean(fileStates[path]?.dirty)
-    ));
-    if (dirtyPaths.length) {
-      const message = targets.length === 1
-        ? `Close ${fileName(targets[0])} without saving your changes?`
-        : `Close ${targets.length} files? Unsaved changes in ${dirtyPaths.length} file${dirtyPaths.length === 1 ? "" : "s"} will be discarded.`;
-      if (!window.confirm(message)) return;
-    }
+  const finishClosingWorkspacePaths = useCallback((targets, discardRadish = false) => {
     for (const path of targets) textEditorRefs.current.get(path)?.discard?.();
     setDocumentModes((current) => Object.fromEntries(
       Object.entries(current).filter(([path]) => !targets.includes(path)),
     ));
     if (onClosePaths) onClosePaths(targets);
     else for (const path of targets) onClosePath?.(path);
-    if (dirtyPaths.includes(sourcePath)) onRadishDiscard?.();
+    if (discardRadish) onRadishDiscard?.();
     setTabMenu(null);
-  }, [fileStates, onClosePath, onClosePaths, onRadishDiscard, openPaths, radishDirty, sourcePath]);
+  }, [onClosePath, onClosePaths, onRadishDiscard]);
+
+  const closeWorkspacePaths = useCallback((paths) => {
+    const targets = [...new Set(paths)].filter((path) => openPaths.includes(path));
+    if (!targets.length) return;
+    const dirtyPaths = targets.filter((path) => (
+      path === sourcePath ? radishDirty : Boolean(fileStates[path]?.dirty)
+    ));
+    const protection = codeCloseProtection(dirtyPaths, settings.general.autosave);
+    if (protection === "prompt-to-save") {
+      setTabMenu(null);
+      setUnsavedClosePrompt({ dirtyPaths, error: "", saving: false, targets });
+      return;
+    }
+    if (protection === "confirm-discard") {
+      const message = targets.length === 1
+        ? `Close ${fileName(targets[0])} without saving your changes?`
+        : `Close ${targets.length} files? Unsaved changes in ${dirtyPaths.length} file${dirtyPaths.length === 1 ? "" : "s"} will be discarded.`;
+      if (!window.confirm(message)) return;
+    }
+    finishClosingWorkspacePaths(targets, dirtyPaths.includes(sourcePath));
+  }, [fileStates, finishClosingWorkspacePaths, openPaths, radishDirty, settings.general.autosave, sourcePath]);
+
+  const saveAndClosePromptedPaths = useCallback(async () => {
+    if (!unsavedClosePrompt || unsavedClosePrompt.saving) return;
+    const { dirtyPaths, targets } = unsavedClosePrompt;
+    setUnsavedClosePrompt((current) => current ? { ...current, error: "", saving: true } : null);
+    const results = await Promise.all(dirtyPaths.map(
+      (path) => textEditorRefs.current.get(path)?.save?.() ?? null,
+    ));
+    if (results.some((result) => !result)) {
+      setUnsavedClosePrompt((current) => current ? {
+        ...current,
+        error: "Taskurotta couldn't save every file. Fix the error in the editor, then try again.",
+        saving: false,
+      } : null);
+      return;
+    }
+    setUnsavedClosePrompt(null);
+    finishClosingWorkspacePaths(targets);
+  }, [finishClosingWorkspacePaths, unsavedClosePrompt]);
 
   const closeWorkspacePath = useCallback((path) => {
     closeWorkspacePaths([path]);
@@ -189,8 +228,27 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     [closeWorkspacePath, currentPath, sourcePath],
   );
 
+  useEffect(() => {
+    if (!active) return undefined;
+    window.addEventListener("keydown", handleWorkspaceKeyDown, true);
+    return () => window.removeEventListener("keydown", handleWorkspaceKeyDown, true);
+  });
+
   function handleWorkspaceKeyDown(event) {
-    const action = codeWorkspaceShortcutAction(event, { active, currentPath, settings });
+    const target = event.target;
+    const targetIsDocument = !target
+      || target === window
+      || target === document
+      || target === document.body
+      || target === document.documentElement;
+    if (!targetIsDocument && !workspaceRef.current?.contains(target)) return;
+    if (target?.closest?.("[role='dialog'], [role='menu']")) return;
+    const action = codeWorkspaceShortcutAction(event, {
+      active,
+      browserActive: Boolean(browserTabs[currentPath]),
+      currentPath,
+      settings,
+    });
     if (!action) return;
     event.preventDefault();
     event.stopPropagation();
@@ -204,6 +262,19 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     }
     if (action === "toggle-word-wrap") {
       onSettingChange?.("editor.wordWrap", !settings.editor.wordWrap);
+      return;
+    }
+    if (action === "next-tab" || action === "previous-tab") {
+      const nextPath = adjacentCodeTab(
+        openPaths,
+        currentPath,
+        action === "previous-tab" ? -1 : 1,
+      );
+      if (nextPath) onActivePathChange?.(nextPath);
+      return;
+    }
+    if (action === "new-browser-tab") {
+      onOpenBrowser?.({ newTab: true });
       return;
     }
     closeWorkspacePath(currentPath);
@@ -225,12 +296,17 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
 
   return (
     <section
+      ref={workspaceRef}
       className="flex min-h-0 flex-1 flex-col bg-white"
       aria-label="Code workspace"
-      onKeyDownCapture={handleWorkspaceKeyDown}
     >
-      <div className="flex h-9 shrink-0 items-center overflow-x-auto border-b border-line bg-slate-50">
-        {openPaths.map((path) => {
+      {openPaths.length ? (
+        <div
+          aria-label="Editor tabs"
+          className="flex h-9 shrink-0 items-center overflow-x-auto border-b border-line bg-slate-50"
+          role="tablist"
+        >
+          {openPaths.map((path) => {
           const browserTab = browserTabs[path];
           const selected = path === currentPath;
           const isRadish = !browserTab && path === sourcePath;
@@ -297,8 +373,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
               {selected ? <span className="absolute inset-x-0 top-0 h-0.5 bg-brand" /> : null}
             </div>
           );
-        })}
-      </div>
+          })}
+        </div>
+      ) : null}
       <div className="relative flex min-h-0 flex-1">
         {draggedPath && openPaths.length > 1 ? (
           <>
@@ -327,6 +404,11 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
                 diffPath={html ? path : ""}
                 showModeToggle={html}
                 onClose={() => closeWorkspacePath(path)}
+                onCycleTab={(direction) => {
+                  const nextPath = adjacentCodeTab(openPaths, path, direction);
+                  if (nextPath) onActivePathChange?.(nextPath);
+                }}
+                onNewTab={() => onOpenBrowser?.({ newTab: true })}
                 onModeChange={(nextMode) => {
                   setDocumentModes((current) => ({ ...current, [path]: nextMode }));
                   if (nextMode === "preview") {
@@ -412,17 +494,31 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
           );
         })}
         {!currentPath ? (
-          <div className="grid min-h-0 flex-1 place-items-center px-8">
-            <div className="w-full max-w-sm">
-              <p className="text-center text-sm font-semibold text-ink">Start in the IDE</p>
-              <p className="mt-1 text-center text-xs leading-5 text-muted">
-                Open a project, a single file, or a browser tab.
-              </p>
-              <div className="mt-4 space-y-2">
-                <EmptyWorkspaceAction icon={FolderOpen} label="Open Project" shortcut="Ctrl+K, Ctrl+O" onClick={onOpenProject} />
-                <EmptyWorkspaceAction icon={FileText} label="Open File" shortcut="Ctrl+O" onClick={onOpenFile} />
-                <EmptyWorkspaceAction icon={Globe} label="Open Browser" shortcut="Ctrl+J" onClick={onOpenBrowser} />
+          <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-12">
+            <div className="mx-auto w-full max-w-2xl">
+              <div className="mx-auto max-w-sm">
+                <p className="text-center text-sm font-semibold text-ink">Getting Started</p>
+                <p className="mt-1 text-center text-xs leading-5 text-muted">
+                  Open a project, a single file, or a browser tab.
+                </p>
+                <div className="mt-4 space-y-2">
+                  <EmptyWorkspaceAction icon={FolderOpen} label="Open Project" shortcut="Ctrl+K, Ctrl+O" onClick={onOpenProject} />
+                  <EmptyWorkspaceAction icon={FileText} label="Open File" shortcut="Ctrl+O" onClick={onOpenFile} />
+                  <EmptyWorkspaceAction icon={Globe} label="Open Browser" shortcut="Ctrl+J" onClick={() => onOpenBrowser?.()} />
+                </div>
               </div>
+              {recentPaths.length ? (
+                <section aria-labelledby="recent-files-heading" className="mt-10">
+                  <h2 id="recent-files-heading" className="mb-3 text-xs font-semibold text-ink">
+                    Recent files
+                  </h2>
+                  <div className="grid grid-cols-2 gap-3">
+                    {recentPaths.map((path) => (
+                      <RecentFileCard key={path} path={path} onOpen={() => onOpenPath?.(path)} />
+                    ))}
+                  </div>
+                </section>
+              ) : null}
             </div>
           </div>
         ) : null}
@@ -437,6 +533,11 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
               theme={theme}
               onActivate={() => onActivePathChange?.(split.path)}
               onClose={() => setSplit(null)}
+              onCycleTab={(direction) => {
+                const nextPath = adjacentCodeTab(openPaths, split.path, direction);
+                if (nextPath) onActivePathChange?.(nextPath);
+              }}
+              onNewTab={() => onOpenBrowser?.({ newTab: true })}
             />
           </div>
         ) : null}
@@ -499,9 +600,94 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
           </button>
         </div>
       ) : null}
+      {unsavedClosePrompt ? (
+        <UnsavedChangesDialog
+          dirtyPaths={unsavedClosePrompt.dirtyPaths}
+          error={unsavedClosePrompt.error}
+          saving={unsavedClosePrompt.saving}
+          onCancel={() => {
+            if (!unsavedClosePrompt.saving) setUnsavedClosePrompt(null);
+          }}
+          onDiscard={() => {
+            if (unsavedClosePrompt.saving) return;
+            const { dirtyPaths, targets } = unsavedClosePrompt;
+            setUnsavedClosePrompt(null);
+            finishClosingWorkspacePaths(targets, dirtyPaths.includes(sourcePath));
+          }}
+          onSave={() => void saveAndClosePromptedPaths()}
+        />
+      ) : null}
     </section>
   );
 });
+
+export function UnsavedChangesDialog({
+  dirtyPaths,
+  error = "",
+  onCancel,
+  onDiscard,
+  onSave,
+  saving = false,
+}) {
+  const fileCount = dirtyPaths.length;
+  const title = fileCount === 1
+    ? `Save changes to ${fileName(dirtyPaths[0])}?`
+    : `Save changes to ${fileCount} files?`;
+  const description = fileCount === 1
+    ? "Your changes will be lost if you don't save them."
+    : `Changes in ${fileCount} files will be lost if you don't save them.`;
+  return (
+    <Dialog
+      description={description}
+      onClose={onCancel}
+      panelClassName="w-full max-w-md rounded-xl border border-line bg-white p-5 text-ink shadow-xl"
+      title={title}
+    >
+      <div className="flex items-start gap-3">
+        <span className="mt-0.5 grid h-8 w-8 shrink-0 place-items-center rounded-full bg-amber-50 text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+          <AlertTriangle aria-hidden="true" size={17} />
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold leading-5">{title}</h2>
+          <p className="mt-1 text-xs leading-5 text-muted">{description}</p>
+        </div>
+      </div>
+      {error ? (
+        <p className="mt-4 rounded-md bg-red-50 px-3 py-2 text-xs leading-5 text-red-700 dark:bg-red-950/40 dark:text-red-300" role="alert">
+          {error}
+        </p>
+      ) : null}
+      <div className="mt-5 flex flex-wrap justify-end gap-2">
+        <button
+          className="h-8 rounded-md px-3 text-xs font-medium text-ink hover:bg-slate-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand disabled:opacity-50"
+          disabled={saving}
+          type="button"
+          onClick={onCancel}
+        >
+          Cancel
+        </button>
+        <button
+          className="h-8 rounded-md px-3 text-xs font-medium text-red-700 hover:bg-red-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-red-600 disabled:opacity-50 dark:text-red-300 dark:hover:bg-red-950/40"
+          disabled={saving}
+          type="button"
+          onClick={onDiscard}
+        >
+          Discard changes
+        </button>
+        <button
+          className="inline-flex h-8 items-center gap-1.5 rounded-md bg-brand px-3 text-xs font-semibold text-white hover:bg-indigo-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand disabled:opacity-60"
+          data-dialog-initial-focus
+          disabled={saving}
+          type="button"
+          onClick={onSave}
+        >
+          {saving ? <Loader2 aria-hidden="true" className="animate-spin" size={13} /> : <Save aria-hidden="true" size={13} />}
+          {saving ? "Saving" : fileCount === 1 ? "Save" : "Save all"}
+        </button>
+      </div>
+    </Dialog>
+  );
+}
 
 function PreviewBrowser({ diffPath = "", ...props }) {
   const [diffAvailable, setDiffAvailable] = useState(false);
@@ -539,6 +725,26 @@ function EmptyWorkspaceAction({ icon: Icon, label, onClick, shortcut }) {
   );
 }
 
+function RecentFileCard({ onOpen, path }) {
+  const parentPath = String(path ?? "").replace(/[\\/][^\\/]+$/, "");
+  return (
+    <button
+      className="group flex min-w-0 items-center gap-3 rounded-lg border border-line bg-white px-3 py-3 text-left transition hover:border-slate-300 hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-brand dark:hover:bg-[#252526]"
+      title={path}
+      type="button"
+      onClick={onOpen}
+    >
+      <span className="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-slate-100 text-muted transition group-hover:text-ink dark:bg-[#252526]">
+        <FileTypeIcon path={path} />
+      </span>
+      <span className="min-w-0">
+        <span className="block truncate text-xs font-semibold text-ink">{fileName(path)}</span>
+        <span className="mt-0.5 block truncate text-[10px] leading-4 text-muted">{parentPath}</span>
+      </span>
+    </button>
+  );
+}
+
 function SplitDropZone({ onDrop, side }) {
   return (
     <div
@@ -556,7 +762,17 @@ function SplitDropZone({ onDrop, side }) {
   );
 }
 
-function SplitDocument({ active, browserTab, onActivate, onClose, path, settings, theme }) {
+function SplitDocument({
+  active,
+  browserTab,
+  onActivate,
+  onClose,
+  onCycleTab,
+  onNewTab,
+  path,
+  settings,
+  theme,
+}) {
   if (browserTab || isPdfPath(path)) {
     return (
       <IntegratedBrowser
@@ -566,6 +782,8 @@ function SplitDocument({ active, browserTab, onActivate, onClose, path, settings
         localPath={browserTab ? "" : path}
         searchUrl={settings.browser.searchUrl}
         onClose={onClose}
+        onCycleTab={onCycleTab}
+        onNewTab={onNewTab}
       />
     );
   }
@@ -1199,6 +1417,21 @@ export function ImagePreview({ path }) {
 
 export function codeWorkspaceShortcutAction(event, options = {}) {
   if (!options.active || event.repeat) return null;
+  if (
+    event.ctrlKey
+    && !event.altKey
+    && !event.metaKey
+    && String(event.key ?? "").toLowerCase() === "tab"
+    && options.currentPath
+  ) return event.shiftKey ? "previous-tab" : "next-tab";
+  if (
+    options.browserActive
+    && event.ctrlKey
+    && !event.altKey
+    && !event.metaKey
+    && !event.shiftKey
+    && String(event.key ?? "").toLowerCase() === "t"
+  ) return "new-browser-tab";
   if (matchesCommand(event, options.settings, "file.new")) return "new";
   if (matchesCommand(event, options.settings, "file.save") && options.currentPath) return "save";
   if (matchesCommand(event, options.settings, "file.close") && options.currentPath) return "close";
@@ -1252,6 +1485,13 @@ export function reorderCodeTabs(openPaths, sourcePath, targetPath) {
   const [source] = next.splice(sourceIndex, 1);
   next.splice(targetIndex, 0, source);
   return next;
+}
+
+export function adjacentCodeTab(openPaths, currentPath, direction = 1) {
+  if (!openPaths.length) return "";
+  const currentIndex = openPaths.indexOf(currentPath);
+  if (currentIndex < 0) return openPaths[0];
+  return openPaths[(currentIndex + direction + openPaths.length) % openPaths.length];
 }
 
 function FileTypeIcon({ browser = false, path }) {
@@ -1320,6 +1560,7 @@ export function browserTabLabel(tab = {}) {
   if (title) return title;
   const url = String(tab.url ?? "").trim();
   if (!url || url === "about:blank") return "New Tab";
+  if (url === "taskurotta://home") return "Taskurotta";
   try {
     return new URL(url).hostname.replace(/^www\./i, "") || url;
   } catch {

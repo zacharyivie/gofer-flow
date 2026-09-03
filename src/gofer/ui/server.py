@@ -53,8 +53,10 @@ from gofer.ui.api import (
     delete_workflow_chat_payload,
     delete_workflow_payload,
     duplicate_workflow_payload,
+    export_radish_bundle_payload,
     export_workflow_bundle_payload,
     health_payload,
+    import_radish_bundle_payload,
     import_workflow_bundle_payload,
     import_workflow_payload,
     latest_workflow_log_payload,
@@ -66,6 +68,7 @@ from gofer.ui.api import (
     mutate_radish_document_payload,
     open_project_payload,
     open_radish_document_payload,
+    preview_radish_bundle_payload,
     preview_workflow_bundle_payload,
     provider_profiles_payload,
     prune_workflow_run_logs_payload,
@@ -828,6 +831,88 @@ class GoferUiRequestHandler(BaseHTTPRequestHandler):
                 self._send_json({"error": str(exc)}, status=400)
                 return
             self._send_json(payload)
+            return
+
+        if parsed.path == "/api/radish/workflows/import/preview":
+            try:
+                body = self._read_json()
+                with _bundle_path_from_body(body) as bundle_path:
+                    if bundle_path is None:
+                        raise WorkflowBundleError("A .taskurotta bundle is required")
+                    if body.get("bundlePath"):
+                        self._assert_bundle_path_allowed(
+                            bundle_path,
+                            body.get("grantId"),
+                            must_exist=True,
+                        )
+                    payload = preview_radish_bundle_payload(
+                        bundle_path,
+                        resource_limits=self._resource_limits(),
+                    )
+            except (WorkflowBundleError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json({"bundle": payload})
+            return
+
+        if parsed.path == "/api/radish/workflows/import":
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                project_root_value = str(body.get("projectRoot", "")).strip()
+                if not project_root_value:
+                    raise WorkflowBundleError("Choose a project folder for the imported workflow")
+                project_root = Path(project_root_value).expanduser()
+                self._assert_bundle_path_allowed(
+                    project_root,
+                    body.get("projectGrantId"),
+                    must_exist=True,
+                )
+                with _bundle_path_from_body(body) as bundle_path:
+                    if bundle_path is None:
+                        raise WorkflowBundleError("A .taskurotta bundle is required")
+                    if body.get("bundlePath"):
+                        self._assert_bundle_path_allowed(
+                            bundle_path,
+                            body.get("grantId"),
+                            must_exist=True,
+                        )
+                    workflow = import_radish_bundle_payload(
+                        bundle_path,
+                        project_root,
+                        self._request_data_dir(query),
+                        resource_limits=self._resource_limits(),
+                    )
+            except (WorkflowBundleError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._sync_schedules()
+            self._send_json({"workflow": workflow}, status=201)
+            return
+
+        if parsed.path.startswith("/api/radish/workflows/") and parsed.path.endswith("/export"):
+            workflow_id = parsed.path.removeprefix("/api/radish/workflows/").removesuffix("/export")
+            query = parse_qs(parsed.query)
+            try:
+                body = self._read_json()
+                output_path = _resolve_ui_bundle_path(
+                    Path(str(body.get("outputPath", ""))),
+                    self._request_data_dir(query),
+                )
+                self._assert_bundle_path_allowed(
+                    output_path,
+                    body.get("grantId"),
+                    must_exist=False,
+                )
+                payload = export_radish_bundle_payload(
+                    workflow_id,
+                    output_path,
+                    self._request_data_dir(query),
+                )
+            except (WorkflowBundleError, json.JSONDecodeError, ValueError) as exc:
+                self._send_json({"error": str(exc)}, status=400)
+                return
+            self._send_json(payload, status=201)
             return
 
         if parsed.path == "/api/workflows/import":

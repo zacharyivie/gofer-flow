@@ -9,11 +9,11 @@ import {
   RefreshCw,
   Sun,
   Terminal,
-  Workflow,
   X,
 } from "lucide-react";
 import { useRouteError } from "react-router-dom";
 import packageMetadata from "../../package.json";
+import TaskurottaMark from "./TaskurottaMark.jsx";
 
 const THEME_STORAGE_KEY = "gofer-ui-theme";
 const ISSUE_URL = `${packageMetadata.homepage}/issues/new`;
@@ -186,9 +186,7 @@ export function AppCrashPage({ crash }) {
     <div className="flex min-h-screen flex-col bg-canvas text-ink">
       <header className="flex h-12 shrink-0 items-center justify-between border-b border-line px-4 sm:px-[18px]">
         <div className="flex items-center gap-2.5">
-          <span className="grid h-[26px] w-[26px] place-items-center rounded-lg bg-brand text-white">
-            <Workflow aria-hidden="true" size={14} strokeWidth={1.8} />
-          </span>
+          <TaskurottaMark className="h-[26px] w-[26px]" />
           <span className="text-[13px] font-semibold">Taskurotta</span>
         </div>
         <button

@@ -44,7 +44,9 @@ FORM: Operate-mode desktop studio, translated directly from wireframes/studio.ht
 html,
 body,
 #root {
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
 }
 
 body {
@@ -251,10 +253,6 @@ select:focus-visible,
   color: #92400e;
 }
 
-.source-control-status--deleted {
-  color: #b91c1c;
-}
-
 .dark .source-control-status--added,
 .dark .source-control-status--untracked {
   color: #6ee7b7;
@@ -262,10 +260,6 @@ select:focus-visible,
 
 .dark .source-control-status--modified {
   color: #fbbf24;
-}
-
-.dark .source-control-status--deleted {
-  color: #fca5a5;
 }
 
 .monaco-editor .tracked-change-line {
@@ -315,6 +309,30 @@ select:focus-visible,
   box-shadow: 0 16px 40px rgba(24, 24, 27, 0.16), 0 4px 10px rgba(24, 24, 27, 0.06);
 }
 
+.empty-workspace-panel {
+  border: 1px solid rgba(228, 228, 231, 0.82);
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 18px 52px rgba(17, 24, 39, 0.08), 0 2px 8px rgba(17, 24, 39, 0.04);
+}
+
+.empty-import-zone {
+  border-color: #c7d2fe;
+  background: #f8f9ff;
+  transition: border-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    background-color 160ms cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.empty-import-zone--active {
+  border-color: #6366f1;
+  background: #eef2ff;
+  box-shadow: 0 8px 24px rgba(79, 70, 229, 0.12);
+}
+
+.empty-import-icon {
+  background: #eef2ff;
+}
+
 .model-picker-option,
 [data-picker-trigger] {
   transition-property: color, border-color;
@@ -354,6 +372,27 @@ select:focus-visible,
 
 .dark .model-picker-popover {
   box-shadow: 0 20px 48px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.4);
+}
+
+.dark .empty-workspace-panel {
+  border-color: rgba(63, 63, 70, 0.78);
+  background: rgba(24, 24, 26, 0.96);
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.34), 0 2px 8px rgba(0, 0, 0, 0.2);
+}
+
+.dark .empty-import-zone {
+  border-color: #3730a3;
+  background: #191827;
+}
+
+.dark .empty-import-zone--active {
+  border-color: #818cf8;
+  background: #211f3d;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
+}
+
+.dark .empty-import-icon {
+  background: #25215d;
 }
 
 .dark .model-picker-option--active,

@@ -3,6 +3,51 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## Unreleased
+
+### Added
+
+- Added portable `.taskurotta` bundles for Radish workflows, with preview,
+  import, and export actions in the graph and empty-workspace screens.
+- Added bundle validation for ignored files, unsafe archive paths, symbolic
+  links, duplicate entries, compression ratios, file counts, and size limits.
+- Added app-wide text zoom from 80% to 150%, recent-file cards in the empty IDE,
+  tab cycling shortcuts, and save-or-discard prompts for unsaved files when
+  autosave is disabled.
+- Added a Taskurotta browser home page, configurable single-word search,
+  modified-click tabs, Backspace history navigation, and Markdown file-link
+  opening from local browser previews.
+- Added a daily TODO implementation workflow that creates tickets, implements
+  and reviews them in sequence, commits approved work, and gates the merge to
+  `main` on user approval.
+- Added a reusable cross-platform release build workflow and a dry run on
+  updates to `main`.
+
+### Changed
+
+- Redesigned the empty Graph and Code views, refreshed Taskurotta branding and
+  application icons, and expanded the studio design tokens.
+- Discover project workflows before opening or refreshing a project so newly
+  created Radish workflows appear without restarting the studio.
+- Keep assistant conversations pinned only when the reader is already at the
+  bottom, grow the composer with its draft, and allow the latest user message
+  to be edited and resent from that point in the conversation.
+- Run tagged releases through the shared build workflow while keeping release
+  publication limited to version tags.
+
+### Fixed
+
+- Fixed workflow deletion so source tabs, previews, and recent-file entries are
+  cleared while the terminal and Code workspace remain available after the last
+  workflow is removed.
+- Fixed the file explorer so it reveals the active file through nested folders,
+  scrolls it into view, and omits paths deleted from the working tree.
+- Fixed integrated-browser focus restoration, overlapping menu and dialog
+  detection, stale session events, owner cleanup, failed navigation recovery,
+  and shortcut handling when an embedded page is unavailable.
+- Fixed deleted-path inspection and update checks so expected errors return
+  usable state instead of rejecting desktop requests.
+
 ## 0.2.1 - 2026-09-01
 
 ### Added
