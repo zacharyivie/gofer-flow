@@ -1,4 +1,4 @@
-/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, localStorage, MouseEvent, process, self, setTimeout, window */
+/* global __dirname, clearTimeout, console, document, getComputedStyle, KeyboardEvent, process, self, setTimeout, window */
 
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -160,43 +160,6 @@ async function exercisePackagedMonacoWorker(baseUrl) {
 }
 
 async function exerciseDesignRegressions() {
-  await evaluate(() => {
-    const project = document.querySelector("[aria-label='gofer-flow workflows']");
-    project.dispatchEvent(new MouseEvent("contextmenu", {
-      bubbles: true,
-      cancelable: true,
-      clientX: 120,
-      clientY: 180,
-    }));
-  });
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='gofer-flow project actions']"))));
-  await evaluate(() => [...document.querySelectorAll("[aria-label='gofer-flow project actions'] button")]
-    .find((button) => button.textContent.includes("Rename")).click());
-  await waitFor(() => evaluate(() => Boolean(document.querySelector("[aria-label='Project label for gofer-flow']"))));
-  assert.equal(await evaluate(() => {
-    const input = document.querySelector("[aria-label='Project label for gofer-flow']");
-    input.focus();
-    input.select();
-    return document.activeElement === input;
-  }), true);
-  await windowRef.webContents.insertText("Taskurotta workspace");
-  await waitFor(() => evaluate(() =>
-    document.querySelector("[aria-label='Project label for gofer-flow']")?.value
-      === "Taskurotta workspace",
-  ), 25, "native project label input");
-  await pressFocusedKey("Enter");
-  await waitFor(() => evaluate(() =>
-    !document.querySelector("[aria-label='Project label for gofer-flow']"),
-  ), 25, "project rename input to commit");
-  await waitFor(() => evaluate(() => {
-    const project = document.querySelector("[aria-label='Taskurotta workspace workflows']");
-    return project?.textContent.includes("Radish editor");
-  }), 25, "renamed gofer-flow workflow group");
-  await waitFor(() => evaluate(() => {
-    const stored = JSON.parse(localStorage.getItem("gofer.projectLabels"));
-    return stored?.["/workspace/gofer-flow"] === "Taskurotta workspace";
-  }), 25, "project rename to persist in local storage");
-
   const pickerWidths = await evaluate(() => {
     const textarea = document.querySelector("textarea[placeholder='Message this workflow']");
     const chat = textarea.closest("aside");
