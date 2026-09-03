@@ -184,7 +184,7 @@ async function exerciseDesignRegressions() {
     document.querySelector("[aria-label='Project label for gofer-flow']")?.value
       === "Taskurotta workspace",
   ), 25, "native project label input");
-  await pressNativeKey("Enter");
+  await pressFocusedKey("Enter");
   await waitFor(() => evaluate(() =>
     !document.querySelector("[aria-label='Project label for gofer-flow']"),
   ), 25, "project rename input to commit");
