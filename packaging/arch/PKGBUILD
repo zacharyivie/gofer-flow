@@ -1,6 +1,6 @@
 # Maintainer: Taskurotta <maintainers@goferflow.local>
 pkgname=gofer-flow
-pkgver=0.2.1
+pkgver=0.2.2
 pkgrel=1
 pkgdesc="Local workflow automation studio for Taskurotta"
 arch=("x86_64")

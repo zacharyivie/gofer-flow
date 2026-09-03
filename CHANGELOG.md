@@ -3,7 +3,7 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
-## Unreleased
+## 0.2.2 - 2026-09-03
 
 ### Added
 
