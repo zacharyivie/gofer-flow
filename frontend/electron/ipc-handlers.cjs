@@ -24,10 +24,12 @@ const desktopIpcHandlers = [
   ["gofer:write-text-file", "writeTextFile"],
   ["gofer:browser-create", "createBrowser"],
   ["gofer:browser-action", "browserAction"],
+  ["gofer:browser-owner-zoom", "browserOwnerZoom"],
   ["gofer:terminal-create", "createTerminal"],
   ["gofer:terminal-write", "writeTerminal"],
   ["gofer:terminal-resize", "resizeTerminal"],
   ["gofer:terminal-close", "closeTerminal"],
+  ["gofer:terminal-editor-complete", "completeTerminalEditor"],
   ["gofer:set-data-dir", "setDataDir"],
   ["gofer:select-path", "selectPath"],
 ];

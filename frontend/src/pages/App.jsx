@@ -25,7 +25,6 @@ import {
   Play,
   RefreshCw,
   Redo2,
-  Save,
   Search,
   Settings as SettingsIcon,
   Sun,
@@ -357,11 +356,13 @@ export default function App() {
   const previewCodePathRef = useRef("");
   const codeNavigationSequenceRef = useRef(0);
   const pendingProjectFileRef = useRef(null);
+  const projectOpenRequestRef = useRef(0);
   const openProjectFolderRef = useRef(null);
   const openFileRef = useRef(null);
   const chordPendingRef = useRef(null);
   const openIntegratedBrowserRef = useRef(null);
   const openLinkedCodeFileRef = useRef(null);
+  const terminalEditorRequestsRef = useRef(new Map());
   const changeStudioViewRef = useRef(null);
   const runWorkflowNowRef = useRef(null);
   const theme = resolvedTheme(settings, systemDark);
@@ -580,6 +581,7 @@ export default function App() {
       if (action === "view.code") changeStudioViewRef.current?.("code");
       if (action === "view.toggleProjectPane") setProjectPaneVisible((current) => !current);
       if (action === "view.toggleAssistantPane") setAssistantPaneVisible((current) => !current);
+      if (action === "panel.toggle") window.dispatchEvent(new CustomEvent("gofer:toggle-bottom-panel"));
       if (action === "workflow.run" && activeWorkflow && !runState.running) {
         void runWorkflowNowRef.current?.(activeWorkflow);
       }
@@ -638,7 +640,22 @@ export default function App() {
       runShortcutAction(action);
     }
     const unsubscribeCommand = window.goferBrowser?.onCommand?.((command) => {
+      if (command?.action === "application-shortcut" && command.commandId) {
+        runShortcutAction(command.commandId);
+      }
+      if (command?.action === "text-zoom" && Number.isFinite(command.direction)) {
+        setTextZoom((current) => nextTextZoom(current, command.direction));
+      }
+      if (command?.action === "text-zoom" && command.reset === true) {
+        setTextZoom(100);
+      }
       if (command?.action === "open-browser") openIntegratedBrowserRef.current?.();
+      if (command?.action === "settings-open") runShortcutAction("settings.open");
+      if (command?.action === "file-open") runShortcutAction("file.open");
+      if (command?.action === "project-open") runShortcutAction("project.open");
+      if (command?.action === "panel-toggle") runShortcutAction("panel.toggle");
+      if (command?.action === "project-pane-toggle") runShortcutAction("view.toggleProjectPane");
+      if (command?.action === "assistant-pane-toggle") runShortcutAction("view.toggleAssistantPane");
     });
     const unsubscribeOpenTab = window.goferBrowser?.onOpenTab?.((request) => {
       if (request?.url) openIntegratedBrowserRef.current?.(request.url, { newTab: true });
@@ -646,12 +663,20 @@ export default function App() {
     const unsubscribeOpenFile = window.goferBrowser?.onOpenFile?.((request) => {
       if (request?.path) void openLinkedCodeFileRef.current?.(request.path);
     });
+    const unsubscribeTerminalEditor = window.goferTerminal?.onOpenEditor?.((request) => {
+      if (!request?.path || !request?.requestId) return;
+      const requests = terminalEditorRequestsRef.current.get(request.path) ?? new Set();
+      requests.add(request.requestId);
+      terminalEditorRequestsRef.current.set(request.path, requests);
+      void openLinkedCodeFileRef.current?.(request.path);
+    });
     window.addEventListener("keydown", handleApplicationShortcut, true);
     return () => {
       clearChordPending();
       unsubscribeCommand?.();
       unsubscribeOpenFile?.();
       unsubscribeOpenTab?.();
+      unsubscribeTerminalEditor?.();
       window.removeEventListener("keydown", handleApplicationShortcut, true);
     };
   }, [activeWorkflow, runState.running, settings, settingsOpen]);
@@ -754,7 +779,13 @@ export default function App() {
     const path = createBrowserTabPath();
     setBrowserTabs((current) => ({
       ...current,
-      [path]: { error: "", loading: true, title: "", url: requestedUrl },
+      [path]: {
+        error: "",
+        focusLocation: options.focusLocation ?? !initialUrl,
+        loading: true,
+        title: "",
+        url: requestedUrl,
+      },
     }));
     setCodeOpenPaths((current) => mergeCodeOpenPaths(current, [path]));
     setActiveCodePath(path);
@@ -845,6 +876,14 @@ export default function App() {
   function closeCodeFiles(paths) {
     const closing = new Set(paths.filter(Boolean));
     if (!closing.size) return;
+    for (const path of closing) {
+      const requests = terminalEditorRequestsRef.current.get(path);
+      if (!requests) continue;
+      terminalEditorRequestsRef.current.delete(path);
+      for (const requestId of requests) {
+        void window.goferTerminal?.completeEditor?.(requestId).catch(() => {});
+      }
+    }
     setCodeOpenPaths((current) => {
       const next = current.filter((candidate) => !closing.has(candidate));
       setActiveCodePath((currentActive) => {
@@ -959,6 +998,8 @@ export default function App() {
   }
 
   async function openProjectAtPath(projectRoot, { rememberProject = false, focusPath = "" } = {}) {
+    const requestId = projectOpenRequestRef.current + 1;
+    projectOpenRequestRef.current = requestId;
     const discoveredPayloads = await discoverProjectWorkflows(projectRoot);
     let mainProjectRoot = projectRoot;
     try {
@@ -967,6 +1008,7 @@ export default function App() {
     } catch {
       // Non-Git projects use their selected folder as the recent-project identity.
     }
+    if (projectOpenRequestRef.current !== requestId) return null;
     const discovered = discoveredPayloads.map((workflow) =>
       summarizeWorkflow(workflow, dataDir));
     if (rememberProject) {
@@ -1095,28 +1137,12 @@ export default function App() {
       setTopBarNotice({ type: "error", message: `Worktree folder is missing: ${selectedProjectRoot}` });
       return;
     }
-    const projectWorkflows = workflows.filter(
-      (workflow) => workflow.projectRoot === selectedProjectRoot,
-    );
-    if (!projectWorkflows.length) {
-      void openProjectAtPath(selectedProjectRoot, { rememberProject: true }).catch((error) => {
-        setTopBarNotice({ type: "error", message: error instanceof Error ? error.message : "Unable to open project" });
+    void openProjectAtPath(selectedProjectRoot, { rememberProject: true }).catch((error) => {
+      setTopBarNotice({
+        type: "error",
+        message: error instanceof Error ? error.message : "Unable to open project",
       });
-      return;
-    }
-    const selectedWorkflow = activeWorkflow?.projectRoot === selectedProjectRoot
-      ? activeWorkflow
-      : projectWorkflows[0];
-    setActiveWorkflowId(selectedWorkflow.id);
-    setActiveProjectRoot(selectedProjectRoot);
-    setRecentProjectRoots((current) => rememberRecentProject(current, mainProjectRoot));
-    setLastWorktreeByProject((current) => ({
-      ...current,
-      [mainProjectRoot]: selectedProjectRoot,
-    }));
-    setCodeEditorOpened(true);
-    setStudioView("code");
-    setQuery("");
+    });
   }
 
   function removeRecentProject(projectRoot) {
@@ -2978,10 +3004,42 @@ export default function App() {
     });
   }
 
+  function runGlobalMenuAction(action) {
+    if (action.startsWith("edit.") || action.startsWith("selection.")) {
+      radishEditorRef.current?.runCommand?.(action);
+      return;
+    }
+    if (action === "file.new") {
+      changeStudioView("code");
+      setNewCodeFileRequest((current) => current + 1);
+    }
+    if (action === "file.open") void openFile();
+    if (action === "file.openFolder") void openProjectFolder();
+    if (action === "file.save") void radishEditorRef.current?.saveActive?.();
+    if (action === "file.close") closeActiveCodeFile();
+    if (action === "view.graph") changeStudioView("graph");
+    if (action === "view.code") changeStudioView("code");
+    if (action === "view.projectPane") setProjectPaneVisible((current) => !current);
+    if (action === "view.assistantPane") setAssistantPaneVisible((current) => !current);
+    if (action === "view.panel") {
+      window.dispatchEvent(new CustomEvent("gofer:toggle-bottom-panel"));
+    }
+    if (action === "terminal.toggle") {
+      window.dispatchEvent(new CustomEvent("gofer:toggle-bottom-panel", {
+        detail: { tab: "terminal" },
+      }));
+    }
+    if (action === "view.zoomIn") setTextZoom((current) => nextTextZoom(current, 1));
+    if (action === "view.zoomOut") setTextZoom((current) => nextTextZoom(current, -1));
+    if (action === "view.resetZoom") setTextZoom(100);
+    if (action === "help.updates") void checkForUpdates();
+    if (action === "help.settings") setSettingsOpen(true);
+  }
+
   return (
     <main
       aria-busy={runState.running || logState.loading || undefined}
-      className={`flex h-full min-h-0 min-w-0 overflow-hidden bg-canvas text-ink ${theme}`}
+      className={`flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-canvas text-ink ${theme}`}
     >
       <div aria-atomic="true" aria-live="polite" className="sr-only" role="status">
         {!runState.running && runState.result
@@ -2993,6 +3051,27 @@ export default function App() {
       <div aria-atomic="true" aria-live="assertive" className="sr-only" role="alert">
         {runState.error}
       </div>
+      <GlobalToolbar
+        activeCodeDocument={activeCodeDocumentState}
+        activeCodePath={activeCodePath}
+        assistantPaneVisible={assistantPaneVisible}
+        projectPaneVisible={projectPaneVisible}
+        recentProjectRoots={recentProjectRoots}
+        settings={settings}
+        settingsOpen={settingsOpen}
+        theme={theme}
+        updateState={updateState}
+        workflow={activeWorkflow}
+        view={studioView}
+        onApplyUpdate={() => applyUpdate(updateState)}
+        onCheckForUpdates={() => checkForUpdates()}
+        onOpenHistory={() => activeWorkflow && openWorkflowHistory(activeWorkflow)}
+        onSelectProject={selectRecentProject}
+        onToggleSettings={() => setSettingsOpen((current) => !current)}
+        onToggleTheme={() => changeSetting("appearance.theme", theme === "dark" ? "light" : "dark")}
+        onMenuAction={runGlobalMenuAction}
+      />
+      <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden">
       {projectPaneVisible ? <WorkflowSidebar
         activeWorkflow={activeWorkflow}
         activeWorkflowId={activeWorkflow?.id}
@@ -3047,31 +3126,18 @@ export default function App() {
       <section className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden border-x border-line bg-[#f9fbfd]">
         {activeWorkflow ? (
           <>
-            <TopBar
-              activeCodePath={activeCodePath}
-              editorState={activeCodeDocumentState}
-              hideCodeLabel={Boolean(browserTabs[activeCodePath])}
+            {studioView === "graph" ? <TopBar
               saveState={
                 saveStatesByWorkflowId[activeWorkflow.id] ??
                 (dirtyWorkflowsById[activeWorkflow.id]
                   ? { status: "saving", error: "" }
                   : undefined)
               }
-              settings={settings}
-              theme={theme}
-              settingsOpen={settingsOpen}
-              updateState={updateState}
               workflow={activeWorkflow}
               view={studioView}
-              onCheckForUpdates={() => checkForUpdates()}
-              onApplyUpdate={() => applyUpdate(updateState)}
-              onOpenHistory={() => openWorkflowHistory(activeWorkflow)}
-              onSaveRadish={() => radishEditorRef.current?.saveActive?.()}
               onGraphToolbarTargetChange={setGraphToolbarTarget}
-              onToggleSettings={() => setSettingsOpen((current) => !current)}
               onRetrySave={() => retryWorkflowSave(activeWorkflow.id)}
-              onToggleTheme={() => changeSetting("appearance.theme", theme === "dark" ? "light" : "dark")}
-            />
+            /> : null}
             {studioView === "graph" ? (
               <WorkflowHealthPanel doctorState={doctorState} workflow={activeWorkflow} />
             ) : null}
@@ -3134,18 +3200,7 @@ export default function App() {
         ) : (
           <>
             {studioView === "graph" ? (
-              <TopBar
-                settings={settings}
-                theme={theme}
-                settingsOpen={settingsOpen}
-                updateState={updateState}
-                view="graph"
-                onCheckForUpdates={() => checkForUpdates()}
-                onApplyUpdate={() => applyUpdate(updateState)}
-                onOpenHistory={() => {}}
-                onToggleSettings={() => setSettingsOpen((current) => !current)}
-                onToggleTheme={() => changeSetting("appearance.theme", theme === "dark" ? "light" : "dark")}
-              />
+              <TopBar view="graph" />
             ) : null}
             <EmptyWorkspace
               error={loadState.error}
@@ -3188,6 +3243,7 @@ export default function App() {
               onBrowserStateChange={updateBrowserTab}
               onClosePath={closeCodeFile}
               onClosePaths={closeCodeFiles}
+              saveBeforeClosePaths={[...terminalEditorRequestsRef.current.keys()]}
               onDocumentStateChange={(nextState) => {
                 radishEditorStateRef.current = nextState;
                 setRadishEditorState(nextState);
@@ -3302,6 +3358,7 @@ export default function App() {
             })
           }
         />
+      </div>
       </div>
       {runPreview ? (
         <RunPreviewDialog
@@ -4775,29 +4832,15 @@ function WorkflowListItem({
 
 export function TopBar({
   activeCodePath = "",
-  editorState,
-  hideCodeLabel = false,
   saveState,
-  settings = DEFAULT_APP_SETTINGS,
-  settingsOpen = false,
-  theme,
-  updateState,
   workflow,
   view = "graph",
-  onApplyUpdate,
-  onCheckForUpdates,
   onGraphToolbarTargetChange,
-  onOpenHistory,
   onRetrySave,
-  onSaveRadish,
-  onToggleSettings,
-  onToggleTheme,
 }) {
-  const hasUpdateBridge = Boolean(window.goferUpdates?.check);
-  const label = !workflow || (view === "code" && (hideCodeLabel || !activeCodePath))
+  const label = !workflow || (view === "code" && !activeCodePath)
     ? null
     : topBarLabelParts(workflow, view, activeCodePath);
-  const editorDocument = editorState?.document ?? editorState;
   return (
     <header className="studio-topbar flex h-[54px] shrink-0 items-center justify-between gap-3 border-b border-line bg-white px-4">
       <div
@@ -4844,81 +4887,278 @@ export function TopBar({
             <span aria-hidden="true" className="h-5 w-px shrink-0 bg-line" />
           </>
         ) : null}
-        {view === "code" && editorDocument ? (
-          <button
-            aria-label="Save active file"
-            className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
-            disabled={!editorDocument.dirty || editorState?.saving}
-            title={editorDocument.dirty ? "Save active file" : "No changes to save"}
-            type="button"
-            onClick={onSaveRadish}
-          >
-            <Save aria-hidden="true" size={15} />
+      </div>
+    </header>
+  );
+}
+
+export function GlobalToolbar({
+  activeCodeDocument,
+  activeCodePath = "",
+  assistantPaneVisible = true,
+  projectPaneVisible = true,
+  recentProjectRoots = [],
+  settings = DEFAULT_APP_SETTINGS,
+  settingsOpen = false,
+  theme,
+  updateState,
+  workflow,
+  view = "graph",
+  onApplyUpdate,
+  onCheckForUpdates,
+  onOpenHistory,
+  onSelectProject,
+  onToggleSettings,
+  onToggleTheme,
+  onMenuAction,
+}) {
+  const hasUpdateBridge = Boolean(window.goferUpdates?.check);
+  const buttonClass = "studio-icon-button grid h-7 w-7 place-items-center rounded-md text-muted transition hover:bg-slate-100 hover:text-ink";
+  return (
+    <header className="global-toolbar flex h-8 shrink-0 items-center justify-between border-b border-line bg-white px-2" aria-label="Application toolbar">
+      <ApplicationMenus
+        activeCodeDocument={activeCodeDocument}
+        activeCodePath={activeCodePath}
+        assistantPaneVisible={assistantPaneVisible}
+        projectPaneVisible={projectPaneVisible}
+        recentProjectRoots={recentProjectRoots}
+        settings={settings}
+        view={view}
+        onAction={onMenuAction}
+        onSelectProject={onSelectProject}
+      />
+      <div className="flex items-center gap-1">
+        {hasUpdateBridge ? updateState?.available ? (
+          <button className="inline-flex h-8 items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50 px-3 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:cursor-wait disabled:opacity-70" disabled={Boolean(updateState.downloading)} title={updateButtonTitle(updateState)} type="button" onClick={onApplyUpdate}>
+            {updateState.downloading ? <Loader2 size={15} className="animate-spin" /> : <Download size={15} />}
+            {updateButtonLabel(updateState)}
+          </button>
+        ) : (
+          <button className={buttonClass} title={updateState?.error ? `Update check failed: ${updateState.error}` : "Check for updates"} type="button" onClick={onCheckForUpdates}>
+            <RefreshCw size={16} className={updateState?.checking ? "animate-spin" : ""} />
           </button>
         ) : null}
-        {hasUpdateBridge ? (
-          updateState?.available ? (
-            <button
-              className="inline-flex h-8 items-center gap-2 rounded-lg border border-indigo-200 bg-indigo-50 px-3 text-xs font-semibold text-indigo-700 transition hover:bg-indigo-100 disabled:cursor-wait disabled:opacity-70"
-              disabled={Boolean(updateState.downloading)}
-              title={updateButtonTitle(updateState)}
-              type="button"
-              onClick={onApplyUpdate}
-            >
-              {updateState.downloading ? (
-                <Loader2 size={15} className="animate-spin" />
-              ) : (
-                <Download size={15} />
-              )}
-              {updateButtonLabel(updateState)}
-            </button>
-          ) : (
-            <button
-              className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
-              title={
-                updateState?.error
-                  ? `Update check failed: ${updateState.error}`
-                  : "Check for updates"
-              }
-              type="button"
-              onClick={onCheckForUpdates}
-            >
-              <RefreshCw
-                size={16}
-                className={updateState?.checking ? "animate-spin" : ""}
-              />
-            </button>
-          )
-        ) : null}
-        <button
-          aria-label="Open settings"
-          aria-expanded={settingsOpen}
-          className={`studio-icon-button grid h-8 w-8 place-items-center rounded-lg transition hover:bg-slate-100 hover:text-ink ${settingsOpen ? "bg-slate-100 text-ink" : "text-muted"}`}
-          title={`Settings (${formatKeybinding(settingBinding(settings, "settings.open"))})`}
-          type="button"
-          onClick={onToggleSettings}
-        >
+        <button aria-label="Open settings" aria-expanded={settingsOpen} className={`${buttonClass} ${settingsOpen ? "bg-slate-100 text-ink" : ""}`} title={`Settings (${formatKeybinding(settingBinding(settings, "settings.open"))})`} type="button" onClick={onToggleSettings}>
           <SettingsIcon size={16} />
         </button>
-        <button
-          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted"
-          disabled={!workflow}
-          title={workflow ? "Workflow history" : "Workflow history is available after you create a workflow"}
-          type="button"
-          onClick={onOpenHistory}
-        >
+        <button className={`${buttonClass} disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-muted`} disabled={!workflow} title={workflow ? "Workflow history" : "Workflow history is available after you create a workflow"} type="button" onClick={onOpenHistory}>
           <History size={16} />
         </button>
-        <button
-          className="studio-icon-button grid h-8 w-8 place-items-center rounded-lg text-muted transition hover:bg-slate-100 hover:text-ink"
-          title={theme === "dark" ? "Light mode" : "Dark mode"}
-          type="button"
-          onClick={onToggleTheme}
-        >
+        <button className={buttonClass} title={theme === "dark" ? "Light mode" : "Dark mode"} type="button" onClick={onToggleTheme}>
           {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
         </button>
       </div>
     </header>
+  );
+}
+
+const APPLICATION_MENUS = [
+  { label: "File", items: [
+    ["file.new", "New File", "Ctrl+N"],
+    ["file.open", "Open File...", "Ctrl+O"],
+    ["file.openFolder", "Open Project...", "project.open"],
+    ["file.recentProjects", "Recent Projects"],
+    null,
+    ["file.save", "Save", "Ctrl+S", "code-document"],
+    ["file.close", "Close Editor", "Ctrl+W", "code-path"],
+  ] },
+  { label: "Edit", items: [
+    ["edit.undo", "Undo", "Ctrl+Z", "code-document"],
+    ["edit.redo", "Redo", "Ctrl+Shift+Z", "code-document"],
+    null,
+    ["edit.cut", "Cut", "Ctrl+X", "code-document"],
+    ["edit.copy", "Copy", "Ctrl+C", "code-document"],
+    ["edit.paste", "Paste", "Ctrl+V", "code-document"],
+    null,
+    ["edit.find", "Find", "Ctrl+F", "code-document"],
+    ["edit.replace", "Replace", "Ctrl+H", "code-document"],
+    ["edit.toggleLineComment", "Toggle Line Comment", "Ctrl+/", "code-document"],
+    ["edit.formatDocument", "Format Document", "Shift+Alt+F", "code-document"],
+  ] },
+  { label: "Selection", items: [
+    ["selection.selectAll", "Select All", "Ctrl+A", "code-document"],
+    ["selection.expand", "Expand Selection", "Shift+Alt+Right", "code-document"],
+    ["selection.shrink", "Shrink Selection", "Shift+Alt+Left", "code-document"],
+    null,
+    ["selection.copyLineUp", "Copy Line Up", "Shift+Alt+Up", "code-document"],
+    ["selection.copyLineDown", "Copy Line Down", "Shift+Alt+Down", "code-document"],
+    ["selection.moveLineUp", "Move Line Up", "Alt+Up", "code-document"],
+    ["selection.moveLineDown", "Move Line Down", "Alt+Down", "code-document"],
+    null,
+    ["selection.addCursorAbove", "Add Cursor Above", "Ctrl+Alt+Up", "code-document"],
+    ["selection.addCursorBelow", "Add Cursor Below", "Ctrl+Alt+Down", "code-document"],
+  ] },
+  { label: "View", items: [
+    ["view.graph", "Workflow Graph", "", "graph-check"],
+    ["view.code", "Code Editor", "", "code-check"],
+    null,
+    ["view.projectPane", "Project Files", "Ctrl+B", "project-check"],
+    ["view.assistantPane", "Assistant", "", "assistant-check"],
+    ["view.panel", "Bottom Panel", "panel.toggle"],
+    null,
+    ["view.zoomIn", "Zoom In", "Ctrl++"],
+    ["view.zoomOut", "Zoom Out", "Ctrl+-"],
+    ["view.resetZoom", "Reset Zoom", "Ctrl+0"],
+  ] },
+  { label: "Terminal", items: [["terminal.toggle", "Toggle Terminal", "panel.toggle"]] },
+  { label: "Help", items: [
+    ["help.updates", "Check for Updates...", ""],
+    ["help.settings", "Settings", ""],
+  ] },
+];
+
+export function ApplicationMenus({
+  activeCodeDocument,
+  activeCodePath,
+  assistantPaneVisible,
+  projectPaneVisible,
+  recentProjectRoots = [],
+  settings,
+  view,
+  onAction,
+  onSelectProject,
+}) {
+  const [openMenu, setOpenMenu] = useState("");
+  const containerRef = useRef(null);
+  useEffect(() => {
+    if (!openMenu) return undefined;
+    const dismiss = (event) => {
+      if (!containerRef.current?.contains(event.target)) setOpenMenu("");
+    };
+    const escape = (event) => {
+      if (event.key === "Escape") setOpenMenu("");
+    };
+    window.addEventListener("pointerdown", dismiss);
+    window.addEventListener("keydown", escape);
+    return () => {
+      window.removeEventListener("pointerdown", dismiss);
+      window.removeEventListener("keydown", escape);
+    };
+  }, [openMenu]);
+  const context = { activeCodeDocument, activeCodePath, assistantPaneVisible, projectPaneVisible, view };
+  return (
+    <nav aria-label="Application menu" className="flex h-full items-center gap-0.5" ref={containerRef}>
+      {APPLICATION_MENUS.map((menu) => (
+        <div className="relative" key={menu.label}>
+          <button
+            aria-expanded={openMenu === menu.label}
+            aria-haspopup="menu"
+            className={`rounded px-2 py-1 text-[13px] text-ink outline-none hover:bg-slate-100 focus-visible:ring-2 focus-visible:ring-brand ${openMenu === menu.label ? "bg-slate-100" : ""}`}
+            type="button"
+            onClick={() => setOpenMenu((current) => current === menu.label ? "" : menu.label)}
+            onPointerEnter={() => openMenu && setOpenMenu(menu.label)}
+          >
+            {menu.label}
+          </button>
+          {openMenu === menu.label ? (
+            <div className="absolute left-0 top-[calc(100%+7px)] z-[100] min-w-[250px] rounded-md border border-line bg-white p-1.5 text-ink shadow-[0_10px_28px_rgba(15,23,42,0.18)]" role="menu">
+              {menu.items.map((item, index) => item === null ? (
+                <div aria-hidden="true" className="my-1 border-t border-line" key={`separator-${index}`} />
+              ) : item[0] === "file.recentProjects" ? (
+                <RecentProjectsMenuItem
+                  key={item[0]}
+                  recentProjectRoots={recentProjectRoots}
+                  onSelect={(root) => {
+                    setOpenMenu("");
+                    onSelectProject?.(root);
+                  }}
+                />
+              ) : (
+                <ApplicationMenuItem
+                  context={context}
+                  item={item}
+                  key={item[0]}
+                  settings={settings}
+                  onSelect={() => {
+                    setOpenMenu("");
+                    onAction?.(item[0]);
+                  }}
+                />
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ))}
+    </nav>
+  );
+}
+
+const APPLICATION_MENU_BINDINGS = {
+  "file.close": "file.close",
+  "file.new": "file.new",
+  "file.open": "file.open",
+  "file.openFolder": "project.open",
+  "file.save": "file.save",
+  "help.settings": "settings.open",
+  "terminal.toggle": "panel.toggle",
+  "view.assistantPane": "view.toggleAssistantPane",
+  "view.code": "view.code",
+  "view.graph": "view.graph",
+  "view.panel": "panel.toggle",
+  "view.projectPane": "view.toggleProjectPane",
+};
+
+function ApplicationMenuItem({ context, item, onSelect, settings }) {
+  const [action, label, fallbackShortcut, condition] = item;
+  const bindingId = APPLICATION_MENU_BINDINGS[action];
+  const shortcut = bindingId
+    ? formatKeybinding(settingBinding(settings, bindingId))
+    : fallbackShortcut;
+  const enabled = !condition || condition.endsWith("-check")
+    || (condition === "code" && context.view === "code")
+    || (condition === "code-path" && context.view === "code" && Boolean(context.activeCodePath))
+    || (condition === "code-document" && context.view === "code" && Boolean(context.activeCodeDocument));
+  const checked = condition === "graph-check" && context.view === "graph"
+    || condition === "code-check" && context.view === "code"
+    || condition === "project-check" && context.projectPaneVisible
+    || condition === "assistant-check" && context.assistantPaneVisible;
+  return (
+    <button
+      className="flex h-8 w-full items-center gap-3 rounded px-2 text-left text-[12px] hover:bg-slate-100 disabled:text-muted disabled:opacity-45 disabled:hover:bg-transparent"
+      disabled={!enabled}
+      role="menuitem"
+      type="button"
+      onClick={onSelect}
+    >
+      <span aria-hidden="true" className="w-3 text-center">{checked ? "✓" : ""}</span>
+      <span className="flex-1">{label}</span>
+      {shortcut ? <span className="text-[11px] text-muted">{shortcut}</span> : null}
+    </button>
+  );
+}
+
+function RecentProjectsMenuItem({ recentProjectRoots, onSelect }) {
+  const [open, setOpen] = useState(false);
+  const labels = loadProjectLabels();
+  const projects = mergeRecentProjects([], recentProjectRoots).map((root) => ({
+    name: labels[root]?.trim() || projectNameFromPath(root),
+    root,
+  }));
+  return (
+    <div className="relative" onPointerEnter={() => setOpen(true)} onPointerLeave={() => setOpen(false)}>
+      <button
+        aria-expanded={open}
+        aria-haspopup="menu"
+        className="flex h-8 w-full items-center gap-3 rounded px-2 text-left text-[12px] hover:bg-slate-100"
+        role="menuitem"
+        type="button"
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span aria-hidden="true" className="w-3" />
+        <span className="flex-1">Recent Projects</span>
+        <ChevronRight aria-hidden="true" size={13} />
+      </button>
+      {open ? (
+        <div aria-label="Recent projects" className="absolute left-full top-[-6px] z-[101] min-w-[260px] rounded-md border border-line bg-white p-1.5 shadow-[0_10px_28px_rgba(15,23,42,0.18)]" role="menu">
+          {projects.length ? projects.map((project) => (
+            <button className="flex h-8 w-full items-center gap-2 rounded px-2 text-left text-xs hover:bg-slate-100" key={project.root} role="menuitem" title={project.root} type="button" onClick={() => onSelect(project.root)}>
+              <FolderOpen aria-hidden="true" className="shrink-0 text-muted" size={13} />
+              <span className="min-w-0 flex-1 truncate">{project.name}</span>
+            </button>
+          )) : <p className="px-2 py-2 text-xs text-muted">No recent projects</p>}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -6385,7 +6625,23 @@ function ChatMessageBubble({ canEdit = false, message, onEdit, onOpenLink, onUnd
                 </div>
               </div>
             ) : message.body ? (
-              <MarkdownMessage inverse={isUser} onOpenLink={onOpenLink} value={message.body} />
+              <>
+                <MarkdownMessage inverse={isUser} onOpenLink={onOpenLink} value={message.body} />
+                {!isUser ? (
+                  <div className="mt-1 flex justify-end border-t border-line/70 pt-1">
+                    <button
+                      aria-label={copied ? "Response copied" : "Copy response as Markdown"}
+                      className="inline-flex h-6 items-center gap-1 rounded px-1.5 text-[10px] leading-none text-muted outline-none transition hover:bg-slate-50 hover:text-ink focus-visible:ring-2 focus-visible:ring-brand/30 dark:hover:bg-[#242426]"
+                      title={copied ? "Response copied" : "Copy response as Markdown"}
+                      type="button"
+                      onClick={() => void copyMessage()}
+                    >
+                      {copied ? <Check aria-hidden="true" size={11} /> : <Copy aria-hidden="true" size={11} />}
+                      <span>{copied ? "Copied" : "Copy Markdown"}</span>
+                    </button>
+                  </div>
+                ) : null}
+              </>
             ) : null}
           </>
         )}

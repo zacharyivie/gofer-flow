@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -11,8 +11,11 @@ import {
 
 export default function IntegratedBrowser({
   active,
+  applicationKeybindings = {},
   clientId,
+  dragActive = false,
   editing = false,
+  focusLocationOnCreate = false,
   initialUrl = "about:blank",
   localPath = "",
   onClose,
@@ -28,22 +31,25 @@ export default function IntegratedBrowser({
 }) {
   const addressRef = useRef(null);
   const activeRef = useRef(active);
+  const focusLocationOnCreatePendingRef = useRef(focusLocationOnCreate);
   const initialUrlRef = useRef(initialUrl);
+  const initialApplicationKeybindingsRef = useRef(applicationKeybindings);
   const initialOpenBrowserBindingRef = useRef(openBrowserBinding);
   const onCloseRef = useRef(onClose);
   const onCycleTabRef = useRef(onCycleTab);
   const onModeChangeRef = useRef(onModeChange);
   const onNewTabRef = useRef(onNewTab);
   const onStateChangeRef = useRef(onStateChange);
-  const placeholderRef = useRef(null);
+  const containerRef = useRef(null);
   const sessionIdRef = useRef("");
+  const webviewRef = useRef(null);
   const [addressDraft, setAddressDraft] = useState(displayBrowserUrl(initialUrl));
   const [addressFocused, setAddressFocused] = useState(false);
-  const [occluded, setOccluded] = useState(false);
   const [state, setState] = useState({
     canGoBack: false,
     canGoForward: false,
     error: "",
+    favicon: "",
     loading: true,
     title: "",
     url: initialUrl,
@@ -78,7 +84,7 @@ export default function IntegratedBrowser({
       onStateChangeRef.current?.(nextState);
     });
     const unsubscribeCommand = bridge.onCommand?.((command) => {
-      if (!activeRef.current || command?.clientId !== clientId) return;
+      if (command?.clientId !== clientId) return;
       if (!browserSessionEventMatches(sessionIdRef.current, command)) return;
       if (command?.action === "focus-location") {
         addressRef.current?.focus();
@@ -91,6 +97,7 @@ export default function IntegratedBrowser({
       if (command?.action === "edit-local-html") onModeChangeRef.current?.("edit");
     });
     bridge.create({
+      applicationKeybindings: initialApplicationKeybindingsRef.current,
       clientId,
       openBrowserBinding: initialOpenBrowserBindingRef.current,
       path: localPath,
@@ -103,14 +110,15 @@ export default function IntegratedBrowser({
         }
         createdId = nextState?.id ?? "";
         sessionIdRef.current = createdId;
-        setState((current) => ({ ...current, ...nextState }));
-        onStateChangeRef.current?.(nextState);
-        if (!localPath && initialUrlRef.current === "about:blank") {
-          requestAnimationFrame(() => {
-            addressRef.current?.focus();
-            addressRef.current?.select();
-          });
-        }
+        attachBrowserWebview(bridge, createdId, containerRef.current, webviewRef, nextState?.src, (partialState) => {
+          if (disposed || sessionIdRef.current !== createdId) return;
+          setState((current) => ({ ...current, ...partialState }));
+          onStateChangeRef.current?.(partialState);
+        });
+        const cleanState = { ...(nextState ?? {}) };
+        delete cleanState.src;
+        setState((current) => ({ ...current, ...cleanState }));
+        onStateChangeRef.current?.(cleanState);
       })
       .catch((error) => {
         if (disposed) return;
@@ -126,6 +134,8 @@ export default function IntegratedBrowser({
       unsubscribeCommand?.();
       const id = sessionIdRef.current || createdId;
       sessionIdRef.current = "";
+      webviewRef.current?.remove?.();
+      webviewRef.current = null;
       if (id) void bridge.close(id).catch(() => {});
     };
   }, [bridge, clientId, localPath]);
@@ -133,8 +143,8 @@ export default function IntegratedBrowser({
   useEffect(() => {
     const id = sessionIdRef.current;
     if (!id || !bridge?.setPreferences) return;
-    void bridge.setPreferences(id, { openBrowserBinding }).catch(() => {});
-  }, [bridge, openBrowserBinding, state.id]);
+    void bridge.setPreferences(id, { applicationKeybindings, openBrowserBinding }).catch(() => {});
+  }, [applicationKeybindings, bridge, openBrowserBinding, state.id]);
 
   useEffect(() => {
     if (!active) return undefined;
@@ -146,6 +156,10 @@ export default function IntegratedBrowser({
       if (action === "focus-location") {
         addressRef.current?.focus();
         addressRef.current?.select();
+        return;
+      }
+      if (action === "new-tab") {
+        onNewTabRef.current?.();
         return;
       }
       const id = sessionIdRef.current;
@@ -161,50 +175,30 @@ export default function IntegratedBrowser({
   }, [addressFocused, state.url]);
 
   useEffect(() => {
-    if (typeof document.querySelector !== "function") return undefined;
-    const updateOcclusion = () => {
-      setOccluded(browserElementIsOccluded(
-        placeholderRef.current,
-        document.querySelectorAll("[role='dialog'], [role='menu']"),
-      ));
-    };
-    updateOcclusion();
-    if (typeof MutationObserver === "undefined") return undefined;
-    const observer = new MutationObserver(updateOcclusion);
-    observer.observe(document.body, { childList: true, subtree: true });
-    window.addEventListener("resize", updateOcclusion);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", updateOcclusion);
-    };
-  }, []);
+    if (!active || state.error || !state.id) return undefined;
+    const frame = window.requestAnimationFrame(() => {
+      const id = sessionIdRef.current;
+      const webview = webviewRef.current;
+      if (focusLocationOnCreatePendingRef.current) {
+        focusLocationOnCreatePendingRef.current = false;
+        addressRef.current?.focus();
+        addressRef.current?.select?.();
+        return;
+      }
+      if (!id || !bridge?.focus) {
+        webview?.focus?.();
+        return;
+      }
+      void bridge.focus(id).catch(() => {
+        if (activeRef.current && sessionIdRef.current === id) webview?.focus?.();
+      });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [active, bridge, state.error, state.id]);
 
-  useLayoutEffect(() => {
-    const id = sessionIdRef.current;
-    if (!bridge || !id) return undefined;
-    const visible = active && !occluded && !state.error;
-    void bridge.activate(id, visible).catch(() => {});
-    if (!visible || !placeholderRef.current) return undefined;
-    const updateBounds = () => {
-      const bounds = placeholderRef.current?.getBoundingClientRect();
-      if (!bounds || bounds.width <= 0 || bounds.height <= 0) return;
-      void bridge.setBounds(id, {
-        height: bounds.height,
-        width: bounds.width,
-        x: bounds.left,
-        y: bounds.top,
-      }).catch(() => {});
-    };
-    updateBounds();
-    const observer = new ResizeObserver(updateBounds);
-    observer.observe(placeholderRef.current);
-    window.addEventListener("resize", updateBounds);
-    return () => {
-      observer.disconnect();
-      window.removeEventListener("resize", updateBounds);
-      void bridge.activate(id, false).catch(() => {});
-    };
-  }, [active, bridge, occluded, state.error, state.id]);
+  useEffect(() => {
+    if (webviewRef.current) webviewRef.current.style.pointerEvents = dragActive ? "none" : "";
+  }, [dragActive, state.id]);
 
   function run(action) {
     const id = sessionIdRef.current;
@@ -246,7 +240,9 @@ export default function IntegratedBrowser({
         <form className="mx-1 flex min-w-0 flex-1" onSubmit={navigate}>
           <div className="relative min-w-0 flex-1">
             {state.loading ? (
-              <Loader2 className="absolute left-2.5 top-1/2 -translate-y-1/2 animate-spin text-muted" size={12} />
+              <span className="absolute left-2.5 top-1/2 flex -translate-y-1/2 text-muted">
+                <Loader2 className="animate-spin" size={12} />
+              </span>
             ) : null}
             <input
               ref={addressRef}
@@ -279,9 +275,13 @@ export default function IntegratedBrowser({
           </>
         ) : null}
       </div>
-      <div ref={placeholderRef} className="relative min-h-0 flex-1 bg-white">
+      <div
+        ref={containerRef}
+        className="relative min-h-0 flex-1 bg-white"
+        style={dragActive ? { pointerEvents: "none" } : undefined}
+      >
         {state.error ? (
-          <div className="absolute inset-0 grid place-items-center px-8 text-center">
+          <div className="absolute inset-0 z-10 grid place-items-center bg-white px-8 text-center">
             <div>
               <p className="text-sm font-semibold text-ink">Could not display this page</p>
               <p className="mt-1 max-w-lg text-xs leading-5 text-muted">{state.error}</p>
@@ -358,6 +358,7 @@ export function browserChromeShortcutAction(event, platform = "") {
     return "focus-location";
   }
   const primary = platform === "darwin" ? event.metaKey : event.ctrlKey;
+  if (primary && !event.altKey && !event.shiftKey && key === "t") return "new-tab";
   if (primary && !event.altKey && !event.shiftKey && key === "r") return "reload";
   if (event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && key === "arrowleft") {
     return "back";
@@ -368,25 +369,71 @@ export function browserChromeShortcutAction(event, platform = "") {
   return "";
 }
 
-export function browserElementIsOccluded(browserElement, overlayElements) {
-  if (!browserElement?.getBoundingClientRect) return false;
-  const browserBounds = browserElement.getBoundingClientRect();
-  if (browserBounds.width <= 0 || browserBounds.height <= 0) return false;
-  return Array.from(overlayElements ?? []).some((element) => {
-    if (!element?.getBoundingClientRect || element.hidden) return false;
-    if (element.getAttribute?.("aria-hidden") === "true") return false;
-    const overlayBounds = element.getBoundingClientRect();
-    return overlayBounds.width > 0
-      && overlayBounds.height > 0
-      && overlayBounds.left < browserBounds.right
-      && overlayBounds.right > browserBounds.left
-      && overlayBounds.top < browserBounds.bottom
-      && overlayBounds.bottom > browserBounds.top;
+function attachBrowserWebview(bridge, sessionId, container, webviewRef, src, onUpdate) {
+  if (!container || typeof document.createElement !== "function") return;
+  const element = document.createElement("webview");
+  element.setAttribute("partition", "persist:taskurotta-browser");
+  element.setAttribute("plugins", "true");
+  if (bridge.preloadPath) element.setAttribute("preload", bridge.preloadPath);
+  element.setAttribute("src", src || "about:blank");
+  element.style.position = "absolute";
+  element.style.inset = "0";
+  element.style.width = "100%";
+  element.style.height = "100%";
+  const emit = (partialState) => {
+    if (webviewRef.current !== element) return;
+    let history = {};
+    try {
+      history = { canGoBack: element.canGoBack(), canGoForward: element.canGoForward() };
+    } catch {
+      // History methods are unavailable until the webview attaches.
+    }
+    onUpdate?.({ ...history, ...partialState });
+  };
+  element.addEventListener("did-start-loading", () => emit({ error: "", loading: true }));
+  element.addEventListener("did-stop-loading", () => emit({ loading: false }));
+  const isDisplayableUrl = (url) => typeof url === "string" && !url.startsWith("data:");
+  element.addEventListener("did-navigate", (event) => {
+    emit(isDisplayableUrl(event.url) ? { favicon: "", title: "", url: event.url } : {});
   });
+  element.addEventListener("did-navigate-in-page", (event) => {
+    if (event.isMainFrame && isDisplayableUrl(event.url)) emit({ url: event.url });
+  });
+  element.addEventListener("page-title-updated", (event) => emit({ title: event.title }));
+  element.addEventListener("page-favicon-updated", (event) => {
+    emit({ favicon: browserFaviconUrl(event.favicons) });
+  });
+  element.addEventListener("did-fail-load", (event) => {
+    if (!event.isMainFrame || event.errorCode === -3) return;
+    emit({ error: `${event.errorDescription}: ${event.validatedURL}`, loading: false });
+  });
+  const handleDomReady = () => {
+    element.removeEventListener("dom-ready", handleDomReady);
+    if (webviewRef.current !== element || !bridge.adopt) return;
+    void bridge.adopt(sessionId, element.getWebContentsId())
+      .then((adoptedState) => {
+        if (adoptedState && webviewRef.current === element) onUpdate?.(adoptedState);
+      })
+      .catch((error) => {
+        console.error("Integrated browser adopt failed:", error);
+        emit({
+          error: error instanceof Error ? error.message : "Could not attach the browser view.",
+          loading: false,
+        });
+      });
+  };
+  element.addEventListener("dom-ready", handleDomReady);
+  webviewRef.current = element;
+  container.appendChild(element);
 }
 
 export function browserSessionEventMatches(sessionId, event) {
   return Boolean(sessionId && event?.id === sessionId);
+}
+
+export function browserFaviconUrl(favicons) {
+  if (!Array.isArray(favicons)) return "";
+  return favicons.find((value) => /^(?:https?:|file:|data:image\/)/i.test(String(value ?? ""))) || "";
 }
 
 export function isIntegratedBrowserShortcut(event) {

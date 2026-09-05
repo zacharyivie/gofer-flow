@@ -250,10 +250,17 @@ test("text zoom clamps stored values and recognizes keyboard zoom shortcuts", ()
 test("text zoom stays consistent across views and ignores the graph visualization", async () => {
   const workflow = workflowFixture();
   const zoomFactors = [];
+  let sendBrowserCommand;
   const fetchMock = createFetchMock([
     jsonResponse("/api/workflows", workflowsPayload([workflow])),
   ]);
   const dom = await mountReact(React.createElement(appModule.default), fetchMock, {
+    browser: {
+      onCommand(callback) {
+        sendBrowserCommand = callback;
+        return () => {};
+      },
+    },
     desktop: {
       appearance: {
         setZoomFactor(value) {
@@ -285,6 +292,21 @@ test("text zoom stays consistent across views and ignores the graph visualizatio
   assert.ok(dom.byLabel("App zoom 110%."));
 
   await dom.dispatchWindow("wheel", { ctrlKey: true, deltaY: 100 });
+  assert.equal(zoomFactors.at(-1), 1);
+
+  await React.act(async () => {
+    sendBrowserCommand({ action: "text-zoom", direction: 1 });
+  });
+  assert.equal(zoomFactors.at(-1), 1.1);
+
+  await React.act(async () => {
+    sendBrowserCommand({ action: "text-zoom", direction: -1 });
+  });
+  assert.equal(zoomFactors.at(-1), 1);
+
+  await React.act(async () => {
+    sendBrowserCommand({ action: "text-zoom", reset: true });
+  });
   assert.equal(zoomFactors.at(-1), 1);
 
   await dom.dispatchWindow("keydown", { ctrlKey: true, key: "+" });
@@ -2190,6 +2212,31 @@ test("HTML documents default to browser mode and browser tabs use page titles", 
   }), "google.com");
   assert.equal(codeWorkspaceModule.browserTabLabel({ url: "about:blank" }), "New Tab");
   assert.equal(codeWorkspaceModule.browserTabLabel({ url: "taskurotta://home" }), "Taskurotta");
+  assert.match(
+    codeWorkspaceModule.browserTabFavicon({ url: "taskurotta://home" }),
+    /taskurotta-icon\.svg$/,
+  );
+  assert.equal(codeWorkspaceModule.browserTabFavicon({
+    favicon: "https://www.youtube.com/s/desktop/favicon.ico",
+  }), "https://www.youtube.com/s/desktop/favicon.ico");
+  assert.equal(codeWorkspaceModule.browserTabFavicon({ favicon: "javascript:alert(1)" }), "");
+  assert.equal(integratedBrowserModule.browserFaviconUrl([
+    "javascript:alert(1)",
+    "https://www.youtube.com/s/desktop/favicon.ico",
+  ]), "https://www.youtube.com/s/desktop/favicon.ico");
+  assert.equal(codeWorkspaceModule.browserViewTabMetadata(null, {
+    title: "",
+    url: "file:///repo/wiki/index.html",
+  }), null);
+  assert.deepEqual(codeWorkspaceModule.browserViewTabMetadata(null, {
+    favicon: "https://www.youtube.com/favicon.ico",
+    title: "Metroid Prime 4 - YouTube",
+    url: "https://www.youtube.com/watch?v=example",
+  }), {
+    favicon: "https://www.youtube.com/favicon.ico",
+    title: "Metroid Prime 4 - YouTube",
+    url: "https://www.youtube.com/watch?v=example",
+  });
   assert.equal(codeWorkspaceModule.codeTabLabel("/repo/wiki/index.html"), "index.html");
 });
 
@@ -2245,11 +2292,205 @@ test("integrated browser shortcut matches VS Code on desktop platforms", () => {
 test("browser chrome keeps navigation shortcuts when the embedded page is unavailable", () => {
   const shortcut = integratedBrowserModule.browserChromeShortcutAction;
   assert.equal(shortcut({ altKey: true, key: "d" }, "linux"), "focus-location");
+  assert.equal(shortcut({ ctrlKey: true, key: "t" }, "linux"), "new-tab");
   assert.equal(shortcut({ ctrlKey: true, key: "l" }, "linux"), "");
   assert.equal(shortcut({ ctrlKey: true, key: "r" }, "linux"), "reload");
   assert.equal(shortcut({ altKey: true, key: "ArrowLeft" }, "linux"), "back");
   assert.equal(shortcut({ altKey: true, key: "ArrowRight" }, "linux"), "forward");
   assert.equal(shortcut({ key: "r", metaKey: true }, "darwin"), "reload");
+});
+
+test("new browser tabs focus the address on the Taskurotta home page", async () => {
+  const browser = {
+    close: async () => null,
+    create: async () => ({
+      id: "home-session",
+      loading: true,
+      src: "data:text/html,Taskurotta",
+      url: "taskurotta://home",
+    }),
+    onCommand: () => () => {},
+    onState: () => () => {},
+    platform: "linux",
+    setPreferences: async () => null,
+  };
+  const dom = await mountReact(
+    React.createElement(integratedBrowserModule.default, {
+      active: true,
+      clientId: "taskurotta-browser:home",
+      focusLocationOnCreate: true,
+      initialUrl: "taskurotta://home",
+    }),
+    createFetchMock([]),
+    { browser },
+  );
+  await dom.flush();
+
+  assert.equal(document.activeElement === dom.byLabel("Browser address"), true);
+  await dom.unmount();
+});
+
+test("cycling browser tabs transfers native focus to the selected guest", async () => {
+  const commandSubscribers = [];
+  const focusCalls = [];
+  const sessions = new Map();
+  const browser = {
+    adopt: async () => null,
+    close: async () => null,
+    create: async ({ clientId, url }) => {
+      const id = `session-${clientId}`;
+      sessions.set(clientId, id);
+      return {
+        clientId,
+        error: "",
+        id,
+        loading: false,
+        src: url,
+        url,
+      };
+    },
+    focus: async (id) => { focusCalls.push(id); },
+    onCommand: (callback) => {
+      commandSubscribers.push(callback);
+      return () => {};
+    },
+    onState: () => () => {},
+    platform: "linux",
+    setPreferences: async () => null,
+  };
+  const paths = ["taskurotta-browser:first", "taskurotta-browser:second"];
+  function BrowserTabsHarness() {
+    const [activePath, setActivePath] = React.useState(paths[0]);
+    return React.createElement(codeWorkspaceModule.default, {
+      active: true,
+      activePath,
+      browserTabs: {
+        [paths[0]]: { title: "First", url: "https://example.com/first" },
+        [paths[1]]: { title: "Second", url: "https://example.com/second" },
+      },
+      onActivePathChange: setActivePath,
+      openPaths: paths,
+      workflow: { projectRoot: "/repo" },
+    });
+  }
+  const dom = await mountReact(
+    React.createElement(BrowserTabsHarness),
+    createFetchMock([]),
+    { browser },
+  );
+  await dom.flush();
+  focusCalls.length = 0;
+
+  await React.act(async () => {
+    for (const callback of commandSubscribers) {
+      callback({
+        action: "next-tab",
+        clientId: paths[0],
+        id: sessions.get(paths[0]),
+      });
+    }
+  });
+  await dom.flush();
+  await React.act(async () => {
+    for (const callback of commandSubscribers) {
+      callback({
+        action: "previous-tab",
+        clientId: paths[1],
+        id: sessions.get(paths[1]),
+      });
+    }
+  });
+  await dom.flush();
+
+  assert.deepEqual(focusCalls, [sessions.get(paths[1]), sessions.get(paths[0])]);
+  await dom.unmount();
+});
+
+test("cycling tabs inside an unfocused split browser pane stays in that pane", async () => {
+  const commandSubscribers = [];
+  const focusCalls = [];
+  const paths = [
+    "taskurotta-browser:left",
+    "taskurotta-browser:right-one",
+    "taskurotta-browser:right-two",
+  ];
+  const browserTabs = Object.fromEntries(paths.map((clientId) => [clientId, {
+    title: clientId.split(":").at(-1),
+    url: `https://example.com/${clientId}`,
+  }]));
+  const browser = {
+    adopt: async () => null,
+    close: async () => null,
+    create: async ({ clientId, url }) => ({
+      clientId,
+      error: "",
+      id: `session-${clientId}`,
+      loading: false,
+      src: url,
+      url,
+    }),
+    focus: async (id) => { focusCalls.push(id); },
+    onCommand: (callback) => {
+      commandSubscribers.push(callback);
+      return () => {};
+    },
+    onState: () => () => {},
+    platform: "linux",
+    setPreferences: async () => null,
+  };
+  function SplitBrowserTabsHarness() {
+    const [activePath, setActivePath] = React.useState(paths[0]);
+    return React.createElement(codeWorkspaceModule.default, {
+      active: true,
+      activePath,
+      browserTabs,
+      onActivePathChange: setActivePath,
+      openPaths: paths,
+      workflow: { projectRoot: "/repo" },
+    });
+  }
+  const dom = await mountReact(
+    React.createElement(SplitBrowserTabsHarness),
+    createFetchMock([]),
+    { browser },
+  );
+  await dom.flush();
+
+  const transferValues = new Map();
+  const dataTransfer = {
+    dropEffect: "none",
+    effectAllowed: "none",
+    getData: (type) => transferValues.get(type) ?? "",
+    setData: (type, value) => transferValues.set(type, value),
+  };
+  await dom.pointer(dom.ancestor(dom.byText("right-one"), "BUTTON"), "onDragStart", { dataTransfer });
+  await dom.pointer(dom.byLabel("Split editor right"), "onDrop", { dataTransfer });
+  await dom.flush();
+  await dom.pointer(dom.ancestor(dom.byText("right-two"), "BUTTON"), "onDragStart", { dataTransfer });
+  await dom.pointer(dom.byLabel("Split editor tabs"), "onDrop", { dataTransfer });
+  await dom.flush();
+  focusCalls.length = 0;
+
+  await React.act(async () => {
+    for (const callback of commandSubscribers) {
+      callback({
+        action: "next-tab",
+        clientId: paths[1],
+        id: `session-${paths[1]}`,
+      });
+    }
+  });
+  await dom.flush();
+
+  assert.equal(dom.ancestor(dom.byText("right-two"), "BUTTON").getAttribute("aria-selected"), "true");
+  assert.deepEqual(focusCalls, [`session-${paths[2]}`]);
+
+  await dom.dispatchWindow("keydown", { ctrlKey: true, key: "Tab" });
+  await dom.flush();
+
+  assert.equal(dom.ancestor(dom.byText("right-one"), "BUTTON").getAttribute("aria-selected"), "true");
+  assert.deepEqual(focusCalls, [`session-${paths[2]}`, `session-${paths[1]}`]);
+  await dom.unmount();
 });
 
 test("single words use the configured browser search engine", () => {
@@ -2270,7 +2511,13 @@ test("single words use the configured browser search engine", () => {
 test("browser addresses normalize dev servers, websites, and searches", () => {
   const {
     browserLoadUrl,
+    browserCommandRequiresOwnerFocus,
+    browserApplicationShortcutAction,
+    browserContentZoomFactor,
+    browserProjectChordAction,
+    browserSessionShortcutAction,
     browserShortcutAction,
+    browserWheelZoomAction,
     normalizeBrowserUrl,
   } = require("../../electron/browser-utils.cjs");
   assert.equal(normalizeBrowserUrl("localhost:5173/app"), "http://localhost:5173/app");
@@ -2284,8 +2531,51 @@ test("browser addresses normalize dev servers, websites, and searches", () => {
     "https://www.google.com/search?q=asdf",
   );
   assert.throws(() => normalizeBrowserUrl("javascript:alert(1)"), /http:\/\/ or https:\/\//);
+  assert.equal(browserContentZoomFactor(1.4, 1), 1.4);
+  assert.equal(browserContentZoomFactor(1.4, 1.1), 1.54);
+  assert.equal(browserContentZoomFactor(1.5, 3), 3);
   assert.equal(browserShortcutAction({ alt: true, key: "d", type: "keyDown" }, "linux"), "focus-location");
-  assert.equal(browserShortcutAction({ control: true, key: "l", type: "keyDown" }, "linux"), "");
+  const applicationSession = { applicationChord: null };
+  assert.equal(
+    browserApplicationShortcutAction(
+      applicationSession,
+      { code: "KeyJ", control: true, key: "j", type: "keyDown" },
+      { "browser.open": "Ctrl+KeyJ" },
+      "linux",
+    ),
+    "command:browser.open",
+  );
+  assert.equal(
+    browserApplicationShortcutAction(
+      applicationSession,
+      { code: "KeyK", control: true, key: "k", type: "keyDown" },
+      { "project.open": "Mod+KeyK Mod+KeyO" },
+      "linux",
+    ),
+    "chord-pending",
+  );
+  assert.equal(
+    browserApplicationShortcutAction(
+      applicationSession,
+      { code: "KeyO", control: true, key: "o", type: "keyDown" },
+      { "project.open": "Mod+KeyK Mod+KeyO" },
+      "linux",
+    ),
+    "command:project.open",
+  );
+  assert.equal(browserShortcutAction({ control: true, key: "l", type: "keyDown" }, "linux"), "assistant-pane-toggle");
+  assert.equal(browserShortcutAction({ control: true, key: "b", type: "keyDown" }, "linux"), "project-pane-toggle");
+  assert.equal(browserShortcutAction({ control: true, key: "o", type: "keyDown" }, "linux"), "file-open");
+  assert.equal(browserShortcutAction({ control: true, key: "`", type: "keyDown" }, "linux"), "panel-toggle");
+  const browserSession = { projectChordDeadline: 0 };
+  assert.equal(
+    browserProjectChordAction(browserSession, { control: true, key: "k", type: "keyDown" }, "linux"),
+    "chord-pending",
+  );
+  assert.equal(
+    browserProjectChordAction(browserSession, { control: true, key: "o", type: "keyDown" }, "linux"),
+    "project-open",
+  );
   assert.equal(browserShortcutAction({ alt: true, control: true, key: "/", type: "keyDown" }, "linux"), "open-browser");
   assert.equal(
     browserShortcutAction(
@@ -2305,9 +2595,47 @@ test("browser addresses normalize dev servers, websites, and searches", () => {
   );
   assert.equal(browserShortcutAction({ key: "r", meta: true, type: "keyDown" }, "darwin"), "reload");
   assert.equal(browserShortcutAction({ control: true, key: "w", type: "keyDown" }, "linux"), "close");
+  assert.equal(
+    browserSessionShortcutAction(
+      {
+        applicationKeybindings: {
+          "file.close": "Mod+KeyW",
+          "terminal.new": "Ctrl+KeyT",
+        },
+        openBrowserBinding: "Mod+Alt+Slash",
+      },
+      { code: "KeyW", control: true, key: "w", type: "keyDown" },
+      "linux",
+    ),
+    "close",
+  );
+  assert.equal(
+    browserSessionShortcutAction(
+      {
+        applicationKeybindings: { "terminal.new": "Ctrl+KeyT" },
+        openBrowserBinding: "Mod+Alt+Slash",
+      },
+      { code: "KeyT", control: true, key: "t", type: "keyDown" },
+      "linux",
+    ),
+    "new-tab",
+  );
+  assert.equal(browserWheelZoomAction({ control: true, deltaY: -100, type: "mouseWheel" }), "zoom-in");
+  assert.equal(browserWheelZoomAction({ modifiers: ["control"], deltaY: 100, type: "mouseWheel" }), "zoom-out");
+  assert.equal(browserWheelZoomAction({ modifiers: ["ctrl"], deltaY: -100, type: "mouseWheel" }), "zoom-in");
+  assert.equal(browserWheelZoomAction({ meta: true, deltaY: -100, type: "mouseWheel" }), "zoom-in");
+  assert.equal(browserWheelZoomAction({ modifiers: ["command"], deltaY: 100, type: "mouseWheel" }), "zoom-out");
+  assert.equal(browserWheelZoomAction({ modifiers: ["meta", "alt"], deltaY: 100, type: "mouseWheel" }), "");
+  assert.equal(browserWheelZoomAction({ deltaY: -100, type: "mouseWheel" }), "");
   assert.equal(browserShortcutAction({ control: true, key: "t", type: "keyDown" }, "linux"), "new-tab");
   assert.equal(browserShortcutAction({ control: true, key: "Tab", type: "keyDown" }, "linux"), "next-tab");
   assert.equal(browserShortcutAction({ control: true, key: "Tab", shift: true, type: "keyDown" }, "linux"), "previous-tab");
+  for (const action of ["close", "edit-local-html", "focus-location", "new-tab", "next-tab", "previous-tab"]) {
+    assert.equal(browserCommandRequiresOwnerFocus(action), true, action);
+  }
+  for (const action of ["back", "open-browser", "reload", "text-zoom"]) {
+    assert.equal(browserCommandRequiresOwnerFocus(action), false, action);
+  }
   assert.equal(normalizeBrowserUrl("taskurotta://home"), "taskurotta://home");
   const homePage = decodeURIComponent(browserLoadUrl("taskurotta://home").split(",", 2)[1]);
   assert.match(homePage, /Workflows that stay on your machine/);
@@ -2318,6 +2646,25 @@ test("browser addresses normalize dev servers, websites, and searches", () => {
 });
 
 test("browser shortcut opens one reusable editor tab", async () => {
+  let browserSequence = 0;
+  const browser = {
+    adopt: async () => null,
+    close: async () => null,
+    create: async ({ clientId, url }) => {
+      browserSequence += 1;
+      return {
+        clientId,
+        id: `browser-session-${browserSequence}`,
+        loading: false,
+        src: "data:text/html,Taskurotta",
+        url,
+      };
+    },
+    onCommand: () => () => {},
+    onState: () => () => {},
+    platform: "linux",
+    setPreferences: async () => null,
+  };
   const workflow = {
     ...workflowFixture(),
     sourceFormat: "radish",
@@ -2331,6 +2678,7 @@ test("browser shortcut opens one reusable editor tab", async () => {
         document: { diagnostics: [], preflight: { diagnostics: [] }, source: "Radish: 1\n" },
       }),
     ]),
+    { browser },
   );
   await dom.flush();
 
@@ -2344,6 +2692,7 @@ test("browser shortcut opens one reusable editor tab", async () => {
   assert.equal(allElements(dom.container).filter(
     (element) => element.getAttribute?.("aria-label") === "Close Taskurotta",
   ).length, 1);
+  assert.equal(document.activeElement?.getAttribute?.("aria-label"), "Browser address");
 
   await dom.dispatchWindow("keydown", {
     code: "KeyJ",
@@ -2364,6 +2713,20 @@ test("browser shortcut opens one reusable editor tab", async () => {
   assert.equal(allElements(dom.container).filter(
     (element) => element.getAttribute?.("aria-label") === "Close Taskurotta",
   ).length, 2);
+  assert.equal(document.activeElement?.getAttribute?.("aria-label"), "Browser address");
+
+  const addressInput = dom.byLabel("Browser address");
+  addressInput.focus();
+  await dom.dispatchWindow("keydown", {
+    code: "KeyT",
+    ctrlKey: true,
+    key: "t",
+    target: addressInput,
+  });
+  await dom.flush();
+  assert.equal(allElements(dom.container).filter(
+    (element) => element.getAttribute?.("aria-label") === "Close Taskurotta",
+  ).length, 3);
   await dom.unmount();
 });
 
@@ -2701,6 +3064,42 @@ test("workspace shortcuts cycle tabs and create a new tab from browser chrome", 
   await browserDom.unmount();
 });
 
+test("editor tabs stay readable while the horizontal scrollbar autohides", async () => {
+  const paths = [
+    "taskurotta-browser:one",
+    "taskurotta-browser:two",
+    "taskurotta-browser:three",
+  ];
+  const browserTabs = Object.fromEntries(paths.map((pathValue, index) => [pathValue, {
+    title: `Browser tab ${index + 1}`,
+    url: `https://example.com/${index + 1}`,
+  }]));
+  const dom = await mountReact(
+    React.createElement(codeWorkspaceModule.default, {
+      active: true,
+      activePath: paths[0],
+      browserTabs,
+      openPaths: paths,
+      workflow: { projectRoot: "/repo" },
+    }),
+    createFetchMock([]),
+  );
+
+  const tabStrip = dom.byLabel("Editor tabs");
+  const firstTab = dom.ancestor(dom.byText("Browser tab 1"), "BUTTON").parentNode;
+  assert.match(tabStrip.getAttribute("class"), /tab-strip-scrollbar/);
+  assert.match(tabStrip.getAttribute("class"), /overflow-y-hidden/);
+  assert.match(firstTab.getAttribute("class"), /w-48/);
+  assert.match(firstTab.getAttribute("class"), /shrink-0/);
+
+  const css = fs.readFileSync(path.join(frontendRoot, "src/styles/index.css"), "utf8");
+  assert.match(css, /\.tab-strip-scrollbar::-webkit-scrollbar\s*{[^}]*height:\s*3px;/s);
+  assert.match(css, /\.tab-strip-scrollbar\s*{[^}]*scrollbar-color:\s*transparent transparent;/s);
+  assert.match(css, /\.tab-strip-scrollbar:hover::-webkit-scrollbar-thumb/);
+
+  await dom.unmount();
+});
+
 test("file tab context actions target the expected tabs", () => {
   const paths = ["/repo/a.js", "/repo/b.js", "/repo/c.js"];
   assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, paths[1], "close"), [paths[1]]);
@@ -2710,6 +3109,130 @@ test("file tab context actions target the expected tabs", () => {
   assert.deepEqual(codeWorkspaceModule.fileTabCloseTargets(paths, "/repo/missing.js", "all"), []);
   assert.deepEqual(codeWorkspaceModule.reorderCodeTabs(paths, paths[0], paths[2]), [paths[1], paths[2], paths[0]]);
   assert.deepEqual(codeWorkspaceModule.reorderCodeTabs(paths, paths[2], paths[0]), [paths[2], paths[0], paths[1]]);
+  assert.deepEqual(
+    codeWorkspaceModule.stableCodeDocumentPaths(paths, [paths[1], paths[2], paths[0]]),
+    paths,
+  );
+  assert.deepEqual(
+    codeWorkspaceModule.stableCodeDocumentPaths(paths, [paths[2], "/repo/d.js"]),
+    [paths[2], "/repo/d.js"],
+  );
+});
+
+test("active browser tabs drag from the left edge and keep their guest while changing panes", async () => {
+  const paths = ["taskurotta-browser:first", "taskurotta-browser:second"];
+  const browserTabs = {
+    [paths[0]]: { title: "First", url: "https://example.com/first" },
+    [paths[1]]: { title: "Second", url: "https://example.com/second" },
+  };
+  const created = [];
+  const closed = [];
+  const commandSubscribers = [];
+  const focusCalls = [];
+  const browser = {
+    adopt: async () => null,
+    close: async (id) => { closed.push(id); },
+    create: async ({ clientId, url }) => {
+      created.push(clientId);
+      return {
+        canGoBack: false,
+        canGoForward: false,
+        clientId,
+        error: "",
+        favicon: "",
+        id: `session-${clientId}`,
+        loading: false,
+        src: url,
+        title: browserTabs[clientId].title,
+        url,
+      };
+    },
+    focus: async (id) => { focusCalls.push(id); },
+    onCommand: (callback) => {
+      commandSubscribers.push(callback);
+      return () => {};
+    },
+    onState: () => () => {},
+    platform: "linux",
+    setPreferences: async () => null,
+  };
+  const reordered = [];
+  function BrowserTabHarness() {
+    const [openPaths, setOpenPaths] = React.useState(paths);
+    const [activePath, setActivePath] = React.useState(paths[0]);
+    return React.createElement(codeWorkspaceModule.default, {
+      active: true,
+      activePath,
+      browserTabs,
+      openPaths,
+      onActivePathChange: setActivePath,
+      onOpenPathsChange: (nextPaths) => {
+        reordered.push(nextPaths);
+        setOpenPaths(nextPaths);
+      },
+      workflow: { projectRoot: "/repo" },
+    });
+  }
+  const dom = await mountReact(
+    React.createElement(BrowserTabHarness),
+    createFetchMock([]),
+    { browser },
+  );
+  await dom.flush();
+  assert.deepEqual(created, paths);
+  const mountedBrowserUrls = () => allElements(dom.container)
+    .filter((node) => node.tagName === "WEBVIEW")
+    .map((node) => node.getAttribute("src"));
+  assert.deepEqual(mountedBrowserUrls(), paths.map((pathValue) => browserTabs[pathValue].url));
+
+  const transferValues = new Map();
+  const dataTransfer = {
+    dropEffect: "none",
+    effectAllowed: "none",
+    getData: (type) => transferValues.get(type) ?? "",
+    setData: (type, value) => transferValues.set(type, value),
+  };
+  const firstTab = dom.ancestor(dom.byText("First"), "BUTTON");
+  await dom.pointer(firstTab, "onDragStart", { dataTransfer });
+  assert.equal(dataTransfer.effectAllowed, "move");
+  assert.equal(dataTransfer.getData("text/plain"), paths[0]);
+  const splitRight = dom.byLabel("Split editor right");
+  assert.equal(splitRight.style.gridRow, "2", "split target covered the tab strip");
+  assert.equal(dom.byLabel("Editor tabs").style.gridRow, "1");
+  await dom.pointer(splitRight, "onDrop", { dataTransfer });
+  await dom.flush();
+
+  assert.deepEqual(created, paths, "splitting recreated an integrated browser guest");
+  assert.deepEqual(closed, [], "splitting closed an integrated browser guest");
+  assert.ok(dom.byLabel("Split editor tabs"));
+
+  const splitFirstTab = dom.ancestor(dom.byText("First"), "BUTTON");
+  const secondTab = dom.ancestor(dom.byText("Second"), "BUTTON");
+  await dom.pointer(splitFirstTab, "onDragStart", { dataTransfer });
+  await dom.pointer(secondTab.parentNode, "onDrop", { dataTransfer });
+  await dom.flush();
+
+  assert.deepEqual(reordered, [[paths[1], paths[0]]]);
+  assert.deepEqual(
+    mountedBrowserUrls(),
+    paths.map((pathValue) => browserTabs[pathValue].url),
+    "reordering tabs moved mounted Electron webviews in the DOM",
+  );
+  assert.deepEqual(created, paths, "moving a tab between panes recreated its browser guest");
+  assert.deepEqual(closed, [], "moving a tab between panes closed its browser guest");
+
+  focusCalls.length = 0;
+  await React.act(async () => {
+    for (const callback of commandSubscribers) {
+      callback({ action: "next-tab", clientId: paths[0], id: `session-${paths[0]}` });
+    }
+  });
+  await dom.flush();
+  assert.equal(dom.ancestor(dom.byText("Second"), "BUTTON").getAttribute("aria-selected"), "true");
+  assert.deepEqual(focusCalls, [`session-${paths[1]}`]);
+
+  await dom.unmount();
+  assert.deepEqual(closed.sort(), paths.map((pathValue) => `session-${pathValue}`).sort());
 });
 
 test("file previews replace only the previous preview and pin on a permanent open", () => {
@@ -2874,6 +3397,22 @@ test("IDE mode exposes project, file, and browser actions without a project", as
   );
   await dom.flush();
   await dom.click(dom.ancestor(dom.byText("Code"), "BUTTON"));
+  assert.equal(
+    allElements(dom.container).some((node) =>
+      String(node.getAttribute?.("class") ?? "").includes("studio-topbar")),
+    false,
+  );
+  await dom.click(dom.byText("File"));
+  assert.ok(dom.byText("New File"));
+  assert.ok(dom.byText("Open Project..."));
+  assert.ok(dom.byText("Close Editor"));
+  await dom.click(dom.byText("File"));
+  await dom.click(dom.byText("Selection"));
+  assert.ok(dom.byText("Expand Selection"));
+  assert.ok(dom.byText("Add Cursor Below"));
+  await dom.click(dom.byText("Selection"));
+  await dom.click(dom.byText("Terminal"));
+  assert.ok(dom.byText("Toggle Terminal"));
   assert.ok(dom.byText("Getting Started"));
   assert.ok(dom.byText("Open Project"));
   assert.ok(dom.byText("Open File"));
@@ -2891,6 +3430,37 @@ test("IDE mode exposes project, file, and browser actions without a project", as
   });
   await dom.flush();
   assert.ok(dom.byLabel("Integrated browser"));
+  await dom.unmount();
+});
+
+test("application menus use configured shortcuts and expose recent projects", async () => {
+  const selectedProjects = [];
+  const settings = settingsModule.normalizeAppSettings({
+    keybindings: {
+      "panel.toggle": "Ctrl+Shift+Backquote",
+      "project.open": "Alt+KeyP",
+    },
+  });
+  const dom = await mountReact(
+    React.createElement(appModule.ApplicationMenus, {
+      recentProjectRoots: ["/workspace/gofer-flow", "/workspace/second-brain"],
+      settings,
+      view: "code",
+      onAction() {},
+      onSelectProject(root) { selectedProjects.push(root); },
+    }),
+    createFetchMock([]),
+  );
+
+  await dom.click(dom.byText("File"));
+  assert.match(dom.ancestor(dom.byText("Open Project..."), "BUTTON").textContent, /Alt\+P/);
+  await dom.click(dom.ancestor(dom.byText("Recent Projects"), "BUTTON"));
+  assert.ok(dom.byText("gofer-flow"));
+  await dom.click(dom.ancestor(dom.byText("second-brain"), "BUTTON"));
+  assert.deepEqual(selectedProjects, ["/workspace/second-brain"]);
+
+  await dom.click(dom.byText("Terminal"));
+  assert.match(dom.ancestor(dom.byText("Toggle Terminal"), "BUTTON").textContent, /Ctrl\+Shift\+`/);
   await dom.unmount();
 });
 
@@ -3370,7 +3940,7 @@ test("Radish graph restores selection and emits targeted inspector mutations", a
   await dom.unmount();
 });
 
-test("Radish edits become dirty immediately and enable the top-bar save button", async () => {
+test("Radish edits become dirty immediately without adding a code-mode top bar", async () => {
   const savedSource = "Radish: 1\n\nWorkflow:\n  name: Demo\n";
   const editedSource = `${savedSource}\nNode prepare:\n  type: bash-command\n  command: echo ready\n`;
   const edited = radishEditorModule.editorDocumentAfterChange(
@@ -3384,7 +3954,6 @@ test("Radish edits become dirty immediately and enable the top-bar save button",
     false,
   );
 
-  let saveRequests = 0;
   const workflow = {
     ...workflowFixture({ id: "demo", name: "Demo" }),
     projectName: "gofer-flow",
@@ -3403,17 +3972,15 @@ test("Radish edits become dirty immediately and enable the top-bar save button",
       onCheckForUpdates() {},
       onOpenHistory() {},
       onRetrySave() {},
-      onSaveRadish() { saveRequests += 1; },
       onToggleTheme() {},
     }),
     createFetchMock([]),
   );
-  const save = dom.byLabel("Save active file");
-  const topBar = dom.ancestor(save, "HEADER");
   assert.equal(dom.byText("workflow.rad").tagName, "H2");
   assert.match(dom.byText("workflow.rad").getAttribute("class"), /text-\[15px\]/);
   assert.equal(dom.byText("/workspace/gofer-flow/.taskurotta/demo").tagName, "SPAN");
   assert.doesNotMatch(dom.text(), /\d+ lines/);
+  const topBar = dom.ancestor(dom.byText("workflow.rad"), "HEADER");
   assert.match(topBar.getAttribute("class"), /studio-topbar/);
   assert.equal(
     allElements(topBar).some(
@@ -3421,11 +3988,10 @@ test("Radish edits become dirty immediately and enable the top-bar save button",
     ),
     false,
   );
-  assert.equal(save.disabled, false);
-  assert.equal(save.textContent, "");
+  assert.equal(allElements(topBar).some(
+    (element) => element.getAttribute?.("aria-label") === "Save active file",
+  ), false);
   assert.doesNotMatch(dom.text(), /Saved/);
-  await dom.click(save);
-  assert.equal(saveRequests, 1);
   await dom.unmount();
 });
 
@@ -4749,11 +5315,19 @@ test("editing and resending the latest user message replaces the rest of the con
   const editButtons = allElements(dom.container).filter(
     (element) => element.getAttribute?.("aria-label") === "Edit message",
   );
+  const responseCopyButtons = allElements(dom.container).filter(
+    (element) => element.getAttribute?.("aria-label") === "Copy response as Markdown",
+  );
   assert.equal(copyButtons.length, 2);
+  assert.equal(responseCopyButtons.length, 2);
   assert.equal(editButtons.length, 1);
   await dom.click(copyButtons[0]);
   assert.deepEqual(writes, ["First prompt"]);
   assert.equal(copyButtons[0].getAttribute("aria-label"), "Message copied");
+
+  await dom.click(responseCopyButtons[0]);
+  assert.deepEqual(writes, ["First prompt", "Done"]);
+  assert.equal(responseCopyButtons[0].getAttribute("aria-label"), "Response copied");
 
   await dom.click(editButtons[0]);
   const editField = dom.byLabel("Edit message text");
@@ -6996,6 +7570,19 @@ test("Electron terminal creation has no fixed session ceiling", () => {
   assert.match(source, /function global:prompt/);
 });
 
+test("Electron Git editor handoff keeps the terminal PTY flowing", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
+  const editorLifecycle = source.slice(
+    source.indexOf("function handleTerminalEditorConnection"),
+    source.indexOf("function cancelTerminalEditorRequests"),
+  );
+
+  assert.doesNotMatch(editorLifecycle, /session\.terminal\.pause/);
+  assert.doesNotMatch(editorLifecycle, /terminal\?\.resume/);
+  assert.match(editorLifecycle, /owner\.send\("gofer:terminal-open-editor"/);
+  assert.match(editorLifecycle, /request\.socket\.end/);
+});
+
 test("Electron path inspection reports deleted files without rejecting the request", async () => {
   const { inspectPath } = require("../../electron/path-info.cjs");
   const tempRoot = await fs.promises.mkdtemp(path.join(os.tmpdir(), "gofer-path-info-"));
@@ -7035,51 +7622,6 @@ test("Electron update checks return an error state instead of rejecting IPC", ()
   assert.match(checkFunction, /return getUpdateState\(\)/);
 });
 
-test("integrated browser only hides for menus and dialogs that overlap it", () => {
-  const boundedElement = (bounds) => ({
-    getBoundingClientRect: () => bounds,
-    hidden: false,
-  });
-  const browserElement = boundedElement({
-    bottom: 800,
-    height: 760,
-    left: 0,
-    right: 1000,
-    top: 40,
-    width: 1000,
-  });
-  const assistantMenu = boundedElement({
-    bottom: 260,
-    height: 220,
-    left: 1280,
-    right: 1600,
-    top: 40,
-    width: 320,
-  });
-  const overlappingDialog = boundedElement({
-    bottom: 600,
-    height: 400,
-    left: 400,
-    right: 800,
-    top: 200,
-    width: 400,
-  });
-
-  assert.equal(
-    integratedBrowserModule.browserElementIsOccluded(browserElement, [assistantMenu]),
-    false,
-  );
-  assert.equal(
-    integratedBrowserModule.browserElementIsOccluded(browserElement, [overlappingDialog]),
-    true,
-  );
-  overlappingDialog.hidden = true;
-  assert.equal(
-    integratedBrowserModule.browserElementIsOccluded(browserElement, [overlappingDialog]),
-    false,
-  );
-});
-
 test("integrated browser ignores late events from replaced native sessions", () => {
   assert.equal(
     integratedBrowserModule.browserSessionEventMatches("current-session", {
@@ -7104,23 +7646,33 @@ test("integrated browser ignores late events from replaced native sessions", () 
   );
 });
 
-test("Electron integrated browser uses isolated disposable WebContentsViews", () => {
+test("Electron integrated browser uses locked-down webview guests", () => {
   const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
   const preloadSource = fs.readFileSync(
     path.join(repoRoot, "frontend/electron/browser-preload.cjs"),
     "utf8",
   );
-  assert.match(source, /new WebContentsView/);
-  assert.match(source, /partition: "persist:taskurotta-browser"/);
-  assert.match(source, /contextIsolation: true/);
-  assert.match(source, /nodeIntegration: false/);
-  assert.match(source, /preload: browserPreloadPath/);
-  assert.match(source, /sandbox: true/);
-  assert.match(source, /webSecurity: true/);
+  const componentSource = fs.readFileSync(
+    path.join(repoRoot, "frontend/src/components/IntegratedBrowser.jsx"),
+    "utf8",
+  );
+  assert.doesNotMatch(source, /new WebContentsView/);
+  assert.match(source, /webviewTag: true/);
+  assert.match(source, /will-attach-webview/);
+  assert.match(source, /params\.partition !== "persist:taskurotta-browser"/);
+  assert.match(source, /isPendingBrowserSessionSrc\(terminalOwnerId, params\.src\)/);
+  assert.match(source, /webPreferences\.preload = browserPreloadPath/);
+  assert.match(source, /webPreferences\.contextIsolation = true/);
+  assert.match(source, /webPreferences\.nodeIntegration = false/);
+  assert.match(source, /webPreferences\.sandbox = true/);
+  assert.match(source, /webPreferences\.webSecurity = true/);
+  assert.match(source, /did-attach-webview/);
+  assert.match(source, /guestContents\.setWindowOpenHandler\(\(\) => \(\{ action: "deny" \}\)\)/);
+  assert.match(source, /guest\.hostWebContents !== event\.sender/);
+  assert.match(source, /guest\.getType\(\) !== "webview"/);
   assert.match(source, /before-mouse-event/);
   assert.match(source, /edit-local-html/);
   assert.match(source, /closeBrowserSession/);
-  assert.match(source, /session\.view\.setVisible\(false\)/);
   assert.match(source, /gofer:browser-open-file/);
   assert.match(source, /isMarkdownFilePath/);
   assert.match(source, /event\.senderFrame !== contents\.mainFrame/);
@@ -7129,37 +7681,55 @@ test("Electron integrated browser uses isolated disposable WebContentsViews", ()
   assert.match(source, /setWindowOpenHandler\(\(\{ url \}\) => \{[\s\S]*?contents\.loadURL\(url\)/);
   assert.match(
     source,
-    /if \(action === "focus-location"\) session\.owner\.focus\(\);[\s\S]*?session\.owner\.send\("gofer:browser-command"/,
+    /if \(browserCommandRequiresOwnerFocus\(action\)\) session\.owner\.focus\(\);\s*session\.owner\.send\("gofer:browser-command"/,
   );
   assert.match(source, /session\.openBrowserBinding/);
+  assert.match(source, /syncBrowserContentZoom\(session\)/);
+  assert.match(source, /session\.ownerZoomFactor/);
   assert.doesNotMatch(source, /accelerator: "CommandOrControl\+Alt\+\//);
-  assert.doesNotMatch(source, /<webview/);
+  assert.match(componentSource, /document\.createElement\("webview"\)/);
+  assert.match(componentSource, /setAttribute\("partition", "persist:taskurotta-browser"\)/);
+  assert.match(componentSource, /bridge\.adopt\(sessionId, element\.getWebContentsId\(\)\)/);
+  assert.match(componentSource, /page-favicon-updated/);
+  assert.match(source, /page-favicon-updated/);
   assert.match(preloadSource, /gofer:browser-link-clicked/);
   assert.match(preloadSource, /gofer:browser-navigation/);
+  assert.match(preloadSource, /gofer:browser-zoom/);
   assert.match(preloadSource, /event\.preventDefault\(\)/);
 });
 
-test("Electron integrated browser restores renderer focus after hiding or closing a focused view", () => {
+test("Electron integrated browser restores renderer focus after closing a focused view", () => {
   const source = fs.readFileSync(path.join(repoRoot, "frontend/electron/main.js"), "utf8");
-  const activeFunction = source.slice(
-    source.indexOf("function setBrowserSessionActive"),
-    source.indexOf("function setBrowserSessionBounds"),
-  );
   const closeFunction = source.slice(
     source.indexOf("function closeBrowserSession"),
-    source.indexOf("function closeBrowsersForOwner"),
+    source.indexOf("function browserSessionContents"),
   );
 
-  assert.match(activeFunction, /const contents = browserSessionContents\(session\)/);
-  assert.match(activeFunction, /!active && contents\?\.isFocused\(\) === true/);
-  assert.match(activeFunction, /session\.view\.setVisible\(active\)/);
-  assert.match(activeFunction, /restoreOwnerFocus[\s\S]*session\.owner\.focus\(\)/);
   assert.match(closeFunction, /const contents = browserSessionContents\(session\)/);
   assert.match(closeFunction, /contents\?\.isFocused\(\) === true/);
-  assert.match(closeFunction, /session\.view\.setVisible\(false\)/);
   assert.match(closeFunction, /restoreOwnerFocus[\s\S]*session\.owner\.focus\(\)/);
-  assert.match(activeFunction, /!session\.owner\.isDestroyed\(\)/);
   assert.match(closeFunction, /!session\.owner\.isDestroyed\(\)/);
+});
+
+test("open editors refresh Git baselines after external branch changes", () => {
+  const source = fs.readFileSync(
+    path.join(repoRoot, "frontend/src/components/CodeWorkspace.jsx"),
+    "utf8",
+  );
+  assert.match(source, /setInterval\(refresh, 2000\)/);
+  assert.match(source, /addEventListener\("focus", refresh\)/);
+  assert.match(source, /addEventListener\("visibilitychange", refresh\)/);
+});
+
+test("recent project selection always rediscovers the selected folder", () => {
+  const source = fs.readFileSync(path.join(repoRoot, "frontend/src/pages/App.jsx"), "utf8");
+  const selectFunction = source.slice(
+    source.indexOf("function selectRecentProject"),
+    source.indexOf("function removeRecentProject"),
+  );
+  assert.match(selectFunction, /openProjectAtPath\(selectedProjectRoot/);
+  assert.doesNotMatch(selectFunction, /projectWorkflows/);
+  assert.match(source, /projectOpenRequestRef\.current !== requestId/);
 });
 
 test("Electron integrated browser ignores state events after native view disposal", () => {
@@ -7236,6 +7806,27 @@ test("integrated browser Backspace navigates unless focus is editable", () => {
   dispatch("keydown", inputBackspace);
   assert.equal(inputBackspace.defaultPrevented, false);
   assert.equal(sent.length, 1);
+});
+
+test("integrated browser forwards modified wheel gestures to app zoom", () => {
+  const { dispatch, sent } = runBrowserPreload();
+
+  const plainWheel = browserPageEvent({ deltaY: -100, type: "wheel" });
+  dispatch("wheel", plainWheel);
+  assert.equal(plainWheel.defaultPrevented, false);
+
+  const zoomIn = browserPageEvent({ ctrlKey: true, deltaY: -100, type: "wheel" });
+  dispatch("wheel", zoomIn);
+  assert.equal(zoomIn.defaultPrevented, true);
+
+  const zoomOut = browserPageEvent({ deltaY: 100, metaKey: true, type: "wheel" });
+  dispatch("wheel", zoomOut);
+  assert.equal(zoomOut.defaultPrevented, true);
+
+  assert.deepEqual(toPlainObject(sent), [
+    { channel: "gofer:browser-zoom", payload: { direction: 1 } },
+    { channel: "gofer:browser-zoom", payload: { direction: -1 } },
+  ]);
 });
 
 test("Electron IPC security validates sender origins and external URL schemes", () => {
@@ -8151,7 +8742,7 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   assert.deepEqual(Object.keys(exposed.goferDesktop.textFiles).sort(), ["read", "readPreview", "write"]);
   assert.deepEqual(Object.keys(exposed.goferDesktop.dataDirectory).sort(), ["choose", "get"]);
   assert.deepEqual(Object.keys(exposed.goferBrowser).sort(), [
-    "activate",
+    "adopt",
     "back",
     "close",
     "create",
@@ -8164,8 +8755,8 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
     "onState",
     "openExternal",
     "platform",
+    "preloadPath",
     "reload",
-    "setBounds",
     "setPreferences",
     "stop",
   ]);
@@ -8179,9 +8770,11 @@ test("Electron preload exposes stable desktop and update bridge contracts", asyn
   ]);
   assert.deepEqual(Object.keys(exposed.goferTerminal).sort(), [
     "close",
+    "completeEditor",
     "create",
     "onData",
     "onExit",
+    "onOpenEditor",
     "resize",
     "write",
   ]);
@@ -8794,13 +9387,14 @@ async function exerciseDialogFamily(renderDialog, desktop = {}) {
   await dom.unmount();
 }
 
-async function mountReact(element, fetchMock, { desktop = {}, storage = {} } = {}) {
+async function mountReact(element, fetchMock, { browser, desktop = {}, storage = {} } = {}) {
   const dom = installTestDom();
   const { createRoot } = require("react-dom/client");
   globalThis.IS_REACT_ACT_ENVIRONMENT = true;
   globalThis.fetch = fetchMock;
   globalThis.window.fetch = fetchMock;
   globalThis.window.goferApiBaseUrl = undefined;
+  globalThis.window.goferBrowser = browser;
   globalThis.window.goferDesktop = desktop;
   globalThis.window.goferUpdates = undefined;
   for (const [key, value] of Object.entries(storage)) {

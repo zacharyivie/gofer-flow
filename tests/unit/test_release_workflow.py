@@ -111,11 +111,15 @@ def _parse_workflow_yaml(path: Path) -> dict[str, Any]:
 
 
 def _release_workflow() -> dict[str, Any]:
-    return _parse_workflow_yaml(REPO_ROOT / ".github" / "workflows" / "release.yml")
+    return _parse_workflow_yaml(REPO_ROOT / ".github" / "workflows" / "release-build.yml")
+
+
+def _job(workflow: dict[str, Any], name: str) -> dict[str, Any]:
+    return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])[name])
 
 
 def _build_job(workflow: dict[str, Any]) -> dict[str, Any]:
-    return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])["build"])
+    return _job(workflow, "build")
 
 
 def _steps_by_name(build_job: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -158,8 +162,8 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
     assert matrix == {
         "linux": {
             "name": "linux",
-            "os": "ubuntu-latest",
-            "package-script": "dist:linux",
+            "os": "ubuntu-24.04",
+            "electron_builder_args": "--linux AppImage deb rpm",
             "artifact-name": "gofer-flow-linux",
             "artifact-glob": (
                 "frontend/release/*.AppImage\n"
@@ -174,7 +178,7 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
         "windows": {
             "name": "windows",
             "os": "windows-latest",
-            "package-script": "dist:win",
+            "electron_builder_args": "--win nsis",
             "artifact-name": "gofer-flow-windows",
             "artifact-glob": (
                 "frontend/release/*.exe\n"
@@ -186,7 +190,7 @@ def test_release_workflow_matrix_matches_supported_platforms() -> None:
         "macos": {
             "name": "macos",
             "os": "macos-latest",
-            "package-script": "dist:mac",
+            "electron_builder_args": "--mac dmg",
             "artifact-name": "gofer-flow-macos",
             "artifact-glob": (
                 "frontend/release/*.dmg\n"
@@ -272,9 +276,12 @@ def test_release_workflow_uploads_expected_artifacts_and_checksums() -> None:
 
 
 def test_release_workflow_publication_and_artifact_upload_contract() -> None:
-    steps = _steps_by_name(_build_job(_release_workflow()))
+    workflow = _release_workflow()
+    build_job = _build_job(workflow)
+    build_steps = _steps_by_name(build_job)
 
-    workflow_upload = steps["Upload workflow artifacts"]
+    assert build_job["needs"] == "validate"
+    workflow_upload = build_steps["Upload workflow artifacts"]
     assert workflow_upload["uses"] == "actions/upload-artifact@v4"
     assert workflow_upload["with"] == {
         "name": "${{ matrix.artifact-name }}",
@@ -282,7 +289,48 @@ def test_release_workflow_publication_and_artifact_upload_contract() -> None:
         "if-no-files-found": "error",
     }
 
-    release_upload = steps["Upload GitHub release artifacts"]
-    assert release_upload["if"] == "startsWith(github.ref, 'refs/tags/')"
+    assert "Upload GitHub release artifacts" not in build_steps
+
+    publish_job = _job(workflow, "publish")
+    assert publish_job["if"] == "inputs.publish_release"
+    assert publish_job["needs"] == "build"
+    assert publish_job["runs-on"] == "ubuntu-24.04"
+    publish_steps = _steps_by_name(publish_job)
+    download = publish_steps["Download packaged artifacts"]
+    assert download["uses"] == "actions/download-artifact@v4"
+    assert download["with"] == {
+        "pattern": "gofer-flow-*",
+        "path": "release-artifacts",
+        "merge-multiple": True,
+    }
+    release_upload = publish_steps["Upload GitHub release artifacts"]
     assert release_upload["uses"] == "softprops/action-gh-release@v2"
-    assert release_upload["with"] == {"files": "${{ matrix.artifact-glob }}"}
+    assert release_upload["with"] == {
+        "files": "release-artifacts/*",
+        "fail_on_unmatched_files": True,
+    }
+
+
+def test_release_validation_gates_packages_and_checks_tag_versions() -> None:
+    workflow = _release_workflow()
+    validation_job = _job(workflow, "validate")
+    validation_steps = _steps_by_name(validation_job)
+
+    assert validation_job["runs-on"] == "ubuntu-24.04"
+    assert validation_steps["Verify tag matches package versions"]["if"] == (
+        "startsWith(inputs.checkout_ref, 'refs/tags/v')"
+    )
+    version_check = cast(str, validation_steps["Verify tag matches package versions"]["run"])
+    assert 'Path("pyproject.toml")' in version_check
+    assert 'Path("frontend/package.json")' in version_check
+    assert 'os.environ["CHECKOUT_REF"].removeprefix("refs/tags/v")' in version_check
+    assert validation_steps["Lint frontend source"]["run"] == "npm run lint"
+    assert validation_steps["Test frontend"]["run"] == "npm test"
+    assert validation_steps["Browser-test workflow studio"]["run"] == (
+        "xvfb-run -a npm run test:browser"
+    )
+
+    build_steps = _steps_by_name(_build_job(workflow))
+    assert "Lint frontend source" not in build_steps
+    assert "Test frontend" not in build_steps
+    assert "Browser-test workflow studio" not in build_steps

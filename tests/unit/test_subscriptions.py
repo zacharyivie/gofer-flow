@@ -21,7 +21,14 @@ def use_unresolved_provider_binaries(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_claude_code_command_basic(monkeypatch) -> None:
     sub = ClaudeCodeSubscription()
     cmd = sub._build_command("hello", [], [])
-    assert cmd[:5] == ["claude", "--print", "--output-format", "stream-json", "-p"]
+    assert cmd[:6] == [
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "-p",
+    ]
     assert "hello" in cmd
 
 
@@ -108,9 +115,16 @@ def test_claude_code_command_adds_extra_sandbox_dirs(
 
     cmd = sub._build_command("hi", [], [], [extra_dir])
 
-    assert cmd[:5] == ["claude", "--print", "--output-format", "stream-json", "--add-dir"]
-    assert cmd[5] == str(extra_dir)
-    assert cmd[6:8] == ["-p", "hi"]
+    assert cmd[:6] == [
+        "claude",
+        "--print",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--add-dir",
+    ]
+    assert cmd[6] == str(extra_dir)
+    assert cmd[7:9] == ["-p", "hi"]
 
 
 def test_subscription_commands_use_resolved_binary_paths(monkeypatch) -> None:

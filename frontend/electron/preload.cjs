@@ -2,6 +2,7 @@ const { contextBridge, ipcRenderer, webFrame, webUtils } = require("electron");
 
 const API_BASE_URL_ARG = "--gofer-api-base-url=";
 const API_TOKEN_ARG = "--gofer-api-token=";
+const BROWSER_PRELOAD_ARG = "--gofer-browser-preload=";
 const DEFAULT_API_BASE_URL = "http://127.0.0.1:8765";
 const LOCAL_HOSTNAMES = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 
@@ -15,6 +16,12 @@ function readApiBaseUrl() {
 function readApiToken() {
   const arg = process.argv.find((value) => value.startsWith(API_TOKEN_ARG));
   return arg ? arg.slice(API_TOKEN_ARG.length) : "";
+}
+
+function readBrowserPreloadPath() {
+  const arg = process.argv.find((value) => value.startsWith(BROWSER_PRELOAD_ARG));
+  const value = arg ? arg.slice(BROWSER_PRELOAD_ARG.length) : "";
+  return value.startsWith("file:") ? value : "";
 }
 
 function isSafeLocalHttpUrl(value) {
@@ -107,6 +114,7 @@ contextBridge.exposeInMainWorld("goferDesktop", {
     setZoomFactor: (value) => {
       const factor = Number.isFinite(value) ? Math.min(1.5, Math.max(0.8, value)) : 1;
       webFrame.setZoomFactor(factor);
+      void Promise.resolve(ipcRenderer.invoke("gofer:browser-owner-zoom", {})).catch(() => {});
       return factor;
     },
   },
@@ -185,8 +193,11 @@ contextBridge.exposeInMainWorld("goferDesktop", {
 
 contextBridge.exposeInMainWorld("goferBrowser", {
   platform: process.platform,
+  preloadPath: readBrowserPreloadPath(),
   create: (options = {}) => createBrowser(options),
-  activate: (id, active) => browserAction(id, "activate", { active: active === true }),
+  adopt: (id, webContentsId) => browserAction(id, "adopt", {
+    webContentsId: Number.isFinite(webContentsId) ? webContentsId : -1,
+  }),
   back: (id) => browserAction(id, "back"),
   close: (id) => browserAction(id, "close"),
   focus: (id) => browserAction(id, "focus"),
@@ -195,11 +206,13 @@ contextBridge.exposeInMainWorld("goferBrowser", {
   openExternal: (id) => browserAction(id, "open-external"),
   reload: (id) => browserAction(id, "reload"),
   setPreferences: (id, preferences = {}) => browserAction(id, "set-preferences", {
+    ...(preferences.applicationKeybindings
+      ? { applicationKeybindings: browserKeybindings(preferences.applicationKeybindings) }
+      : {}),
     openBrowserBinding: typeof preferences.openBrowserBinding === "string"
       ? preferences.openBrowserBinding.slice(0, 120)
       : "",
   }),
-  setBounds: (id, bounds) => browserAction(id, "set-bounds", { bounds }),
   stop: (id) => browserAction(id, "stop"),
   onCommand: (callback) => subscribeToBrowserEvent("gofer:browser-command", callback),
   onOpenFile: (callback) => subscribeToBrowserEvent("gofer:browser-open-file", callback),
@@ -224,7 +237,12 @@ contextBridge.exposeInMainWorld("goferTerminal", {
     ipcRenderer.invoke("gofer:terminal-close", {
       id: typeof id === "string" ? id : "",
     }),
+  completeEditor: (requestId) =>
+    ipcRenderer.invoke("gofer:terminal-editor-complete", {
+      requestId: typeof requestId === "string" ? requestId : "",
+    }),
   onData: (callback) => subscribeToTerminalEvent("gofer:terminal-data", callback),
+  onOpenEditor: (callback) => subscribeToTerminalEvent("gofer:terminal-open-editor", callback),
   onExit: (callback) => subscribeToTerminalEvent("gofer:terminal-exit", callback),
 });
 
@@ -251,6 +269,9 @@ async function createBrowser(options = {}) {
     await trustProjectRoot(targetPath);
   }
   return ipcRenderer.invoke("gofer:browser-create", {
+    ...(options.applicationKeybindings
+      ? { applicationKeybindings: browserKeybindings(options.applicationKeybindings) }
+      : {}),
     clientId: typeof options.clientId === "string" ? options.clientId : "",
     grantId: grantForPath(targetPath),
     ...(typeof options.openBrowserBinding === "string" && options.openBrowserBinding
@@ -259,6 +280,15 @@ async function createBrowser(options = {}) {
     path: targetPath,
     url: typeof options.url === "string" ? options.url : "",
   });
+}
+
+function browserKeybindings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([commandId, binding]) => (
+    typeof commandId === "string" && commandId.length <= 120 && typeof binding === "string"
+      ? [[commandId, binding.slice(0, 240)]]
+      : []
+  )));
 }
 
 function browserAction(id, action, extra = {}) {

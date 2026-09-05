@@ -3,6 +3,8 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
@@ -27,6 +29,7 @@ import {
   matchesKeybinding,
   settingBinding,
 } from "../lib/settings.js";
+import taskurottaIcon from "../assets/taskurotta-icon.svg";
 import { Dialog } from "./Dialog.jsx";
 import MarkdownContent from "./MarkdownContent.jsx";
 import IntegratedBrowser, { HtmlModeToggle } from "./IntegratedBrowser.jsx";
@@ -97,29 +100,116 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   onRadishDiscard,
   onRadishSaved,
   onSettingChange,
+  saveBeforeClosePaths = [],
   browserTabs = {},
 }, ref) {
   const textEditorRefs = useRef(new Map());
   const workspaceRef = useRef(null);
   const tabMenuRef = useRef(null);
   const tabMenuFirstActionRef = useRef(null);
+  const draggedPathRef = useRef("");
+  const documentPathOrderRef = useRef(openPaths);
   const [fileStates, setFileStates] = useState({});
+  const [browserViewStates, setBrowserViewStates] = useState({});
   const [documentModes, setDocumentModes] = useState({});
   const [diffOnOpenPaths, setDiffOnOpenPaths] = useState(() => new Set());
   const [tabMenu, setTabMenu] = useState(null);
   const [unsavedClosePrompt, setUnsavedClosePrompt] = useState(null);
   const [draggedPath, setDraggedPath] = useState("");
-  const [split, setSplit] = useState(null);
+  const [splitGroup, setSplitGroup] = useState(null);
+  const [primaryActivePath, setPrimaryActivePath] = useState("");
+  const [splitActivePath, setSplitActivePath] = useState("");
   const sourcePath = workflow?.sourcePath ?? "";
   const currentPath = activePath || openPaths[0] || "";
   const localOpenPaths = openPaths.filter((path) => !browserTabs[path]);
-  const primaryPath = split?.path === currentPath
-    ? openPaths.find((path) => path !== split.path) ?? ""
-    : currentPath;
+  const splitPaths = useMemo(
+    () => (splitGroup ? splitGroup.paths.filter((path) => openPaths.includes(path)) : []),
+    [openPaths, splitGroup],
+  );
+  const primaryGroupPaths = useMemo(
+    () => openPaths.filter((path) => !splitPaths.includes(path)),
+    [openPaths, splitPaths],
+  );
+  // Electron tears down a webview guest when its mounted ancestor moves in the DOM.
+  // Keep document order stable while the tab strips follow the user's chosen order.
+  const documentPaths = stableCodeDocumentPaths(documentPathOrderRef.current, openPaths);
+  const primaryPath = primaryGroupPaths.includes(currentPath)
+    ? currentPath
+    : (primaryGroupPaths.includes(primaryActivePath) ? primaryActivePath : primaryGroupPaths[0] ?? "");
+  const splitPath = splitPaths.includes(currentPath)
+    ? currentPath
+    : (splitPaths.includes(splitActivePath) ? splitActivePath : splitPaths[0] ?? "");
+
+  useLayoutEffect(() => {
+    documentPathOrderRef.current = documentPaths;
+  }, [documentPaths]);
+
+  function beginTabDrag(event, path) {
+    draggedPathRef.current = path;
+    setDraggedPath(path);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/x-taskurotta-tab", path);
+    event.dataTransfer.setData("text/plain", path);
+  }
+
+  function endTabDrag() {
+    draggedPathRef.current = "";
+    setDraggedPath("");
+  }
+
+  function draggedTabFrom(event) {
+    return event.dataTransfer.getData("text/x-taskurotta-tab")
+      || event.dataTransfer.getData("text/plain")
+      || draggedPathRef.current;
+  }
 
   useEffect(() => {
-    if (split && !openPaths.includes(split.path)) setSplit(null);
-  }, [openPaths, split]);
+    if (primaryGroupPaths.includes(currentPath)) setPrimaryActivePath(currentPath);
+  }, [currentPath, primaryGroupPaths]);
+
+  useEffect(() => {
+    if (splitPaths.includes(currentPath)) setSplitActivePath(currentPath);
+  }, [currentPath, splitPaths]);
+
+  useEffect(() => {
+    if (!splitGroup) return;
+    const remaining = splitGroup.paths.filter((path) => openPaths.includes(path));
+    const primaryRemaining = openPaths.filter((path) => !remaining.includes(path));
+    if (!remaining.length || !primaryRemaining.length) {
+      setSplitGroup(null);
+      return;
+    }
+    if (remaining.length !== splitGroup.paths.length) {
+      setSplitGroup((current) => (current ? { ...current, paths: remaining } : null));
+    }
+  }, [openPaths, splitGroup]);
+
+  function moveTab(source, target, targetIsSplit) {
+    if (!source) return;
+    const sourceIsSplit = splitPaths.includes(source);
+    if (source !== target) onOpenPathsChange?.(reorderCodeTabs(openPaths, source, target));
+    if (sourceIsSplit === targetIsSplit) return;
+    if (targetIsSplit) {
+      setSplitGroup((current) => current
+        ? { ...current, paths: current.paths.includes(source) ? current.paths : [...current.paths, source] }
+        : { paths: [source], side: "right" });
+    } else {
+      setSplitGroup((current) => {
+        if (!current) return current;
+        const paths = current.paths.filter((path) => path !== source);
+        return paths.length ? { ...current, paths } : null;
+      });
+    }
+  }
+
+  function addToSplitGroup(path, side) {
+    if (!path) return;
+    setSplitGroup((current) => {
+      if (!current) return { paths: [path], side };
+      const paths = current.paths.includes(path) ? current.paths : [...current.paths, path];
+      return { paths, side };
+    });
+  }
 
   useEffect(() => {
     if (!currentPath || browserTabs[currentPath]) {
@@ -139,6 +229,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
 
   const finishClosingWorkspacePaths = useCallback((targets, discardRadish = false) => {
     for (const path of targets) textEditorRefs.current.get(path)?.discard?.();
+    setBrowserViewStates((current) => Object.fromEntries(
+      Object.entries(current).filter(([path]) => !targets.includes(path)),
+    ));
     setDocumentModes((current) => Object.fromEntries(
       Object.entries(current).filter(([path]) => !targets.includes(path)),
     ));
@@ -148,26 +241,34 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     setTabMenu(null);
   }, [onClosePath, onClosePaths, onRadishDiscard]);
 
-  const closeWorkspacePaths = useCallback((paths) => {
+  const closeWorkspacePaths = useCallback(async (paths) => {
     const targets = [...new Set(paths)].filter((path) => openPaths.includes(path));
     if (!targets.length) return;
     const dirtyPaths = targets.filter((path) => (
       path === sourcePath ? radishDirty : Boolean(fileStates[path]?.dirty)
     ));
-    const protection = codeCloseProtection(dirtyPaths, settings.general.autosave);
+    const requiredSavePaths = dirtyPaths.filter((path) => saveBeforeClosePaths.includes(path));
+    if (requiredSavePaths.length) {
+      const results = await Promise.all(requiredSavePaths.map(
+        (path) => textEditorRefs.current.get(path)?.save?.() ?? false,
+      ));
+      if (results.some((result) => !result)) return;
+    }
+    const remainingDirtyPaths = dirtyPaths.filter((path) => !requiredSavePaths.includes(path));
+    const protection = codeCloseProtection(remainingDirtyPaths, settings.general.autosave);
     if (protection === "prompt-to-save") {
       setTabMenu(null);
-      setUnsavedClosePrompt({ dirtyPaths, error: "", saving: false, targets });
+      setUnsavedClosePrompt({ dirtyPaths: remainingDirtyPaths, error: "", saving: false, targets });
       return;
     }
     if (protection === "confirm-discard") {
       const message = targets.length === 1
         ? `Close ${fileName(targets[0])} without saving your changes?`
-        : `Close ${targets.length} files? Unsaved changes in ${dirtyPaths.length} file${dirtyPaths.length === 1 ? "" : "s"} will be discarded.`;
+        : `Close ${targets.length} files? Unsaved changes in ${remainingDirtyPaths.length} file${remainingDirtyPaths.length === 1 ? "" : "s"} will be discarded.`;
       if (!window.confirm(message)) return;
     }
-    finishClosingWorkspacePaths(targets, dirtyPaths.includes(sourcePath));
-  }, [fileStates, finishClosingWorkspacePaths, openPaths, radishDirty, settings.general.autosave, sourcePath]);
+    finishClosingWorkspacePaths(targets, remainingDirtyPaths.includes(sourcePath));
+  }, [fileStates, finishClosingWorkspacePaths, openPaths, radishDirty, saveBeforeClosePaths, settings.general.autosave, sourcePath]);
 
   const saveAndClosePromptedPaths = useCallback(async () => {
     if (!unsavedClosePrompt || unsavedClosePrompt.saving) return;
@@ -189,7 +290,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   }, [finishClosingWorkspacePaths, unsavedClosePrompt]);
 
   const closeWorkspacePath = useCallback((path) => {
-    closeWorkspacePaths([path]);
+    void closeWorkspacePaths([path]);
   }, [closeWorkspacePaths]);
 
   useEffect(() => {
@@ -227,6 +328,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
       },
       revealDiagnostic: (diagnostic) =>
         textEditorRefs.current.get(sourcePath)?.revealDiagnostic?.(diagnostic),
+      runCommand: (command) => textEditorRefs.current.get(currentPath)?.runCommand?.(command),
       save: () => textEditorRefs.current.get(sourcePath)?.save?.(),
       saveActive: () => textEditorRefs.current.get(currentPath)?.save?.(),
     }),
@@ -240,6 +342,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
   });
 
   function handleWorkspaceKeyDown(event) {
+    if (event.defaultPrevented) return;
     const target = event.target;
     const targetIsDocument = !target
       || target === window
@@ -270,8 +373,9 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
       return;
     }
     if (action === "next-tab" || action === "previous-tab") {
+      const groupPaths = splitPaths.includes(currentPath) ? splitPaths : primaryGroupPaths;
       const nextPath = adjacentCodeTab(
-        openPaths,
+        groupPaths,
         currentPath,
         action === "previous-tab" ? -1 : 1,
       );
@@ -285,7 +389,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     closeWorkspacePath(currentPath);
   }
 
-  function openTabMenu(event, path) {
+  function openTabMenu(event, path, groupPaths) {
     event.preventDefault();
     event.stopPropagation();
     const bounds = event.currentTarget.getBoundingClientRect();
@@ -293,69 +397,77 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
     const requestedTop = event.clientY || bounds.bottom - 2;
     onActivePathChange?.(path);
     setTabMenu({
+      groupPaths,
       left: Math.max(8, Math.min(requestedLeft, window.innerWidth - 184)),
       path,
       top: Math.max(8, Math.min(requestedTop, window.innerHeight - 188)),
     });
   }
 
-  return (
-    <section
-      ref={workspaceRef}
-      className="flex min-h-0 flex-1 flex-col bg-white"
-      aria-label="Code workspace"
-    >
-      {openPaths.length ? (
-        <div
-          aria-label="Editor tabs"
-          className="flex h-9 shrink-0 items-center overflow-x-auto border-b border-line bg-slate-50"
-          role="tablist"
-        >
-          {openPaths.map((path) => {
+  function renderTabStrip(paths, activeForGroup, isSplit, column) {
+    return (
+      <div
+        aria-label={isSplit ? "Split editor tabs" : "Editor tabs"}
+        className={`tab-strip-scrollbar flex h-9 min-w-0 items-center overflow-x-auto overflow-y-hidden border-b border-line bg-slate-50 ${column === 2 ? "border-l" : ""}`}
+        role="tablist"
+        style={{ gridColumn: column, gridRow: 1 }}
+        onDragOver={(event) => {
+          if (!draggedPathRef.current) return;
+          event.preventDefault();
+        }}
+        onDrop={(event) => {
+          if (!draggedPathRef.current) return;
+          event.preventDefault();
+          const source = draggedTabFrom(event);
+          const target = paths[paths.length - 1] ?? source;
+          if (source) moveTab(source, target, isSplit);
+          endTabDrag();
+        }}
+      >
+        {paths.map((path) => {
           const browserTab = browserTabs[path];
-          const selected = path === currentPath;
+          const browserViewState = browserViewStates[path];
+          const tabMetadata = browserViewTabMetadata(browserTab, browserViewState);
+          const selected = path === activeForGroup;
           const isRadish = !browserTab && path === sourcePath;
           const dirty = isRadish ? radishDirty : fileStates[path]?.dirty;
           const preview = !browserTab && path === previewPath;
           const folderLabel = browserTab ? "" : duplicateTabFolder(path, localOpenPaths);
-          const label = codeTabLabel(path, browserTab);
-          const title = browserTab
-            ? [label, browserTab.url].filter(Boolean).join("\n")
+          const label = codeTabLabel(path, tabMetadata);
+          const title = tabMetadata
+            ? [label, tabMetadata.url].filter(Boolean).join("\n")
             : path;
           return (
             <div
               key={path}
-              aria-selected={selected}
-              className={`group relative flex h-full max-w-64 shrink-0 items-center border-r border-line text-xs ${selected ? "bg-white font-semibold text-ink" : "text-muted hover:bg-white/70 hover:text-ink"}`}
-              role="tab"
-              draggable
+              className={`group relative flex h-full w-48 shrink-0 items-center border-r border-line text-xs ${selected ? "bg-white font-semibold text-ink" : "text-muted hover:bg-white/70 hover:text-ink"}`}
               title={title}
-              onContextMenu={(event) => openTabMenu(event, path)}
-              onDragStart={(event) => {
-                setDraggedPath(path);
-                event.dataTransfer.effectAllowed = "move";
-                event.dataTransfer.setData("text/x-taskurotta-tab", path);
-              }}
-              onDragEnd={() => setDraggedPath("")}
+              onContextMenu={(event) => openTabMenu(event, path, paths)}
               onDragOver={(event) => {
-                if (!draggedPath || draggedPath === path) return;
+                if (!draggedPathRef.current || draggedPathRef.current === path) return;
                 event.preventDefault();
                 event.dataTransfer.dropEffect = "move";
               }}
               onDrop={(event) => {
                 event.preventDefault();
-                const source = event.dataTransfer.getData("text/x-taskurotta-tab") || draggedPath;
-                if (source && source !== path) onOpenPathsChange?.(reorderCodeTabs(openPaths, source, path));
-                setDraggedPath("");
+                event.stopPropagation();
+                const source = draggedTabFrom(event);
+                if (source) moveTab(source, path, isSplit);
+                endTabDrag();
               }}
             >
               <button
+                aria-selected={selected}
                 className="flex h-full min-w-0 flex-1 items-center gap-2 py-0 pl-3 pr-2 text-left"
+                draggable
+                role="tab"
                 type="button"
                 onClick={() => onActivePathChange?.(path)}
                 onDoubleClick={() => onPinPath?.(path)}
+                onDragEnd={endTabDrag}
+                onDragStart={(event) => beginTabDrag(event, path)}
               >
-                <FileTypeIcon browser={Boolean(browserTab)} path={path} />
+                <FileTypeIcon browserTab={tabMetadata} path={path} />
                 <span className={`flex min-w-0 flex-col justify-center ${preview ? "italic" : ""}`}>
                   {folderLabel ? (
                     <span className="max-w-full truncate text-[9px] font-normal leading-[11px] text-muted">
@@ -369,137 +481,195 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
               <button
                 aria-label={`Close ${label}`}
                 className="mr-1 grid h-5 w-5 shrink-0 place-items-center rounded text-muted opacity-0 hover:bg-slate-100 hover:text-ink focus:opacity-100 group-hover:opacity-100"
+                draggable={false}
                 type="button"
                 onClick={(event) => {
                   event.stopPropagation();
                   closeWorkspacePath(path);
                 }}
               ><X size={12} /></button>
-              {selected ? <span className="absolute inset-x-0 top-0 h-0.5 bg-brand" /> : null}
+              {selected ? <span className="pointer-events-none absolute inset-x-0 top-0 h-0.5 bg-brand" /> : null}
             </div>
           );
-          })}
-        </div>
-      ) : null}
-      <div className="relative flex min-h-0 flex-1">
-        {draggedPath && openPaths.length > 1 ? (
-          <>
-            <SplitDropZone side="left" onDrop={() => setSplit({ path: draggedPath, side: "left" })} />
-            <SplitDropZone side="right" onDrop={() => setSplit({ path: draggedPath, side: "right" })} />
-          </>
-        ) : null}
-        <div className={`min-w-0 flex-1 ${split?.side === "left" ? "order-2" : "order-1"}`}>
-        {openPaths.filter((path) => path !== split?.path).map((path) => {
-          const browserTab = browserTabs[path];
-          const html = !browserTab && isHtmlPath(path);
-          const image = !browserTab && isImagePath(path);
-          const pdf = !browserTab && isPdfPath(path);
-          const svg = !browserTab && isSvgPath(path);
-          const mode = codeDocumentMode(path, documentModes, settings.editor);
-          return (
-          <div key={path} className={`${primaryPath === path ? "flex" : "hidden"} h-full min-h-0 flex-1 flex-col`}>
-            {browserTab || pdf || (html && mode === "preview") ? (
-              <PreviewBrowser
-                active={active && currentPath === path}
-                clientId={browserTab ? path : `html:${path}`}
-                initialUrl={browserTab?.url || "about:blank"}
-                localPath={browserTab ? "" : path}
-                openBrowserBinding={settingBinding(settings, "browser.open")}
-                searchUrl={settings.browser.searchUrl}
-                diffPath={html ? path : ""}
-                showModeToggle={html}
-                onClose={() => closeWorkspacePath(path)}
-                onCycleTab={(direction) => {
-                  const nextPath = adjacentCodeTab(openPaths, path, direction);
-                  if (nextPath) onActivePathChange?.(nextPath);
-                }}
-                onNewTab={() => onOpenBrowser?.({ newTab: true })}
-                onModeChange={(nextMode) => {
-                  setDocumentModes((current) => ({ ...current, [path]: nextMode }));
-                  if (nextMode === "preview") {
-                    setDiffOnOpenPaths((current) => withoutSetValue(current, path));
-                  }
-                  if (nextMode === "edit") onPinPath?.(path);
-                }}
-                onShowDiff={() => {
-                  setDiffOnOpenPaths((current) => withSetValue(current, path));
-                  setDocumentModes((current) => ({ ...current, [path]: "edit" }));
-                  onPinPath?.(path);
-                }}
-                onStateChange={browserTab
-                  ? (nextState) => onBrowserStateChange?.(path, nextState)
-                  : undefined}
-              />
-            ) : image ? (
-              <ImagePreview path={path} />
-            ) : (
-            <TextCodeEditor
+        })}
+      </div>
+    );
+  }
+
+  function renderDocuments(paths) {
+    return paths.map((path) => {
+      const inSplitGroup = splitPaths.includes(path);
+      const groupPaths = inSplitGroup ? splitPaths : primaryGroupPaths;
+      const activeForGroup = inSplitGroup ? splitPath : primaryPath;
+      const column = splitGroup?.side === "left"
+        ? (inSplitGroup ? 1 : 2)
+        : (inSplitGroup ? 2 : 1);
+      const browserTab = browserTabs[path];
+      const html = !browserTab && isHtmlPath(path);
+      const image = !browserTab && isImagePath(path);
+      const pdf = !browserTab && isPdfPath(path);
+      const svg = !browserTab && isSvgPath(path);
+      const mode = codeDocumentMode(path, documentModes, settings.editor);
+      const selected = activeForGroup === path;
+      return (
+        <div
+          key={path}
+          aria-hidden={!selected}
+          className={`flex min-h-0 min-w-0 flex-col ${selected ? "visible z-10" : "invisible z-0 pointer-events-none"} ${splitGroup && column === 2 ? "border-l border-line" : ""}`}
+          style={{ gridColumn: column, gridRow: 2 }}
+        >
+          {browserTab || pdf || (html && mode === "preview") ? (
+            <PreviewBrowser
               active={active && currentPath === path}
-              diagnostics={path === sourcePath
-                ? [
-                    ...(radishDocument?.diagnostics ?? []),
-                    ...(radishDocument?.preflight?.diagnostics ?? []),
-                  ]
-                : []}
-              editing={mode === "edit"}
-              html={html}
-              initialDiffMode={diffOnOpenPaths.has(path)}
-              markdown={isMarkdownPath(path)}
-              svg={svg}
-              navigationRequest={navigationRequest?.path === path ? navigationRequest : null}
-              path={path}
-              autosaveEnabled={settings.general.autosave}
-              editorSettings={settings.editor}
-              ref={(editor) => {
-                if (editor) textEditorRefs.current.set(path, editor);
-                else textEditorRefs.current.delete(path);
+              applicationKeybindings={settings.keybindings}
+              clientId={browserTab ? path : `html:${path}`}
+              dragActive={Boolean(draggedPath)}
+              focusLocationOnCreate={browserTab?.focusLocation === true}
+              initialUrl={browserTab?.url || "about:blank"}
+              localPath={browserTab ? "" : path}
+              openBrowserBinding={settingBinding(settings, "browser.open")}
+              searchUrl={settings.browser.searchUrl}
+              diffPath={html ? path : ""}
+              showModeToggle={html}
+              onClose={() => closeWorkspacePath(path)}
+              onCycleTab={(direction) => {
+                const nextPath = adjacentCodeTab(groupPaths, path, direction);
+                if (nextPath) onActivePathChange?.(nextPath);
               }}
-              theme={theme}
-              onModeChange={(mode) => {
-                setDocumentModes((current) => ({ ...current, [path]: mode }));
-                if (mode === "preview") {
+              onNewTab={() => onOpenBrowser?.({ newTab: true })}
+              onModeChange={(nextMode) => {
+                setDocumentModes((current) => ({ ...current, [path]: nextMode }));
+                if (nextMode === "preview") {
                   setDiffOnOpenPaths((current) => withoutSetValue(current, path));
                 }
-                if (mode === "edit") onPinPath?.(path);
-              }}
-              onOpenRelativeLink={(href) => {
-                if (onOpenMarkdownPath) {
-                  onOpenMarkdownPath(href, path);
-                  return;
+                if (nextMode === "edit") {
+                  setBrowserViewStates((current) => {
+                    const next = { ...current };
+                    delete next[path];
+                    return next;
+                  });
+                  onPinPath?.(path);
                 }
-                const targetPath = resolveMarkdownLinkPath(path, href);
-                if (targetPath) onOpenPath?.(targetPath, { preview: true });
+              }}
+              onShowDiff={() => {
+                setDiffOnOpenPaths((current) => withSetValue(current, path));
+                setDocumentModes((current) => ({ ...current, [path]: "edit" }));
+                onPinPath?.(path);
               }}
               onStateChange={(nextState) => {
-                setFileStates((current) => ({ ...current, [path]: nextState }));
-                if (nextState.dirty) onPinPath?.(path);
-                if (path === sourcePath) {
-                  const currentDocument = radishDocument;
-                  onDocumentStateChange?.({
-                    document: nextState.content == null
-                      ? currentDocument
-                      : {
-                          ...(currentDocument ?? {}),
-                          diagnostics: currentDocument?.diagnostics ?? [],
-                          dirty: nextState.dirty,
-                          preflight: currentDocument?.preflight ?? { diagnostics: [] },
-                          source: nextState.content,
-                        },
-                    error: nextState.error,
-                    loading: nextState.loading,
-                    saving: nextState.saving,
-                  });
-                }
+                setBrowserViewStates((current) => ({
+                  ...current,
+                  [path]: { ...current[path], ...nextState },
+                }));
+                if (browserTab) onBrowserStateChange?.(path, nextState);
               }}
-              onSaved={path === sourcePath ? onRadishSaved : undefined}
-              onContentChange={path === sourcePath ? onRadishContentChange : undefined}
             />
-            )}
-          </div>
-          );
-        })}
+          ) : image ? (
+            <ImagePreview path={path} />
+          ) : (
+          <TextCodeEditor
+            active={active && currentPath === path}
+            diagnostics={path === sourcePath
+              ? [
+                  ...(radishDocument?.diagnostics ?? []),
+                  ...(radishDocument?.preflight?.diagnostics ?? []),
+                ]
+              : []}
+            editing={mode === "edit"}
+            html={html}
+            initialDiffMode={diffOnOpenPaths.has(path)}
+            markdown={isMarkdownPath(path)}
+            svg={svg}
+            navigationRequest={navigationRequest?.path === path ? navigationRequest : null}
+            path={path}
+            autosaveEnabled={settings.general.autosave}
+            editorSettings={settings.editor}
+            ref={(editor) => {
+              if (editor) textEditorRefs.current.set(path, editor);
+              else textEditorRefs.current.delete(path);
+            }}
+            theme={theme}
+            onModeChange={(mode) => {
+              setDocumentModes((current) => ({ ...current, [path]: mode }));
+              if (mode === "preview") {
+                setDiffOnOpenPaths((current) => withoutSetValue(current, path));
+              }
+              if (mode === "edit") onPinPath?.(path);
+            }}
+            onOpenRelativeLink={(href) => {
+              if (onOpenMarkdownPath) {
+                onOpenMarkdownPath(href, path);
+                return;
+              }
+              const targetPath = resolveMarkdownLinkPath(path, href);
+              if (targetPath) onOpenPath?.(targetPath, { preview: true });
+            }}
+            onStateChange={(nextState) => {
+              setFileStates((current) => ({ ...current, [path]: nextState }));
+              if (nextState.dirty) onPinPath?.(path);
+              if (path === sourcePath) {
+                const currentDocument = radishDocument;
+                onDocumentStateChange?.({
+                  document: nextState.content == null
+                    ? currentDocument
+                    : {
+                        ...(currentDocument ?? {}),
+                        diagnostics: currentDocument?.diagnostics ?? [],
+                        dirty: nextState.dirty,
+                        preflight: currentDocument?.preflight ?? { diagnostics: [] },
+                        source: nextState.content,
+                      },
+                  error: nextState.error,
+                  loading: nextState.loading,
+                  saving: nextState.saving,
+                });
+              }
+            }}
+            onSaved={path === sourcePath ? onRadishSaved : undefined}
+            onContentChange={path === sourcePath ? onRadishContentChange : undefined}
+          />
+          )}
+        </div>
+      );
+    });
+  }
+
+  return (
+    <section
+      ref={workspaceRef}
+      className="flex min-h-0 flex-1 flex-col bg-white"
+      aria-label="Code workspace"
+    >
+      <div
+        className="relative grid min-h-0 flex-1"
+        style={{
+          gridTemplateColumns: splitGroup && splitPaths.length
+            ? "minmax(0, 1fr) minmax(0, 1fr)"
+            : "minmax(0, 1fr)",
+          gridTemplateRows: currentPath ? "2.25rem minmax(0, 1fr)" : "minmax(0, 1fr)",
+        }}
+      >
+        {draggedPath && openPaths.length > 1 ? (
+          <>
+            <SplitDropZone side="left" onDrop={() => { addToSplitGroup(draggedPathRef.current, "left"); endTabDrag(); }} />
+            <SplitDropZone side="right" onDrop={() => { addToSplitGroup(draggedPathRef.current, "right"); endTabDrag(); }} />
+          </>
+        ) : null}
+        {primaryGroupPaths.length ? renderTabStrip(
+          primaryGroupPaths,
+          primaryPath,
+          false,
+          splitGroup?.side === "left" ? 2 : 1,
+        ) : null}
+        {splitGroup && splitPaths.length ? renderTabStrip(
+          splitPaths,
+          splitPath,
+          true,
+          splitGroup.side === "left" ? 1 : 2,
+        ) : null}
+        {renderDocuments(documentPaths)}
         {!currentPath ? (
-          <div className="min-h-0 flex-1 overflow-y-auto px-8 pb-10 pt-12">
+          <div className="min-h-0 overflow-y-auto px-8 pb-10 pt-12" style={{ gridColumn: 1, gridRow: 1 }}>
             <div className="mx-auto w-full max-w-2xl">
               <div className="mx-auto max-w-sm">
                 <p className="text-center text-sm font-semibold text-ink">Getting Started</p>
@@ -525,25 +695,6 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
                 </section>
               ) : null}
             </div>
-          </div>
-        ) : null}
-        </div>
-        {split ? (
-          <div className={`min-w-0 flex-1 border-line ${split.side === "left" ? "order-1 border-r" : "order-2 border-l"}`}>
-            <SplitDocument
-              active={active && currentPath === split.path}
-              browserTab={browserTabs[split.path]}
-              path={split.path}
-              settings={settings}
-              theme={theme}
-              onActivate={() => onActivePathChange?.(split.path)}
-              onClose={() => setSplit(null)}
-              onCycleTab={(direction) => {
-                const nextPath = adjacentCodeTab(openPaths, split.path, direction);
-                if (nextPath) onActivePathChange?.(nextPath);
-              }}
-              onNewTab={() => onOpenBrowser?.({ newTab: true })}
-            />
           </div>
         ) : null}
       </div>
@@ -573,25 +724,25 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
             className="flex h-7 w-full items-center rounded px-2 text-left hover:bg-slate-100"
             role="menuitem"
             type="button"
-            onClick={() => closeWorkspacePaths(fileTabCloseTargets(openPaths, tabMenu.path, "close"))}
+            onClick={() => closeWorkspacePaths(fileTabCloseTargets(tabMenu.groupPaths, tabMenu.path, "close"))}
           >
             Close
           </button>
           <button
             className="flex h-7 w-full items-center rounded px-2 text-left hover:bg-slate-100 disabled:cursor-default disabled:text-muted disabled:hover:bg-transparent"
-            disabled={openPaths.length < 2}
+            disabled={tabMenu.groupPaths.length < 2}
             role="menuitem"
             type="button"
-            onClick={() => closeWorkspacePaths(fileTabCloseTargets(openPaths, tabMenu.path, "others"))}
+            onClick={() => closeWorkspacePaths(fileTabCloseTargets(tabMenu.groupPaths, tabMenu.path, "others"))}
           >
             Close others
           </button>
           <button
             className="flex h-7 w-full items-center rounded px-2 text-left hover:bg-slate-100 disabled:cursor-default disabled:text-muted disabled:hover:bg-transparent"
-            disabled={openPaths.indexOf(tabMenu.path) >= openPaths.length - 1}
+            disabled={tabMenu.groupPaths.indexOf(tabMenu.path) >= tabMenu.groupPaths.length - 1}
             role="menuitem"
             type="button"
-            onClick={() => closeWorkspacePaths(fileTabCloseTargets(openPaths, tabMenu.path, "right"))}
+            onClick={() => closeWorkspacePaths(fileTabCloseTargets(tabMenu.groupPaths, tabMenu.path, "right"))}
           >
             Close to the right
           </button>
@@ -599,7 +750,7 @@ const CodeWorkspace = forwardRef(function CodeWorkspace({
             className="flex h-7 w-full items-center rounded px-2 text-left hover:bg-slate-100"
             role="menuitem"
             type="button"
-            onClick={() => closeWorkspacePaths(fileTabCloseTargets(openPaths, tabMenu.path, "all"))}
+            onClick={() => closeWorkspacePaths(fileTabCloseTargets(tabMenu.groupPaths, tabMenu.path, "all"))}
           >
             Close all
           </button>
@@ -754,7 +905,8 @@ function SplitDropZone({ onDrop, side }) {
   return (
     <div
       aria-label={`Split editor ${side}`}
-      className={`absolute top-2 z-40 flex h-[calc(100%-1rem)] w-[22%] items-center justify-center rounded-md border border-indigo-400 bg-indigo-100/80 text-xs font-semibold text-indigo-700 ${side === "left" ? "left-2" : "right-2"}`}
+      className={`z-40 m-2 flex w-[22%] items-center justify-center rounded-md border border-indigo-400 bg-indigo-100/80 text-xs font-semibold text-indigo-700 ${side === "left" ? "justify-self-start" : "justify-self-end"}`}
+      style={{ gridColumn: "1 / -1", gridRow: 2 }}
       onDragOver={(event) => event.preventDefault()}
       onDrop={(event) => {
         event.preventDefault();
@@ -767,44 +919,6 @@ function SplitDropZone({ onDrop, side }) {
   );
 }
 
-function SplitDocument({
-  active,
-  browserTab,
-  onActivate,
-  onClose,
-  onCycleTab,
-  onNewTab,
-  path,
-  settings,
-  theme,
-}) {
-  if (browserTab || isPdfPath(path)) {
-    return (
-      <IntegratedBrowser
-        active={active}
-        clientId={`split:${path}`}
-        initialUrl={browserTab?.url || "about:blank"}
-        localPath={browserTab ? "" : path}
-        searchUrl={settings.browser.searchUrl}
-        onClose={onClose}
-        onCycleTab={onCycleTab}
-        onNewTab={onNewTab}
-      />
-    );
-  }
-  if (isImagePath(path)) return <ImagePreview path={path} />;
-  return (
-    <div className="flex h-full min-h-0 flex-col" onPointerDown={onActivate}>
-      <TextCodeEditor
-        active={active}
-        autosaveEnabled={settings.general.autosave}
-        editorSettings={settings.editor}
-        path={path}
-        theme={theme}
-      />
-    </div>
-  );
-}
 
 const TextCodeEditor = forwardRef(function TextCodeEditor({
   active,
@@ -874,6 +988,18 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
 
   useEffect(() => {
     void refreshGitBaseline();
+  }, [refreshGitBaseline]);
+
+  useEffect(() => {
+    const refresh = () => void refreshGitBaseline();
+    const interval = window.setInterval(refresh, 2000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, [refreshGitBaseline]);
 
   useEffect(() => {
@@ -998,6 +1124,35 @@ const TextCodeEditor = forwardRef(function TextCodeEditor({
       editor.revealRangeInCenter(marker);
       editor.setPosition({ lineNumber: marker.startLineNumber, column: marker.startColumn });
       editor.focus();
+    },
+    runCommand: (command) => {
+      const editor = editorRef.current;
+      if (!editor) return false;
+      const commandIds = {
+        "edit.undo": "undo",
+        "edit.redo": "redo",
+        "edit.cut": "editor.action.clipboardCutAction",
+        "edit.copy": "editor.action.clipboardCopyAction",
+        "edit.paste": "editor.action.clipboardPasteAction",
+        "edit.find": "actions.find",
+        "edit.replace": "editor.action.startFindReplaceAction",
+        "selection.selectAll": "editor.action.selectAll",
+        "selection.expand": "editor.action.smartSelect.expand",
+        "selection.shrink": "editor.action.smartSelect.shrink",
+        "selection.copyLineUp": "editor.action.copyLinesUpAction",
+        "selection.copyLineDown": "editor.action.copyLinesDownAction",
+        "selection.moveLineUp": "editor.action.moveLinesUpAction",
+        "selection.moveLineDown": "editor.action.moveLinesDownAction",
+        "selection.addCursorAbove": "editor.action.insertCursorAbove",
+        "selection.addCursorBelow": "editor.action.insertCursorBelow",
+        "edit.toggleLineComment": "editor.action.commentLine",
+        "edit.formatDocument": "editor.action.formatDocument",
+      };
+      const commandId = commandIds[command];
+      if (!commandId) return false;
+      editor.focus();
+      editor.trigger("taskurotta-menu", commandId, null);
+      return true;
     },
     save,
   }), [path, save]);
@@ -1488,6 +1643,15 @@ export function reorderCodeTabs(openPaths, sourcePath, targetPath) {
   return next;
 }
 
+export function stableCodeDocumentPaths(previousPaths, openPaths) {
+  const openPathSet = new Set(openPaths);
+  const previousPathSet = new Set(previousPaths);
+  return [
+    ...previousPaths.filter((path) => openPathSet.has(path)),
+    ...openPaths.filter((path) => !previousPathSet.has(path)),
+  ];
+}
+
 export function adjacentCodeTab(openPaths, currentPath, direction = 1) {
   if (!openPaths.length) return "";
   const currentIndex = openPaths.indexOf(currentPath);
@@ -1495,8 +1659,22 @@ export function adjacentCodeTab(openPaths, currentPath, direction = 1) {
   return openPaths[(currentIndex + direction + openPaths.length) % openPaths.length];
 }
 
-function FileTypeIcon({ browser = false, path }) {
-  if (browser) return <Globe aria-hidden="true" className="shrink-0 text-brand" size={14} />;
+function FileTypeIcon({ browserTab, path }) {
+  const favicon = browserTabFavicon(browserTab);
+  const [faviconFailed, setFaviconFailed] = useState(false);
+  useEffect(() => setFaviconFailed(false), [favicon]);
+  if (browserTab && favicon && !faviconFailed) {
+    return (
+      <img
+        alt=""
+        className="h-3.5 w-3.5 shrink-0 object-contain"
+        draggable={false}
+        src={favicon}
+        onError={() => setFaviconFailed(true)}
+      />
+    );
+  }
+  if (browserTab) return <Globe aria-hidden="true" className="shrink-0 text-brand" size={14} />;
   if (path.toLowerCase().endsWith(".json")) return <FileJson2 aria-hidden="true" className="shrink-0 text-amber-600" size={14} />;
   if (languageForPath(path) !== "plaintext") return <FileCode2 aria-hidden="true" className="shrink-0 text-brand" size={14} />;
   return <FileText aria-hidden="true" className="shrink-0 text-muted" size={14} />;
@@ -1567,6 +1745,19 @@ export function browserTabLabel(tab = {}) {
   } catch {
     return url;
   }
+}
+
+export function browserTabFavicon(tab = {}) {
+  const favicon = String(tab?.favicon ?? "").trim();
+  if (/^(?:https?:|file:|data:image\/)/i.test(favicon)) return favicon;
+  return String(tab?.url ?? "").trim() === "taskurotta://home" ? taskurottaIcon : "";
+}
+
+export function browserViewTabMetadata(browserTab, viewState) {
+  if (browserTab) return viewState ? { ...browserTab, ...viewState } : browserTab;
+  const title = String(viewState?.title ?? "").trim();
+  const url = String(viewState?.url ?? "").trim();
+  return title || /^https?:/i.test(url) ? viewState : null;
 }
 
 export function codeTabLabel(path, browserTab) {

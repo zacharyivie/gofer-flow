@@ -2,6 +2,8 @@ import { createRequire } from "node:module";
 import { spawn } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
+import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -10,10 +12,10 @@ const {
   app,
   BrowserWindow,
   Menu,
-  WebContentsView,
   dialog,
   ipcMain,
   shell,
+  webContents,
 } = require("electron");
 const { autoUpdater } = require("electron-updater");
 const pty = require("node-pty");
@@ -27,8 +29,10 @@ const {
 } = require("./git-status.cjs");
 const {
   TASKUROTTA_HOME_URL,
+  browserCommandRequiresOwnerFocus,
+  browserContentZoomFactor,
   browserLoadUrl,
-  browserShortcutAction,
+  browserSessionShortcutAction,
   normalizeBrowserUrl,
 } = require("./browser-utils.cjs");
 const { registerIpcHandlers } = require("./ipc-handlers.cjs");
@@ -82,7 +86,10 @@ let ipcSecurity;
 let backendErrorIpcSecurity;
 const terminalSessions = new Map();
 const browserSessions = new Map();
+const terminalEditorRequests = new Map();
 const browserOwnersWithCleanup = new WeakSet();
+let terminalEditorServer;
+let terminalEditorEndpoint = "";
 let updateState = {
   available: false,
   checking: false,
@@ -113,13 +120,37 @@ function createWindow(apiBaseUrl, apiToken = "") {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: !isSmokeTest,
+      webviewTag: true,
       additionalArguments: [
         `--gofer-api-base-url=${apiBaseUrl}`,
         `--gofer-api-token=${apiToken}`,
+        `--gofer-browser-preload=${pathToFileURL(browserPreloadPath)}`,
       ],
     },
   });
   const terminalOwnerId = mainWindow.webContents.id;
+
+  mainWindow.webContents.on("will-attach-webview", (event, webPreferences, params) => {
+    if (
+      params.partition !== "persist:taskurotta-browser"
+      || !isPendingBrowserSessionSrc(terminalOwnerId, params.src)
+    ) {
+      event.preventDefault();
+      return;
+    }
+    delete webPreferences.preloadURL;
+    webPreferences.preload = browserPreloadPath;
+    webPreferences.backgroundThrottling = true;
+    webPreferences.contextIsolation = true;
+    webPreferences.nodeIntegration = false;
+    webPreferences.nodeIntegrationInSubFrames = false;
+    webPreferences.sandbox = true;
+    webPreferences.webSecurity = true;
+    webPreferences.allowRunningInsecureContent = false;
+  });
+  mainWindow.webContents.on("did-attach-webview", (_event, guestContents) => {
+    guestContents.setWindowOpenHandler(() => ({ action: "deny" }));
+  });
 
   mainWindow.webContents.once("did-finish-load", () => {
     if (!isSmokeTest) return;
@@ -441,10 +472,11 @@ function createBackendErrorWindow(error, { title = "Taskurotta backend did not s
 }
 
 app.whenReady().then(async () => {
-  setupApplicationMenu();
+  Menu.setApplicationMenu(null);
   setupIpcHandlers();
   setupAutoUpdater();
   try {
+    await startTerminalEditorServer();
     const backend = await startBackend();
     activeApiBaseUrl = backend.apiBaseUrl;
     activeUiApiToken = backend.apiToken;
@@ -482,6 +514,7 @@ app.on("second-instance", () => {
 app.on("before-quit", () => {
   isQuitting = true;
   closeAllBrowsers();
+  closeTerminalEditorServer();
   closeAllTerminals();
   stopBackend();
 });
@@ -491,62 +524,6 @@ app.on("window-all-closed", () => {
     app.quit();
   }
 });
-
-function setupApplicationMenu() {
-  const viewSubmenu = [
-    {
-      label: "Browser",
-      click: () => {
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send("gofer:browser-command", { action: "open-browser" });
-        }
-      },
-    },
-  ];
-  if (!isProduction) {
-    viewSubmenu.push(
-      { type: "separator" },
-      { role: "reload", label: "Reload" },
-      { role: "forceReload", label: "Force Reload" },
-      { type: "separator" },
-      { role: "toggleDevTools" },
-    );
-  }
-  const template = [
-    {
-      label: "Taskurotta",
-      submenu: [
-        {
-          label: "About Taskurotta",
-          click: () => {
-            dialog.showMessageBox({
-              type: "info",
-              title: "About Taskurotta",
-              message: "Taskurotta",
-              detail: "Local workflow automation studio.",
-            });
-          },
-        },
-        { type: "separator" },
-        {
-          label: "Open Logs Folder",
-          click: openLogsFolder,
-        },
-        { type: "separator" },
-        {
-          role: "quit",
-          label: "Quit",
-        },
-      ],
-    },
-    {
-      label: "View",
-      submenu: viewSubmenu,
-    },
-  ];
-
-  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
-}
 
 function setupIpcHandlers() {
   ipcSecurity = createIpcSecurity({
@@ -571,6 +548,7 @@ function setupIpcHandlers() {
     checkForUpdates,
     copyPath,
     browserAction,
+    browserOwnerZoom,
     createBrowser,
     createFile,
     createFolder,
@@ -602,6 +580,7 @@ function setupIpcHandlers() {
     selectPath,
     setDataDir,
     closeTerminal,
+    completeTerminalEditor,
     writeTerminal,
     writeTextFile,
   }, {
@@ -640,56 +619,90 @@ function createBrowser(event, options = {}) {
   }
 
   const id = crypto.randomUUID();
-  const view = new WebContentsView({
-    webPreferences: {
-      backgroundThrottling: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-      preload: browserPreloadPath,
-      sandbox: true,
-      webSecurity: true,
-      partition: "persist:taskurotta-browser",
-    },
-  });
-  view.setBackgroundColor("#ffffff");
-  view.setVisible(false);
-  mainWindow.contentView.addChildView(view);
   const session = {
+    applicationChord: null,
+    applicationKeybindings: sanitizeBrowserKeybindings(options.applicationKeybindings),
     clientId: typeof options.clientId === "string" ? options.clientId : "",
+    contents: null,
     error: "",
+    favicon: "",
     grantId,
     id,
+    initialUrl: url,
     internalHomeUrl: url.startsWith("data:text/html") ? url : "",
     owner: event.sender,
     ownerId: event.sender.id,
     openBrowserBinding: typeof options.openBrowserBinding === "string"
       ? options.openBrowserBinding.slice(0, 120)
       : "Mod+Alt+Slash",
-    view,
+    ownerZoomFactor: 1,
+    pageZoomFactor: 1,
+    pendingSrc: url,
+    projectChordDeadline: 0,
   };
   browserSessions.set(id, session);
   registerBrowserOwnerCleanup(event.sender);
+  return { ...browserSessionState(session, url), src: url };
+}
+
+function isPendingBrowserSessionSrc(ownerId, src) {
+  const requested = String(src ?? "");
+  for (const session of browserSessions.values()) {
+    if (session.ownerId === ownerId && session.pendingSrc && session.pendingSrc === requested) {
+      return true;
+    }
+  }
+  return requested === "about:blank";
+}
+
+function adoptBrowserContents(event, session, webContentsId) {
+  const guest = webContents.fromId(Number(webContentsId));
+  if (
+    !guest
+    || guest.isDestroyed()
+    || guest.hostWebContents !== event.sender
+    || guest.getType() !== "webview"
+  ) {
+    throw new Error("Browser view is unavailable.");
+  }
+  if (session.contents === guest) return;
+  if (session.contents) throw new Error("Browser session already has a view.");
+  session.contents = guest;
+  session.pendingSrc = "";
+  if (typeof guest.setBackgroundColor === "function") guest.setBackgroundColor("#ffffff");
+  guest.once("destroyed", () => closeBrowserSession(session));
   configureBrowserSession(session);
-  void view.webContents.loadURL(url).catch((error) => {
-    session.error = error instanceof Error ? error.message : String(error);
-    emitBrowserState(session);
-  });
-  return browserSessionState(session, url);
+  session.ownerZoomFactor = session.owner.getZoomFactor();
+  syncBrowserContentZoom(session);
+  emitBrowserState(session);
 }
 
 function browserAction(event, options = {}) {
   const session = ownedBrowserSession(event, options.id);
-  const contents = session.view.webContents;
+  if (options.action === "adopt") {
+    adoptBrowserContents(event, session, options.webContentsId);
+    return browserSessionState(session);
+  }
+  if (options.action === "close") {
+    closeBrowserSession(session);
+    return { closed: true };
+  }
+  if (options.action === "set-preferences") {
+    if (options.applicationKeybindings) {
+      session.applicationKeybindings = sanitizeBrowserKeybindings(options.applicationKeybindings);
+    }
+    session.openBrowserBinding = typeof options.openBrowserBinding === "string"
+      && options.openBrowserBinding
+      ? options.openBrowserBinding.slice(0, 120)
+      : session.openBrowserBinding;
+    return browserSessionState(session);
+  }
+  const contents = browserSessionContents(session);
+  if (!contents) throw new Error("Browser view is unavailable.");
   switch (options.action) {
-    case "activate":
-      setBrowserSessionActive(session, options.active === true);
-      break;
     case "back":
       if (contents.navigationHistory.canGoBack()) contents.navigationHistory.goBack();
       break;
-    case "close":
-      closeBrowserSession(session);
-      return { closed: true };
     case "focus":
       contents.focus();
       break;
@@ -716,14 +729,6 @@ function browserAction(event, options = {}) {
     case "reload":
       contents.reload();
       break;
-    case "set-preferences":
-      session.openBrowserBinding = typeof options.openBrowserBinding === "string"
-        ? options.openBrowserBinding.slice(0, 120)
-        : session.openBrowserBinding;
-      break;
-    case "set-bounds":
-      setBrowserSessionBounds(session, options.bounds);
-      break;
     case "stop":
       contents.stop();
       break;
@@ -734,16 +739,23 @@ function browserAction(event, options = {}) {
 }
 
 function configureBrowserSession(session) {
-  const contents = session.view.webContents;
+  const contents = session.contents;
   const update = () => emitBrowserState(session);
   contents.on("did-start-loading", () => {
     session.error = "";
     update();
   });
   contents.on("did-stop-loading", update);
-  contents.on("did-navigate", update);
+  contents.on("did-navigate", () => {
+    session.favicon = "";
+    update();
+  });
   contents.on("did-navigate-in-page", update);
   contents.on("page-title-updated", update);
+  contents.on("page-favicon-updated", (_event, favicons) => {
+    session.favicon = Array.isArray(favicons) ? String(favicons[0] || "") : "";
+    update();
+  });
   contents.on("did-fail-load", (_event, errorCode, errorDescription, validatedUrl, isMainFrame) => {
     if (!isMainFrame || errorCode === -3) return;
     session.error = `${errorDescription}: ${validatedUrl}`;
@@ -760,6 +772,13 @@ function configureBrowserSession(session) {
     if (event.senderFrame !== contents.mainFrame) return;
     if (channel === "gofer:browser-link-clicked") openBrowserLink(session, payload?.url);
     if (
+      channel === "gofer:browser-zoom"
+      && (payload?.direction === 1 || payload?.direction === -1)
+    ) {
+      session.pageZoomFactor = 1;
+      emitBrowserCommand(session, "text-zoom", { direction: payload.direction });
+    }
+    if (
       channel === "gofer:browser-navigation"
       && payload?.action === "back"
       && contents.navigationHistory.canGoBack()
@@ -768,10 +787,29 @@ function configureBrowserSession(session) {
     }
   });
   contents.on("before-input-event", (event, input) => {
-    const action = browserShortcutAction(input, process.platform, session.openBrowserBinding);
+    const action = browserSessionShortcutAction(session, input, process.platform);
     if (!action) return;
     event.preventDefault();
-    if (["focus-location", "close", "next-tab", "previous-tab", "new-tab"].includes(action)) {
+    if (action === "chord-pending") return;
+    if (action.startsWith("command:")) {
+      emitBrowserCommand(session, "application-shortcut", {
+        commandId: action.slice("command:".length),
+      });
+      return;
+    }
+    if ([
+      "focus-location",
+      "close",
+      "next-tab",
+      "previous-tab",
+      "new-tab",
+      "settings-open",
+      "file-open",
+      "project-open",
+      "panel-toggle",
+      "project-pane-toggle",
+      "assistant-pane-toggle",
+    ].includes(action)) {
       emitBrowserCommand(session, action);
       return;
     }
@@ -786,9 +824,18 @@ function configureBrowserSession(session) {
     if (action === "forward" && contents.navigationHistory.canGoForward()) {
       contents.navigationHistory.goForward();
     }
-    if (action === "zoom-in") contents.setZoomFactor(Math.min(3, contents.getZoomFactor() + 0.1));
-    if (action === "zoom-out") contents.setZoomFactor(Math.max(0.5, contents.getZoomFactor() - 0.1));
-    if (action === "zoom-reset") contents.setZoomFactor(1);
+    if (action === "zoom-in" || action === "zoom-out") {
+      event.preventDefault();
+      session.pageZoomFactor = 1;
+      emitBrowserCommand(session, "text-zoom", {
+        direction: action === "zoom-in" ? 1 : -1,
+      });
+    }
+    if (action === "zoom-reset") {
+      session.pageZoomFactor = 1;
+      syncBrowserContentZoom(session);
+      emitBrowserCommand(session, "text-zoom", { reset: true });
+    }
   });
   if (session.grantId) {
     contents.on("before-mouse-event", (event, mouse) => {
@@ -831,7 +878,7 @@ function isMarkdownFilePath(value) {
 }
 
 function showBrowserContextMenu(session, params) {
-  const contents = session.view.webContents;
+  const contents = session.contents;
   const template = [];
   if (params.linkURL && isSafeExternalUrl(params.linkURL)) {
     template.push({
@@ -863,51 +910,62 @@ function showBrowserContextMenu(session, params) {
   Menu.buildFromTemplate(template).popup({ window: mainWindow });
 }
 
-function setBrowserSessionActive(session, active) {
-  const contents = browserSessionContents(session);
-  const restoreOwnerFocus = !active && contents?.isFocused() === true;
-  if (active) {
-    for (const candidate of browserSessions.values()) {
-      if (candidate.ownerId === session.ownerId && candidate.id !== session.id) {
-        candidate.view.setVisible(false);
-      }
-    }
+function browserOwnerZoom(event) {
+  const ownerZoomFactor = event.sender.getZoomFactor();
+  for (const session of browserSessions.values()) {
+    if (session.ownerId !== event.sender.id) continue;
+    if (session.ownerZoomFactor === ownerZoomFactor) continue;
+    session.ownerZoomFactor = ownerZoomFactor;
+    syncBrowserContentZoom(session);
   }
-  session.view.setVisible(active);
-  if (active) contents?.focus();
-  else if (restoreOwnerFocus && !session.owner.isDestroyed()) session.owner.focus();
+  return { zoomFactor: ownerZoomFactor };
 }
 
-function setBrowserSessionBounds(session, bounds = {}) {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  const windowBounds = mainWindow.getContentBounds();
-  const x = clampInteger(bounds.x, 0, windowBounds.width);
-  const y = clampInteger(bounds.y, 0, windowBounds.height);
-  const width = clampInteger(bounds.width, 0, windowBounds.width - x);
-  const height = clampInteger(bounds.height, 0, windowBounds.height - y);
-  session.view.setBounds({ x, y, width, height });
+function syncBrowserContentZoom(session) {
+  const contents = browserSessionContents(session);
+  if (!contents) return;
+  contents.setZoomFactor(browserContentZoomFactor(
+    session.ownerZoomFactor,
+    session.pageZoomFactor,
+  ));
 }
 
-function browserSessionState(session, fallbackUrl = "about:blank") {
+function browserSessionState(session, fallbackUrl = "") {
+  const fallback = fallbackUrl || session.initialUrl || "about:blank";
   const contents = browserSessionContents(session);
   if (!contents) {
+    if (!browserSessions.has(session.id)) {
+      return {
+        canGoBack: false,
+        canGoForward: false,
+        clientId: session.clientId,
+        error: session.error || "Browser view is unavailable.",
+        favicon: session.favicon || "",
+        id: session.id,
+        loading: false,
+        title: "",
+        url: fallback,
+      };
+    }
     return {
       canGoBack: false,
       canGoForward: false,
       clientId: session.clientId,
-      error: session.error || "Browser view is unavailable.",
+      error: session.error,
+      favicon: session.favicon || "",
       id: session.id,
-      loading: false,
+      loading: !session.error,
       title: "",
-      url: fallbackUrl,
+      url: session.internalHomeUrl ? TASKUROTTA_HOME_URL : fallback,
     };
   }
-  const currentUrl = contents.getURL() || fallbackUrl;
+  const currentUrl = contents.getURL() || fallback;
   return {
     canGoBack: contents.navigationHistory.canGoBack(),
     canGoForward: contents.navigationHistory.canGoForward(),
     clientId: session.clientId,
     error: session.error,
+    favicon: session.favicon || "",
     id: session.id,
     loading: contents.isLoading(),
     title: contents.getTitle(),
@@ -927,15 +985,25 @@ function emitBrowserState(session) {
   }
 }
 
-function emitBrowserCommand(session, action) {
+function emitBrowserCommand(session, action, details = {}) {
   if (!session.owner.isDestroyed()) {
-    if (action === "focus-location") session.owner.focus();
+    if (browserCommandRequiresOwnerFocus(action)) session.owner.focus();
     session.owner.send("gofer:browser-command", {
       action,
       clientId: session.clientId,
+      ...details,
       id: session.id,
     });
   }
+}
+
+function sanitizeBrowserKeybindings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).flatMap(([commandId, binding]) => (
+    typeof commandId === "string" && commandId.length <= 120 && typeof binding === "string"
+      ? [[commandId, binding.slice(0, 240)]]
+      : []
+  )));
 }
 
 function ownedBrowserSession(event, id) {
@@ -951,16 +1019,12 @@ function closeBrowserSession(session) {
   const contents = browserSessionContents(session);
   const restoreOwnerFocus = contents?.isFocused() === true;
   browserSessions.delete(session.id);
-  session.view.setVisible(false);
-  if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.contentView.removeChildView(session.view);
-  }
-  contents?.close();
+  session.contents = null;
   if (restoreOwnerFocus && !session.owner.isDestroyed()) session.owner.focus();
 }
 
 function browserSessionContents(session) {
-  const contents = session?.view?.webContents;
+  const contents = session?.contents;
   return contents && !contents.isDestroyed() ? contents : null;
 }
 
@@ -993,10 +1057,6 @@ function isAllowedBrowserNavigation(session, value) {
   }
 }
 
-function clampInteger(value, minimum, maximum) {
-  return Math.max(minimum, Math.min(maximum, Math.round(Number(value) || 0)));
-}
-
 function createTerminal(event, options = {}) {
   const requestedCwd = typeof options.cwd === "string" ? options.cwd.trim() : "";
   const cwd = requestedCwd
@@ -1008,6 +1068,7 @@ function createTerminal(event, options = {}) {
 
   const shell = terminalShell();
   const id = crypto.randomUUID();
+  const editorToken = crypto.randomBytes(32).toString("hex");
   const terminal = pty.spawn(shell.command, shell.args, {
     cols: terminalDimension(options.cols, 80, 2, 500),
     cwd,
@@ -1015,13 +1076,22 @@ function createTerminal(event, options = {}) {
       ...process.env,
       ...(shell.env ?? {}),
       COLORTERM: "truecolor",
+      GIT_EDITOR: terminalEditorCommand(),
       TERM: "xterm-256color",
+      TASKUROTTA_EDITOR_CWD: cwd,
+      TASKUROTTA_EDITOR_ENDPOINT: terminalEditorEndpoint,
+      TASKUROTTA_EDITOR_RUNTIME: process.execPath,
+      TASKUROTTA_EDITOR_SCRIPT: path.join(__dirname, "terminal-editor.cjs"),
+      TASKUROTTA_EDITOR_TOKEN: editorToken,
+      TASKUROTTA_TERMINAL_ID: id,
+      VISUAL: terminalEditorCommand(),
     },
     name: "xterm-256color",
     rows: terminalDimension(options.rows, 24, 1, 200),
   });
   const session = {
     id,
+    editorToken,
     ownerId: event.sender.id,
     terminal,
   };
@@ -1067,8 +1137,150 @@ function resizeTerminal(event, options = {}) {
 function closeTerminal(event, options = {}) {
   const session = ownedTerminalSession(event, options.id);
   terminalSessions.delete(session.id);
+  cancelTerminalEditorRequests(session.id, "The terminal was closed.");
   session.terminal.kill();
   return { closed: true };
+}
+
+function completeTerminalEditor(event, options = {}) {
+  const request = typeof options.requestId === "string"
+    ? terminalEditorRequests.get(options.requestId)
+    : null;
+  if (!request || request.ownerId !== event.sender.id) {
+    throw new Error("Git editor request was not found.");
+  }
+  finishTerminalEditorRequest(request, { ok: true });
+  return { completed: true };
+}
+
+function terminalEditorCommand() {
+  const launcherPath = terminalEditorLauncherPath();
+  return process.platform === "win32" ? `"${launcherPath}"` : shellQuote(launcherPath);
+}
+
+function terminalEditorLauncherPath() {
+  const directory = path.join(app.getPath("userData"), "terminal-editor");
+  fs.mkdirSync(directory, { recursive: true });
+  if (process.platform === "win32") {
+    const launcherPath = path.join(directory, "taskurotta-editor.cmd");
+    fs.writeFileSync(launcherPath, [
+      "@echo off",
+      "set ELECTRON_RUN_AS_NODE=1",
+      '"%TASKUROTTA_EDITOR_RUNTIME%" "%TASKUROTTA_EDITOR_SCRIPT%" %*',
+      "",
+    ].join("\r\n"), "utf8");
+    return launcherPath;
+  }
+  const launcherPath = path.join(directory, "taskurotta-editor");
+  fs.writeFileSync(launcherPath, [
+    "#!/bin/sh",
+    "export ELECTRON_RUN_AS_NODE=1",
+    'exec "$TASKUROTTA_EDITOR_RUNTIME" "$TASKUROTTA_EDITOR_SCRIPT" "$@"',
+    "",
+  ].join("\n"), { encoding: "utf8", mode: 0o700 });
+  fs.chmodSync(launcherPath, 0o700);
+  return launcherPath;
+}
+
+function shellQuote(value) {
+  return `'${String(value).replaceAll("'", `'"'"'`)}'`;
+}
+
+function startTerminalEditorServer() {
+  if (terminalEditorServer) return Promise.resolve();
+  terminalEditorEndpoint = process.platform === "win32"
+    ? `\\\\.\\pipe\\taskurotta-editor-${process.pid}-${crypto.randomUUID()}`
+    : path.join(os.tmpdir(), `taskurotta-editor-${process.pid}-${crypto.randomUUID()}.sock`);
+  terminalEditorServer = net.createServer(handleTerminalEditorConnection);
+  return new Promise((resolve, reject) => {
+    terminalEditorServer.once("error", reject);
+    terminalEditorServer.listen(terminalEditorEndpoint, () => {
+      terminalEditorServer.off("error", reject);
+      resolve();
+    });
+  });
+}
+
+function handleTerminalEditorConnection(socket) {
+  socket.setEncoding("utf8");
+  let requestText = "";
+  const fail = (error) => {
+    socket.end(`${JSON.stringify({ error, ok: false })}\n`);
+  };
+  socket.on("data", async (chunk) => {
+    requestText += chunk;
+    if (requestText.length > 16 * 1024) {
+      fail("Git editor request was too large.");
+      return;
+    }
+    const newline = requestText.indexOf("\n");
+    if (newline < 0) return;
+    socket.removeAllListeners("data");
+    try {
+      const payload = JSON.parse(requestText.slice(0, newline));
+      const session = terminalSessions.get(payload.terminalId);
+      if (!session || payload.token !== session.editorToken) {
+        fail("Git editor request was rejected.");
+        return;
+      }
+      const targetPath = path.resolve(String(payload.targetPath || ""));
+      const stat = await fs.promises.stat(targetPath);
+      if (!stat.isFile() || stat.size > 2 * 1024 * 1024) {
+        fail("Git editor target is not an editable text file.");
+        return;
+      }
+      const content = await fs.promises.readFile(targetPath);
+      if (content.includes(0)) {
+        fail("Git editor target is not a text file.");
+        return;
+      }
+      const handle = pathHandle(targetPath);
+      await registerBackendPathGrant(handle);
+      const request = {
+        id: crypto.randomUUID(),
+        ownerId: session.ownerId,
+        socket,
+        targetPath: handle.path,
+        terminalId: session.id,
+      };
+      terminalEditorRequests.set(request.id, request);
+      const owner = mainWindow?.webContents;
+      if (!owner || owner.isDestroyed() || owner.id !== session.ownerId) {
+        finishTerminalEditorRequest(request, { error: "Taskurotta's editor is unavailable.", ok: false });
+        return;
+      }
+      owner.send("gofer:terminal-open-editor", { path: handle.path, requestId: request.id });
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error));
+    }
+  });
+}
+
+function finishTerminalEditorRequest(request, response) {
+  if (!request || !terminalEditorRequests.delete(request.id)) return;
+  request.socket.end(`${JSON.stringify(response)}\n`);
+}
+
+function cancelTerminalEditorRequests(terminalId, error) {
+  for (const request of [...terminalEditorRequests.values()]) {
+    if (request.terminalId === terminalId) {
+      finishTerminalEditorRequest(request, { error, ok: false });
+    }
+  }
+}
+
+function closeTerminalEditorServer() {
+  for (const request of [...terminalEditorRequests.values()]) {
+    finishTerminalEditorRequest(request, { error: "Taskurotta was closed.", ok: false });
+  }
+  terminalEditorServer?.close();
+  terminalEditorServer = undefined;
+  if (process.platform !== "win32" && terminalEditorEndpoint) {
+    try { fs.unlinkSync(terminalEditorEndpoint); } catch {
+      // The operating system may already have removed the socket.
+    }
+  }
+  terminalEditorEndpoint = "";
 }
 
 function ownedTerminalSession(event, id) {
@@ -1160,6 +1372,7 @@ function closeTerminalsForOwner(ownerId) {
   for (const [id, session] of terminalSessions.entries()) {
     if (session.ownerId !== ownerId) continue;
     terminalSessions.delete(id);
+    cancelTerminalEditorRequests(id, "The terminal was closed.");
     session.terminal.kill();
   }
 }
@@ -1167,6 +1380,7 @@ function closeTerminalsForOwner(ownerId) {
 function closeAllTerminals() {
   for (const [id, session] of terminalSessions.entries()) {
     terminalSessions.delete(id);
+    cancelTerminalEditorRequests(id, "The terminal was closed.");
     session.terminal.kill();
   }
 }

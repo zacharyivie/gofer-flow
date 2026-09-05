@@ -4,6 +4,21 @@ const { ipcRenderer } = require("electron");
 
 const LINK_CHANNEL = "gofer:browser-link-clicked";
 const NAVIGATION_CHANNEL = "gofer:browser-navigation";
+const ZOOM_CHANNEL = "gofer:browser-zoom";
+
+window.addEventListener("wheel", (event) => {
+  if (
+    event.defaultPrevented
+    || (!event.ctrlKey && !event.metaKey)
+    || event.altKey
+    || event.deltaY === 0
+  ) return;
+  event.preventDefault();
+  event.stopPropagation();
+  ipcRenderer.send(ZOOM_CHANNEL, {
+    direction: event.deltaY < 0 ? 1 : -1,
+  });
+}, { capture: true, passive: false });
 
 window.addEventListener("click", (event) => {
   if (

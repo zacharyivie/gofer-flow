@@ -109,6 +109,34 @@ select:focus-visible,
   scrollbar-width: thin;
 }
 
+.tab-strip-scrollbar {
+  scrollbar-color: transparent transparent;
+  scrollbar-width: thin;
+}
+
+.tab-strip-scrollbar:hover,
+.tab-strip-scrollbar:focus-within {
+  scrollbar-color: rgb(var(--color-muted) / 0.45) transparent;
+}
+
+.tab-strip-scrollbar::-webkit-scrollbar {
+  height: 3px;
+}
+
+.tab-strip-scrollbar::-webkit-scrollbar-track,
+.tab-strip-scrollbar::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.tab-strip-scrollbar::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+}
+
+.tab-strip-scrollbar:hover::-webkit-scrollbar-thumb,
+.tab-strip-scrollbar:focus-within::-webkit-scrollbar-thumb {
+  background: rgb(var(--color-muted) / 0.45);
+}
+
 .terminal-host .xterm,
 .terminal-host .xterm-viewport,
 .terminal-host .xterm-screen {

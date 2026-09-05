@@ -13,15 +13,81 @@ on:
         type: boolean
 
 jobs:
+  validate:
+    name: Validate release source
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Verify tag matches package versions
+        if: startsWith(inputs.checkout_ref, 'refs/tags/v')
+        env:
+          CHECKOUT_REF: ${{ inputs.checkout_ref }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import tomllib
+
+          expected = os.environ["CHECKOUT_REF"].removeprefix("refs/tags/v")
+          python_version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf8"))["project"]["version"]
+          frontend_version = json.loads(Path("frontend/package.json").read_text(encoding="utf8"))["version"]
+          versions = {"pyproject.toml": python_version, "frontend/package.json": frontend_version}
+          mismatches = {path: version for path, version in versions.items() if version != expected}
+          if mismatches:
+              details = ", ".join(f"{path}={version}" for path, version in mismatches.items())
+              raise SystemExit(f"Tag v{expected} does not match {details}")
+          print(f"Release tag v{expected} matches all package versions.")
+          PY
+
+      - name: Install browser runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Lint frontend source
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Test frontend
+        working-directory: frontend
+        run: npm test
+
+      - name: Browser-test workflow studio
+        working-directory: frontend
+        run: xvfb-run -a npm run test:browser
+
   build:
     name: Build ${{ matrix.name }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: linux
-            os: ubuntu-latest
+            os: ubuntu-24.04
             electron_builder_args: --linux AppImage deb rpm
             artifact-name: gofer-flow-linux
             artifact-glob: |
@@ -64,7 +130,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y dpkg-dev rpm xvfb
+          sudo apt-get install -y dpkg-dev rpm
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -90,19 +156,6 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
-
-      - name: Lint frontend source
-        working-directory: frontend
-        run: npm run lint
-
-      - name: Test frontend
-        working-directory: frontend
-        run: npm test
-
-      - name: Browser-test workflow studio
-        if: runner.os == 'Linux'
-        working-directory: frontend
-        run: xvfb-run -a npm run test:browser
 
       - name: Build Electron packages
         working-directory: frontend
@@ -200,8 +253,24 @@ jobs:
           path: ${{ matrix.artifact-glob }}
           if-no-files-found: error
 
+  publish:
+    name: Publish release
+    if: inputs.publish_release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gofer-flow-*
+          path: release-artifacts
+          merge-multiple: true
+
       - name: Upload GitHub release artifacts
-        if: inputs.publish_release
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.artifact-glob }}
+          files: release-artifacts/*
+          fail_on_unmatched_files: true

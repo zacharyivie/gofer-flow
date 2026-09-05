@@ -3,6 +3,32 @@
 This file records the major user-facing changes in Taskurotta. Releases through
 version 0.1.3 used the Gofer Flow name.
 
+## 0.2.3 - 2026-09-05
+
+### Added
+
+- Added desktop menus for file, editor, selection, view, terminal, and help
+  actions, including configured shortcuts and recent-project access.
+- Added terminal Git editor handoff so commit, merge, and rebase messages open
+  in the Code workspace and save before the editor request completes.
+- Added page titles and favicons to integrated-browser tabs.
+
+### Changed
+
+- Reworked the integrated browser around isolated webview guests so pages stay
+  live while tabs move between editor panes, and browser shortcuts and zoom
+  follow the application settings.
+- Improved split-pane tab dragging and kept overflowing tabs readable with a
+  compact scrollbar that appears on interaction.
+- Refreshed the Taskurotta browser home page.
+
+### Fixed
+
+- Refreshed open-editor Git baselines after external branch changes and
+  rediscovered workflows whenever a recent project is reopened.
+- Restored Claude Code streaming compatibility by enabling verbose output for
+  its stream-json mode.
+
 ## 0.2.2 - 2026-09-03
 
 ### Added

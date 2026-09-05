@@ -61,10 +61,7 @@ export default function UnifiedBottomPanel({
   }, [activeTab, collapsed, selectTab]);
 
   useEffect(() => {
-    function handleKeyDown(event) {
-      if (!matchesCommand(event, settings, "panel.toggle") || event.repeat) return;
-      event.preventDefault();
-      event.stopPropagation();
+    function togglePanel() {
       if (collapsed) {
         const targetTab = bottomPanelTabForShortcut(
           activeTab,
@@ -76,9 +73,32 @@ export default function UnifiedBottomPanel({
       setCollapsed((current) => !current);
     }
 
+    function handleKeyDown(event) {
+      if (!matchesCommand(event, settings, "panel.toggle") || event.repeat) return;
+      event.preventDefault();
+      event.stopPropagation();
+      togglePanel();
+    }
+
+    function handleExternalToggle(event) {
+      if (event.detail?.tab) {
+        if (activeTab === event.detail.tab && !collapsed) {
+          setCollapsed(true);
+        } else {
+          selectTab(event.detail.tab);
+        }
+        return;
+      }
+      togglePanel();
+    }
+
     window.addEventListener("keydown", handleKeyDown, true);
-    return () => window.removeEventListener("keydown", handleKeyDown, true);
-  }, [activeTab, collapsed, settings]);
+    window.addEventListener("gofer:toggle-bottom-panel", handleExternalToggle);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown, true);
+      window.removeEventListener("gofer:toggle-bottom-panel", handleExternalToggle);
+    };
+  }, [activeTab, collapsed, selectTab, settings]);
 
   useEffect(() => {
     setHeight(settings.layout.bottomPanelHeight);

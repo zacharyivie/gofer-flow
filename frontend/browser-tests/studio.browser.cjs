@@ -328,22 +328,30 @@ async function exerciseDesignRegressions() {
     const composer = document.querySelector("[data-chat-composer]");
     const textarea = composer.querySelector("textarea");
     const send = composer.querySelector("button[title='Send message']");
+    const toolbar = send.parentElement;
     const composerRect = composer.getBoundingClientRect();
     const textareaRect = textarea.getBoundingClientRect();
     const sendRect = send.getBoundingClientRect();
+    const toolbarRect = toolbar.getBoundingClientRect();
+    const inside = (child, parent) => (
+      child.left >= parent.left - 1 &&
+      child.right <= parent.right + 1 &&
+      child.top >= parent.top - 1 &&
+      child.bottom <= parent.bottom + 1
+    );
     return {
-      composer: { height: composerRect.height, width: composerRect.width },
-      sendInsideTextarea:
-        sendRect.left >= textareaRect.left &&
-        sendRect.right <= textareaRect.right &&
-        sendRect.top >= textareaRect.top &&
-        sendRect.bottom <= textareaRect.bottom,
-      textarea: { height: textareaRect.height, width: textareaRect.width },
+      sendInsideComposer: inside(sendRect, composerRect),
+      sendInsideToolbar: inside(sendRect, toolbarRect),
+      textareaInsideComposer: inside(textareaRect, composerRect),
+      toolbarBelowTextarea: toolbarRect.top >= textareaRect.bottom - 1,
+      toolbarInsideComposer: inside(toolbarRect, composerRect),
     };
   });
-  assert.ok(Math.abs(composerLayout.textarea.width - composerLayout.composer.width) <= 2);
-  assert.ok(Math.abs(composerLayout.textarea.height - composerLayout.composer.height) <= 2);
-  assert.equal(composerLayout.sendInsideTextarea, true);
+  assert.equal(composerLayout.textareaInsideComposer, true);
+  assert.equal(composerLayout.toolbarInsideComposer, true);
+  assert.equal(composerLayout.toolbarBelowTextarea, true);
+  assert.equal(composerLayout.sendInsideComposer, true);
+  assert.equal(composerLayout.sendInsideToolbar, true);
 
   await evaluate(() => document.querySelector("button[title='Map']").click());
   await evaluate(() => [...document.querySelectorAll("button")]

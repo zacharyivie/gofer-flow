@@ -22,6 +22,7 @@ class ClaudeCodeSubscription(Subscription):
             "--print",
             "--output-format",
             "stream-json",
+            "--verbose",
         ]
         if provider_settings:
             if provider_settings.model:
