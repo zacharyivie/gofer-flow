@@ -162,18 +162,25 @@ def _powershell_checksum_patterns(run: str) -> set[str]:
 
 def test_main_and_tag_entries_call_the_same_release_build() -> None:
     dry_run = _job(_entry_workflow("release-dry-run.yml"), "release-dry-run")
-    tagged_release = _job(_entry_workflow("release.yml"), "release")
+    tagged_release = _job(_entry_workflow("release.yml"), "release-build")
 
     assert dry_run["uses"] == "./.github/workflows/release-build.yml"
-    assert dry_run["with"] == {
-        "checkout_ref": "${{ github.sha }}",
-        "publish_release": False,
-    }
+    assert dry_run["with"] == {"checkout_ref": "${{ github.sha }}"}
     assert tagged_release["uses"] == "./.github/workflows/release-build.yml"
-    assert tagged_release["with"] == {
-        "checkout_ref": "${{ github.ref }}",
-        "publish_release": True,
-    }
+    assert tagged_release["with"] == {"checkout_ref": "${{ github.ref }}"}
+
+
+def test_only_tag_entry_can_publish() -> None:
+    dry_run = _entry_workflow("release-dry-run.yml")
+    tagged_release = _entry_workflow("release.yml")
+
+    assert dry_run["permissions"] == {"contents": "read"}
+    assert "publish" not in cast(dict[str, Any], dry_run["jobs"])
+    assert tagged_release["permissions"] == {"contents": "read"}
+
+    publish_job = _job(tagged_release, "publish")
+    assert publish_job["needs"] == "release-build"
+    assert publish_job["permissions"] == {"contents": "write"}
 
 
 def test_release_workflow_matrix_matches_supported_platforms() -> None:
@@ -311,9 +318,9 @@ def test_release_workflow_publication_and_artifact_upload_contract() -> None:
 
     assert "Upload GitHub release artifacts" not in build_steps
 
-    publish_job = _job(workflow, "publish")
-    assert publish_job["if"] == "inputs.publish_release"
-    assert publish_job["needs"] == "build"
+    assert "publish" not in cast(dict[str, Any], workflow["jobs"])
+
+    publish_job = _job(_entry_workflow("release.yml"), "publish")
     assert publish_job["runs-on"] == "ubuntu-24.04"
     publish_steps = _steps_by_name(publish_job)
     download = publish_steps["Download packaged artifacts"]

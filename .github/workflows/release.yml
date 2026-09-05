@@ -6,12 +6,32 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Build and publish release
+  release-build:
+    name: Build release
     uses: ./.github/workflows/release-build.yml
     with:
       checkout_ref: ${{ github.ref }}
-      publish_release: true
+
+  publish:
+    name: Publish release
+    needs: release-build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: gofer-flow-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Upload GitHub release artifacts
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
