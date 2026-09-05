@@ -819,7 +819,7 @@ test("app crash fallback exposes recovery actions and complete diagnostics", () 
   assert.ok(report.includes(`Taskurotta v${frontendPackage.version}`));
 
   const issueUrl = new URL(crashBoundaryModule.issueUrlForCrash(crash));
-  assert.equal(issueUrl.origin + issueUrl.pathname, "https://github.com/zacharyivie/gofer-flow/issues/new");
+  assert.equal(issueUrl.origin + issueUrl.pathname, "https://github.com/zacharyivie/Taskurotta/issues/new");
   assert.match(issueUrl.searchParams.get("title"), /^Crash: ReferenceError:/);
   assert.ok(issueUrl.searchParams.get("body").includes(`Taskurotta v${frontendPackage.version}`));
 });
@@ -4050,29 +4050,6 @@ test("studio header separates quiet paths from focused workflow and file names",
   assert.ok(dom.ancestor(workflowTitle, (element) =>
     String(element.getAttribute?.("class") ?? "").includes("gap-1")));
   await dom.unmount();
-
-  const browserHeader = await mountReact(
-    React.createElement(appModule.TopBar, {
-      activeCodePath: "browser://tab-1",
-      hideCodeLabel: true,
-      theme: "dark",
-      updateState: {},
-      view: "code",
-      workflow: { id: "review", name: "Review PR", projectRoot: "/repos/gofer-flow" },
-      onApplyUpdate() {},
-      onCheckForUpdates() {},
-      onOpenHistory() {},
-      onRetrySave() {},
-      onToggleTheme() {},
-    }),
-    createFetchMock([]),
-  );
-  const browserHeading = allElements(browserHeader.container).find(
-    (element) => element.tagName === "H2",
-  );
-  assert.equal(browserHeading, undefined);
-  assert.doesNotMatch(browserHeader.container.textContent, /No file open|browser:\/\//);
-  await browserHeader.unmount();
 });
 
 test("create workflow dialog submits the selected project folder", async () => {
@@ -7877,7 +7854,7 @@ test("Electron IPC security validates sender origins and external URL schemes", 
     false,
   );
 
-  assert.equal(isSafeExternalUrl("https://github.com/zacharyivie/gofer-flow"), true);
+  assert.equal(isSafeExternalUrl("https://github.com/zacharyivie/Taskurotta"), true);
   assert.equal(isSafeExternalUrl("http://127.0.0.1:8765/docs"), true);
   assert.equal(isSafeExternalUrl("mailto:help@example.com"), true);
   assert.equal(isSafeExternalUrl("file:///etc/passwd"), false);

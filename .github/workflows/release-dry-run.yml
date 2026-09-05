@@ -11,8 +11,8 @@ permissions:
 
 jobs:
   release-dry-run:
-    name: Build and test origin/main
+    name: Build and test main push
     uses: ./.github/workflows/release-build.yml
     with:
-      checkout_ref: refs/heads/main
+      checkout_ref: ${{ github.sha }}
       publish_release: false

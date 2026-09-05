@@ -1,10 +1,10 @@
 # Maintainer: Taskurotta <maintainers@goferflow.local>
 pkgname=gofer-flow
-pkgver=0.2.2
+pkgver=0.2.3
 pkgrel=1
 pkgdesc="Local workflow automation studio for Taskurotta"
 arch=("x86_64")
-url="https://github.com/doonk/gofer-flow"
+url="https://github.com/zacharyivie/Taskurotta"
 license=("AGPL-3.0-only")
 depends=(
   "fuse2"

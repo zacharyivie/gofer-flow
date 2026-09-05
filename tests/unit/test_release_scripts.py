@@ -27,6 +27,7 @@ def _copy_release_fixture(tmp_path: Path) -> Path:
         shutil.copy2(REPO_ROOT / "scripts" / script, repo / "scripts" / script)
 
     shutil.copy2(REPO_ROOT / "pyproject.toml", repo / "pyproject.toml")
+    shutil.copy2(REPO_ROOT / "uv.lock", repo / "uv.lock")
     shutil.copy2(REPO_ROOT / "LICENSE", repo / "LICENSE")
     shutil.copy2(REPO_ROOT / "frontend" / "package.json", repo / "frontend" / "package.json")
     shutil.copy2(
@@ -96,6 +97,19 @@ def test_release_metadata_uses_agpl_3_only() -> None:
     ).read_text(encoding="utf8")
 
 
+def test_release_metadata_uses_canonical_repository() -> None:
+    repository = "https://github.com/zacharyivie/Taskurotta"
+    frontend_package = _read_json(REPO_ROOT / "frontend" / "package.json")
+
+    assert frontend_package["homepage"] == repository
+    assert frontend_package["build"]["publish"] == [
+        {"provider": "github", "owner": "zacharyivie", "repo": "Taskurotta"}
+    ]
+    assert repository in (
+        REPO_ROOT / "scripts" / "package-cli-linux.sh"
+    ).read_text(encoding="utf8")
+
+
 def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path) -> None:
     repo = _copy_release_fixture(tmp_path)
     appimage_sha = "A" * 64
@@ -116,6 +130,9 @@ def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path)
 
     assert result.returncode == 0, result.stderr
     assert 'version = "1.2.3"' in (repo / "pyproject.toml").read_text(encoding="utf8")
+    assert 'name = "gofer-flow"\nversion = "1.2.3"' in (
+        repo / "uv.lock"
+    ).read_text(encoding="utf8")
     assert _read_json(repo / "frontend" / "package.json")["version"] == "1.2.3"
     package_lock = _read_json(repo / "frontend" / "package-lock.json")
     assert package_lock["version"] == "1.2.3"
@@ -130,7 +147,7 @@ def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path)
     assert "pkgver = 1.2.3" in arch_srcinfo
     assert (
         "source_x86_64 = Taskurotta-1.2.3-x86_64.AppImage::"
-        "https://github.com/doonk/gofer-flow/releases/download/v1.2.3/"
+        "https://github.com/zacharyivie/Taskurotta/releases/download/v1.2.3/"
         "Taskurotta-1.2.3-x86_64.AppImage"
     ) in arch_srcinfo
     assert f"sha256sums_x86_64 = {appimage_sha.lower()}" in arch_srcinfo
@@ -143,7 +160,7 @@ def test_bump_version_updates_manifests_and_checksums_in_fixture(tmp_path: Path)
     assert "pkgver = 1.2.3" in cli_srcinfo
     assert (
         "source_x86_64 = gof-linux-x64-1.2.3::"
-        "https://github.com/doonk/gofer-flow/releases/download/v1.2.3/gof-linux-x64"
+        "https://github.com/zacharyivie/Taskurotta/releases/download/v1.2.3/gof-linux-x64"
     ) in cli_srcinfo
     assert f"sha256sums_x86_64 = {cli_sha}" in cli_srcinfo
 

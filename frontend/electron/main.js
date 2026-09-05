@@ -68,7 +68,7 @@ const BACKEND_START_TIMEOUT_MS = 15000;
 const ELECTRON_READY_MESSAGE = "GOFER_ELECTRON_READY";
 const BACKEND_EXECUTABLE_NAME = process.platform === "win32" ? "gof.exe" : "gof";
 const LATEST_RELEASE_URL =
-  "https://api.github.com/repos/zacharyivie/gofer-flow/releases/latest";
+  "https://api.github.com/repos/zacharyivie/Taskurotta/releases/latest";
 const isProduction =
   app.isPackaged || process.env.GOFER_ELECTRON_MODE === "production";
 const isSmokeTest = process.env.GOFER_ELECTRON_SMOKE_TEST === "1";
@@ -1505,7 +1505,7 @@ function installDownloadedUpdate() {
 }
 
 async function openUpdateRelease() {
-  await shell.openExternal("https://github.com/zacharyivie/gofer-flow/releases/latest");
+  await shell.openExternal("https://github.com/zacharyivie/Taskurotta/releases/latest");
   return { opened: true };
 }
 

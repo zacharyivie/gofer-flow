@@ -1,10 +1,10 @@
 {
   "name": "gofer-flow-ui",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Local workflow automation studio for Taskurotta.",
   "author": "Taskurotta",
   "license": "AGPL-3.0-only",
-  "homepage": "https://github.com/zacharyivie/gofer-flow",
+  "homepage": "https://github.com/zacharyivie/Taskurotta",
   "desktopName": "gofer-flow",
   "private": true,
   "type": "module",
@@ -45,7 +45,7 @@
       {
         "provider": "github",
         "owner": "zacharyivie",
-        "repo": "gofer-flow"
+        "repo": "Taskurotta"
       }
     ],
     "files": [

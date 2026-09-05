@@ -83,6 +83,15 @@ updateTextFile("pyproject.toml", (text) =>
   ),
 );
 
+updateTextFile("uv.lock", (text) =>
+  replaceOnce(
+    text,
+    /^(name = "gofer-flow"\nversion = ")[^"]+("$)/m,
+    `$1${version}$2`,
+    "uv.lock project version",
+  ),
+);
+
 updateJsonFile("frontend/package.json", (json) => {
   json.version = version;
   return json;
@@ -126,8 +135,8 @@ updateTextFile("packaging/arch/.SRCINFO", (text) => {
 
   next = replaceOnce(
     next,
-    /source_x86_64 = Taskurotta-.+-x86_64\.AppImage::https:\/\/github\.com\/doonk\/gofer-flow\/releases\/download\/v[^/]+\/Taskurotta-.+-x86_64\.AppImage/,
-    `source_x86_64 = Taskurotta-${version}-x86_64.AppImage::https://github.com/doonk/gofer-flow/releases/download/v${version}/Taskurotta-${version}-x86_64.AppImage`,
+    /source_x86_64 = Taskurotta-.+-x86_64\.AppImage::https:\/\/github\.com\/zacharyivie\/Taskurotta\/releases\/download\/v[^/]+\/Taskurotta-.+-x86_64\.AppImage/,
+    `source_x86_64 = Taskurotta-${version}-x86_64.AppImage::https://github.com/zacharyivie/Taskurotta/releases/download/v${version}/Taskurotta-${version}-x86_64.AppImage`,
     ".SRCINFO AppImage source URL",
   );
 
@@ -173,8 +182,8 @@ updateTextFile("packaging/arch-cli/.SRCINFO", (text) => {
 
   next = replaceOnce(
     next,
-    /source_x86_64 = gof-linux-x64-[^:]+::https:\/\/github\.com\/doonk\/gofer-flow\/releases\/download\/v[^/]+\/gof-linux-x64/,
-    `source_x86_64 = gof-linux-x64-${version}::https://github.com/doonk/gofer-flow/releases/download/v${version}/gof-linux-x64`,
+    /source_x86_64 = gof-linux-x64-[^:]+::https:\/\/github\.com\/zacharyivie\/Taskurotta\/releases\/download\/v[^/]+\/gof-linux-x64/,
+    `source_x86_64 = gof-linux-x64-${version}::https://github.com/zacharyivie/Taskurotta/releases/download/v${version}/gof-linux-x64`,
     "CLI .SRCINFO source URL",
   );
 

@@ -114,6 +114,10 @@ def _release_workflow() -> dict[str, Any]:
     return _parse_workflow_yaml(REPO_ROOT / ".github" / "workflows" / "release-build.yml")
 
 
+def _entry_workflow(name: str) -> dict[str, Any]:
+    return _parse_workflow_yaml(REPO_ROOT / ".github" / "workflows" / name)
+
+
 def _job(workflow: dict[str, Any], name: str) -> dict[str, Any]:
     return cast(dict[str, Any], cast(dict[str, Any], workflow["jobs"])[name])
 
@@ -154,6 +158,22 @@ def _bash_checksum_patterns(run: str) -> set[str]:
 
 def _powershell_checksum_patterns(run: str) -> set[str]:
     return set(re.findall(r'\$_.Name -(?:like|eq) "([^"]+)"', run))
+
+
+def test_main_and_tag_entries_call_the_same_release_build() -> None:
+    dry_run = _job(_entry_workflow("release-dry-run.yml"), "release-dry-run")
+    tagged_release = _job(_entry_workflow("release.yml"), "release")
+
+    assert dry_run["uses"] == "./.github/workflows/release-build.yml"
+    assert dry_run["with"] == {
+        "checkout_ref": "${{ github.sha }}",
+        "publish_release": False,
+    }
+    assert tagged_release["uses"] == "./.github/workflows/release-build.yml"
+    assert tagged_release["with"] == {
+        "checkout_ref": "${{ github.ref }}",
+        "publish_release": True,
+    }
 
 
 def test_release_workflow_matrix_matches_supported_platforms() -> None:

@@ -68,7 +68,7 @@ Version:        ${version}
 Release:        1%{?dist}
 Summary:        ${description}
 License:        AGPL-3.0-only
-URL:            https://github.com/doonk/gofer-flow
+URL:            https://github.com/zacharyivie/Taskurotta
 BuildArch:      x86_64
 
 %description
